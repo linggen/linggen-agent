@@ -1,0 +1,16 @@
+# Rust
+/target
+Cargo.lock
+
+# Node.js / UI
+/ui/node_modules
+/ui/dist
+/ui/.env
+
+# Linggen Agent State
+/.linggen-agent
+*.redb
+*.log
+
+# macOS
+.DS_Store

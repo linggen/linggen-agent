@@ -1,0 +1,29 @@
+[[models]]
+id = "local_ollama"
+provider = "ollama"
+url = "http://127.0.0.1:11434"
+model = "qwen3-coder"
+
+
+# [[models]]
+# id = "cloud_api"
+# provider = "openai"
+# url = "https://api.openai.com/v1"
+# model = "gpt-4o"
+# api_key = "sk-..."
+
+[server]
+port = 6666
+
+[agent]
+max_iters = 10
+
+[[agents]]
+id = "pm"
+spec_path = "agents/pm.md"
+model = "local_ollama"
+
+[[agents]]
+id = "coder"
+spec_path = "agents/coder.md"
+model = "local_ollama"

@@ -1,0 +1,36 @@
+[package]
+name = "linggen-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.30"
+crossterm = "0.29"
+ignore = "0.4"
+globset = "0.4"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+uuid = { version = "1", features = ["v4"] }
+headless_chrome = "1.0"
+base64 = "0.22"
+axum = "0.7"
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+rust-embed = "8.0"
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
+mime_guess = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+serde_yaml = "0.9"
+redb = "2.1"
+dirs = "5.0"
+notify = "6.1"
+grep = "0.3"
+grep-regex = "0.1"
+grep-searcher = "0.1"
