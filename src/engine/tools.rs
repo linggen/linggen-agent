@@ -6,7 +6,6 @@ use grep::searcher::sinks::UTF8;
 use grep::searcher::Searcher;
 use headless_chrome::Browser;
 use ignore::WalkBuilder;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -14,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing::info;
 
 #[derive(Debug)]
 pub struct ToolCall {
@@ -80,6 +80,7 @@ impl Tools {
     }
 
     pub fn execute(&self, call: ToolCall) -> Result<ToolResult> {
+        info!("Executing tool: {} with args: {}", call.tool, call.args);
         match call.tool.as_str() {
             "get_repo_info" => Ok(ToolResult::RepoInfo(format!(
                 "root={} platform={}",
@@ -145,12 +146,12 @@ impl Tools {
                 continue;
             }
             let path = entry.path();
+            let rel = to_rel_string(&self.root, path)?;
             if let Some(gs) = &globset {
-                if !gs.is_match(path) {
+                if !gs.is_match(Path::new(&rel)) {
                     continue;
                 }
             }
-            let rel = to_rel_string(&self.root, path)?;
             out.push(rel);
             if out.len() >= max_results {
                 break;
@@ -163,6 +164,14 @@ impl Tools {
     fn read_file(&self, args: ReadFileArgs) -> Result<ToolResult> {
         let rel = sanitize_rel_path(&args.path)?;
         let path = self.root.join(&rel);
+        if !path.exists() {
+            // Return a structured "not found" message instead of hard erroring.
+            // This helps the model self-correct (e.g. by calling Glob first).
+            return Ok(ToolResult::Success(format!(
+                "file_not_found: {} (tip: use Glob to list available files first)",
+                rel
+            )));
+        }
         let file = fs::File::open(&path)?;
         let max = args.max_bytes.unwrap_or(64 * 1024);
         let mut buf = Vec::new();
@@ -206,13 +215,12 @@ impl Tools {
             }
 
             let path = entry.path();
+            let rel_path = to_rel_string(&self.root, path)?;
             if let Some(gs) = &globset {
-                if !gs.is_match(path) {
+                if !gs.is_match(Path::new(&rel_path)) {
                     continue;
                 }
             }
-
-            let rel_path = to_rel_string(&self.root, path)?;
             let mut file_matches = Vec::new();
             
             let _ = searcher.search_path(

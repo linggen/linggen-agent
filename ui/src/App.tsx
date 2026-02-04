@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Terminal, Play, Eye, Activity, Send, MessageSquare, ListTodo, FileText, Folder, ChevronRight, ChevronDown, User, Bot, Sparkles, Trash2, Plus } from 'lucide-react';
+import { Terminal, Play, Eye, Activity, Send, MessageSquare, ListTodo, FileText, Folder, ChevronRight, ChevronDown, User, Bot, Sparkles, Trash2, Plus, RefreshCw, Eraser, Copy } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -13,6 +13,7 @@ interface ChatMessage {
   to?: string;
   text: string;
   timestamp: string;
+  isGenerating?: boolean;
 }
 
 interface FileEntry {
@@ -51,6 +52,28 @@ interface SkillInfo {
 interface AgentInfo {
   name: string;
   description: string;
+}
+
+interface ModelInfo {
+  id: string;
+  provider: string;
+  model: string;
+  url: string;
+}
+
+interface OllamaPsModel {
+  name: string;
+  model: string;
+  size: number;
+  size_vram: number;
+  details: {
+    parameter_size: string;
+    quantization_level: string;
+  };
+}
+
+interface OllamaPsResponse {
+  models: OllamaPsModel[];
 }
 
 interface SessionInfo {
@@ -128,6 +151,8 @@ const App: React.FC = () => {
   const [showAgentDropdown, setShowAgentDropdown] = useState(false);
   const [agentFilter, setAgentFilter] = useState('');
   const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [ollamaStatus, setOllamaStatus] = useState<OllamaPsResponse | null>(null);
 
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -138,6 +163,7 @@ const App: React.FC = () => {
   const [chatInput, setChatInput] = useState('');
   const [selectedAgent, setSelectedAgent] = useState<'lead' | 'coder'>('lead');
   const [isRunning, setIsRunning] = useState(false);
+  // Refresh icon should only refresh UI state, not run an audit skill.
   
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [currentPath, setCurrentPath] = useState('');
@@ -274,7 +300,14 @@ const App: React.FC = () => {
       // Update chat messages from state if needed
       if (data.messages) {
         const msgs: ChatMessage[] = data.messages.map(([meta, body]: any) => ({
-          role: meta.from === 'user' ? 'user' : (meta.from === 'lead' ? 'lead' : 'coder'),
+          role:
+            meta.from === 'user'
+              ? 'user'
+              : meta.from === 'lead'
+                ? 'lead'
+                : meta.from === 'coder'
+                  ? 'coder'
+                  : 'agent',
           from: meta.from,
           to: meta.to,
           text: body,
@@ -354,10 +387,37 @@ const App: React.FC = () => {
     }
   };
 
+  const fetchModels = async () => {
+    try {
+      const resp = await fetch('/api/models');
+      const data = await resp.json();
+      setModels(data);
+    } catch (e) {
+      console.error('Failed to fetch models:', e);
+    }
+  };
+
+  const fetchOllamaStatus = async () => {
+    try {
+      const resp = await fetch('/api/utils/ollama-status');
+      if (resp.ok) {
+        const data = await resp.json();
+        setOllamaStatus(data);
+      }
+    } catch (e) {
+      console.error('Failed to fetch Ollama status:', e);
+    }
+  };
+
   useEffect(() => {
     fetchProjects();
     fetchSkills();
     fetchAgents();
+    fetchModels();
+    
+    const interval = setInterval(fetchOllamaStatus, 5000);
+    fetchOllamaStatus();
+    return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
@@ -384,11 +444,67 @@ const App: React.FC = () => {
           fetchLeadState();
           fetchFiles(currentPath);
           fetchAgentTree();
+        } else if (event.type === 'Observation') {
+          // Observations are persisted to DB; refresh to show tool actions.
+          fetchLeadState();
+        } else if (event.type === 'Token') {
+          setChatMessages(prev => {
+            const lastMsg = prev[prev.length - 1];
+            if (lastMsg && lastMsg.from === event.agent_id && lastMsg.isGenerating) {
+              return prev.map((msg, idx) => 
+                idx === prev.length - 1 
+                  ? { ...msg, text: msg.text + event.token }
+                  : msg
+              );
+            } else {
+              return [...prev, {
+                role: event.agent_id === 'lead' ? 'lead' : 'coder',
+                from: event.agent_id,
+                to: 'user',
+                text: event.token,
+                timestamp: new Date().toLocaleTimeString(),
+                isGenerating: true
+              }];
+            }
+          });
         } else if (event.type === 'Message') {
+          setChatMessages(prev => {
+            const lastMsg = prev[prev.length - 1];
+            if (lastMsg && lastMsg.from === event.from && lastMsg.isGenerating) {
+              return prev.map((msg, idx) => 
+                idx === prev.length - 1 
+                  ? { ...msg, text: event.content, isGenerating: false }
+                  : msg
+              );
+            }
+            // If there's no streaming message to finalize, append as a new message.
+            const role: ChatMessage['role'] =
+              event.from === 'user'
+                ? 'user'
+                : event.from === 'lead'
+                  ? 'lead'
+                  : event.from === 'coder'
+                    ? 'coder'
+                    : 'agent';
+
+            return [...prev, {
+              role,
+              from: event.from,
+              to: event.to,
+              text: event.content,
+              timestamp: new Date().toLocaleTimeString(),
+              isGenerating: false
+            }];
+          });
+          fetchLeadState();
+        } else if (event.type === 'Outcome') {
           fetchLeadState();
         }
       } catch (err) {
+        // If we ever receive a malformed SSE payload (e.g. due to lag/drop),
+        // fall back to a state refresh so tool actions still show up.
         console.error("SSE parse error", err);
+        fetchLeadState();
       }
     };
 
@@ -430,6 +546,15 @@ const App: React.FC = () => {
     setChatInput('');
     setShowSkillDropdown(false);
     setShowAgentDropdown(false);
+
+    // Immediately show user message in UI
+    setChatMessages(prev => [...prev, {
+      role: 'user',
+      from: 'user',
+      to: selectedAgent,
+      text: userMessage,
+      timestamp: new Date().toLocaleTimeString()
+    }]);
     
     // Handle slash commands
     if (userMessage.startsWith('/user_story ')) {
@@ -463,6 +588,65 @@ const App: React.FC = () => {
     }
   };
 
+  const clearChat = async () => {
+    if (!selectedProjectRoot) return;
+    if (!confirm('Clear chat history for this session?')) return;
+    try {
+      await fetch('/api/chat/clear', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_root: selectedProjectRoot,
+          session_id: activeSessionId,
+        }),
+      });
+      setChatMessages([]);
+      fetchLeadState();
+    } catch (e) {
+      addLog(`Error clearing chat: ${e}`);
+    }
+  };
+
+  const [copyChatStatus, setCopyChatStatus] = useState<'idle' | 'copied' | 'error'>('idle');
+
+  const copyChat = async () => {
+    try {
+      const headerLines = [
+        `Linggen Agent Chat Export`,
+        `Project: ${selectedProjectRoot || '(none)'}`,
+        `Session: ${activeSessionId || 'default'}`,
+        `Agent: ${selectedAgent}`,
+        `ExportedAt: ${new Date().toISOString()}`,
+        ``,
+      ];
+
+      const body = chatMessages
+        .map((m) => {
+          const from = m.from || m.role;
+          const to = m.to ? ` → ${m.to}` : '';
+          return `[${m.timestamp}] ${from}${to}\n${m.text}\n`;
+        })
+        .join('\n');
+
+      const text = headerLines.join('\n') + body;
+      await navigator.clipboard.writeText(text);
+      setCopyChatStatus('copied');
+      window.setTimeout(() => setCopyChatStatus('idle'), 1200);
+    } catch (e) {
+      console.error('Failed to copy chat', e);
+      setCopyChatStatus('error');
+      window.setTimeout(() => setCopyChatStatus('idle'), 1600);
+    }
+  };
+
+  const refreshPageState = async () => {
+    if (!selectedProjectRoot) return;
+    fetchLeadState();
+    fetchFiles(currentPath);
+    fetchAgentTree();
+    fetchSessions();
+  };
+
   return (
     <div className="flex flex-col h-screen bg-slate-50 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200 font-sans overflow-hidden">
       {/* Header */}
@@ -476,6 +660,14 @@ const App: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-2">
+            <button 
+              onClick={refreshPageState}
+              disabled={!selectedProjectRoot || isRunning}
+              className="p-1.5 hover:bg-blue-500/10 hover:text-blue-500 rounded-lg text-slate-500 transition-colors disabled:opacity-50"
+              title="Refresh page state"
+            >
+              <RefreshCw size={16} className={cn(isRunning && "animate-spin")} />
+            </button>
             <select 
               value={selectedProjectRoot}
               onChange={(e) => setSelectedProjectRoot(e.target.value)}
@@ -566,56 +758,94 @@ const App: React.FC = () => {
         <main className="flex-1 flex flex-col overflow-hidden p-4 gap-4 bg-slate-50 dark:bg-[#0a0a0a]">
           
           <div className="grid grid-cols-2 gap-4 h-1/3">
-            {/* Lead Card */}
+            {/* Agents Card */}
             <section className="bg-white dark:bg-[#141414] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm flex flex-col overflow-hidden">
               <div className="px-4 py-2 border-b border-slate-200 dark:border-white/5 bg-slate-50 dark:bg-white/[0.02] flex items-center justify-between">
                 <h3 className="text-[10px] font-bold uppercase tracking-widest text-blue-500 flex items-center gap-2">
-                  <User size={12} /> Lead Agent
+                  <User size={12} /> Agents Status
                 </h3>
-                <span className="text-[10px] text-slate-400">Global State</span>
+                <span className="text-[10px] text-slate-400">Swarm</span>
               </div>
-              <div className="flex-1 p-4 overflow-y-auto text-xs space-y-3">
-                <div>
-                  <div className="text-slate-500 mb-1 font-bold">Active Task</div>
-                  <div className="bg-slate-50 dark:bg-black/20 p-2 rounded border border-slate-200 dark:border-white/5 italic">
-                    {leadState?.active_lead_task ? leadState.active_lead_task[1].substring(0, 100) + '...' : 'No active task'}
+              <div className="flex-1 p-4 overflow-y-auto text-xs space-y-4">
+                {agents.map(agent => (
+                  <div key={agent.name} className="flex items-center justify-between bg-slate-50 dark:bg-black/20 px-3 py-2 rounded-lg border border-slate-200 dark:border-white/5">
+                    <div className="flex items-center gap-2">
+                      {agent.name === 'lead' ? <User size={14} className="text-blue-500" /> : <Bot size={14} className="text-purple-500" />}
+                      <span className="font-bold uppercase tracking-tight">{agent.name}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className={cn(
+                        "text-[8px] font-bold px-1.5 py-0.5 rounded-full uppercase",
+                        (isRunning && selectedAgent === agent.name) ? "bg-green-500/20 text-green-500 animate-pulse" : "bg-slate-500/20 text-slate-500"
+                      )}>
+                        {(isRunning && selectedAgent === agent.name) ? 'Working' : 'Idle'}
+                      </span>
+                    </div>
                   </div>
-                </div>
-                <div>
-                  <div className="text-slate-500 mb-1 font-bold">Assigned Tasks</div>
-                  <div className="space-y-1">
-                    {leadState?.tasks.map(([meta, body]: any) => (
-                      <div key={meta.id} className="flex items-center justify-between bg-slate-50 dark:bg-black/20 px-2 py-1 rounded text-[10px]">
-                        <span className="truncate max-w-[150px]">{meta.id}</span>
-                        <span className={cn(
-                          "px-1.5 py-0.5 rounded-full font-bold uppercase tracking-tighter",
-                          meta.status === 'active' ? "bg-green-500/20 text-green-500" : "bg-slate-500/20 text-slate-500"
-                        )}>{meta.status}</span>
-                      </div>
-                    ))}
-                    {(!leadState?.tasks || leadState.tasks.length === 0) && <div className="text-slate-600 italic">No tasks assigned</div>}
+                ))}
+                
+                <div className="pt-2 border-t border-slate-200 dark:border-white/5">
+                  <div className="text-[10px] text-slate-500 mb-1 font-bold uppercase tracking-widest">Active Lead Task</div>
+                  <div className="bg-slate-50 dark:bg-black/20 p-2 rounded border border-slate-200 dark:border-white/5 italic text-[10px] text-slate-400 truncate">
+                    {leadState?.active_lead_task ? leadState.active_lead_task[1].substring(0, 100) + '...' : 'No active task'}
                   </div>
                 </div>
               </div>
             </section>
 
-            {/* Coder Card */}
+            {/* Models Card */}
             <section className="bg-white dark:bg-[#141414] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm flex flex-col overflow-hidden">
               <div className="px-4 py-2 border-b border-slate-200 dark:border-white/5 bg-slate-50 dark:bg-white/[0.02] flex items-center justify-between">
                 <h3 className="text-[10px] font-bold uppercase tracking-widest text-purple-500 flex items-center gap-2">
-                  <Bot size={12} /> Coder Agent
+                  <Sparkles size={12} /> Models Status
                 </h3>
-                <span className="text-[10px] text-slate-400">Implementation</span>
+                <span className="text-[10px] text-slate-400">Inference</span>
               </div>
-              <div className="flex-1 p-4 overflow-y-auto text-xs">
-                <div className="text-slate-500 mb-1 font-bold">Current Assignment</div>
-                {leadState?.tasks.find(([meta]: any) => meta.status === 'active') ? (
-                  <div className="bg-slate-50 dark:bg-black/20 p-2 rounded border border-slate-200 dark:border-white/5 italic">
-                    {leadState.tasks.find(([meta]: any) => meta.status === 'active')![1].substring(0, 150)}...
-                  </div>
-                ) : (
-                  <div className="text-slate-600 italic">Waiting for Lead assignment...</div>
-                )}
+              <div className="flex-1 p-4 overflow-y-auto text-xs space-y-3">
+                {models.map(m => {
+                  const isActive = ollamaStatus?.models.some(om => om.name.includes(m.model) || m.model.includes(om.name));
+                  const activeInfo = ollamaStatus?.models.find(om => om.name.includes(m.model) || m.model.includes(om.name));
+                  
+                  return (
+                    <div key={m.id} className="bg-slate-50 dark:bg-black/20 p-3 rounded-lg border border-slate-200 dark:border-white/5 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <div className={cn(
+                            "w-1.5 h-1.5 rounded-full",
+                            isActive ? "bg-green-500 animate-pulse" : "bg-slate-500"
+                          )} />
+                          <span className="font-mono font-bold">{m.model}</span>
+                        </div>
+                        <span className="text-[8px] text-slate-500 uppercase">{m.provider}</span>
+                      </div>
+                      
+                      {activeInfo && (
+                        <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[9px] text-slate-400 font-mono">
+                          <div className="flex justify-between border-b border-white/5 pb-0.5">
+                            <span>PARAMS:</span>
+                            <span className="text-slate-200">{activeInfo.details.parameter_size}</span>
+                          </div>
+                          <div className="flex justify-between border-b border-white/5 pb-0.5">
+                            <span>VRAM:</span>
+                            <span className="text-slate-200">{(activeInfo.size_vram / 1024 / 1024 / 1024).toFixed(1)}GB</span>
+                          </div>
+                          <div className="flex justify-between border-b border-white/5 pb-0.5">
+                            <span>QUANT:</span>
+                            <span className="text-slate-200">{activeInfo.details.quantization_level}</span>
+                          </div>
+                          <div className="flex justify-between border-b border-white/5 pb-0.5">
+                            <span>CONTEXT:</span>
+                            <span className="text-slate-200">{chatMessages.reduce((acc, msg) => acc + msg.text.length, 0).toLocaleString()}</span>
+                          </div>
+                        </div>
+                      )}
+                      
+                      {!activeInfo && (
+                        <div className="text-[9px] text-slate-600 italic">Model is currently idle</div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </section>
           </div>
@@ -642,6 +872,33 @@ const App: React.FC = () => {
                 <MessageSquare size={14} /> Unified Chat
               </h2>
               <div className="flex items-center gap-2">
+                <button
+                  onClick={copyChat}
+                  className={cn(
+                    "p-1.5 rounded-lg transition-colors text-slate-500",
+                    copyChatStatus === 'copied'
+                      ? "bg-green-500/10 text-green-600"
+                      : copyChatStatus === 'error'
+                        ? "bg-red-500/10 text-red-500"
+                        : "hover:bg-slate-100 dark:hover:bg-white/5"
+                  )}
+                  title={
+                    copyChatStatus === 'copied'
+                      ? "Copied"
+                      : copyChatStatus === 'error'
+                        ? "Copy failed"
+                        : "Copy Chat"
+                  }
+                >
+                  <Copy size={16} />
+                </button>
+                <button
+                  onClick={clearChat}
+                  className="p-1.5 hover:bg-red-500/10 hover:text-red-500 rounded-lg text-slate-500 transition-colors"
+                  title="Clear Chat"
+                >
+                  <Eraser size={16} />
+                </button>
                 <button 
                   onClick={createSession}
                   className="p-1.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded-lg text-blue-500 transition-colors"
@@ -697,11 +954,39 @@ const App: React.FC = () => {
                   "px-3 py-2 rounded-xl text-xs leading-relaxed shadow-sm",
                   msg.role === 'user' 
                     ? "bg-blue-600 text-white rounded-tr-none" 
-                    : (msg.from === 'pm' && msg.to === 'coder' 
+                    : (msg.from === 'lead' && msg.to === 'coder' 
                         ? "bg-amber-500/10 border border-amber-500/20 text-amber-200 italic" 
                         : "bg-slate-100 dark:bg-white/5 text-slate-800 dark:text-slate-200 border border-slate-200 dark:border-white/10 rounded-tl-none")
                 )}>
-                  {msg.text}
+                  {(() => {
+                    if (msg.role === 'user') return msg.text;
+                    try {
+                      const parsed = JSON.parse(msg.text);
+                      if (parsed.type === 'ask' && parsed.question) {
+                        return parsed.question;
+                      }
+                      if (parsed.type === 'tool' && parsed.tool) {
+                        return (
+                          <div className="flex items-center gap-2 text-blue-500 italic">
+                            <Activity size={12} className="animate-pulse" />
+                            <span>Using tool: {parsed.tool}...</span>
+                          </div>
+                        );
+                      }
+                      if (parsed.type === 'finalize_task' && parsed.packet) {
+                        return (
+                          <div className="space-y-2">
+                            <div className="font-bold text-blue-500">Task Finalized: {parsed.packet.title}</div>
+                            <div className="text-[10px] opacity-80">{parsed.packet.user_stories.join(', ')}</div>
+                          </div>
+                        );
+                      }
+                      return msg.text;
+                    } catch (e) {
+                      return msg.text;
+                    }
+                  })()}
+                  {msg.isGenerating && <span className="inline-block w-1.5 h-3.5 bg-blue-500 ml-1 animate-pulse align-middle" />}
                 </div>
                 <span className="text-[8px] text-slate-500 px-1">{msg.timestamp}</span>
               </div>
@@ -710,15 +995,6 @@ const App: React.FC = () => {
           </div>
 
           <div className="p-4 border-t border-slate-200 dark:border-white/5 space-y-3">
-            <div className="flex gap-2">
-              <button 
-                onClick={handleRun} 
-                disabled={isRunning || !selectedProjectRoot} 
-                className="w-full py-2 bg-blue-600 text-white rounded-lg text-xs font-bold disabled:opacity-50 shadow-lg shadow-blue-600/20 flex items-center justify-center gap-2"
-              >
-                <Play size={14} /> Run Agent Loop
-              </button>
-            </div>
             <div className="flex gap-2 bg-slate-100 dark:bg-white/5 p-1 rounded-xl border border-slate-200 dark:border-white/10 relative">
               {showSkillDropdown && (
                 <div className="absolute bottom-full left-0 right-0 mb-2 bg-white dark:bg-[#141414] border border-slate-200 dark:border-white/10 rounded-lg shadow-xl max-h-48 overflow-y-auto z-[70]">

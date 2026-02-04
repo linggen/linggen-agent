@@ -227,6 +227,29 @@ impl Db {
         Ok(())
     }
 
+    pub fn clear_chat_history(&self, repo_path: &str, session_id: &str) -> Result<usize> {
+        let write_txn = self.db.begin_write()?;
+        let mut removed = 0usize;
+        {
+            let mut table = write_txn.open_table(CHAT_HISTORY_TABLE)?;
+            let prefix = format!("{}:{}:", repo_path, session_id);
+            let mut to_remove = Vec::new();
+            for res in table.iter()? {
+                let (key, _val) = res?;
+                let k = key.value();
+                if k.starts_with(&prefix) {
+                    to_remove.push(k.to_string());
+                }
+            }
+            for k in to_remove {
+                table.remove(k.as_str())?;
+                removed += 1;
+            }
+        }
+        write_txn.commit()?;
+        Ok(removed)
+    }
+
     pub fn add_chat_message(&self, msg: ChatMessageRecord) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
@@ -234,19 +257,31 @@ impl Db {
             // Key: repo:session:agent:timestamp_nanos
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
             let nanos = now.as_nanos();
-            let key = format!("{}:{}:{}:{:020}", msg.repo_path, msg.session_id, msg.agent_id, nanos);
+            let key = format!(
+                "{}:{}:{}:{:020}",
+                msg.repo_path, msg.session_id, msg.agent_id, nanos
+            );
             let val = serde_json::to_string(&msg)?;
             table.insert(key.as_str(), val.as_str())?;
         }
         write_txn.commit()?;
+
+        // Log to console for debugging
+        tracing::debug!("Chat Message Recorded: {} -> {}", msg.from_id, msg.to_id);
+
         Ok(())
     }
 
-    pub fn get_chat_history(&self, repo_path: &str, session_id: &str, agent_id: Option<&str>) -> Result<Vec<ChatMessageRecord>> {
+    pub fn get_chat_history(
+        &self,
+        repo_path: &str,
+        session_id: &str,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<ChatMessageRecord>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(CHAT_HISTORY_TABLE)?;
         let mut history = Vec::new();
-        
+
         // Simple prefix scan for now
         let prefix = if let Some(aid) = agent_id {
             format!("{}:{}:{}:", repo_path, session_id, aid)
