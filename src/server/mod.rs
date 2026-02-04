@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
@@ -41,6 +42,10 @@ pub enum ServerEvent {
         to: String,
         content: String,
     },
+    Token {
+        agent_id: String,
+        token: String,
+    },
     Observation {
         agent_id: String,
         content: String,
@@ -56,11 +61,38 @@ pub async fn start_server(
     skill_manager: Arc<crate::skills::SkillManager>,
     port: u16,
     dev_mode: bool,
+    mut agent_events_rx: mpsc::UnboundedReceiver<crate::agent_manager::AgentEvent>,
 ) -> anyhow::Result<()> {
-    setup_tracing();
     info!("linggen-agent server starting on port {}...", port);
 
-    let (events_tx, _) = broadcast::channel(100);
+    // SSE can be bursty (tokens, tool steps). Use a larger buffer to reduce lag drops.
+    let (events_tx, _) = broadcast::channel(4096);
+
+    // Bridge internal AgentManager events to SSE for the UI.
+    {
+        let events_tx = events_tx.clone();
+        tokio::spawn(async move {
+            while let Some(event) = agent_events_rx.recv().await {
+                let mapped = match event {
+                    crate::agent_manager::AgentEvent::StateUpdated => Some(ServerEvent::StateUpdated),
+                    crate::agent_manager::AgentEvent::Message { from, to, content } => {
+                        Some(ServerEvent::Message { from, to, content })
+                    }
+                    crate::agent_manager::AgentEvent::Outcome { agent_id, outcome } => {
+                        Some(ServerEvent::Outcome { agent_id, outcome })
+                    }
+                    crate::agent_manager::AgentEvent::TaskUpdate { .. } => {
+                        // UI will refresh state from DB
+                        Some(ServerEvent::StateUpdated)
+                    }
+                };
+
+                if let Some(ev) = mapped {
+                    let _ = events_tx.send(ev);
+                }
+            }
+        });
+    }
 
     let state = Arc::new(ServerState {
         manager,
@@ -74,6 +106,7 @@ pub async fn start_server(
         .route("/api/projects", post(add_project))
         .route("/api/projects", delete(remove_project))
         .route("/api/agents", get(list_agents_api))
+        .route("/api/models", get(list_models_api))
         .route("/api/skills", get(list_skills))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions", post(create_session))
@@ -81,12 +114,14 @@ pub async fn start_server(
         .route("/api/task", post(set_task))
         .route("/api/run", post(run_agent))
         .route("/api/chat", post(chat_handler))
+        .route("/api/chat/clear", post(clear_chat_history_api))
         .route("/api/workspace/tree", get(get_agent_tree))
         .route("/api/files", get(list_files))
         .route("/api/file", get(read_file_api))
         .route("/api/lead/state", get(get_lead_state))
         .route("/api/events", get(events_handler))
         .route("/api/utils/pick-folder", get(pick_folder))
+        .route("/api/utils/ollama-status", get(get_ollama_status))
         .fallback(static_handler)
         .with_state(state);
 
@@ -95,18 +130,6 @@ pub async fn start_server(
     axum::serve(listener, app).await?;
 
     Ok(())
-}
-
-fn setup_tracing() {
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_thread_ids(false)
-        .with_thread_names(false)
-        .with_file(true)
-        .with_line_number(true)
-        .with_level(true)
-        .compact()
-        .init();
 }
 
 #[derive(Deserialize)]
@@ -235,6 +258,30 @@ struct ChatRequest {
     session_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ClearChatRequest {
+    project_root: String,
+    session_id: Option<String>,
+}
+
+async fn clear_chat_history_api(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<ClearChatRequest>,
+) -> impl IntoResponse {
+    let session_id = req.session_id.unwrap_or_else(|| "default".to_string());
+    match state
+        .manager
+        .db
+        .clear_chat_history(&req.project_root, &session_id)
+    {
+        Ok(removed) => {
+            let _ = state.events_tx.send(ServerEvent::StateUpdated);
+            Json(serde_json::json!({ "removed": removed })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 async fn chat_handler(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ChatRequest>,
@@ -242,7 +289,6 @@ async fn chat_handler(
     let root = PathBuf::from(&req.project_root);
     let session_id = req.session_id.clone();
     let events_tx = state.events_tx.clone();
-    let manager_clone = state.manager.clone();
 
     // Check for @Lead or @Coder prefix
     let (target_id, clean_msg) = if req.message.starts_with("@Lead ") {
@@ -258,41 +304,223 @@ async fn chat_handler(
 
     match state.manager.get_or_create_agent(&root, &target_id).await {
         Ok(agent) => {
+            let events_tx_clone = events_tx.clone();
+            let target_id_clone = target_id.clone();
+            let clean_msg_clone = clean_msg.clone();
+
+            // Emit user message event immediately
+            let _ = events_tx.send(ServerEvent::Message {
+                from: "user".to_string(),
+                to: target_id.clone(),
+                content: clean_msg.clone(),
+            });
+
+            // Persist user message in DB immediately so fetchLeadState sees it
+            if let Ok(ctx) = state.manager.get_or_create_project(root.clone()).await {
+                let _ = ctx.state_fs.append_message(
+                    "user",
+                    &target_id,
+                    &clean_msg,
+                    None,
+                    session_id.as_deref(),
+                );
+                
+                let _ = state.manager.db.add_chat_message(crate::db::ChatMessageRecord {
+                    repo_path: root.to_string_lossy().to_string(),
+                    session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
+                    agent_id: target_id.clone(),
+                    from_id: "user".to_string(),
+                    to_id: target_id.clone(),
+                    content: clean_msg.clone(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    is_observation: false,
+                });
+            }
+
             tokio::spawn(async move {
                 let mut engine = agent.lock().await;
-                let response = engine
-                    .chat(&clean_msg, session_id.as_deref())
-                    .await
-                    .unwrap_or_else(|e| format!("Error: {}", e));
+                let mut full_response = String::new();
 
-                // Log message if it's Lead or Coder
-                if let Ok(ctx) = manager_clone.get_or_create_project(root).await {
-                    let _ = ctx.state_fs.append_message(
-                        "user",
-                        &target_id,
-                        &clean_msg,
-                        None,
-                        session_id.as_deref(),
-                    );
-                    let _ = ctx.state_fs.append_message(
-                        &target_id,
-                        "user",
-                        &response,
-                        None,
-                        session_id.as_deref(),
-                    );
+                // If the user is invoking a skill (slash command), skip streaming chat.
+                // Go straight into the structured agent loop to avoid dumping tool JSON into the UI.
+                if clean_msg_clone.trim_start().starts_with('/') {
+                    // Activate skill and set the loop task from the command payload.
+                    let parts: Vec<&str> = clean_msg_clone.trim().splitn(2, ' ').collect();
+                    let cmd = parts[0].trim_start_matches('/');
+                    let task_for_loop = parts
+                        .get(1)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "Initialize this workspace and summarize status.".to_string());
+
+                    if let Some(manager) = engine.tools.get_manager() {
+                        if let Some(skill) = manager.skill_manager.get_skill(cmd).await {
+                            engine.active_skill = Some(skill);
+                        }
+                    }
+
+                    // New skill run: clear stale observations.
+                    engine.observations.clear();
+                    engine.task = Some(task_for_loop);
+
+                    let _ = events_tx_clone.send(ServerEvent::Message {
+                        from: target_id_clone.clone(),
+                        to: "user".to_string(),
+                        content: format!("Running skill: {}", cmd),
+                    });
+
+                    if let Err(e) = engine.run_agent_loop(session_id.as_deref()).await {
+                        tracing::warn!("Skill loop failed: {}", e);
+                        let _ = events_tx_clone.send(ServerEvent::Message {
+                            from: target_id_clone.clone(),
+                            to: "user".to_string(),
+                            content: format!("Error: {}", e),
+                        });
+                    } else {
+                        // Force UI refresh after loop
+                        let _ = events_tx_clone.send(ServerEvent::StateUpdated);
+                    }
+
+                    return;
                 }
 
-                let _ = events_tx.send(ServerEvent::Message {
-                    from: "user".to_string(),
-                    to: target_id.clone(),
-                    content: clean_msg,
-                });
-                let _ = events_tx.send(ServerEvent::Message {
-                    from: target_id,
-                    to: "user".to_string(),
-                    content: response,
-                });
+                match engine.chat_stream(&clean_msg_clone, session_id.as_deref()).await {
+                    Ok(mut stream) => {
+                        while let Some(token_result) = stream.next().await {
+                            if let Ok(token) = token_result {
+                                full_response.push_str(&token);
+                                let _ = events_tx_clone.send(ServerEvent::Token {
+                                    agent_id: target_id_clone.clone(),
+                                    token,
+                                });
+                            }
+                        }
+
+                        // Finalize chat in engine (updates history and DB)
+                        let _ = engine.finalize_chat(&clean_msg_clone, &full_response, session_id.as_deref()).await;
+
+                        // If the model asked for a tool, don't dump the raw model output (often multi-JSON)
+                        // into the chat UI. Instead send a clean single tool JSON message and proceed.
+                        let mut handled_tool = false;
+                        if let Ok(action) = crate::engine::parse_first_action(&full_response) {
+                            if let crate::engine::ModelAction::Tool { tool, args } = action {
+                                handled_tool = true;
+                                let _ = events_tx_clone.send(ServerEvent::Message {
+                                    from: target_id_clone.clone(),
+                                    to: "user".to_string(),
+                                    content: serde_json::json!({
+                                        "type": "tool",
+                                        "tool": tool,
+                                        "args": args
+                                    })
+                                    .to_string(),
+                                });
+
+                                // 1. Execute the tool that was just requested in chat
+                                let call = crate::engine::tools::ToolCall { tool: tool.clone(), args };
+                                match engine.tools.execute(call) {
+                                    Ok(result) => {
+                                        let rendered_model = crate::engine::render_tool_result(&result);
+                                        let rendered_public =
+                                            crate::engine::render_tool_result_public(&result);
+                                        engine.observations.push(rendered_model.clone());
+
+                                        // Record observation in DB
+                                        let _ = engine
+                                            .manager_db_add_observation(
+                                                &tool,
+                                                &rendered_public,
+                                                session_id.as_deref(),
+                                            )
+                                            .await;
+
+                                        let _ = events_tx_clone.send(ServerEvent::Observation {
+                                            agent_id: target_id_clone.clone(),
+                                            content: format!("Executed {}: {}", tool, rendered_public),
+                                        });
+
+                                    // Ensure loop uses *this* request as the task (strip slash command prefix).
+                                    let task_for_loop = if clean_msg_clone.starts_with('/') {
+                                        clean_msg_clone
+                                            .splitn(2, ' ')
+                                            .nth(1)
+                                            .unwrap_or("Initialize and proceed.")
+                                            .trim()
+                                            .to_string()
+                                    } else {
+                                        clean_msg_clone.clone()
+                                    };
+                                    engine.task = Some(task_for_loop);
+
+                                        // 2. Continue the autonomous loop
+                                        if let Err(e) = engine.run_agent_loop(session_id.as_deref()).await {
+                                            tracing::warn!("Auto-run loop failed: {}", e);
+                                            let _ = events_tx_clone.send(ServerEvent::Message {
+                                                from: target_id_clone.clone(),
+                                                to: "user".to_string(),
+                                                content: format!("Error: {}", e),
+                                            });
+                                        }
+                                        // Force UI refresh after loop so the final LLM answer
+                                        // (persisted to DB) shows up immediately.
+                                        let _ = events_tx_clone.send(ServerEvent::StateUpdated);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Tool execution failed ({}): {}", tool, e);
+                                        // Record the tool error as an observation so the loop can self-correct.
+                                        let rendered = format!("tool_error: tool={} error={}", tool, e);
+                                        engine.observations.push(rendered.clone());
+                                        let _ = engine
+                                            .manager_db_add_observation(&tool, &rendered, session_id.as_deref())
+                                            .await;
+                                        let _ = events_tx_clone.send(ServerEvent::Observation {
+                                            agent_id: target_id_clone.clone(),
+                                            content: format!("Tool error {}: {}", tool, e),
+                                        });
+                                        let task_for_loop = if clean_msg_clone.starts_with('/') {
+                                            clean_msg_clone
+                                                .splitn(2, ' ')
+                                                .nth(1)
+                                                .unwrap_or("Initialize and proceed.")
+                                                .trim()
+                                                .to_string()
+                                        } else {
+                                            clean_msg_clone.clone()
+                                        };
+                                        engine.task = Some(task_for_loop);
+                                        // Ask the model again with the error + schema.
+                                        let _ = engine.run_agent_loop(session_id.as_deref()).await;
+                                        let _ = events_tx_clone.send(ServerEvent::Message {
+                                            from: target_id_clone.clone(),
+                                            to: "user".to_string(),
+                                            content: format!("Tool execution failed ({}): {}", tool, e),
+                                        });
+                                    }
+                                };
+                            }
+                        }
+
+                        if !handled_tool {
+                            // Normal assistant message (ask/finalize/other text)
+                            let _ = events_tx_clone.send(ServerEvent::Message {
+                                from: target_id_clone.clone(),
+                                to: "user".to_string(),
+                                content: full_response.clone(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        let error_msg = format!("Error: {}", e);
+                        let _ = events_tx_clone.send(ServerEvent::Message {
+                            from: target_id_clone,
+                            to: "user".to_string(),
+                            content: error_msg,
+                        });
+                    }
+                }
             });
 
             Json(serde_json::json!({ "status": "started" })).into_response()
@@ -427,6 +655,11 @@ async fn list_agents_api(State(state): State<Arc<ServerState>>) -> impl IntoResp
         Ok(agents) => Json(agents).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+async fn list_models_api(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    let models = state.manager.models.list_models();
+    Json(models).into_response()
 }
 
 async fn list_skills(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
@@ -628,46 +861,33 @@ async fn events_handler(
             let data = serde_json::to_string(&event).unwrap_or_default();
             Ok(Event::default().data(data))
         }
-        Err(_) => Ok(Event::default().data("error")),
+        // If the broadcast stream lags/drops messages, emit a parseable event that
+        // prompts the UI to refresh from DB instead of sending non-JSON "error".
+        Err(_) => {
+            let data = serde_json::to_string(&ServerEvent::StateUpdated).unwrap_or_default();
+            Ok(Event::default().data(data))
+        }
     });
 
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 async fn pick_folder() -> impl IntoResponse {
-    // On macOS, we can use an AppleScript to open a folder picker.
-    // This is a bit of a hack but works well for a local-only tool.
-    #[cfg(target_os = "macos")]
-    {
-        let output = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg("choose folder with prompt \"Select a repository folder:\"")
-            .output();
+    // ... (existing code)
+}
 
-        if let Ok(output) = output {
-            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path_str.is_empty() {
-                // osascript returns "alias Macintosh HD:Users:path:to:folder:"
-                // or "folder Macintosh HD:Users:path:to:folder:"
-                // We need to convert this to a POSIX path.
-                let posix_output = std::process::Command::new("osascript")
-                    .arg("-e")
-                    .arg(format!(
-                        "POSIX path of alias \"{}\"",
-                        path_str.replace("alias ", "").replace("folder ", "")
-                    ))
-                    .output();
+async fn get_ollama_status(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    // We'll just check the first ollama model we find
+    let models = state.manager.models.list_models();
+    let ollama_model = models.iter().find(|m| m.provider == "ollama");
 
-                if let Ok(posix_output) = posix_output {
-                    let posix_path = String::from_utf8_lossy(&posix_output.stdout)
-                        .trim()
-                        .to_string();
-                    return Json(serde_json::json!({ "path": posix_path })).into_response();
-                }
-            }
+    if let Some(m) = ollama_model {
+        let client = crate::ollama::OllamaClient::new(m.url.clone(), m.api_key.clone());
+        match client.get_ps().await {
+            Ok(status) => Json(status).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         }
+    } else {
+        (StatusCode::NOT_FOUND, "No Ollama models configured").into_response()
     }
-
-    // Fallback or other OS (placeholder for now)
-    StatusCode::NOT_IMPLEMENTED.into_response()
 }

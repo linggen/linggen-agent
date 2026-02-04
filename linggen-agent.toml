@@ -19,8 +19,8 @@ port = 6666
 max_iters = 10
 
 [[agents]]
-id = "pm"
-spec_path = "agents/pm.md"
+id = "lead"
+spec_path = "agents/lead.md"
 model = "local_ollama"
 
 [[agents]]

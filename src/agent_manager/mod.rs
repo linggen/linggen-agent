@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
+use tracing::warn;
 
 pub mod locks;
 pub mod models;
@@ -101,12 +102,25 @@ impl AgentManager {
             notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
                     let repo_path = root_clone.to_string_lossy().to_string();
+                    
+                    // Ignore internal and build directories
+                    if event.paths.iter().any(|p| {
+                        let s = p.to_string_lossy();
+                        s.contains("/target/") || 
+                        s.contains("/.git/") || 
+                        s.contains("/.linggen-agent/") || 
+                        s.contains("/node_modules/")
+                    }) {
+                        return;
+                    }
+
                     match event.kind {
                         EventKind::Remove(_) => {
                             for path in event.paths {
                                 if let Ok(rel) = path.strip_prefix(&root_clone) {
-                                    let _ = db_clone
-                                        .remove_activity(&repo_path, &rel.to_string_lossy());
+                                    let rel_str = rel.to_string_lossy();
+                                    tracing::info!("File removed on disk: {}", rel_str);
+                                    let _ = db_clone.remove_activity(&repo_path, &rel_str);
                                 }
                             }
                             let _ = events_tx.send(AgentEvent::StateUpdated);
@@ -120,10 +134,13 @@ impl AgentManager {
                                 if let (Ok(old_rel), Ok(new_rel)) =
                                     (old.strip_prefix(&root_clone), new.strip_prefix(&root_clone))
                                 {
+                                    let old_str = old_rel.to_string_lossy();
+                                    let new_str = new_rel.to_string_lossy();
+                                    tracing::info!("File renamed on disk: {} -> {}", old_str, new_str);
                                     let _ = db_clone.rename_activity(
                                         &repo_path,
-                                        &old_rel.to_string_lossy(),
-                                        &new_rel.to_string_lossy(),
+                                        &old_str,
+                                        &new_str,
                                     );
                                 }
                             }
@@ -247,10 +264,19 @@ impl AgentManager {
     pub async fn list_agents(&self) -> Result<Vec<AgentSpec>> {
         let mut result = Vec::new();
         for agent_ref in &self.config.agents {
-            let (spec, _) = AgentSpec::from_markdown(&PathBuf::from(&agent_ref.spec_path))?;
-            result.push(spec);
+            let spec_path = PathBuf::from(&agent_ref.spec_path);
+            if spec_path.exists() {
+                let (spec, _) = AgentSpec::from_markdown(&spec_path)?;
+                result.push(spec);
+            } else {
+                warn!("Agent spec file not found: {:?}", spec_path);
+            }
         }
         Ok(result)
+    }
+
+    pub fn get_config(&self) -> &Config {
+        &self.config
     }
 
     #[allow(dead_code)]

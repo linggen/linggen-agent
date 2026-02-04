@@ -15,6 +15,18 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 
+fn setup_tracing() {
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .with_file(true)
+        .with_line_number(true)
+        .with_level(true)
+        .compact()
+        .init();
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "linggen-agent")]
 #[command(about = "Linggen Agent (multi-agent) - autonomous prototype", long_about = None)]
@@ -73,6 +85,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    setup_tracing();
     let cli = Cli::parse();
     let config = Config::load().unwrap_or_default();
 
@@ -124,16 +137,30 @@ async fn main() -> Result<()> {
             let _ = skill_manager.load_all(Some(&ws_root)).await;
 
             // Register initial project
-            let _ = manager.get_or_create_project(ws_root).await?;
+            let _ = manager.get_or_create_project(ws_root.clone()).await?;
 
-            // Spawn a task to handle events
-            tokio::spawn(async move {
-                while let Some(event) = rx.recv().await {
-                    tracing::info!("Agent Event: {:?}", event);
-                }
-            });
+            // Log startup info
+            tracing::info!("--- Linggen Agent Startup ---");
+            tracing::info!("Workspace Root: {}", ws_root.display());
+            tracing::info!("Server Port: {}", port);
+            
+            let config = manager.get_config();
+            tracing::info!("Max Tool Iterations: {}", config.agent.max_iters);
+            
+            let models = manager.models.list_models();
+            tracing::info!("Configured Models ({}):", models.len());
+            for m in models {
+                tracing::info!("  - ID: {}, Provider: {}, Model: {}, URL: {}", m.id, m.provider, m.model, m.url);
+            }
 
-            server::start_server(manager, skill_manager, port, dev).await?;
+            let agents = manager.list_agents().await?;
+            tracing::info!("Active Agents ({}):", agents.len());
+            for a in agents {
+                tracing::info!("  - Name: {}, Tools: {:?}", a.name, a.tools);
+            }
+            tracing::info!("------------------------------");
+
+            server::start_server(manager, skill_manager, port, dev, rx).await?;
         }
     }
 

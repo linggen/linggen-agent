@@ -9,7 +9,11 @@ use crate::engine::tools::{ToolCall, ToolResult, Tools};
 use crate::ollama::ChatMessage;
 use crate::skills::Skill;
 use anyhow::Result;
+use futures_util::Stream;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::de::Deserializer;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -40,21 +44,21 @@ pub struct EngineConfig {
 }
 
 pub struct AgentEngine {
-    cfg: EngineConfig,
-    model_manager: Arc<ModelManager>,
-    model_id: String,
-    tools: Tools,
-    role: AgentRole,
-    task: Option<String>,
+    pub cfg: EngineConfig,
+    pub model_manager: Arc<ModelManager>,
+    pub model_id: String,
+    pub tools: Tools,
+    pub role: AgentRole,
+    pub task: Option<String>,
     // Agent spec and runtime context
-    spec: Option<AgentSpec>,
-    agent_id: Option<String>,
+    pub spec: Option<AgentSpec>,
+    pub agent_id: Option<String>,
     // Rolling tool observations that we feed back to the model.
-    observations: Vec<String>,
+    pub observations: Vec<String>,
     // Conversational history for chat.
-    chat_history: Vec<ChatMessage>,
+    pub chat_history: Vec<ChatMessage>,
     // Active skill if any
-    active_skill: Option<Skill>,
+    pub active_skill: Option<Skill>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -124,9 +128,13 @@ impl AgentEngine {
         self.task.clone()
     }
 
-    pub async fn chat(&mut self, message: &str, session_id: Option<&str>) -> Result<String> {
+    pub async fn chat_stream(
+        &mut self,
+        message: &str,
+        _session_id: Option<&str>,
+    ) -> Result<impl Stream<Item = Result<String>> + Send + Unpin> {
         info!(
-            "Processing chat message for role {:?}: {}",
+            "Processing chat stream for role {:?}: {}",
             self.role, message
         );
 
@@ -146,35 +154,10 @@ impl AgentEngine {
                     }
                 }
             }
+        } else {
+            // Prevent a previously activated skill from affecting normal chat.
+            self.active_skill = None;
         }
-
-        // Record message in DB
-        if let Some(manager) = self.tools.get_manager() {
-            let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
-                repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
-                session_id: session_id.unwrap_or("default").to_string(),
-                agent_id: self
-                    .agent_id
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                from_id: "user".to_string(),
-                to_id: self
-                    .agent_id
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                content: clean_message.clone(),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                is_observation: false,
-            });
-        }
-
-        self.chat_history.push(ChatMessage {
-            role: "user".to_string(),
-            content: clean_message,
-        });
 
         let mut messages = vec![ChatMessage {
             role: "system".to_string(),
@@ -182,7 +165,7 @@ impl AgentEngine {
         }];
 
         // Add workspace context to the first message if history is short
-        if self.chat_history.len() == 1 {
+        if self.chat_history.len() == 0 {
             messages.push(ChatMessage {
                 role: "user".to_string(),
                 content: format!(
@@ -196,29 +179,59 @@ impl AgentEngine {
         }
 
         messages.extend(self.chat_history.clone());
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: clean_message,
+        });
 
-        // Use chat_text for conversational turns (no JSON enforcement unless we want tools in chat)
-        let response = self
+        let stream = self
             .model_manager
-            .chat_text(&self.model_id, &messages)
+            .chat_text_stream(&self.model_id, &messages)
             .await?;
 
+        Ok(stream)
+    }
+
+    pub async fn finalize_chat(
+        &mut self,
+        user_message: &str,
+        assistant_response: &str,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        let mut clean_message = user_message.to_string();
+        if user_message.starts_with('/') {
+            let parts: Vec<&str> = user_message.splitn(2, ' ').collect();
+            if parts.len() > 1 {
+                clean_message = parts[1].to_string();
+            } else {
+                clean_message = "I'm ready to use this skill. How can I help?".to_string();
+            }
+        }
+
+        self.chat_history.push(ChatMessage {
+            role: "user".to_string(),
+            content: clean_message,
+        });
+
         // Try to parse the response as JSON to extract the question if the model followed the system prompt
-        let final_content = if let Ok(action) = serde_json::from_str::<ModelAction>(&response) {
+        let final_content = if let Ok(action) = serde_json::from_str::<ModelAction>(assistant_response) {
             match action {
                 ModelAction::Ask { question } => question,
                 ModelAction::FinalizeTask { packet } => {
-                    format!("I've finalized the task: {}. You can review it in the Planning section.", packet.title)
+                    format!(
+                        "I've finalized the task: {}. You can review it in the Planning section.",
+                        packet.title
+                    )
                 }
                 ModelAction::Tool { tool, .. } => {
-                    format!("I'm using the tool: {}. Please use the 'Execute Loop' button to let me continue with tool execution.", tool)
+                    format!("I'm using the tool: {}. I will continue automatically.", tool)
                 }
                 ModelAction::Patch { .. } => {
-                    "I've proposed a code patch. Please use the 'Execute Loop' button to see the details.".to_string()
+                    "I've proposed a code patch. I will apply it now.".to_string()
                 }
             }
         } else {
-            response
+            assistant_response.to_string()
         };
 
         // Record assistant response in DB
@@ -246,10 +259,71 @@ impl AgentEngine {
 
         self.chat_history.push(ChatMessage {
             role: "assistant".to_string(),
-            content: final_content.clone(),
+            content: final_content,
         });
 
-        Ok(final_content)
+        Ok(())
+    }
+
+    pub async fn chat(&mut self, _message: &str, _session_id: Option<&str>) -> Result<String> {
+        anyhow::bail!("chat() is deprecated, use chat_stream()")
+    }
+
+    pub async fn manager_db_add_observation(&self, tool: &str, rendered: &str, session_id: Option<&str>) -> Result<()> {
+        if let Some(manager) = self.tools.get_manager() {
+            let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
+                repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
+                session_id: session_id.unwrap_or("default").to_string(),
+                agent_id: self
+                    .agent_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                from_id: "system".to_string(),
+                to_id: self
+                    .agent_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                content: format!("Tool {}: {}", tool, rendered),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                is_observation: true,
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn manager_db_add_assistant_message(
+        &self,
+        content: &str,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        if let Some(manager) = self.tools.get_manager() {
+            let agent_id = self
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
+                repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
+                session_id: session_id.unwrap_or("default").to_string(),
+                agent_id: agent_id.clone(),
+                from_id: agent_id.clone(),
+                to_id: "user".to_string(),
+                content: content.to_string(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                is_observation: false,
+            });
+
+            // Nudge UI to refresh immediately.
+            manager
+                .send_event(crate::agent_manager::AgentEvent::StateUpdated)
+                .await;
+        }
+        Ok(())
     }
 
     pub async fn run_agent_loop(&mut self, session_id: Option<&str>) -> Result<AgentOutcome> {
@@ -308,12 +382,24 @@ impl AgentEngine {
             ),
         });
 
+        // Include chat history so the model has context of the current conversation
+        messages.extend(self.chat_history.clone());
+
         for obs in &self.observations {
             messages.push(ChatMessage {
                 role: "user".to_string(),
                 content: format!("Observation:\n{}", obs),
             });
         }
+
+        #[derive(Clone)]
+        struct CachedToolObs {
+            model: String,
+            public: String,
+        }
+
+        // Cache tool results by (tool,args) to prevent repetition loops.
+        let mut tool_cache: HashMap<String, CachedToolObs> = HashMap::new();
 
         for _ in 0..self.cfg.max_iters {
             // Ask model for the next action as JSON.
@@ -322,7 +408,7 @@ impl AgentEngine {
                 .chat_json(&self.model_id, &messages)
                 .await?;
 
-            let action: ModelAction = match serde_json::from_str(&raw) {
+            let action: ModelAction = match parse_first_action(&raw) {
                 Ok(v) => v,
                 Err(e) => {
                     messages.push(ChatMessage {
@@ -338,41 +424,98 @@ impl AgentEngine {
             match action {
                 ModelAction::Tool { tool, args } => {
                     info!("Agent requested tool: {} with args: {}", tool, args);
+                    let sig = format!("{}|{}", tool, args);
+                    if let Some(cached) = tool_cache.get(&sig) {
+                        self.observations.push(cached.model.clone());
+                        let _ = self
+                            .manager_db_add_observation(&tool, &cached.public, session_id)
+                            .await;
+                        if let Some(manager) = self.tools.get_manager() {
+                            manager
+                                .send_event(crate::agent_manager::AgentEvent::StateUpdated)
+                                .await;
+                        }
+                        messages.push(ChatMessage {
+                            role: "user".to_string(),
+                            content: format!("Observation:\n{}", cached.model),
+                        });
+                        // Don't re-run identical tool calls.
+                        continue;
+                    }
+
+                    // Tell the UI what tool we're about to use (progress visibility).
+                    if let Some(manager) = self.tools.get_manager() {
+                        let from = self
+                            .agent_id
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let _ = manager
+                            .send_event(crate::agent_manager::AgentEvent::Message {
+                                from,
+                                to: "user".to_string(),
+                                content: serde_json::json!({
+                                    "type": "tool",
+                                    "tool": tool,
+                                    "args": args
+                                })
+                                .to_string(),
+                            })
+                            .await;
+                    }
+
                     let call = ToolCall {
                         tool: tool.clone(),
                         args,
                     };
-                    let result = self.tools.execute(call)?;
-                    let rendered = render_tool_result(&result);
-                    self.observations.push(rendered.clone());
+                    match self.tools.execute(call) {
+                        Ok(result) => {
+                            let rendered_model = render_tool_result(&result);
+                            let rendered_public = render_tool_result_public(&result);
+                            tool_cache.insert(
+                                sig,
+                                CachedToolObs {
+                                    model: rendered_model.clone(),
+                                    public: rendered_public.clone(),
+                                },
+                            );
+                            self.observations.push(rendered_model.clone());
 
-                    // Record observation in DB
-                    if let Some(manager) = self.tools.get_manager() {
-                        let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
-                            repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
-                            session_id: session_id.unwrap_or("default").to_string(),
-                            agent_id: self
-                                .agent_id
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string()),
-                            from_id: "system".to_string(),
-                            to_id: self
-                                .agent_id
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string()),
-                            content: format!("Tool {}: {}", tool, rendered),
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs(),
-                            is_observation: true,
-                        });
+                            // Record observation in DB
+                            let _ = self
+                                .manager_db_add_observation(&tool, &rendered_public, session_id)
+                                .await;
+                            if let Some(manager) = self.tools.get_manager() {
+                                // Trigger a UI refresh via the server's SSE bridge.
+                                manager
+                                    .send_event(crate::agent_manager::AgentEvent::StateUpdated)
+                                    .await;
+                            }
+
+                            messages.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: format!("Observation:\n{}", rendered_model),
+                            });
+                        }
+                        Err(e) => {
+                            warn!("Tool execution failed ({}): {}", tool, e);
+                            let rendered = format!("tool_error: tool={} error={}", tool, e);
+                            tool_cache.insert(
+                                sig,
+                                CachedToolObs {
+                                    model: rendered.clone(),
+                                    public: rendered.clone(),
+                                },
+                            );
+                            self.observations.push(rendered.clone());
+                            let _ = self.manager_db_add_observation(&tool, &rendered, session_id).await;
+                            messages.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: format!(
+                                    "Tool execution failed for tool='{tool}'. Error: {e}. Choose a valid tool+args from the tool schema and try again."
+                                ),
+                            });
+                        }
                     }
-
-                    messages.push(ChatMessage {
-                        role: "user".to_string(),
-                        content: format!("Observation:\n{}", rendered),
-                    });
                 }
                 ModelAction::Patch { diff } => {
                     info!("Agent proposed a patch");
@@ -431,6 +574,7 @@ impl AgentEngine {
                         }
                     }
 
+                    self.active_skill = None;
                     return Ok(AgentOutcome::Patch(diff));
                 }
                 ModelAction::FinalizeTask { packet } => {
@@ -443,15 +587,35 @@ impl AgentEngine {
                         });
                         continue;
                     }
+                    // Persist the structured final answer for the UI (DB-backed chat).
+                    let msg = serde_json::json!({ "type": "finalize_task", "packet": packet }).to_string();
+                    let _ = self
+                        .manager_db_add_assistant_message(&msg, session_id)
+                        .await;
+                    self.chat_history.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: msg,
+                    });
+                    self.active_skill = None;
                     return Ok(AgentOutcome::Task(packet));
                 }
                 ModelAction::Ask { question } => {
                     info!("Agent asked a question: {}", question);
+                    let msg = serde_json::json!({ "type": "ask", "question": question }).to_string();
+                    let _ = self
+                        .manager_db_add_assistant_message(&msg, session_id)
+                        .await;
+                    self.chat_history.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: msg,
+                    });
+                    self.active_skill = None;
                     return Ok(AgentOutcome::Ask(question));
                 }
             }
         }
 
+        self.active_skill = None;
         Ok(AgentOutcome::None)
     }
 
@@ -554,7 +718,7 @@ impl AgentEngine {
     }
 }
 
-fn render_tool_result(r: &ToolResult) -> String {
+pub fn render_tool_result(r: &ToolResult) -> String {
     match r {
         ToolResult::RepoInfo(v) => format!("repo_info: {}", v),
         ToolResult::FileList(v) => format!("files:\n{}", v.join("\n")),
@@ -603,9 +767,54 @@ fn render_tool_result(r: &ToolResult) -> String {
     }
 }
 
+fn preview_text(content: &str, max_lines: usize, max_chars: usize) -> (String, bool) {
+    let mut out = String::new();
+    let mut lines = 0usize;
+    let mut truncated = false;
+
+    for line in content.lines() {
+        if lines >= max_lines {
+            truncated = true;
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+        lines += 1;
+
+        if out.len() >= max_chars {
+            truncated = true;
+            out.truncate(max_chars);
+            break;
+        }
+    }
+
+    (out, truncated)
+}
+
+/// Render tool results for DB/UI without dumping large payloads (e.g. full files).
+pub fn render_tool_result_public(r: &ToolResult) -> String {
+    match r {
+        ToolResult::FileContent {
+            path,
+            content,
+            truncated,
+        } => {
+            let (preview, preview_truncated) = preview_text(content, 20, 1200);
+            let shown_note = if preview_truncated { " (preview)" } else { "" };
+            format!(
+                "read_file: {} (truncated: {}){}\n{}\n\n(content omitted in chat; open the file viewer for full text)",
+                path, truncated, shown_note, preview
+            )
+        }
+        other => render_tool_result(other),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
-enum ModelAction {
+pub enum ModelAction {
     #[serde(rename = "tool")]
     Tool {
         tool: String,
@@ -617,4 +826,10 @@ enum ModelAction {
     FinalizeTask { packet: TaskPacket },
     #[serde(rename = "ask")]
     Ask { question: String },
+}
+
+pub fn parse_first_action(raw: &str) -> Result<ModelAction> {
+    let mut de = Deserializer::from_str(raw);
+    let action = ModelAction::deserialize(&mut de)?;
+    Ok(action)
 }
