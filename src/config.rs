@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -9,6 +9,8 @@ pub struct Config {
     pub models: Vec<ModelConfig>,
     pub server: ServerConfig,
     pub agent: AgentConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
     #[serde(default)]
     pub agents: Vec<AgentSpecRef>,
 }
@@ -73,16 +75,46 @@ pub struct AgentConfig {
     pub max_iters: usize,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct LoggingConfig {
+    pub level: Option<String>,
+    pub directory: Option<String>,
+    pub rotation: Option<String>,
+    pub retention_days: Option<u64>,
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
-        let config_path = Path::new("linggen-agent.toml");
-        if config_path.exists() {
-            let content = fs::read_to_string(config_path)?;
-            let config: Config = toml::from_str(&content)?;
-            Ok(config)
-        } else {
-            Ok(Config::default())
+        let (cfg, _path) = Self::load_with_path()?;
+        Ok(cfg)
+    }
+
+    pub fn load_with_path() -> Result<(Self, Option<PathBuf>)> {
+        let mut candidates = Vec::new();
+
+        if let Ok(explicit) = std::env::var("LINGGEN_CONFIG") {
+            candidates.push(PathBuf::from(explicit));
         }
+
+        candidates.push(PathBuf::from("linggen-agent.toml"));
+
+        if let Some(dir) = dirs::config_dir() {
+            candidates.push(dir.join("linggen-agent").join("linggen-agent.toml"));
+        }
+
+        if let Some(dir) = dirs::data_dir() {
+            candidates.push(dir.join("linggen-agent").join("linggen-agent.toml"));
+        }
+
+        for path in candidates {
+            if path.exists() {
+                let content = fs::read_to_string(&path)?;
+                let config: Config = toml::from_str(&content)?;
+                return Ok((config, Some(path)));
+            }
+        }
+
+        Ok((Config::default(), None))
     }
 }
 
@@ -98,6 +130,12 @@ impl Default for Config {
             }],
             server: ServerConfig { port: 8080 },
             agent: AgentConfig { max_iters: 10 },
+            logging: LoggingConfig {
+                level: None,
+                directory: None,
+                rotation: None,
+                retention_days: None,
+            },
             agents: Vec::new(),
         }
     }

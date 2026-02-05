@@ -3,6 +3,7 @@ mod check;
 mod config;
 mod db;
 mod engine;
+mod logging;
 mod ollama;
 mod repl;
 mod server;
@@ -14,18 +15,6 @@ use crate::config::{Config, ModelConfig};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
-
-fn setup_tracing() {
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_thread_ids(false)
-        .with_thread_names(false)
-        .with_file(true)
-        .with_line_number(true)
-        .with_level(true)
-        .compact()
-        .init();
-}
 
 #[derive(Parser, Debug)]
 #[command(name = "linggen-agent")]
@@ -85,9 +74,15 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    setup_tracing();
+    let (config, config_path) =
+        Config::load_with_path().unwrap_or_else(|_| (Config::default(), None));
+    let log_dir = logging::setup_tracing_with_settings(logging::LoggingSettings {
+        level: config.logging.level.as_deref(),
+        directory: config.logging.directory.as_deref(),
+        rotation: config.logging.rotation.as_deref(),
+        retention_days: config.logging.retention_days,
+    });
     let cli = Cli::parse();
-    let config = Config::load().unwrap_or_default();
 
     match cli.cmd {
         Command::Agent {
@@ -141,8 +136,16 @@ async fn main() -> Result<()> {
 
             // Log startup info
             tracing::info!("--- Linggen Agent Startup ---");
+            if let Some(path) = config_path.as_ref() {
+                tracing::info!("Config File: {}", path.display());
+            } else {
+                tracing::info!("Config File: (default)");
+            }
             tracing::info!("Workspace Root: {}", ws_root.display());
             tracing::info!("Server Port: {}", port);
+            if let Some(dir) = log_dir.as_ref() {
+                tracing::info!("Log Directory: {}", dir.display());
+            }
             
             let config = manager.get_config();
             tracing::info!("Max Tool Iterations: {}", config.agent.max_iters);
