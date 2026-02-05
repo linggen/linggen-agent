@@ -1,6 +1,7 @@
 use crate::agent_manager::models::ModelManager;
 use crate::check;
 use crate::engine::{AgentEngine, AgentOutcome, AgentRole, EngineConfig, TaskPacket};
+use crate::logging;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -267,14 +268,10 @@ fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) -> Result<
 }
 
 fn setup_tracing() {
-    // Only initialize if not already initialized
-    let _ = tracing_subscriber::fmt()
-        .with_target(false)
-        .with_thread_ids(false)
-        .with_thread_names(false)
-        .with_file(true)
-        .with_line_number(true)
-        .with_level(true)
-        .compact()
-        .try_init();
+    let _ = logging::setup_tracing_with_settings(logging::LoggingSettings {
+        level: None,
+        directory: None,
+        rotation: None,
+        retention_days: None,
+    });
 }

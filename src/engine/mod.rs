@@ -59,6 +59,13 @@ pub struct AgentEngine {
     pub chat_history: Vec<ChatMessage>,
     // Active skill if any
     pub active_skill: Option<Skill>,
+    pub prompt_mode: PromptMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptMode {
+    Structured,
+    Chat,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -94,6 +101,7 @@ impl AgentEngine {
             observations: Vec::new(),
             chat_history: Vec::new(),
             active_skill: None,
+            prompt_mode: PromptMode::Structured,
         })
     }
 
@@ -128,10 +136,19 @@ impl AgentEngine {
         self.task.clone()
     }
 
+    pub fn set_prompt_mode(&mut self, mode: PromptMode) {
+        self.prompt_mode = mode;
+    }
+
+    pub fn get_prompt_mode(&self) -> PromptMode {
+        self.prompt_mode
+    }
+
     pub async fn chat_stream(
         &mut self,
         message: &str,
         _session_id: Option<&str>,
+        mode: PromptMode,
     ) -> Result<impl Stream<Item = Result<String>> + Send + Unpin> {
         info!(
             "Processing chat stream for role {:?}: {}",
@@ -161,7 +178,7 @@ impl AgentEngine {
 
         let mut messages = vec![ChatMessage {
             role: "system".to_string(),
-            content: self.system_prompt(),
+            content: self.system_prompt_with_mode(mode),
         }];
 
         // Add workspace context to the first message if history is short
@@ -197,6 +214,7 @@ impl AgentEngine {
         user_message: &str,
         assistant_response: &str,
         session_id: Option<&str>,
+        mode: PromptMode,
     ) -> Result<()> {
         let mut clean_message = user_message.to_string();
         if user_message.starts_with('/') {
@@ -213,25 +231,29 @@ impl AgentEngine {
             content: clean_message,
         });
 
-        // Try to parse the response as JSON to extract the question if the model followed the system prompt
-        let final_content = if let Ok(action) = serde_json::from_str::<ModelAction>(assistant_response) {
-            match action {
-                ModelAction::Ask { question } => question,
-                ModelAction::FinalizeTask { packet } => {
-                    format!(
-                        "I've finalized the task: {}. You can review it in the Planning section.",
-                        packet.title
-                    )
-                }
-                ModelAction::Tool { tool, .. } => {
-                    format!("I'm using the tool: {}. I will continue automatically.", tool)
-                }
-                ModelAction::Patch { .. } => {
-                    "I've proposed a code patch. I will apply it now.".to_string()
-                }
-            }
-        } else {
+        let final_content = if mode == PromptMode::Chat {
             assistant_response.to_string()
+        } else {
+            // Try to parse the response as JSON to extract the question if the model followed the system prompt
+            if let Ok(action) = serde_json::from_str::<ModelAction>(assistant_response) {
+                match action {
+                    ModelAction::Ask { question } => question,
+                    ModelAction::FinalizeTask { packet } => {
+                        format!(
+                            "I've finalized the task: {}. You can review it in the Planning section.",
+                            packet.title
+                        )
+                    }
+                    ModelAction::Tool { tool, .. } => {
+                        format!("I'm using the tool: {}. I will continue automatically.", tool)
+                    }
+                    ModelAction::Patch { .. } => {
+                        "I've proposed a code patch. I will apply it now.".to_string()
+                    }
+                }
+            } else {
+                assistant_response.to_string()
+            }
         };
 
         // Record assistant response in DB
@@ -451,16 +473,35 @@ impl AgentEngine {
                             .unwrap_or_else(|| "unknown".to_string());
                         let _ = manager
                             .send_event(crate::agent_manager::AgentEvent::Message {
-                                from,
+                                from: from.clone(),
                                 to: "user".to_string(),
                                 content: serde_json::json!({
                                     "type": "tool",
-                                    "tool": tool,
-                                    "args": args
+                                    "tool": tool.clone(),
+                                    "args": args.clone()
                                 })
                                 .to_string(),
                             })
                             .await;
+                        let tool_msg = serde_json::json!({
+                            "type": "tool",
+                            "tool": tool.clone(),
+                            "args": args.clone()
+                        })
+                        .to_string();
+                        let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
+                            repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
+                            session_id: session_id.unwrap_or("default").to_string(),
+                            agent_id: from.clone(),
+                            from_id: from,
+                            to_id: "user".to_string(),
+                            content: tool_msg,
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs(),
+                            is_observation: false,
+                        });
                     }
 
                     let call = ToolCall {
@@ -620,6 +661,10 @@ impl AgentEngine {
     }
 
     fn system_prompt(&self) -> String {
+        self.system_prompt_with_mode(PromptMode::Structured)
+    }
+
+    fn system_prompt_with_mode(&self, mode: PromptMode) -> String {
         let mut prompt = if let Some(spec) = &self.spec {
             // Use the spec-defined system prompt if available
             let base = match self.role {
@@ -630,11 +675,27 @@ impl AgentEngine {
                     "- Use tools to inspect the repo to understand the current state before planning.",
                     "- When you have a clear plan, respond with a JSON object of type 'finalize_task' containing the TaskPacket.",
                     "- If UI is involved, include a Mermaid wireframe in the TaskPacket.",
-                    "- Respond with EXACTLY one JSON object each turn.",
-                    "- Allowed JSON variants:",
+                    if mode == PromptMode::Structured {
+                        "- Respond with EXACTLY one JSON object each turn."
+                    } else {
+                        "- You may respond in plain text."
+                    },
+                    if mode == PromptMode::Structured {
+                        "- Allowed JSON variants:"
+                    } else {
+                        "- If you need to use a tool, respond with EXACTLY one JSON object:"
+                    },
                     "  {\"type\":\"tool\",\"tool\":<string>,\"args\":<object>}",
-                    "  {\"type\":\"finalize_task\",\"packet\":{\"title\":<string>,\"user_stories\":[<string>],\"acceptance_criteria\":[<string>],\"mermaid_wireframe\":<string|null>}}",
-                    "  {\"type\":\"ask\",\"question\":<string>}",
+                    if mode == PromptMode::Structured {
+                        "  {\"type\":\"finalize_task\",\"packet\":{\"title\":<string>,\"user_stories\":[<string>],\"acceptance_criteria\":[<string>],\"mermaid_wireframe\":<string|null>}}"
+                    } else {
+                        "  (Otherwise respond in plain text)"
+                    },
+                    if mode == PromptMode::Structured {
+                        "  {\"type\":\"ask\",\"question\":<string>}"
+                    } else {
+                        ""
+                    },
                 ]
                 .join("\n"),
                 AgentRole::Coder => [
@@ -642,10 +703,22 @@ impl AgentEngine {
                     "Rules:",
                     "- You can write files directly using the provided tools.",
                     "- Use tools to inspect the repo before making changes.",
-                    "- Respond with EXACTLY one JSON object each turn.",
-                    "- Allowed JSON variants:",
+                    if mode == PromptMode::Structured {
+                        "- Respond with EXACTLY one JSON object each turn."
+                    } else {
+                        "- You may respond in plain text."
+                    },
+                    if mode == PromptMode::Structured {
+                        "- Allowed JSON variants:"
+                    } else {
+                        "- If you need to use a tool, respond with EXACTLY one JSON object:"
+                    },
                     "  {\"type\":\"tool\",\"tool\":<string>,\"args\":<object>}",
-                    "  {\"type\":\"ask\",\"question\":<string>}",
+                    if mode == PromptMode::Structured {
+                        "  {\"type\":\"ask\",\"question\":<string>}"
+                    } else {
+                        "  (Otherwise respond in plain text)"
+                    },
                 ]
                 .join("\n"),
                 AgentRole::Operator => [
@@ -655,10 +728,22 @@ impl AgentEngine {
                     "- Use 'run_command' to run tests and verify the build state.",
                     "- Use 'capture_screenshot' to verify UI requirements for web apps.",
                     "- Report success or failure clearly. If tests fail, provide logs to help the Coder.",
-                    "- Respond with EXACTLY one JSON object each turn.",
-                    "- Allowed JSON variants:",
+                    if mode == PromptMode::Structured {
+                        "- Respond with EXACTLY one JSON object each turn."
+                    } else {
+                        "- You may respond in plain text."
+                    },
+                    if mode == PromptMode::Structured {
+                        "- Allowed JSON variants:"
+                    } else {
+                        "- If you need to use a tool, respond with EXACTLY one JSON object:"
+                    },
                     "  {\"type\":\"tool\",\"tool\":<string>,\"args\":<object>}",
-                    "  {\"type\":\"ask\",\"question\":<string>}",
+                    if mode == PromptMode::Structured {
+                        "  {\"type\":\"ask\",\"question\":<string>}"
+                    } else {
+                        "  (Otherwise respond in plain text)"
+                    },
                 ]
                 .join("\n"),
             };

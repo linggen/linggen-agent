@@ -301,12 +301,38 @@ async fn chat_handler(
 
     let target_id = target_id.to_string();
     let clean_msg = clean_msg.to_string();
+    let trimmed_msg = clean_msg.trim();
 
     match state.manager.get_or_create_agent(&root, &target_id).await {
         Ok(agent) => {
             let events_tx_clone = events_tx.clone();
             let target_id_clone = target_id.clone();
             let clean_msg_clone = clean_msg.clone();
+            let root_clone = root.clone();
+            let manager = state.manager.clone();
+
+            // Handle mode switch commands before emitting a user message.
+            if let Some(mode_value) = trimmed_msg.strip_prefix("/mode ") {
+                let mode_value = mode_value.trim().to_lowercase();
+                let mut engine = agent.lock().await;
+                let mode = if mode_value == "chat" {
+                    crate::engine::PromptMode::Chat
+                } else {
+                    crate::engine::PromptMode::Structured
+                };
+                engine.set_prompt_mode(mode);
+                let mode_label = if mode == crate::engine::PromptMode::Chat {
+                    "chat"
+                } else {
+                    "auto"
+                };
+                let _ = events_tx_clone.send(ServerEvent::Message {
+                    from: target_id_clone.clone(),
+                    to: "user".to_string(),
+                    content: format!("Mode set to {}", mode_label),
+                });
+                return Json(serde_json::json!({ "status": "mode_set" })).into_response();
+            }
 
             // Emit user message event immediately
             let _ = events_tx.send(ServerEvent::Message {
@@ -340,6 +366,36 @@ async fn chat_handler(
                 });
             }
 
+            let emit_outcome = |outcome: &crate::engine::AgentOutcome,
+                                events_tx: &broadcast::Sender<ServerEvent>,
+                                from_id: &str| {
+                match outcome {
+                    crate::engine::AgentOutcome::Task(packet) => {
+                        let _ = events_tx.send(ServerEvent::Message {
+                            from: from_id.to_string(),
+                            to: "user".to_string(),
+                            content: serde_json::json!({
+                                "type": "finalize_task",
+                                "packet": packet
+                            })
+                            .to_string(),
+                        });
+                    }
+                    crate::engine::AgentOutcome::Ask(question) => {
+                        let _ = events_tx.send(ServerEvent::Message {
+                            from: from_id.to_string(),
+                            to: "user".to_string(),
+                            content: serde_json::json!({
+                                "type": "ask",
+                                "question": question
+                            })
+                            .to_string(),
+                        });
+                    }
+                    _ => {}
+                }
+            };
+
             tokio::spawn(async move {
                 let mut engine = agent.lock().await;
                 let mut full_response = String::new();
@@ -371,15 +427,64 @@ async fn chat_handler(
                         to: "user".to_string(),
                         content: format!("Running skill: {}", cmd),
                     });
+                    if let Ok(ctx) = manager.get_or_create_project(root_clone.clone()).await {
+                        let _ = ctx.state_fs.append_message(
+                            &target_id_clone,
+                            "user",
+                            &format!("Running skill: {}", cmd),
+                            None,
+                            session_id.as_deref(),
+                        );
+                        let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
+                            repo_path: root_clone.to_string_lossy().to_string(),
+                            session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
+                            agent_id: target_id_clone.clone(),
+                            from_id: target_id_clone.clone(),
+                            to_id: "user".to_string(),
+                            content: format!("Running skill: {}", cmd),
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs(),
+                            is_observation: false,
+                        });
+                    }
 
-                    if let Err(e) = engine.run_agent_loop(session_id.as_deref()).await {
+                    let outcome = engine.run_agent_loop(session_id.as_deref()).await;
+                    if let Err(e) = outcome {
                         tracing::warn!("Skill loop failed: {}", e);
                         let _ = events_tx_clone.send(ServerEvent::Message {
                             from: target_id_clone.clone(),
                             to: "user".to_string(),
                             content: format!("Error: {}", e),
                         });
+                        if let Ok(ctx) = manager.get_or_create_project(root_clone.clone()).await {
+                            let err_msg = format!("Error: {}", e);
+                            let _ = ctx.state_fs.append_message(
+                                &target_id_clone,
+                                "user",
+                                &err_msg,
+                                None,
+                                session_id.as_deref(),
+                            );
+                            let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
+                                repo_path: root_clone.to_string_lossy().to_string(),
+                                session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
+                                agent_id: target_id_clone.clone(),
+                                from_id: target_id_clone.clone(),
+                                to_id: "user".to_string(),
+                                content: err_msg,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs(),
+                                is_observation: false,
+                            });
+                        }
                     } else {
+                        if let Ok(outcome) = &outcome {
+                            emit_outcome(outcome, &events_tx_clone, &target_id_clone);
+                        }
                         // Force UI refresh after loop
                         let _ = events_tx_clone.send(ServerEvent::StateUpdated);
                     }
@@ -387,7 +492,11 @@ async fn chat_handler(
                     return;
                 }
 
-                match engine.chat_stream(&clean_msg_clone, session_id.as_deref()).await {
+                let prompt_mode = engine.get_prompt_mode();
+                match engine
+                    .chat_stream(&clean_msg_clone, session_id.as_deref(), prompt_mode)
+                    .await
+                {
                     Ok(mut stream) => {
                         while let Some(token_result) = stream.next().await {
                             if let Ok(token) = token_result {
@@ -400,7 +509,14 @@ async fn chat_handler(
                         }
 
                         // Finalize chat in engine (updates history and DB)
-                        let _ = engine.finalize_chat(&clean_msg_clone, &full_response, session_id.as_deref()).await;
+                        let _ = engine
+                            .finalize_chat(
+                                &clean_msg_clone,
+                                &full_response,
+                                session_id.as_deref(),
+                                prompt_mode,
+                            )
+                            .await;
 
                         // If the model asked for a tool, don't dump the raw model output (often multi-JSON)
                         // into the chat UI. Instead send a clean single tool JSON message and proceed.
@@ -413,11 +529,39 @@ async fn chat_handler(
                                     to: "user".to_string(),
                                     content: serde_json::json!({
                                         "type": "tool",
-                                        "tool": tool,
-                                        "args": args
+                                        "tool": tool.clone(),
+                                        "args": args.clone()
                                     })
                                     .to_string(),
                                 });
+                                if let Ok(ctx) = manager.get_or_create_project(root_clone.clone()).await {
+                                    let tool_msg = serde_json::json!({
+                                        "type": "tool",
+                                        "tool": tool.clone(),
+                                        "args": args.clone()
+                                    })
+                                    .to_string();
+                                    let _ = ctx.state_fs.append_message(
+                                        &target_id_clone,
+                                        "user",
+                                        &tool_msg,
+                                        None,
+                                        session_id.as_deref(),
+                                    );
+                                    let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
+                                        repo_path: root_clone.to_string_lossy().to_string(),
+                                        session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
+                                        agent_id: target_id_clone.clone(),
+                                        from_id: target_id_clone.clone(),
+                                        to_id: "user".to_string(),
+                                        content: tool_msg,
+                                        timestamp: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_secs(),
+                                        is_observation: false,
+                                    });
+                                }
 
                                 // 1. Execute the tool that was just requested in chat
                                 let call = crate::engine::tools::ToolCall { tool: tool.clone(), args };
@@ -442,31 +586,48 @@ async fn chat_handler(
                                             content: format!("Executed {}: {}", tool, rendered_public),
                                         });
 
-                                    // Ensure loop uses *this* request as the task (strip slash command prefix).
-                                    let task_for_loop = if clean_msg_clone.starts_with('/') {
-                                        clean_msg_clone
-                                            .splitn(2, ' ')
-                                            .nth(1)
-                                            .unwrap_or("Initialize and proceed.")
-                                            .trim()
-                                            .to_string()
-                                    } else {
-                                        clean_msg_clone.clone()
-                                    };
-                                    engine.task = Some(task_for_loop);
+                                        let followup_prompt = format!(
+                                            "Use the observation below to answer the user's request in plain text.\n\nUser request: {}\n\nObservation:\n{}",
+                                            clean_msg_clone,
+                                            rendered_public
+                                        );
 
-                                        // 2. Continue the autonomous loop
-                                        if let Err(e) = engine.run_agent_loop(session_id.as_deref()).await {
-                                            tracing::warn!("Auto-run loop failed: {}", e);
+                                        let mut followup_response = String::new();
+                                        if let Ok(mut followup_stream) =
+                                            engine
+                                                .chat_stream(
+                                                    &followup_prompt,
+                                                    session_id.as_deref(),
+                                                    crate::engine::PromptMode::Chat,
+                                                )
+                                                .await
+                                        {
+                                            while let Some(token_result) = followup_stream.next().await {
+                                                if let Ok(token) = token_result {
+                                                    followup_response.push_str(&token);
+                                                    let _ = events_tx_clone.send(ServerEvent::Token {
+                                                        agent_id: target_id_clone.clone(),
+                                                        token,
+                                                    });
+                                                }
+                                            }
+
+                                            let _ = engine
+                                                .finalize_chat(
+                                                    &followup_prompt,
+                                                    &followup_response,
+                                                    session_id.as_deref(),
+                                                    crate::engine::PromptMode::Chat,
+                                                )
+                                                .await;
+
                                             let _ = events_tx_clone.send(ServerEvent::Message {
                                                 from: target_id_clone.clone(),
                                                 to: "user".to_string(),
-                                                content: format!("Error: {}", e),
+                                                content: followup_response.clone(),
                                             });
+                                            let _ = events_tx_clone.send(ServerEvent::StateUpdated);
                                         }
-                                        // Force UI refresh after loop so the final LLM answer
-                                        // (persisted to DB) shows up immediately.
-                                        let _ = events_tx_clone.send(ServerEvent::StateUpdated);
                                     }
                                     Err(e) => {
                                         tracing::warn!("Tool execution failed ({}): {}", tool, e);
@@ -492,12 +653,39 @@ async fn chat_handler(
                                         };
                                         engine.task = Some(task_for_loop);
                                         // Ask the model again with the error + schema.
-                                        let _ = engine.run_agent_loop(session_id.as_deref()).await;
+                                        let outcome = engine.run_agent_loop(session_id.as_deref()).await;
+                                        if let Ok(outcome) = &outcome {
+                                            emit_outcome(outcome, &events_tx_clone, &target_id_clone);
+                                        }
+                                        let _ = events_tx_clone.send(ServerEvent::StateUpdated);
                                         let _ = events_tx_clone.send(ServerEvent::Message {
                                             from: target_id_clone.clone(),
                                             to: "user".to_string(),
                                             content: format!("Tool execution failed ({}): {}", tool, e),
                                         });
+                                        if let Ok(ctx) = manager.get_or_create_project(root_clone.clone()).await {
+                                            let err_msg = format!("Tool execution failed ({}): {}", tool, e);
+                                            let _ = ctx.state_fs.append_message(
+                                                &target_id_clone,
+                                                "user",
+                                                &err_msg,
+                                                None,
+                                                session_id.as_deref(),
+                                            );
+                                            let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
+                                                repo_path: root_clone.to_string_lossy().to_string(),
+                                                session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
+                                                agent_id: target_id_clone.clone(),
+                                                from_id: target_id_clone.clone(),
+                                                to_id: "user".to_string(),
+                                                content: err_msg,
+                                                timestamp: std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap()
+                                                    .as_secs(),
+                                                is_observation: false,
+                                            });
+                                        }
                                     }
                                 };
                             }
@@ -515,10 +703,32 @@ async fn chat_handler(
                     Err(e) => {
                         let error_msg = format!("Error: {}", e);
                         let _ = events_tx_clone.send(ServerEvent::Message {
-                            from: target_id_clone,
+                            from: target_id_clone.clone(),
                             to: "user".to_string(),
-                            content: error_msg,
+                            content: error_msg.clone(),
                         });
+                        if let Ok(ctx) = manager.get_or_create_project(root_clone.clone()).await {
+                            let _ = ctx.state_fs.append_message(
+                                &target_id_clone,
+                                "user",
+                                &error_msg,
+                                None,
+                                session_id.as_deref(),
+                            );
+                            let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
+                                repo_path: root_clone.to_string_lossy().to_string(),
+                                session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
+                                agent_id: target_id_clone.clone(),
+                                from_id: target_id_clone.clone(),
+                                to_id: "user".to_string(),
+                                content: error_msg,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs(),
+                                is_observation: false,
+                            });
+                        }
                     }
                 }
             });

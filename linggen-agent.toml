@@ -18,6 +18,11 @@ port = 6666
 [agent]
 max_iters = 10
 
+[logging]
+level = "debug"
+rotation = "daily"
+retention_days = 30
+
 [[agents]]
 id = "lead"
 spec_path = "agents/lead.md"

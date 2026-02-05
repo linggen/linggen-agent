@@ -69,6 +69,10 @@ Autonomy Level controls permissions, tool availability, approvals, and cloud spe
 - **CLI MVP**
   - `linggen coder` for interactive coding.
   - Planned: `linggen pm`, `linggen operator`.
+- **Chat mode switching (CLI/Web)**
+  - Support `/mode chat` for plain-text responses (e.g. summaries, explanations).
+  - Support `/mode auto` for structured planning responses (user stories + acceptance criteria).
+  - Mode should persist per session until changed.
 - **Web UI (vNext)**
   - Status dashboard: task stage, confidence, failures, last actions.
   - Artifacts: user stories, diffs, `/check` logs, deployment reports.
