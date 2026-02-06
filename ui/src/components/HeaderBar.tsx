@@ -16,6 +16,8 @@ export const HeaderBar: React.FC<{
   pickFolder: () => void;
   refreshPageState: () => void;
   isRunning: boolean;
+  currentMode: 'chat' | 'auto';
+  onModeChange: (mode: 'chat' | 'auto') => void;
 }> = ({
   projects,
   selectedProjectRoot,
@@ -29,6 +31,8 @@ export const HeaderBar: React.FC<{
   pickFolder,
   refreshPageState,
   isRunning,
+  currentMode,
+  onModeChange,
 }) => {
   return (
     <header className="flex items-center justify-between px-6 py-3 border-b border-slate-200 dark:border-white/5 bg-white/80 dark:bg-[#0f0f0f]/80 backdrop-blur-md z-50">
@@ -111,7 +115,15 @@ export const HeaderBar: React.FC<{
           <span className="text-[10px] font-bold uppercase tracking-widest text-slate-500">{isRunning ? 'Active' : 'Standby'}</span>
         </div>
         <div className="w-px h-3 bg-slate-300 dark:bg-white/10" />
-        <span className="text-[10px] font-bold text-blue-600 dark:text-blue-400 uppercase tracking-widest">L2 Autonomy</span>
+        <select
+          value={currentMode}
+          onChange={(e) => onModeChange((e.target.value === 'chat' ? 'chat' : 'auto'))}
+          className="text-[10px] font-bold text-blue-600 dark:text-blue-400 uppercase tracking-widest bg-transparent outline-none"
+          title="Prompt mode"
+        >
+          <option value="auto">Mode: Auto</option>
+          <option value="chat">Mode: Chat</option>
+        </select>
       </div>
     </header>
   );

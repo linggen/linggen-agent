@@ -1,7 +1,17 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { MessageSquare, Copy, Eraser, Plus, Send, Activity } from 'lucide-react';
 import { cn } from '../lib/cn';
 import type { AgentInfo, ChatMessage, SessionInfo, SkillInfo } from '../types';
+
+function normalizeMarkdownish(text: string): string {
+  // Improve readability when model emits markdown tokens without proper newlines.
+  return text
+    .replace(/\s+(#{1,6}\s)/g, '\n\n$1')
+    .replace(/\s+(\d+\.\s)/g, '\n$1')
+    .replace(/\s+(-\s)/g, '\n$1')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
 
 export const ChatPanel: React.FC<{
   chatMessages: ChatMessage[];
@@ -42,6 +52,69 @@ export const ChatPanel: React.FC<{
   const [showAgentDropdown, setShowAgentDropdown] = useState(false);
   const [agentFilter, setAgentFilter] = useState('');
   const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(0);
+  const [expandedToolResults, setExpandedToolResults] = useState<Record<string, boolean>>({});
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+
+  type DisplayMessage = {
+    key: string;
+    msg: ChatMessage;
+    toolResults: ChatMessage[];
+  };
+
+  const displayMessages = useMemo<DisplayMessage[]>(() => {
+    const out: DisplayMessage[] = [];
+    let i = 0;
+    while (i < chatMessages.length) {
+      const msg = chatMessages[i];
+      let toolResults: ChatMessage[] = [];
+      let consumed = false;
+
+      try {
+        const parsed = JSON.parse(msg.text);
+        if (parsed?.type === 'tool' && parsed?.tool && msg.from) {
+          const prefix = `Tool ${parsed.tool}:`;
+          let j = i + 1;
+          while (j < chatMessages.length) {
+            const next = chatMessages[j];
+            if (next.from === 'system' && next.to === msg.from && next.text.startsWith(prefix)) {
+              toolResults.push(next);
+              j += 1;
+            } else {
+              break;
+            }
+          }
+          if (toolResults.length > 0) {
+            i = j - 1;
+            consumed = true;
+          }
+        }
+      } catch (_e) {}
+
+      out.push({
+        key: `${msg.timestamp}-${i}-${msg.from || msg.role}`,
+        msg,
+        toolResults,
+      });
+      i += 1;
+
+      if (consumed) {
+        // no-op, already advanced `i` above and then incremented.
+      }
+    }
+
+    return out;
+  }, [chatMessages]);
+
+  const resizeInput = () => {
+    if (!inputRef.current) return;
+    inputRef.current.style.height = '0px';
+    const next = Math.min(inputRef.current.scrollHeight, 220);
+    inputRef.current.style.height = `${next}px`;
+  };
+
+  useEffect(() => {
+    resizeInput();
+  }, [chatInput]);
 
   const send = () => {
     if (!chatInput.trim()) return;
@@ -49,7 +122,13 @@ export const ChatPanel: React.FC<{
     setChatInput('');
     setShowSkillDropdown(false);
     setShowAgentDropdown(false);
+    if (userMessage.trim().toLowerCase().startsWith('@coder ')) {
+      setSelectedAgent('coder');
+    } else if (userMessage.trim().toLowerCase().startsWith('@lead ')) {
+      setSelectedAgent('lead');
+    }
     onSendMessage(userMessage);
+    window.setTimeout(resizeInput, 0);
   };
 
   const buildSkillSuggestions = () => {
@@ -156,29 +235,21 @@ export const ChatPanel: React.FC<{
               <Plus size={16} />
             </button>
             <select
-              value={selectedAgent}
-              onChange={(e: any) => setSelectedAgent(e.target.value)}
-              className="text-[10px] bg-slate-100 dark:bg-white/5 border-none rounded px-2 py-1 outline-none"
+              value={activeSessionId || ''}
+              onChange={(e) => setActiveSessionId(e.target.value || null)}
+              className="text-[10px] bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded px-2 py-1 outline-none w-44"
             >
-              <option value="lead">Lead Agent</option>
-              <option value="coder">Coder Agent</option>
+              <option value="">Default Session</option>
+              {sessions.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.title}
+                </option>
+              ))}
             </select>
           </div>
         </div>
 
         <div className="flex flex-col gap-1">
-          <select
-            value={activeSessionId || ''}
-            onChange={(e) => setActiveSessionId(e.target.value || null)}
-            className="text-[10px] bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded px-2 py-1 outline-none w-full"
-          >
-            <option value="">Default Session</option>
-            {sessions.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.title}
-              </option>
-            ))}
-          </select>
           {activeSessionId && (
             <button onClick={() => removeSession(activeSessionId)} className="text-[8px] text-red-500 hover:underline text-right">
               Delete Session
@@ -188,9 +259,12 @@ export const ChatPanel: React.FC<{
       </div>
 
       <div className="flex-1 overflow-y-scroll p-4 flex flex-col gap-4 custom-scrollbar min-h-0">
-        {chatMessages.map((msg, i) => (
+        {displayMessages.map((item, i) => {
+          const msg = item.msg;
+          const toolToggleKey = `${item.key}-tool`;
+          return (
           <div
-            key={i}
+            key={item.key}
             className={cn('flex flex-col gap-1 max-w-[95%]', msg.role === 'user' ? 'self-end items-end' : 'self-start items-start')}
           >
             <div className="flex items-center gap-1 px-1">
@@ -213,13 +287,36 @@ export const ChatPanel: React.FC<{
                 try {
                   const parsed = JSON.parse(msg.text);
                   if (parsed.type === 'ask' && parsed.question) {
-                    return parsed.question;
+                    return <div className="whitespace-pre-wrap break-words">{normalizeMarkdownish(parsed.question)}</div>;
                   }
                   if (parsed.type === 'tool' && parsed.tool) {
                     return (
-                      <div className="flex items-center gap-2 text-blue-500 italic">
-                        <Activity size={12} className="animate-pulse" />
-                        <span>Using tool: {parsed.tool}...</span>
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2 text-blue-500 italic">
+                          <Activity size={12} className="animate-pulse" />
+                          <span>Using tool: {parsed.tool}...</span>
+                        </div>
+                        {item.toolResults.length > 0 && (
+                          <div className="space-y-1">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setExpandedToolResults((prev) => ({
+                                  ...prev,
+                                  [toolToggleKey]: !prev[toolToggleKey],
+                                }))
+                              }
+                              className="text-[10px] text-slate-600 dark:text-slate-300 underline underline-offset-2"
+                            >
+                              {expandedToolResults[toolToggleKey] ? 'Hide result' : `Show result (${item.toolResults.length})`}
+                            </button>
+                            {expandedToolResults[toolToggleKey] && (
+                              <div className="rounded-md border border-slate-300 dark:border-white/10 bg-white/70 dark:bg-black/20 p-2 text-[11px] whitespace-pre-wrap break-words">
+                                {item.toolResults.map((r) => r.text).join('\n\n')}
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     );
                   }
@@ -255,21 +352,21 @@ export const ChatPanel: React.FC<{
                       </div>
                     );
                   }
-                  return msg.text;
+                  return <div className="whitespace-pre-wrap break-words">{normalizeMarkdownish(msg.text)}</div>;
                 } catch (e) {
-                  return msg.text;
+                  return <div className="whitespace-pre-wrap break-words">{normalizeMarkdownish(msg.text)}</div>;
                 }
               })()}
               {msg.isGenerating && <span className="inline-block w-1.5 h-3.5 bg-blue-500 ml-1 animate-pulse align-middle" />}
             </div>
             <span className="text-[8px] text-slate-500 px-1">{msg.timestamp}</span>
           </div>
-        ))}
+        )})}
         <div ref={chatEndRef} />
       </div>
 
       <div className="p-4 border-t border-slate-200 dark:border-white/5 space-y-3 bg-slate-50 dark:bg-white/[0.02]">
-        <div className="flex gap-2 bg-slate-100 dark:bg-white/5 p-1 rounded-xl border border-slate-200 dark:border-white/10 relative">
+        <div className="flex gap-2 bg-slate-100 dark:bg-white/5 p-1 rounded-xl border border-slate-200 dark:border-white/10 relative items-center">
           {showSkillDropdown && (
             <div className="absolute bottom-full left-0 right-0 mb-2 bg-white dark:bg-[#141414] border border-slate-200 dark:border-white/10 rounded-lg shadow-xl max-h-52 overflow-y-auto z-[70]">
               <div className="px-3 py-2 text-[10px] text-slate-500 border-b border-slate-200 dark:border-white/10">
@@ -320,7 +417,16 @@ export const ChatPanel: React.FC<{
                 ))}
             </div>
           )}
-          <input
+          <select
+            value={selectedAgent}
+            onChange={(e: any) => setSelectedAgent(e.target.value)}
+            className="text-[10px] bg-white/80 dark:bg-black/20 border border-slate-200 dark:border-white/10 rounded-lg px-2 py-1.5 outline-none"
+          >
+            <option value="lead">Lead</option>
+            <option value="coder">Coder</option>
+          </select>
+          <textarea
+            ref={inputRef}
             value={chatInput}
             onChange={(e) => {
               const val = e.target.value;
@@ -352,14 +458,18 @@ export const ChatPanel: React.FC<{
                 suggestions[selectedSuggestionIndex]?.apply();
                 return;
               }
-              if (e.key === 'Enter' && !showSkillDropdown && !showAgentDropdown) send();
+              if (e.key === 'Enter' && !e.shiftKey && !showSkillDropdown && !showAgentDropdown) {
+                e.preventDefault();
+                send();
+              }
               if (e.key === 'Escape') {
                 setShowSkillDropdown(false);
                 setShowAgentDropdown(false);
               }
             }}
             placeholder="Message... (use / for skills, @ for agents)"
-            className="flex-1 bg-transparent border-none px-3 py-2 text-xs outline-none"
+            rows={1}
+            className="flex-1 bg-transparent border-none px-3 py-2 text-xs outline-none resize-none min-h-[40px] max-h-[220px] leading-5"
           />
           <button onClick={send} className="w-8 h-8 rounded-lg bg-blue-600 text-white flex items-center justify-center shadow-lg shadow-blue-600/20">
             <Send size={14} />

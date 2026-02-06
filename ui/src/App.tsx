@@ -38,7 +38,9 @@ const App: React.FC = () => {
   const [logs, setLogs] = useState<string[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [selectedAgent, setSelectedAgent] = useState<'lead' | 'coder'>('lead');
+  const [currentMode, setCurrentMode] = useState<'chat' | 'auto'>('auto');
   const [isRunning, setIsRunning] = useState(false);
+  const [agentStatus, setAgentStatus] = useState<Record<string, 'idle' | 'working'>>({});
   // Refresh icon should only refresh UI state, not run an audit skill.
   
   const [files, setFiles] = useState<FileEntry[]>([]);
@@ -304,6 +306,34 @@ const App: React.FC = () => {
     }
   };
 
+  const fetchSettings = async () => {
+    if (!selectedProjectRoot) return;
+    try {
+      const resp = await fetch(`/api/settings?project_root=${encodeURIComponent(selectedProjectRoot)}`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      setCurrentMode(data.mode === 'chat' ? 'chat' : 'auto');
+    } catch (e) {
+      console.error('Failed to fetch settings:', e);
+    }
+  };
+
+  const updateMode = async (mode: 'chat' | 'auto') => {
+    if (!selectedProjectRoot) return;
+    try {
+      const resp = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_root: selectedProjectRoot, mode }),
+      });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      setCurrentMode(data.mode === 'chat' ? 'chat' : 'auto');
+    } catch (e) {
+      console.error('Failed to update mode:', e);
+    }
+  };
+
   useEffect(() => {
     fetchProjects();
     fetchSkills();
@@ -321,6 +351,7 @@ const App: React.FC = () => {
       fetchLeadState();
       fetchAgentTree();
       fetchSessions();
+      fetchSettings();
     }
   }, [selectedProjectRoot]);
 
@@ -347,6 +378,15 @@ const App: React.FC = () => {
           fetchLeadState();
           fetchFiles(currentPath);
           fetchAgentTree();
+        } else if (event.type === 'AgentStatus') {
+          setAgentStatus((prev) => ({
+            ...prev,
+            [event.agent_id]: event.status,
+          }));
+        } else if (event.type === 'SettingsUpdated') {
+          if (event.project_root === selectedProjectRoot) {
+            setCurrentMode(event.mode === 'chat' ? 'chat' : 'auto');
+          }
         } else if (event.type === 'Observation') {
           // Observations are persisted to DB; refresh to show tool actions.
           fetchLeadState();
@@ -445,6 +485,12 @@ const App: React.FC = () => {
 
   const sendChatMessage = async (userMessage: string) => {
     if (!userMessage.trim() || !selectedProjectRoot) return;
+    const trimmed = userMessage.trim().toLowerCase();
+    if (trimmed === '/mode chat') {
+      setCurrentMode('chat');
+    } else if (trimmed === '/mode auto') {
+      setCurrentMode('auto');
+    }
     if (userMessage.startsWith('/user_story ')) {
       const story = userMessage.substring(12).trim();
       addLog(`Setting user story: ${story}`);
@@ -532,6 +578,7 @@ const App: React.FC = () => {
     fetchFiles(currentPath);
     fetchAgentTree();
     fetchSessions();
+    fetchSettings();
   };
 
   return (
@@ -550,6 +597,8 @@ const App: React.FC = () => {
         pickFolder={pickFolder}
         refreshPageState={refreshPageState}
         isRunning={isRunning}
+        currentMode={currentMode}
+        onModeChange={updateMode}
       />
 
       {/* Main Layout */}
@@ -590,7 +639,13 @@ const App: React.FC = () => {
 
         {/* Right: Status */}
         <aside className="w-80 border-l border-slate-200 dark:border-white/5 flex flex-col bg-slate-50 dark:bg-[#0a0a0a] p-4 gap-4 overflow-y-auto">
-          <AgentsCard agents={agents} leadState={leadState} isRunning={isRunning} selectedAgent={selectedAgent} />
+          <AgentsCard
+            agents={agents}
+            leadState={leadState}
+            isRunning={isRunning}
+            selectedAgent={selectedAgent}
+            agentStatus={agentStatus}
+          />
           <ModelsCard models={models} ollamaStatus={ollamaStatus} chatMessages={chatMessages} />
         </aside>
       </div>

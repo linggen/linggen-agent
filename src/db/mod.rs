@@ -9,6 +9,7 @@ const PROJECTS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("projec
 const FILE_ACTIVITY_TABLE: TableDefinition<&str, &str> = TableDefinition::new("file_activity");
 const SESSIONS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sessions");
 const CHAT_HISTORY_TABLE: TableDefinition<&str, &str> = TableDefinition::new("chat_history");
+const PROJECT_SETTINGS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("project_settings");
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProjectInfo {
@@ -46,6 +47,12 @@ pub struct FileActivity {
     pub last_modified: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ProjectSettings {
+    pub repo_path: String,
+    pub mode: String, // "chat" | "auto"
+}
+
 pub struct Db {
     db: Arc<Database>,
 }
@@ -69,6 +76,7 @@ impl Db {
             let _ = write_txn.open_table(FILE_ACTIVITY_TABLE)?;
             let _ = write_txn.open_table(SESSIONS_TABLE)?;
             let _ = write_txn.open_table(CHAT_HISTORY_TABLE)?;
+            let _ = write_txn.open_table(PROJECT_SETTINGS_TABLE)?;
         }
         write_txn.commit()?;
 
@@ -87,6 +95,14 @@ impl Db {
             };
             let val = serde_json::to_string(&info)?;
             table.insert(path.as_str(), val.as_str())?;
+
+            let mut settings_table = write_txn.open_table(PROJECT_SETTINGS_TABLE)?;
+            let settings = ProjectSettings {
+                repo_path: path.clone(),
+                mode: "auto".to_string(),
+            };
+            let settings_val = serde_json::to_string(&settings)?;
+            settings_table.insert(path.as_str(), settings_val.as_str())?;
         }
         write_txn.commit()?;
         Ok(())
@@ -109,6 +125,8 @@ impl Db {
         {
             let mut table = write_txn.open_table(PROJECTS_TABLE)?;
             table.remove(path)?;
+            let mut settings_table = write_txn.open_table(PROJECT_SETTINGS_TABLE)?;
+            settings_table.remove(path)?;
 
             // Also remove all activity for this project
             let mut act_table = write_txn.open_table(FILE_ACTIVITY_TABLE)?;
@@ -123,6 +141,35 @@ impl Db {
             for key in to_remove {
                 act_table.remove(key.as_str())?;
             }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_project_settings(&self, repo_path: &str) -> Result<ProjectSettings> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(PROJECT_SETTINGS_TABLE)?;
+        if let Some(val) = table.get(repo_path)? {
+            let settings: ProjectSettings = serde_json::from_str(val.value())?;
+            Ok(settings)
+        } else {
+            Ok(ProjectSettings {
+                repo_path: repo_path.to_string(),
+                mode: "auto".to_string(),
+            })
+        }
+    }
+
+    pub fn set_project_mode(&self, repo_path: &str, mode: &str) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(PROJECT_SETTINGS_TABLE)?;
+            let settings = ProjectSettings {
+                repo_path: repo_path.to_string(),
+                mode: mode.to_string(),
+            };
+            let val = serde_json::to_string(&settings)?;
+            table.insert(repo_path, val.as_str())?;
         }
         write_txn.commit()?;
         Ok(())
