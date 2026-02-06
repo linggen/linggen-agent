@@ -13,7 +13,7 @@ use futures_util::Stream;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::de::Deserializer;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -422,6 +422,10 @@ impl AgentEngine {
 
         // Cache tool results by (tool,args) to prevent repetition loops.
         let mut tool_cache: HashMap<String, CachedToolObs> = HashMap::new();
+        // Guardrails: track files read in this loop so writes to existing files are never blind.
+        let mut read_paths: HashSet<String> = HashSet::new();
+        // Guardrail: repeated search with no matches means no progress.
+        let mut empty_search_streak = 0usize;
 
         for _ in 0..self.cfg.max_iters {
             // Ask model for the next action as JSON.
@@ -446,17 +450,41 @@ impl AgentEngine {
             match action {
                 ModelAction::Tool { tool, args } => {
                     info!("Agent requested tool: {} with args: {}", tool, args);
+                    if tool == "read_file" {
+                        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                            read_paths.insert(path.to_string());
+                        }
+                    }
+
+                    if tool == "write_file" {
+                        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                            let existing = self.cfg.ws_root.join(path).exists();
+                            if existing && !read_paths.contains(path) {
+                                let rendered = format!(
+                                    "tool_error: tool=write_file error=precondition_failed: must call read_file on '{}' before write_file for existing files",
+                                    path
+                                );
+                                self.observations.push(rendered.clone());
+                                let _ = self
+                                    .manager_db_add_observation("write_file", &rendered, session_id)
+                                    .await;
+                                messages.push(ChatMessage {
+                                    role: "user".to_string(),
+                                    content: format!(
+                                        "Tool execution blocked for safety: {}. Read the existing file first, then write a minimal update.",
+                                        rendered
+                                    ),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+
                     let sig = format!("{}|{}", tool, args);
                     if let Some(cached) = tool_cache.get(&sig) {
                         self.observations.push(cached.model.clone());
-                        let _ = self
-                            .manager_db_add_observation(&tool, &cached.public, session_id)
-                            .await;
-                        if let Some(manager) = self.tools.get_manager() {
-                            manager
-                                .send_event(crate::agent_manager::AgentEvent::StateUpdated)
-                                .await;
-                        }
+                        // Cached tool call: keep context for the model, but don't keep re-logging
+                        // identical observation rows to DB/UI.
                         messages.push(ChatMessage {
                             role: "user".to_string(),
                             content: format!("Observation:\n{}", cached.model),
@@ -536,6 +564,17 @@ impl AgentEngine {
                                 role: "user".to_string(),
                                 content: format!("Observation:\n{}", rendered_model),
                             });
+
+                            if tool == "search_rg" && rendered_model.contains("(no matches)") {
+                                empty_search_streak += 1;
+                            } else {
+                                empty_search_streak = 0;
+                            }
+                            if empty_search_streak >= 4 {
+                                let question = "I searched several times and found no matches, so I'm not making progress. I can proceed by editing the file directly after reading it, or you can provide the exact target symbol/line.".to_string();
+                                self.active_skill = None;
+                                return Ok(AgentOutcome::Ask(question));
+                            }
                         }
                         Err(e) => {
                             warn!("Tool execution failed ({}): {}", tool, e);
@@ -657,7 +696,10 @@ impl AgentEngine {
         }
 
         self.active_skill = None;
-        Ok(AgentOutcome::None)
+        Ok(AgentOutcome::Ask(
+            "I couldn't complete this automatically within the current tool loop limit. Please refine the request or switch to `/mode chat` for a direct answer."
+                .to_string(),
+        ))
     }
 
     fn system_prompt(&self) -> String {
@@ -708,6 +750,8 @@ impl AgentEngine {
                     "Rules:",
                     "- You can write files directly using the provided tools.",
                     "- Use tools to inspect the repo before making changes.",
+                    "- For existing files, ALWAYS call read_file first before write_file.",
+                    "- Prefer minimal edits; do not replace an entire existing file unless explicitly asked.",
                     if mode == PromptMode::Structured {
                         "- Respond with EXACTLY one JSON object each turn."
                     } else {
@@ -835,8 +879,12 @@ pub fn render_tool_result(r: &ToolResult) -> String {
         ToolResult::SearchMatches(v) => {
             let mut out = String::new();
             out.push_str("search_matches:\n");
-            for m in v {
-                out.push_str(&format!("{}:{}:{}\n", m.path, m.line, m.snippet));
+            if v.is_empty() {
+                out.push_str("(no matches)\n");
+            } else {
+                for m in v {
+                    out.push_str(&format!("{}:{}:{}\n", m.path, m.line, m.snippet));
+                }
             }
             out
         }

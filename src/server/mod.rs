@@ -14,11 +14,14 @@ use axum::{
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tokio::sync::broadcast;
+use tokio::sync::Mutex;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tracing::info;
@@ -32,6 +35,17 @@ pub struct ServerState {
     pub dev_mode: bool,
     pub events_tx: broadcast::Sender<ServerEvent>,
     pub skill_manager: Arc<crate::skills::SkillManager>,
+    pub queued_chats: Arc<Mutex<HashMap<String, Vec<QueuedChatItem>>>>,
+    pub queue_seq: AtomicU64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueuedChatItem {
+    pub id: String,
+    pub agent_id: String,
+    pub session_id: String,
+    pub preview: String,
+    pub timestamp: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -50,6 +64,12 @@ pub enum ServerEvent {
     SettingsUpdated {
         project_root: String,
         mode: String,
+    },
+    QueueUpdated {
+        project_root: String,
+        session_id: String,
+        agent_id: String,
+        items: Vec<QueuedChatItem>,
     },
     Token {
         agent_id: String,
@@ -108,6 +128,8 @@ pub async fn start_server(
         dev_mode,
         events_tx,
         skill_manager,
+        queued_chats: Arc::new(Mutex::new(HashMap::new())),
+        queue_seq: AtomicU64::new(1),
     });
 
     let app = Router::new()
@@ -318,6 +340,39 @@ fn mode_label(mode: PromptMode) -> &'static str {
     }
 }
 
+fn queue_key(project_root: &str, session_id: &str, agent_id: &str) -> String {
+    format!("{project_root}|{session_id}|{agent_id}")
+}
+
+fn queue_preview(message: &str) -> String {
+    const LIMIT: usize = 100;
+    let trimmed = message.trim();
+    if trimmed.len() <= LIMIT {
+        trimmed.to_string()
+    } else {
+        format!("{}...", &trimmed[..LIMIT])
+    }
+}
+
+async fn emit_queue_updated(
+    state: &Arc<ServerState>,
+    project_root: &str,
+    session_id: &str,
+    agent_id: &str,
+) {
+    let key = queue_key(project_root, session_id, agent_id);
+    let items = {
+        let guard = state.queued_chats.lock().await;
+        guard.get(&key).cloned().unwrap_or_default()
+    };
+    let _ = state.events_tx.send(ServerEvent::QueueUpdated {
+        project_root: project_root.to_string(),
+        session_id: session_id.to_string(),
+        agent_id: agent_id.to_string(),
+        items,
+    });
+}
+
 async fn get_settings_api(
     State(state): State<Arc<ServerState>>,
     Query(q): Query<SettingsQuery>,
@@ -386,7 +441,9 @@ async fn chat_handler(
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
     let root = PathBuf::from(&req.project_root);
+    let project_root_str = root.to_string_lossy().to_string();
     let session_id = req.session_id.clone();
+    let effective_session_id = session_id.clone().unwrap_or_else(|| "default".to_string());
     let events_tx = state.events_tx.clone();
 
     // Check for @Lead or @Coder prefix
@@ -404,11 +461,46 @@ async fn chat_handler(
 
     match state.manager.get_or_create_agent(&root, &target_id).await {
         Ok(agent) => {
+            let was_busy = agent.try_lock().is_err();
+            let queued_item = if was_busy {
+                Some(QueuedChatItem {
+                    id: format!(
+                        "{}-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis(),
+                        state.queue_seq.fetch_add(1, Ordering::Relaxed)
+                    ),
+                    agent_id: target_id.clone(),
+                    session_id: effective_session_id.clone(),
+                    preview: queue_preview(&clean_msg),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                })
+            } else {
+                None
+            };
+            if let Some(item) = &queued_item {
+                let key = queue_key(&project_root_str, &effective_session_id, &target_id);
+                {
+                    let mut guard = state.queued_chats.lock().await;
+                    guard.entry(key).or_default().push(item.clone());
+                }
+                emit_queue_updated(&state, &project_root_str, &effective_session_id, &target_id).await;
+            }
+
             let events_tx_clone = events_tx.clone();
             let target_id_clone = target_id.clone();
             let clean_msg_clone = clean_msg.clone();
             let root_clone = root.clone();
             let manager = state.manager.clone();
+            let state_clone = state.clone();
+            let queued_item_id = queued_item.as_ref().map(|q| q.id.clone());
+            let session_id_for_queue = effective_session_id.clone();
+            let project_root_for_queue = project_root_str.clone();
 
             // Handle mode switch commands before emitting a user message.
             if let Some(mode_value) = trimmed_msg.strip_prefix("/mode ") {
@@ -526,6 +618,26 @@ async fn chat_handler(
             };
 
             tokio::spawn(async move {
+                if let Some(queued_id) = queued_item_id.as_deref() {
+                    let key = queue_key(&project_root_for_queue, &session_id_for_queue, &target_id_clone);
+                    {
+                        let mut guard = state_clone.queued_chats.lock().await;
+                        if let Some(items) = guard.get_mut(&key) {
+                            items.retain(|item| item.id != queued_id);
+                            if items.is_empty() {
+                                guard.remove(&key);
+                            }
+                        }
+                    }
+                    emit_queue_updated(
+                        &state_clone,
+                        &project_root_for_queue,
+                        &session_id_for_queue,
+                        &target_id_clone,
+                    )
+                    .await;
+                }
+
                 let _ = events_tx_clone.send(ServerEvent::AgentStatus {
                     agent_id: target_id_clone.clone(),
                     status: "working".to_string(),
@@ -824,36 +936,37 @@ async fn chat_handler(
                                         let outcome = engine.run_agent_loop(session_id.as_deref()).await;
                                         if let Ok(outcome) = &outcome {
                                             emit_outcome(outcome, &events_tx_clone, &target_id_clone);
+                                        } else {
+                                            let _ = events_tx_clone.send(ServerEvent::Message {
+                                                from: target_id_clone.clone(),
+                                                to: "user".to_string(),
+                                                content: format!("Tool execution failed ({}): {}", tool, e),
+                                            });
+                                            if let Ok(ctx) = manager.get_or_create_project(root_clone.clone()).await {
+                                                let err_msg = format!("Tool execution failed ({}): {}", tool, e);
+                                                let _ = ctx.state_fs.append_message(
+                                                    &target_id_clone,
+                                                    "user",
+                                                    &err_msg,
+                                                    None,
+                                                    session_id.as_deref(),
+                                                );
+                                                let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
+                                                    repo_path: root_clone.to_string_lossy().to_string(),
+                                                    session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
+                                                    agent_id: target_id_clone.clone(),
+                                                    from_id: target_id_clone.clone(),
+                                                    to_id: "user".to_string(),
+                                                    content: err_msg,
+                                                    timestamp: std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap()
+                                                        .as_secs(),
+                                                    is_observation: false,
+                                                });
+                                            }
                                         }
                                         let _ = events_tx_clone.send(ServerEvent::StateUpdated);
-                                        let _ = events_tx_clone.send(ServerEvent::Message {
-                                            from: target_id_clone.clone(),
-                                            to: "user".to_string(),
-                                            content: format!("Tool execution failed ({}): {}", tool, e),
-                                        });
-                                        if let Ok(ctx) = manager.get_or_create_project(root_clone.clone()).await {
-                                            let err_msg = format!("Tool execution failed ({}): {}", tool, e);
-                                            let _ = ctx.state_fs.append_message(
-                                                &target_id_clone,
-                                                "user",
-                                                &err_msg,
-                                                None,
-                                                session_id.as_deref(),
-                                            );
-                                            let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
-                                                repo_path: root_clone.to_string_lossy().to_string(),
-                                                session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
-                                                agent_id: target_id_clone.clone(),
-                                                from_id: target_id_clone.clone(),
-                                                to_id: "user".to_string(),
-                                                content: err_msg,
-                                                timestamp: std::time::SystemTime::now()
-                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                    .unwrap()
-                                                    .as_secs(),
-                                                is_observation: false,
-                                            });
-                                        }
                                     }
                                 };
                             }
