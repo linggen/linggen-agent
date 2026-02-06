@@ -15,6 +15,7 @@ import type {
   ModelInfo,
   OllamaPsResponse,
   ProjectInfo,
+  QueuedChatItem,
   SessionInfo,
   SkillInfo,
 } from './types';
@@ -41,6 +42,7 @@ const App: React.FC = () => {
   const [currentMode, setCurrentMode] = useState<'chat' | 'auto'>('auto');
   const [isRunning, setIsRunning] = useState(false);
   const [agentStatus, setAgentStatus] = useState<Record<string, 'idle' | 'working'>>({});
+  const [queuedMessages, setQueuedMessages] = useState<QueuedChatItem[]>([]);
   // Refresh icon should only refresh UI state, not run an audit skill.
   
   const [files, setFiles] = useState<FileEntry[]>([]);
@@ -352,12 +354,14 @@ const App: React.FC = () => {
       fetchAgentTree();
       fetchSessions();
       fetchSettings();
+      setQueuedMessages([]);
     }
   }, [selectedProjectRoot]);
 
   useEffect(() => {
     if (selectedProjectRoot) {
       fetchLeadState();
+      setQueuedMessages([]);
     }
   }, [activeSessionId]);
 
@@ -386,6 +390,11 @@ const App: React.FC = () => {
         } else if (event.type === 'SettingsUpdated') {
           if (event.project_root === selectedProjectRoot) {
             setCurrentMode(event.mode === 'chat' ? 'chat' : 'auto');
+          }
+        } else if (event.type === 'QueueUpdated') {
+          const session = activeSessionId || 'default';
+          if (event.project_root === selectedProjectRoot && event.session_id === session) {
+            setQueuedMessages(event.items || []);
           }
         } else if (event.type === 'Observation') {
           // Observations are persisted to DB; refresh to show tool actions.
@@ -452,7 +461,7 @@ const App: React.FC = () => {
     };
 
     return () => events.close();
-  }, [currentPath]);
+  }, [currentPath, selectedProjectRoot, activeSessionId]);
 
   const handleRun = async () => {
     if (!selectedProjectRoot) return;
@@ -483,7 +492,7 @@ const App: React.FC = () => {
     setTask('');
   };
 
-  const sendChatMessage = async (userMessage: string) => {
+  const sendChatMessage = async (userMessage: string, targetAgent?: 'lead' | 'coder') => {
     if (!userMessage.trim() || !selectedProjectRoot) return;
     const trimmed = userMessage.trim().toLowerCase();
     if (trimmed === '/mode chat') {
@@ -506,13 +515,15 @@ const App: React.FC = () => {
       return;
     }
 
+    const agentToUse = targetAgent || selectedAgent;
+
     try {
       await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           project_root: selectedProjectRoot, 
-          agent_id: selectedAgent, 
+          agent_id: agentToUse,
           message: userMessage,
           session_id: activeSessionId
         }),
@@ -619,6 +630,7 @@ const App: React.FC = () => {
           <div className="flex-1 p-4 min-h-0">
             <ChatPanel
               chatMessages={chatMessages}
+              queuedMessages={queuedMessages}
               chatEndRef={chatEndRef}
               copyChat={copyChat}
               copyChatStatus={copyChatStatus}

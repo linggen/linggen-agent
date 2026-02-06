@@ -7,6 +7,14 @@ export interface ChatMessage {
   isGenerating?: boolean;
 }
 
+export interface QueuedChatItem {
+  id: string;
+  agent_id: string;
+  session_id: string;
+  preview: string;
+  timestamp: number;
+}
+
 export interface FileEntry {
   name: string;
   isDir: boolean;

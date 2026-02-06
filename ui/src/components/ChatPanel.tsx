@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { MessageSquare, Copy, Eraser, Plus, Send, Activity } from 'lucide-react';
+import { MessageSquare, Copy, Eraser, Plus, Send, Activity, ChevronRight, ChevronDown } from 'lucide-react';
 import { cn } from '../lib/cn';
-import type { AgentInfo, ChatMessage, SessionInfo, SkillInfo } from '../types';
+import type { AgentInfo, ChatMessage, QueuedChatItem, SessionInfo, SkillInfo } from '../types';
 
 function normalizeMarkdownish(text: string): string {
   // Improve readability when model emits markdown tokens without proper newlines.
@@ -15,6 +15,7 @@ function normalizeMarkdownish(text: string): string {
 
 export const ChatPanel: React.FC<{
   chatMessages: ChatMessage[];
+  queuedMessages: QueuedChatItem[];
   chatEndRef: React.RefObject<HTMLDivElement | null>;
   copyChat: () => void;
   copyChatStatus: 'idle' | 'copied' | 'error';
@@ -28,9 +29,10 @@ export const ChatPanel: React.FC<{
   setSelectedAgent: (value: 'lead' | 'coder') => void;
   skills: SkillInfo[];
   agents: AgentInfo[];
-  onSendMessage: (message: string) => void;
+  onSendMessage: (message: string, targetAgent?: 'lead' | 'coder') => void;
 }> = ({
   chatMessages,
+  queuedMessages,
   chatEndRef,
   copyChat,
   copyChatStatus,
@@ -54,6 +56,7 @@ export const ChatPanel: React.FC<{
   const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(0);
   const [expandedToolResults, setExpandedToolResults] = useState<Record<string, boolean>>({});
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const agentSelectRef = useRef<HTMLSelectElement | null>(null);
 
   type DisplayMessage = {
     key: string;
@@ -127,7 +130,8 @@ export const ChatPanel: React.FC<{
     } else if (userMessage.trim().toLowerCase().startsWith('@lead ')) {
       setSelectedAgent('lead');
     }
-    onSendMessage(userMessage);
+    const dropdownAgent = agentSelectRef.current?.value as 'lead' | 'coder' | undefined;
+    onSendMessage(userMessage, dropdownAgent || selectedAgent);
     window.setTimeout(resizeInput, 0);
   };
 
@@ -259,6 +263,18 @@ export const ChatPanel: React.FC<{
       </div>
 
       <div className="flex-1 overflow-y-scroll p-4 flex flex-col gap-4 custom-scrollbar min-h-0">
+        {queuedMessages.length > 0 && (
+          <div className="self-stretch rounded-lg border border-amber-300/50 bg-amber-50 dark:bg-amber-500/10 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-200">
+            <div className="font-semibold">Queued messages ({queuedMessages.length})</div>
+            <div className="mt-1 space-y-1">
+              {queuedMessages.map((item) => (
+                <div key={item.id} className="truncate">
+                  [{item.agent_id}] {item.preview}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
         {displayMessages.map((item, i) => {
           const msg = item.msg;
           const toolToggleKey = `${item.key}-tool`;
@@ -295,9 +311,7 @@ export const ChatPanel: React.FC<{
                         <div className="flex items-center gap-2 text-blue-500 italic">
                           <Activity size={12} className="animate-pulse" />
                           <span>Using tool: {parsed.tool}...</span>
-                        </div>
-                        {item.toolResults.length > 0 && (
-                          <div className="space-y-1">
+                          {item.toolResults.length > 0 && (
                             <button
                               type="button"
                               onClick={() =>
@@ -306,10 +320,16 @@ export const ChatPanel: React.FC<{
                                   [toolToggleKey]: !prev[toolToggleKey],
                                 }))
                               }
-                              className="text-[10px] text-slate-600 dark:text-slate-300 underline underline-offset-2"
+                              className="ml-auto inline-flex items-center gap-1 text-[10px] not-italic text-slate-600 dark:text-slate-300 hover:text-blue-500"
+                              title={expandedToolResults[toolToggleKey] ? 'Hide result' : 'Show result'}
                             >
-                              {expandedToolResults[toolToggleKey] ? 'Hide result' : `Show result (${item.toolResults.length})`}
+                              {expandedToolResults[toolToggleKey] ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                              <span>result ({item.toolResults.length})</span>
                             </button>
+                          )}
+                        </div>
+                        {item.toolResults.length > 0 && (
+                          <div className="space-y-1">
                             {expandedToolResults[toolToggleKey] && (
                               <div className="rounded-md border border-slate-300 dark:border-white/10 bg-white/70 dark:bg-black/20 p-2 text-[11px] whitespace-pre-wrap break-words">
                                 {item.toolResults.map((r) => r.text).join('\n\n')}
@@ -418,6 +438,7 @@ export const ChatPanel: React.FC<{
             </div>
           )}
           <select
+            ref={agentSelectRef}
             value={selectedAgent}
             onChange={(e: any) => setSelectedAgent(e.target.value)}
             className="text-[10px] bg-white/80 dark:bg-black/20 border border-slate-200 dark:border-white/10 rounded-lg px-2 py-1.5 outline-none"

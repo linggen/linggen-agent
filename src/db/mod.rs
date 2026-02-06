@@ -97,12 +97,14 @@ impl Db {
             table.insert(path.as_str(), val.as_str())?;
 
             let mut settings_table = write_txn.open_table(PROJECT_SETTINGS_TABLE)?;
-            let settings = ProjectSettings {
-                repo_path: path.clone(),
-                mode: "auto".to_string(),
-            };
-            let settings_val = serde_json::to_string(&settings)?;
-            settings_table.insert(path.as_str(), settings_val.as_str())?;
+            if settings_table.get(path.as_str())?.is_none() {
+                let settings = ProjectSettings {
+                    repo_path: path.clone(),
+                    mode: "auto".to_string(),
+                };
+                let settings_val = serde_json::to_string(&settings)?;
+                settings_table.insert(path.as_str(), settings_val.as_str())?;
+            }
         }
         write_txn.commit()?;
         Ok(())
