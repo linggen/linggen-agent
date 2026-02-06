@@ -1,4 +1,5 @@
 use crate::agent_manager::AgentManager;
+use crate::engine::PromptMode;
 use crate::skills::Skill;
 use crate::state_fs::StateFile;
 use axum::{
@@ -41,6 +42,14 @@ pub enum ServerEvent {
         from: String,
         to: String,
         content: String,
+    },
+    AgentStatus {
+        agent_id: String,
+        status: String,
+    },
+    SettingsUpdated {
+        project_root: String,
+        mode: String,
     },
     Token {
         agent_id: String,
@@ -111,6 +120,8 @@ pub async fn start_server(
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions", post(create_session))
         .route("/api/sessions", delete(remove_session_api))
+        .route("/api/settings", get(get_settings_api))
+        .route("/api/settings", post(update_settings_api))
         .route("/api/task", post(set_task))
         .route("/api/run", post(run_agent))
         .route("/api/chat", post(chat_handler))
@@ -202,6 +213,10 @@ async fn run_agent(
     {
         Ok(agent) => {
             tokio::spawn(async move {
+                let _ = events_tx.send(ServerEvent::AgentStatus {
+                    agent_id: agent_id.clone(),
+                    status: "working".to_string(),
+                });
                 let mut engine = agent.lock().await;
                 let outcome = engine
                     .run_agent_loop(session_id.as_deref())
@@ -241,7 +256,14 @@ async fn run_agent(
                     }
                 }
 
-                let _ = events_tx.send(ServerEvent::Outcome { agent_id, outcome });
+                let _ = events_tx.send(ServerEvent::Outcome {
+                    agent_id: agent_id.clone(),
+                    outcome,
+                });
+                let _ = events_tx.send(ServerEvent::AgentStatus {
+                    agent_id: agent_id.clone(),
+                    status: "idle".to_string(),
+                });
             });
 
             Json(serde_json::json!({ "status": "started" })).into_response()
@@ -262,6 +284,83 @@ struct ChatRequest {
 struct ClearChatRequest {
     project_root: String,
     session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SettingsQuery {
+    project_root: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateSettingsRequest {
+    project_root: String,
+    mode: String,
+}
+
+#[derive(Serialize)]
+struct SettingsResponse {
+    mode: String,
+}
+
+fn prompt_mode_from_string(mode: &str) -> PromptMode {
+    if mode.eq_ignore_ascii_case("chat") {
+        PromptMode::Chat
+    } else {
+        PromptMode::Structured
+    }
+}
+
+fn mode_label(mode: PromptMode) -> &'static str {
+    if mode == PromptMode::Chat {
+        "chat"
+    } else {
+        "auto"
+    }
+}
+
+async fn get_settings_api(
+    State(state): State<Arc<ServerState>>,
+    Query(q): Query<SettingsQuery>,
+) -> impl IntoResponse {
+    let root = PathBuf::from(&q.project_root)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&q.project_root));
+    match state
+        .manager
+        .db
+        .get_project_settings(&root.to_string_lossy())
+    {
+        Ok(settings) => Json(SettingsResponse { mode: settings.mode }).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn update_settings_api(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<UpdateSettingsRequest>,
+) -> impl IntoResponse {
+    let mode = if req.mode.eq_ignore_ascii_case("chat") {
+        "chat".to_string()
+    } else {
+        "auto".to_string()
+    };
+    let root = PathBuf::from(&req.project_root)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&req.project_root));
+    let root_str = root.to_string_lossy().to_string();
+    let _ = state.manager.get_or_create_project(root.clone()).await;
+    if let Err(e) = state.manager.db.set_project_mode(&root_str, &mode) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    let _ = state
+        .manager
+        .set_project_prompt_mode(&root, prompt_mode_from_string(&mode))
+        .await;
+    let _ = state.events_tx.send(ServerEvent::SettingsUpdated {
+        project_root: root_str,
+        mode: mode.clone(),
+    });
+    Json(SettingsResponse { mode }).into_response()
 }
 
 async fn clear_chat_history_api(
@@ -313,19 +412,49 @@ async fn chat_handler(
 
             // Handle mode switch commands before emitting a user message.
             if let Some(mode_value) = trimmed_msg.strip_prefix("/mode ") {
+                // Emit and persist the user's /mode command so it appears in chat history.
+                let _ = events_tx.send(ServerEvent::Message {
+                    from: "user".to_string(),
+                    to: target_id.clone(),
+                    content: clean_msg.clone(),
+                });
+                if let Ok(ctx) = state.manager.get_or_create_project(root.clone()).await {
+                    let _ = ctx.state_fs.append_message(
+                        "user",
+                        &target_id,
+                        &clean_msg,
+                        None,
+                        session_id.as_deref(),
+                    );
+                    let _ = state.manager.db.add_chat_message(crate::db::ChatMessageRecord {
+                        repo_path: root.to_string_lossy().to_string(),
+                        session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
+                        agent_id: target_id.clone(),
+                        from_id: "user".to_string(),
+                        to_id: target_id.clone(),
+                        content: clean_msg.clone(),
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                        is_observation: false,
+                    });
+                }
+
                 let mode_value = mode_value.trim().to_lowercase();
                 let mut engine = agent.lock().await;
-                let mode = if mode_value == "chat" {
-                    crate::engine::PromptMode::Chat
-                } else {
-                    crate::engine::PromptMode::Structured
-                };
+                let mode = prompt_mode_from_string(&mode_value);
                 engine.set_prompt_mode(mode);
-                let mode_label = if mode == crate::engine::PromptMode::Chat {
-                    "chat"
-                } else {
-                    "auto"
-                };
+                let mode_label = mode_label(mode);
+                let _ = state
+                    .manager
+                    .db
+                    .set_project_mode(&root.to_string_lossy(), mode_label);
+                let _ = state.manager.set_project_prompt_mode(&root, mode).await;
+                let _ = events_tx_clone.send(ServerEvent::SettingsUpdated {
+                    project_root: root.to_string_lossy().to_string(),
+                    mode: mode_label.to_string(),
+                });
                 let _ = events_tx_clone.send(ServerEvent::Message {
                     from: target_id_clone.clone(),
                     to: "user".to_string(),
@@ -397,7 +526,14 @@ async fn chat_handler(
             };
 
             tokio::spawn(async move {
+                let _ = events_tx_clone.send(ServerEvent::AgentStatus {
+                    agent_id: target_id_clone.clone(),
+                    status: "working".to_string(),
+                });
                 let mut engine = agent.lock().await;
+                if let Ok(settings) = manager.get_project_settings(&root_clone).await {
+                    engine.set_prompt_mode(prompt_mode_from_string(&settings.mode));
+                }
                 let mut full_response = String::new();
 
                 // If the user is invoking a skill (slash command), skip streaming chat.
@@ -489,6 +625,10 @@ async fn chat_handler(
                         let _ = events_tx_clone.send(ServerEvent::StateUpdated);
                     }
 
+                    let _ = events_tx_clone.send(ServerEvent::AgentStatus {
+                        agent_id: target_id_clone.clone(),
+                        status: "idle".to_string(),
+                    });
                     return;
                 }
 
@@ -620,13 +760,41 @@ async fn chat_handler(
                                                     crate::engine::PromptMode::Chat,
                                                 )
                                                 .await;
-
-                                            let _ = events_tx_clone.send(ServerEvent::Message {
-                                                from: target_id_clone.clone(),
-                                                to: "user".to_string(),
-                                                content: followup_response.clone(),
-                                            });
-                                            let _ = events_tx_clone.send(ServerEvent::StateUpdated);
+                                            if let Ok(action) =
+                                                crate::engine::parse_first_action(&followup_response)
+                                            {
+                                                if let crate::engine::ModelAction::Tool { .. } = action {
+                                                    // Model asked for another tool in follow-up; continue the autonomous loop
+                                                    // instead of dumping raw JSON into chat and stopping.
+                                                    engine.task = Some(clean_msg_clone.clone());
+                                                    let outcome = engine
+                                                        .run_agent_loop(session_id.as_deref())
+                                                        .await;
+                                                    if let Ok(outcome) = &outcome {
+                                                        emit_outcome(
+                                                            outcome,
+                                                            &events_tx_clone,
+                                                            &target_id_clone,
+                                                        );
+                                                    }
+                                                    let _ = events_tx_clone
+                                                        .send(ServerEvent::StateUpdated);
+                                                } else {
+                                                    let _ = events_tx_clone.send(ServerEvent::Message {
+                                                        from: target_id_clone.clone(),
+                                                        to: "user".to_string(),
+                                                        content: followup_response.clone(),
+                                                    });
+                                                    let _ = events_tx_clone.send(ServerEvent::StateUpdated);
+                                                }
+                                            } else {
+                                                let _ = events_tx_clone.send(ServerEvent::Message {
+                                                    from: target_id_clone.clone(),
+                                                    to: "user".to_string(),
+                                                    content: followup_response.clone(),
+                                                });
+                                                let _ = events_tx_clone.send(ServerEvent::StateUpdated);
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -731,6 +899,10 @@ async fn chat_handler(
                         }
                     }
                 }
+                let _ = events_tx_clone.send(ServerEvent::AgentStatus {
+                    agent_id: target_id_clone.clone(),
+                    status: "idle".to_string(),
+                });
             });
 
             Json(serde_json::json!({ "status": "started" })).into_response()

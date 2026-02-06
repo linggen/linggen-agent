@@ -1,8 +1,8 @@
 use crate::agent_manager::locks::LockManager;
 use crate::agent_manager::models::ModelManager;
 use crate::config::{AgentSpec, Config};
-use crate::db::Db;
-use crate::engine::{AgentEngine, AgentOutcome, AgentRole, EngineConfig};
+use crate::db::{Db, ProjectSettings};
+use crate::engine::{AgentEngine, AgentOutcome, AgentRole, EngineConfig, PromptMode};
 use crate::skills::SkillManager;
 use crate::state_fs::{StateFile, StateFs};
 use anyhow::Result;
@@ -225,6 +225,17 @@ impl AgentManager {
 
         engine.set_spec(agent_id.to_string(), spec);
         engine.set_manager_context(self.clone());
+        if let Ok(settings) = self
+            .db
+            .get_project_settings(&project_root.to_string_lossy())
+        {
+            let mode = if settings.mode == "chat" {
+                PromptMode::Chat
+            } else {
+                PromptMode::Structured
+            };
+            engine.set_prompt_mode(mode);
+        }
 
         let agent = Arc::new(Mutex::new(engine));
         agents.insert(agent_id.to_string(), agent.clone());
@@ -279,6 +290,15 @@ impl AgentManager {
         &self.config
     }
 
+    pub async fn get_project_settings(&self, project_root: &PathBuf) -> Result<ProjectSettings> {
+        let project_root = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.clone());
+        self.db
+            .get_project_settings(&project_root.to_string_lossy())
+            .map_err(Into::into)
+    }
+
     #[allow(dead_code)]
     pub async fn send_event(&self, event: AgentEvent) {
         let _ = self.events.send(event);
@@ -316,6 +336,23 @@ impl AgentManager {
             }
         }
 
+        Ok(())
+    }
+
+    pub async fn set_project_prompt_mode(
+        &self,
+        project_root: &PathBuf,
+        mode: PromptMode,
+    ) -> Result<()> {
+        let project_root = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.clone());
+        let ctx = self.get_or_create_project(project_root).await?;
+        let agents = ctx.agents.lock().await;
+        for agent in agents.values() {
+            let mut engine = agent.lock().await;
+            engine.set_prompt_mode(mode);
+        }
         Ok(())
     }
 

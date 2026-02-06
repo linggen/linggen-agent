@@ -8,7 +8,8 @@ export const AgentsCard: React.FC<{
   leadState: LeadState | null;
   isRunning: boolean;
   selectedAgent: string;
-}> = ({ agents, leadState, isRunning, selectedAgent }) => {
+  agentStatus?: Record<string, 'idle' | 'working'>;
+}> = ({ agents, leadState, isRunning, selectedAgent, agentStatus }) => {
   return (
     <section className="bg-white dark:bg-[#141414] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm flex flex-col overflow-hidden">
       <div className="px-4 py-2 border-b border-slate-200 dark:border-white/5 bg-slate-50 dark:bg-white/[0.02] flex items-center justify-between">
@@ -18,7 +19,9 @@ export const AgentsCard: React.FC<{
         <span className="text-[10px] text-slate-400">Swarm</span>
       </div>
       <div className="flex-1 p-4 overflow-y-auto text-xs space-y-4">
-        {agents.map((agent) => (
+        {agents.map((agent) => {
+          const status = agentStatus?.[agent.name] ?? ((isRunning && selectedAgent === agent.name) ? 'working' : 'idle');
+          return (
           <div
             key={agent.name}
             className="flex items-center justify-between bg-slate-50 dark:bg-black/20 px-3 py-2 rounded-lg border border-slate-200 dark:border-white/5"
@@ -31,16 +34,16 @@ export const AgentsCard: React.FC<{
               <span
                 className={cn(
                   'text-[8px] font-bold px-1.5 py-0.5 rounded-full uppercase',
-                  isRunning && selectedAgent === agent.name
+                  status === 'working'
                     ? 'bg-green-500/20 text-green-500 animate-pulse'
                     : 'bg-slate-500/20 text-slate-500'
                 )}
               >
-                {isRunning && selectedAgent === agent.name ? 'Working' : 'Idle'}
+                {status === 'working' ? 'Working' : 'Idle'}
               </span>
             </div>
           </div>
-        ))}
+        )})}
 
         <div className="pt-2 border-t border-slate-200 dark:border-white/5">
           <div className="text-[10px] text-slate-500 mb-1 font-bold uppercase tracking-widest">Active Lead Task</div>

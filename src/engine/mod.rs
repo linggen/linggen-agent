@@ -681,6 +681,11 @@ impl AgentEngine {
                         "- You may respond in plain text."
                     },
                     if mode == PromptMode::Structured {
+                        ""
+                    } else {
+                        "- In plain-text mode, format output using Markdown (headings, bullets, short paragraphs, fenced code blocks when needed)."
+                    },
+                    if mode == PromptMode::Structured {
                         "- Allowed JSON variants:"
                     } else {
                         "- If you need to use a tool, respond with EXACTLY one JSON object:"
@@ -709,6 +714,11 @@ impl AgentEngine {
                         "- You may respond in plain text."
                     },
                     if mode == PromptMode::Structured {
+                        ""
+                    } else {
+                        "- In plain-text mode, format output using Markdown (headings, bullets, short paragraphs, fenced code blocks when needed)."
+                    },
+                    if mode == PromptMode::Structured {
                         "- Allowed JSON variants:"
                     } else {
                         "- If you need to use a tool, respond with EXACTLY one JSON object:"
@@ -732,6 +742,11 @@ impl AgentEngine {
                         "- Respond with EXACTLY one JSON object each turn."
                     } else {
                         "- You may respond in plain text."
+                    },
+                    if mode == PromptMode::Structured {
+                        ""
+                    } else {
+                        "- In plain-text mode, format output using Markdown (headings, bullets, short paragraphs, fenced code blocks when needed)."
                     },
                     if mode == PromptMode::Structured {
                         "- Allowed JSON variants:"
@@ -914,7 +929,24 @@ pub enum ModelAction {
 }
 
 pub fn parse_first_action(raw: &str) -> Result<ModelAction> {
-    let mut de = Deserializer::from_str(raw);
-    let action = ModelAction::deserialize(&mut de)?;
-    Ok(action)
+    let trimmed = raw.trim();
+
+    // Fast path: a single clean JSON object.
+    if let Ok(action) = serde_json::from_str::<ModelAction>(trimmed) {
+        return Ok(action);
+    }
+
+    // Fallback: models sometimes emit prose + one or more JSON objects.
+    // Scan for JSON object starts and return the first valid ModelAction.
+    for (idx, _) in trimmed.match_indices('{') {
+        let candidate = &trimmed[idx..];
+        let stream = Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+        for value in stream.flatten() {
+            if let Ok(action) = serde_json::from_value::<ModelAction>(value) {
+                return Ok(action);
+            }
+        }
+    }
+
+    anyhow::bail!("no valid model action found in response")
 }
