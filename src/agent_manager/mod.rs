@@ -7,6 +7,7 @@ use crate::skills::SkillManager;
 use crate::state_fs::{StateFile, StateFs};
 use anyhow::Result;
 use globset::Glob;
+use ignore::gitignore::GitignoreBuilder;
 use notify::{EventKind, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -97,11 +98,30 @@ impl AgentManager {
         let db_clone = self.db.clone();
         let root_clone = root.clone();
         let events_tx = self.events.clone();
+        let mut gitignore_builder = GitignoreBuilder::new(&root);
+        let root_gitignore = root.join(".gitignore");
+        if root_gitignore.exists() {
+            if let Some(path_str) = root_gitignore.to_str() {
+                if let Some(err) = gitignore_builder.add(path_str) {
+                    tracing::warn!("Failed to load .gitignore: {}", err);
+                }
+            }
+        }
+        let gitignore = Arc::new(gitignore_builder.build()?);
 
         let mut watcher =
             notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
                     let repo_path = root_clone.to_string_lossy().to_string();
+                    let gitignore = gitignore.clone();
+                    let is_ignored = |path: &std::path::Path| -> bool {
+                        match path.strip_prefix(&root_clone) {
+                            Ok(rel) => gitignore
+                                .matched_path_or_any_parents(rel, false)
+                                .is_ignore(),
+                            Err(_) => false,
+                        }
+                    };
                     
                     // Ignore internal and build directories
                     if event.paths.iter().any(|p| {
@@ -116,35 +136,53 @@ impl AgentManager {
 
                     match event.kind {
                         EventKind::Remove(_) => {
+                            let mut changed = false;
                             for path in event.paths {
+                                if is_ignored(&path) {
+                                    continue;
+                                }
                                 if let Ok(rel) = path.strip_prefix(&root_clone) {
                                     let rel_str = rel.to_string_lossy();
                                     tracing::info!("File removed on disk: {}", rel_str);
                                     let _ = db_clone.remove_activity(&repo_path, &rel_str);
+                                    changed = true;
                                 }
                             }
-                            let _ = events_tx.send(AgentEvent::StateUpdated);
+                            if changed {
+                                let _ = events_tx.send(AgentEvent::StateUpdated);
+                            }
                         }
                         EventKind::Modify(notify::event::ModifyKind::Name(
                             notify::event::RenameMode::Both,
                         )) => {
+                            let mut changed = false;
                             if event.paths.len() == 2 {
                                 let old = &event.paths[0];
                                 let new = &event.paths[1];
+                                let old_ignored = is_ignored(old);
+                                let new_ignored = is_ignored(new);
                                 if let (Ok(old_rel), Ok(new_rel)) =
                                     (old.strip_prefix(&root_clone), new.strip_prefix(&root_clone))
                                 {
                                     let old_str = old_rel.to_string_lossy();
                                     let new_str = new_rel.to_string_lossy();
-                                    tracing::info!("File renamed on disk: {} -> {}", old_str, new_str);
-                                    let _ = db_clone.rename_activity(
-                                        &repo_path,
-                                        &old_str,
-                                        &new_str,
-                                    );
+                                    if !old_ignored && !new_ignored {
+                                        tracing::info!("File renamed on disk: {} -> {}", old_str, new_str);
+                                        let _ = db_clone.rename_activity(
+                                            &repo_path,
+                                            &old_str,
+                                            &new_str,
+                                        );
+                                        changed = true;
+                                    } else if !old_ignored && new_ignored {
+                                        let _ = db_clone.remove_activity(&repo_path, &old_str);
+                                        changed = true;
+                                    }
                                 }
                             }
-                            let _ = events_tx.send(AgentEvent::StateUpdated);
+                            if changed {
+                                let _ = events_tx.send(AgentEvent::StateUpdated);
+                            }
                         }
                         _ => {}
                     }
@@ -244,32 +282,34 @@ impl AgentManager {
 
     pub async fn is_path_allowed(
         &self,
-        project_root: &PathBuf,
+        _project_root: &PathBuf,
         agent_id: &str,
         path: &str,
     ) -> bool {
-        let projects = self.projects.lock().await;
-        let key = project_root.to_string_lossy().to_string();
-        if let Some(ctx) = projects.get(&key) {
-            let agents = ctx.agents.lock().await;
-            if let Some(agent) = agents.get(agent_id) {
-                let engine = agent.lock().await;
-                if let Some(spec) = engine.get_spec() {
-                    if spec.work_globs.is_empty() {
-                        return true;
-                    }
-                    for glob_str in &spec.work_globs {
-                        if let Ok(glob) = Glob::new(glob_str) {
-                            if glob.compile_matcher().is_match(path) {
-                                return true;
-                            }
-                        }
-                    }
-                    return false;
+        // Important: do NOT lock a live agent engine here.
+        // `write_file` is called while the engine mutex is already held by run_agent_loop,
+        // and re-locking that same engine causes a deadlock.
+        let Some(agent_ref) = self.config.agents.iter().find(|a| a.id == agent_id) else {
+            return true;
+        };
+
+        let spec_path = PathBuf::from(&agent_ref.spec_path);
+        let Ok((spec, _)) = AgentSpec::from_markdown(&spec_path) else {
+            return true;
+        };
+
+        if spec.work_globs.is_empty() {
+            return true;
+        }
+
+        for glob_str in &spec.work_globs {
+            if let Ok(glob) = Glob::new(glob_str) {
+                if glob.compile_matcher().is_match(path) {
+                    return true;
                 }
             }
         }
-        true
+        false
     }
 
     pub async fn list_agents(&self) -> Result<Vec<AgentSpec>> {

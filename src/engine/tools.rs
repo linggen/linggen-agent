@@ -8,6 +8,7 @@ use headless_chrome::Browser;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -80,7 +81,12 @@ impl Tools {
     }
 
     pub fn execute(&self, call: ToolCall) -> Result<ToolResult> {
-        info!("Executing tool: {} with args: {}", call.tool, call.args);
+        let normalized_args = normalize_tool_args(&call.tool, &call.args);
+        info!(
+            "Executing tool: {} with args: {}",
+            call.tool,
+            summarize_tool_args(&call.tool, &normalized_args)
+        );
         match call.tool.as_str() {
             "get_repo_info" => Ok(ToolResult::RepoInfo(format!(
                 "root={} platform={}",
@@ -88,39 +94,60 @@ impl Tools {
                 std::env::consts::OS
             ))),
             "list_files" | "Glob" => {
-                let args: ListFilesArgs = serde_json::from_value(call.args)?;
+                let args: ListFilesArgs = serde_json::from_value(normalized_args)
+                    .map_err(|e| anyhow::anyhow!("invalid args for list_files: {}", e))?;
                 self.list_files(args)
             }
             "read_file" | "Read" => {
-                let args: ReadFileArgs = serde_json::from_value(call.args)?;
+                let args: ReadFileArgs = serde_json::from_value(normalized_args).map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid args for read_file: {}. Expected keys: path|max_bytes|line_range",
+                        e
+                    )
+                })?;
                 self.read_file(args)
             }
             "search_rg" | "Grep" => {
-                let args: SearchArgs = serde_json::from_value(call.args)?;
+                let args: SearchArgs = serde_json::from_value(normalized_args)
+                    .map_err(|e| anyhow::anyhow!("invalid args for search_rg: {}", e))?;
                 self.search_rg(args)
             }
             "run_command" | "Bash" => {
-                let args: RunCommandArgs = serde_json::from_value(call.args)?;
+                let args: RunCommandArgs = serde_json::from_value(normalized_args).map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid args for run_command: {}. Expected keys: cmd|timeout_ms",
+                        e
+                    )
+                })?;
                 self.run_command(args)
             }
             "capture_screenshot" => {
-                let args: CaptureScreenshotArgs = serde_json::from_value(call.args)?;
+                let args: CaptureScreenshotArgs = serde_json::from_value(normalized_args)
+                    .map_err(|e| anyhow::anyhow!("invalid args for capture_screenshot: {}", e))?;
                 self.capture_screenshot(args)
             }
             "write_file" | "Write" => {
-                let args: WriteFileArgs = serde_json::from_value(call.args)?;
+                let args: WriteFileArgs = serde_json::from_value(normalized_args).map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid args for write_file: {}. Expected keys: path|content",
+                        e
+                    )
+                })?;
                 self.write_file(args)
             }
             "lock_paths" => {
-                let args: LockPathsArgs = serde_json::from_value(call.args)?;
+                let args: LockPathsArgs = serde_json::from_value(normalized_args)
+                    .map_err(|e| anyhow::anyhow!("invalid args for lock_paths: {}", e))?;
                 self.lock_paths(args)
             }
             "unlock_paths" => {
-                let args: UnlockPathsArgs = serde_json::from_value(call.args)?;
+                let args: UnlockPathsArgs = serde_json::from_value(normalized_args)
+                    .map_err(|e| anyhow::anyhow!("invalid args for unlock_paths: {}", e))?;
                 self.unlock_paths(args)
             }
             "delegate_to_agent" => {
-                let args: DelegateToAgentArgs = serde_json::from_value(call.args)?;
+                let args: DelegateToAgentArgs = serde_json::from_value(normalized_args)
+                    .map_err(|e| anyhow::anyhow!("invalid args for delegate_to_agent: {}", e))?;
                 self.delegate_to_agent(args)
             }
             _ => anyhow::bail!("unknown tool: {}", call.tool),
@@ -162,7 +189,7 @@ impl Tools {
     }
 
     fn read_file(&self, args: ReadFileArgs) -> Result<ToolResult> {
-        let rel = sanitize_rel_path(&args.path)?;
+        let rel = sanitize_rel_path(&self.root, &args.path)?;
         let path = self.root.join(&rel);
         if !path.exists() {
             // Return a structured "not found" message instead of hard erroring.
@@ -249,12 +276,9 @@ impl Tools {
     }
 
     fn run_command(&self, args: RunCommandArgs) -> Result<ToolResult> {
-        // Strict allowlist for safety
-        let allowed_commands = ["cargo", "npm", "pnpm", "yarn", "ls", "pwd"];
-        let cmd_base = args.cmd.split_whitespace().next().unwrap_or("");
-        if !allowed_commands.contains(&cmd_base) {
-            anyhow::bail!("Command not allowed: {}", cmd_base);
-        }
+        // Hybrid shell mode: support common dev/inspection tools while enforcing
+        // an allowlist on every shell segment.
+        validate_shell_command(&args.cmd)?;
         let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(30000));
 
         let mut child = if cfg!(target_os = "windows") {
@@ -334,8 +358,9 @@ impl Tools {
     }
 
     fn write_file(&self, args: WriteFileArgs) -> Result<ToolResult> {
-        let rel = sanitize_rel_path(&args.path)?;
+        let rel = sanitize_rel_path(&self.root, &args.path)?;
         let path = self.root.join(&rel);
+        let new_content = args.content;
 
         // Enforcement check
         if let (Some(manager), Some(agent_id)) = (&self.manager, &self.agent_id) {
@@ -385,8 +410,22 @@ impl Tools {
             fs::create_dir_all(parent)?;
         }
 
-        fs::write(&path, args.content)?;
-        Ok(ToolResult::Success(format!("File written: {}", rel)))
+        if path.exists() {
+            let existing = fs::read_to_string(&path).unwrap_or_default();
+            if existing == new_content {
+                return Ok(ToolResult::Success(format!(
+                    "File unchanged (content identical): {}",
+                    rel
+                )));
+            }
+        }
+
+        let bytes = new_content.len();
+        fs::write(&path, new_content)?;
+        Ok(ToolResult::Success(format!(
+            "File written: {} ({} bytes)",
+            rel, bytes
+        )))
     }
 
     fn lock_paths(&self, args: LockPathsArgs) -> Result<ToolResult> {
@@ -446,6 +485,7 @@ impl Tools {
 
 #[derive(Debug, Deserialize)]
 struct WriteFileArgs {
+    #[serde(alias = "file", alias = "filepath")]
     path: String,
     content: String,
 }
@@ -469,6 +509,7 @@ struct ListFilesArgs {
 
 #[derive(Debug, Deserialize)]
 struct ReadFileArgs {
+    #[serde(alias = "file", alias = "filepath")]
     path: String,
     max_bytes: Option<usize>,
     #[allow(dead_code)]
@@ -515,22 +556,135 @@ fn build_globset(globs: Option<&[String]>) -> Result<Option<GlobSet>> {
     Ok(Some(builder.build()?))
 }
 
-fn sanitize_rel_path(path: &str) -> Result<String> {
+fn sanitize_rel_path(root: &Path, path: &str) -> Result<String> {
+    use std::path::Component;
+
     if path.is_empty() {
         anyhow::bail!("empty path");
     }
-    if path.starts_with('/') || path.starts_with("\\") {
-        anyhow::bail!("absolute paths not allowed");
+    let raw = Path::new(path);
+    let rel_path = if raw.is_absolute() {
+        raw.strip_prefix(root)
+            .map_err(|_| anyhow::anyhow!("absolute path must be inside workspace root"))?
+            .to_path_buf()
+    } else {
+        raw.to_path_buf()
+    };
+
+    if rel_path.as_os_str().is_empty() {
+        anyhow::bail!("empty path");
     }
-    if path.contains("..") {
+    if rel_path.components().any(|c| matches!(c, Component::ParentDir)) {
         anyhow::bail!("path traversal not allowed");
     }
-    Ok(path.to_string())
+    if rel_path
+        .components()
+        .any(|c| matches!(c, Component::RootDir | Component::Prefix(_)))
+    {
+        anyhow::bail!("path must resolve inside workspace root");
+    }
+
+    Ok(rel_path.to_string_lossy().to_string())
 }
 
 fn to_rel_string(root: &Path, path: &Path) -> Result<String> {
     let rel = path.strip_prefix(root)?;
     Ok(rel.to_string_lossy().to_string())
+}
+
+fn summarize_tool_args(tool: &str, args: &Value) -> String {
+    let mut safe_args = args.clone();
+    if let Some(obj) = safe_args.as_object_mut() {
+        match tool {
+            "write_file" | "Write" => {
+                if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
+                    let byte_len = content.len();
+                    let line_count = content.lines().count();
+                    obj.insert(
+                        "content".to_string(),
+                        serde_json::json!(format!("<omitted:{} bytes, {} lines>", byte_len, line_count)),
+                    );
+                }
+            }
+            "run_command" | "Bash" => {
+                if let Some(cmd) = obj.get("cmd").and_then(|v| v.as_str()) {
+                    let preview = if cmd.len() > 160 {
+                        format!("{}... (truncated, {} chars)", &cmd[..160], cmd.len())
+                    } else {
+                        cmd.to_string()
+                    };
+                    obj.insert("cmd".to_string(), serde_json::json!(preview));
+                }
+            }
+            _ => {}
+        }
+    }
+    safe_args.to_string()
+}
+
+fn normalize_tool_args(tool: &str, args: &Value) -> Value {
+    let mut normalized = args.clone();
+    if let Some(obj) = normalized.as_object_mut() {
+        if matches!(tool, "read_file" | "Read" | "write_file" | "Write") && !obj.contains_key("path") {
+            if let Some(fp) = obj.get("filepath").cloned() {
+                obj.insert("path".to_string(), fp);
+            } else if let Some(file) = obj.get("file").cloned() {
+                obj.insert("path".to_string(), file);
+            }
+        }
+    }
+    normalized
+}
+
+fn validate_shell_command(cmd: &str) -> Result<()> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("empty command");
+    }
+
+    // Disallow common shell injection patterns.
+    for banned in ["$(", "`", "\n", "\r"] {
+        if trimmed.contains(banned) {
+            anyhow::bail!("command contains disallowed shell construct: {}", banned);
+        }
+    }
+
+    let allowed: HashSet<&str> = [
+        "ls", "pwd", "cat", "head", "tail", "wc", "cut", "sort", "uniq", "tr", "sed", "awk",
+        "find", "fd", "rg", "grep", "git", "cargo", "rustc", "npm", "pnpm", "yarn", "node",
+        "python3", "pytest", "go", "make", "just",
+    ]
+    .into_iter()
+    .collect();
+
+    for segment in split_shell_segments(trimmed) {
+        let token = first_segment_token(segment)
+            .ok_or_else(|| anyhow::anyhow!("invalid command segment: '{}'", segment))?;
+        if !allowed.contains(token) {
+            anyhow::bail!(
+                "Command not allowed: {} (allowed tools are code/search/build/test commands)",
+                token
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn split_shell_segments(cmd: &str) -> Vec<&str> {
+    cmd.split(|c| c == '|' || c == ';')
+        .flat_map(|part| part.split("&&"))
+        .flat_map(|part| part.split("||"))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn first_segment_token(segment: &str) -> Option<&str> {
+    segment
+        .split_whitespace()
+        .next()
+        .map(|token| token.trim_start_matches('('))
 }
 
 pub fn tool_schema_json() -> String {
@@ -549,7 +703,8 @@ pub fn tool_schema_json() -> String {
             {
                 "name": "read_file",
                 "args": {"path": "string", "max_bytes": "number?", "line_range": "[number,number]?"},
-                "returns": "{path,content,truncated}"
+                "returns": "{path,content,truncated}",
+                "notes": "Path aliases accepted: path, file, filepath."
             },
             {
                 "name": "search_rg",
@@ -557,9 +712,16 @@ pub fn tool_schema_json() -> String {
                 "returns": "{matches:[{path,line,snippet}]}"
             },
             {
+                "name": "write_file",
+                "args": {"path": "string", "content": "string"},
+                "returns": "success",
+                "notes": "Path aliases accepted: path, file, filepath."
+            },
+            {
                 "name": "run_command",
                 "args": {"cmd": "string", "timeout_ms": "number?"},
-                "returns": "{exit_code,stdout,stderr}"
+                "returns": "{exit_code,stdout,stderr}",
+                "notes": "Alias: Bash. Supports common dev/search/build CLI commands with per-segment allowlist checks."
             },
             {
                 "name": "capture_screenshot",

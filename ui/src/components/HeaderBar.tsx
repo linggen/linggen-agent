@@ -35,7 +35,7 @@ export const HeaderBar: React.FC<{
   onModeChange,
 }) => {
   return (
-    <header className="flex items-center justify-between px-6 py-3 border-b border-slate-200 dark:border-white/5 bg-white/80 dark:bg-[#0f0f0f]/80 backdrop-blur-md z-50">
+    <header className="flex items-center justify-between px-6 py-3 border-b border-slate-200 dark:border-white/5 bg-white/90 dark:bg-[#0f0f0f]/90 backdrop-blur-md z-50">
       <div className="flex items-center gap-6">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shadow-lg shadow-blue-600/20">
@@ -56,7 +56,7 @@ export const HeaderBar: React.FC<{
           <select
             value={selectedProjectRoot}
             onChange={(e) => setSelectedProjectRoot(e.target.value)}
-            className="text-xs bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded-lg px-3 py-1.5 outline-none font-mono max-w-[300px]"
+            className="text-xs bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded-lg px-3 py-1.5 outline-none font-mono max-w-[360px]"
           >
             {projects.map((p) => (
               <option key={p.path} value={p.path}>
@@ -84,7 +84,7 @@ export const HeaderBar: React.FC<{
       </div>
 
       {showAddProject && (
-        <div className="absolute top-14 left-64 bg-white dark:bg-[#141414] border border-slate-200 dark:border-white/10 rounded-xl p-4 shadow-2xl z-[60] flex flex-col gap-3 w-96">
+        <div className="absolute top-14 left-1/2 -translate-x-1/2 bg-white dark:bg-[#141414] border border-slate-200 dark:border-white/10 rounded-xl p-4 shadow-2xl z-[60] flex flex-col gap-3 w-[min(42rem,90vw)]">
           <div className="flex gap-2">
             <input
               value={newProjectPath}
@@ -109,7 +109,7 @@ export const HeaderBar: React.FC<{
         </div>
       )}
 
-      <div className="flex items-center gap-4 bg-slate-100 dark:bg-white/5 px-3 py-1.5 rounded-full border border-slate-200 dark:border-white/10">
+      <div className="flex items-center gap-4 bg-slate-100 dark:bg-white/5 px-3 py-1.5 rounded-full border border-slate-200 dark:border-white/10 shadow-sm">
         <div className="flex items-center gap-2">
           <div className={cn('w-2 h-2 rounded-full', isRunning ? 'bg-green-500 animate-pulse' : 'bg-slate-400')} />
           <span className="text-[10px] font-bold uppercase tracking-widest text-slate-500">{isRunning ? 'Active' : 'Standby'}</span>
