@@ -4,6 +4,7 @@ export interface ChatMessage {
   to?: string;
   text: string;
   timestamp: string;
+  timestampMs?: number;
   isGenerating?: boolean;
 }
 

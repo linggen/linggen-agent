@@ -2,7 +2,7 @@
 id = "local_ollama"
 provider = "ollama"
 url = "http://127.0.0.1:11434"
-model = "qwen3-coder"
+model = "qwen3-coder-next"
 
 
 # [[models]]

@@ -20,6 +20,59 @@ import type {
   SkillInfo,
 } from './types';
 
+const SELECTED_AGENT_STORAGE_KEY = 'linggen-agent:selected-agent';
+const LIVE_MESSAGE_GRACE_MS = 10_000;
+
+const parseToolNameFromParsedPayload = (parsed: any): string | null => {
+  if (!parsed || typeof parsed !== 'object') return null;
+  if (parsed?.type === 'tool' && typeof parsed?.tool === 'string') return parsed.tool;
+  if (
+    typeof parsed?.type === 'string' &&
+    parsed.type !== 'ask' &&
+    parsed.type !== 'finalize_task' &&
+    parsed.args &&
+    typeof parsed.args === 'object'
+  ) {
+    return parsed.type;
+  }
+  return null;
+};
+
+const parseToolNameFromMessage = (text: string): string | null => {
+  try {
+    const parsed = JSON.parse(text);
+    return parseToolNameFromParsedPayload(parsed);
+  } catch (_e) {
+    // Non-JSON messages are ignored.
+  }
+  return null;
+};
+
+const extractToolNameFromRawText = (text: string): string | null => {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  const lines = trimmed.split('\n').map((line) => line.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const toolName = parseToolNameFromMessage(lines[i]);
+    if (toolName) return toolName;
+  }
+  return parseToolNameFromMessage(trimmed);
+};
+
+const stripToolPayloadLines = (text: string): string => {
+  const cleaned = text
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => !parseToolNameFromMessage(line.trim()))
+    .join('\n')
+    .trim();
+  return cleaned;
+};
+
+const isToolResultMessage = (from?: string, text?: string) => {
+  return from === 'system' && !!text && text.startsWith('Tool ');
+};
+
 const App: React.FC = () => {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [selectedProjectRoot, setSelectedProjectRoot] = useState<string>('');
@@ -38,10 +91,15 @@ const App: React.FC = () => {
   const [task, setTask] = useState('');
   const [logs, setLogs] = useState<string[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [selectedAgent, setSelectedAgent] = useState<'lead' | 'coder'>('lead');
+  const [selectedAgent, setSelectedAgent] = useState<'lead' | 'coder'>(() => {
+    if (typeof window === 'undefined') return 'lead';
+    const stored = window.localStorage.getItem(SELECTED_AGENT_STORAGE_KEY);
+    return stored === 'coder' ? 'coder' : 'lead';
+  });
   const [currentMode, setCurrentMode] = useState<'chat' | 'auto'>('auto');
   const [isRunning, setIsRunning] = useState(false);
-  const [agentStatus, setAgentStatus] = useState<Record<string, 'idle' | 'working'>>({});
+  const [agentStatus, setAgentStatus] = useState<Record<string, 'idle' | 'thinking' | 'calling_tool' | 'working'>>({});
+  const [agentStatusText, setAgentStatusText] = useState<Record<string, string>>({});
   const [queuedMessages, setQueuedMessages] = useState<QueuedChatItem[]>([]);
   // Refresh icon should only refresh UI state, not run an audit skill.
   
@@ -53,38 +111,86 @@ const App: React.FC = () => {
   const [leadState, setLeadState] = useState<LeadState | null>(null);
   
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const lastChatCountRef = useRef(0);
+  const lastSseSeqRef = useRef(0);
 
   const addLog = (msg: string) => {
     setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
   };
 
+  const shouldHideInternalChatMessage = (from?: string, text?: string) => {
+    if (!text) return false;
+    if (isToolResultMessage(from, text)) return true;
+    const toolName = parseToolNameFromMessage(text);
+    if (toolName) return true;
+    if (from !== 'system') return false;
+    return text.startsWith('Starting autonomous loop for task:');
+  };
+
   const chatMessageKey = (msg: ChatMessage) => {
     const from = msg.from || msg.role;
     const to = msg.to || '';
-    return `${from}|${to}|${msg.text}`;
+    const ts = msg.timestampMs ?? 0;
+    return `${from}|${to}|${ts}|${msg.text}`;
+  };
+
+  const sameMessageContent = (a: ChatMessage, b: ChatMessage) => {
+    const fromA = a.from || a.role;
+    const fromB = b.from || b.role;
+    const toA = a.to || '';
+    const toB = b.to || '';
+    return fromA === fromB && toA === toB && a.text === b.text;
+  };
+
+  const isStructuredAgentMessage = (msg: ChatMessage) => {
+    if ((msg.from || msg.role) === 'user') return false;
+    try {
+      const parsed = JSON.parse(msg.text);
+      return typeof parsed?.type === 'string';
+    } catch (_e) {
+      return false;
+    }
+  };
+
+  const likelySameMessage = (a: ChatMessage, b: ChatMessage) => {
+    if (!sameMessageContent(a, b)) return false;
+    if (isStructuredAgentMessage(a) || isStructuredAgentMessage(b)) return true;
+    const ta = a.timestampMs ?? 0;
+    const tb = b.timestampMs ?? 0;
+    if (ta === 0 || tb === 0) return true;
+    return Math.abs(ta - tb) <= 120_000;
   };
 
   const mergeChatMessages = (persisted: ChatMessage[], live: ChatMessage[]) => {
-    if (live.length === 0) return persisted;
     if (persisted.length === 0) return live;
+    if (live.length === 0) return persisted;
 
-    const lastPersisted = persisted[persisted.length - 1];
-    const lastKey = chatMessageKey(lastPersisted);
-    let lastIdx = -1;
-    for (let i = live.length - 1; i >= 0; i -= 1) {
-      if (chatMessageKey(live[i]) === lastKey) {
-        lastIdx = i;
-        break;
+    const now = Date.now();
+    const uniqueExtras = live.filter(
+      (m) => {
+        if (m.isGenerating) return true;
+        if (persisted.some((p) => likelySameMessage(p, m))) return false;
+        const ts = m.timestampMs ?? now;
+        // Keep non-persisted live messages briefly to bridge DB/state lag.
+        return now - ts <= LIVE_MESSAGE_GRACE_MS;
       }
-    }
-
-    const extras = lastIdx >= 0 ? live.slice(lastIdx + 1) : live.filter(m => m.isGenerating);
-    const persistedKeys = new Set(persisted.map(chatMessageKey));
-    const uniqueExtras = extras.filter(m => !persistedKeys.has(chatMessageKey(m)));
-    return [...persisted, ...uniqueExtras];
+    );
+    const merged = [...persisted, ...uniqueExtras];
+    const seen = new Set<string>();
+    return merged.filter((m) => {
+      const key = chatMessageKey(m);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   };
 
-  // Chat scroll is user-controlled; no auto-scroll.
+  useEffect(() => {
+    if (chatMessages.length > lastChatCountRef.current) {
+      chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    }
+    lastChatCountRef.current = chatMessages.length;
+  }, [chatMessages.length]);
 
   const fetchProjects = async () => {
     try {
@@ -198,23 +304,29 @@ const App: React.FC = () => {
       
       // Update chat messages from state if needed
       if (data.messages) {
-        const msgs: ChatMessage[] = data.messages.map(([meta, body]: any) => ({
-          role:
-            meta.from === 'user'
-              ? 'user'
-              : meta.from === 'lead'
-                ? 'lead'
-                : meta.from === 'coder'
-                  ? 'coder'
-                  : 'agent',
-          from: meta.from,
-          to: meta.to,
-          text: body,
-          timestamp: new Date(meta.ts * 1000).toLocaleTimeString()
-        }));
+        const msgs: ChatMessage[] = data.messages
+          .filter(([meta, body]: any) => !shouldHideInternalChatMessage(meta.from, body))
+          .flatMap(([meta, body]: any) => {
+            const isUser = meta.from === 'user';
+            const cleaned = isUser ? body : stripToolPayloadLines(String(body || ''));
+            if (!isUser && !cleaned) return [];
+            return [{
+              role:
+                meta.from === 'user'
+                  ? 'user'
+                  : meta.from === 'lead'
+                    ? 'lead'
+                    : meta.from === 'coder'
+                      ? 'coder'
+                      : 'agent',
+              from: meta.from,
+              to: meta.to,
+              text: cleaned,
+              timestamp: new Date(meta.ts * 1000).toLocaleTimeString(),
+              timestampMs: Number(meta.ts || 0) * 1000,
+            }];
+          });
         setChatMessages(prev => mergeChatMessages(msgs, prev));
-      } else {
-        setChatMessages([]);
       }
     } catch (e) {
       addLog(`Error fetching Lead state: ${e}`);
@@ -354,6 +466,8 @@ const App: React.FC = () => {
       fetchAgentTree();
       fetchSessions();
       fetchSettings();
+      setAgentStatus({});
+      setAgentStatusText({});
       setQueuedMessages([]);
     }
   }, [selectedProjectRoot]);
@@ -374,19 +488,64 @@ const App: React.FC = () => {
   }, [selectedProjectRoot, activeSessionId]);
 
   useEffect(() => {
+    window.localStorage.setItem(SELECTED_AGENT_STORAGE_KEY, selectedAgent);
+  }, [selectedAgent]);
+
+  useEffect(() => {
     const events = new EventSource('/api/events');
     events.onmessage = (e) => {
       try {
         const event = JSON.parse(e.data);
+        if (typeof event.seq === 'number') {
+          if (event.seq <= lastSseSeqRef.current) return;
+          lastSseSeqRef.current = event.seq;
+        }
         if (event.type === 'StateUpdated') {
           fetchLeadState();
           fetchFiles(currentPath);
           fetchAgentTree();
         } else if (event.type === 'AgentStatus') {
+          const nextStatus: 'idle' | 'thinking' | 'calling_tool' | 'working' =
+            event.status === 'calling_tool'
+              ? 'calling_tool'
+              : event.status === 'thinking'
+                ? 'thinking'
+                : event.status === 'working'
+                  ? 'working'
+                  : 'idle';
           setAgentStatus((prev) => ({
             ...prev,
-            [event.agent_id]: event.status,
+            [event.agent_id]: nextStatus,
           }));
+          setAgentStatusText((prev) => ({
+            ...prev,
+            [event.agent_id]:
+              typeof event.detail === 'string' && event.detail.trim().length > 0
+                ? event.detail
+                : nextStatus === 'calling_tool'
+                  ? 'Calling Tool'
+                  : nextStatus === 'thinking'
+                    ? 'Thinking'
+                    : nextStatus === 'working'
+                      ? 'Working'
+                      : 'Idle',
+          }));
+          if (nextStatus === 'thinking' || nextStatus === 'calling_tool') {
+            const placeholder = nextStatus === 'calling_tool'
+              ? `Calling tool: ${event.detail || '...'}` 
+              : 'Thinking...';
+            setChatMessages(prev => {
+              const lastMsg = prev[prev.length - 1];
+              if (lastMsg && lastMsg.from === event.agent_id && lastMsg.isGenerating) {
+                return prev.map((msg, idx) =>
+                  idx === prev.length - 1
+                    ? { ...msg, text: placeholder }
+                    : msg
+                );
+              }
+              return prev;
+            });
+          }
         } else if (event.type === 'SettingsUpdated') {
           if (event.project_root === selectedProjectRoot) {
             setCurrentMode(event.mode === 'chat' ? 'chat' : 'auto');
@@ -396,36 +555,117 @@ const App: React.FC = () => {
           if (event.project_root === selectedProjectRoot && event.session_id === session) {
             setQueuedMessages(event.items || []);
           }
-        } else if (event.type === 'Observation') {
-          // Observations are persisted to DB; refresh to show tool actions.
-          fetchLeadState();
         } else if (event.type === 'Token') {
           setChatMessages(prev => {
             const lastMsg = prev[prev.length - 1];
             if (lastMsg && lastMsg.from === event.agent_id && lastMsg.isGenerating) {
+              const nextText = lastMsg.text === 'Thinking...' ? event.token : lastMsg.text + event.token;
+              const rawToolName = extractToolNameFromRawText(nextText);
+              if (rawToolName) {
+                const narrative = stripToolPayloadLines(nextText);
+                const finalizedPrev = [...prev];
+                if (finalizedPrev.length > 0) {
+                  const lastIdx = finalizedPrev.length - 1;
+                  if (narrative.length > 0 && finalizedPrev[lastIdx].text !== 'Thinking...') {
+                    finalizedPrev[lastIdx] = {
+                      ...finalizedPrev[lastIdx],
+                      text: narrative,
+                      isGenerating: false,
+                    };
+                  } else {
+                    finalizedPrev.pop();
+                  }
+                }
+                return [
+                  ...finalizedPrev,
+                  {
+                    role: event.agent_id === 'lead' ? 'lead' : 'coder',
+                    from: event.agent_id,
+                    to: 'user',
+                    text: `Calling tool: ${rawToolName}`,
+                    timestamp: new Date().toLocaleTimeString(),
+                    timestampMs: Date.now(),
+                    isGenerating: false,
+                  },
+                ];
+              }
               return prev.map((msg, idx) => 
                 idx === prev.length - 1 
-                  ? { ...msg, text: msg.text + event.token }
+                  ? {
+                      ...msg,
+                      text: rawToolName ? `Calling tool: ${rawToolName}` : nextText,
+                    }
                   : msg
               );
             } else {
+              const rawToolName = extractToolNameFromRawText(event.token);
               return [...prev, {
                 role: event.agent_id === 'lead' ? 'lead' : 'coder',
                 from: event.agent_id,
                 to: 'user',
-                text: event.token,
+                text: rawToolName ? `Calling tool: ${rawToolName}` : event.token,
                 timestamp: new Date().toLocaleTimeString(),
+                timestampMs: Date.now(),
                 isGenerating: true
               }];
             }
           });
         } else if (event.type === 'Message') {
+          const toolName = parseToolNameFromMessage(event.content || '');
+          if (toolName) {
+            setChatMessages(prev => {
+              const lastMsg = prev[prev.length - 1];
+              if (lastMsg && lastMsg.from === event.from && lastMsg.isGenerating) {
+                const narrative = stripToolPayloadLines(lastMsg.text);
+                const head = prev.slice(0, -1);
+                const finalizedNarrative =
+                  narrative.length > 0 && lastMsg.text !== 'Thinking...'
+                    ? [{ ...lastMsg, text: narrative, isGenerating: false }]
+                    : [];
+                return [
+                  ...head,
+                  ...finalizedNarrative,
+                  {
+                    role: event.from === 'lead' ? 'lead' : 'coder',
+                    from: event.from,
+                    to: event.to || 'user',
+                    text: `Calling tool: ${toolName}`,
+                    timestamp: new Date().toLocaleTimeString(),
+                    timestampMs: Date.now(),
+                    isGenerating: false,
+                  },
+                ];
+              }
+              return [...prev, {
+                role: event.from === 'lead' ? 'lead' : 'coder',
+                from: event.from,
+                to: event.to || 'user',
+                text: `Calling tool: ${toolName}`,
+                timestamp: new Date().toLocaleTimeString(),
+                timestampMs: Date.now(),
+                isGenerating: false,
+              }];
+            });
+            return;
+          }
+          if (shouldHideInternalChatMessage(event.from, event.content)) {
+            return;
+          }
+          const cleanedContent =
+            event.from === 'user'
+              ? (event.content || '')
+              : stripToolPayloadLines(event.content || '');
+          if (event.from !== 'user' && !cleanedContent) {
+            return;
+          }
+          if (event.from && event.from !== 'user') {
+          }
           setChatMessages(prev => {
             const lastMsg = prev[prev.length - 1];
             if (lastMsg && lastMsg.from === event.from && lastMsg.isGenerating) {
               return prev.map((msg, idx) => 
                 idx === prev.length - 1 
-                  ? { ...msg, text: event.content, isGenerating: false }
+                  ? { ...msg, text: cleanedContent, isGenerating: false }
                   : msg
               );
             }
@@ -439,12 +679,25 @@ const App: React.FC = () => {
                     ? 'coder'
                     : 'agent';
 
+            if (
+              prev.some(
+                (msg) =>
+                  !msg.isGenerating &&
+                  (msg.from || msg.role) === event.from &&
+                  (msg.to || '') === (event.to || '') &&
+                  msg.text === cleanedContent
+              )
+            ) {
+              return prev;
+            }
+
             return [...prev, {
               role,
               from: event.from,
               to: event.to,
-              text: event.content,
+              text: cleanedContent,
               timestamp: new Date().toLocaleTimeString(),
+              timestampMs: Date.now(),
               isGenerating: false
             }];
           });
@@ -494,6 +747,22 @@ const App: React.FC = () => {
 
   const sendChatMessage = async (userMessage: string, targetAgent?: 'lead' | 'coder') => {
     if (!userMessage.trim() || !selectedProjectRoot) return;
+    const agentToUse = targetAgent || selectedAgent;
+    const now = new Date();
+
+    setChatMessages(prev => [
+      ...prev,
+      {
+        role: 'user',
+        from: 'user',
+        to: agentToUse,
+        text: userMessage,
+        timestamp: now.toLocaleTimeString(),
+        timestampMs: now.getTime(),
+        isGenerating: false,
+      },
+    ]);
+
     const trimmed = userMessage.trim().toLowerCase();
     if (trimmed === '/mode chat') {
       setCurrentMode('chat');
@@ -515,10 +784,8 @@ const App: React.FC = () => {
       return;
     }
 
-    const agentToUse = targetAgent || selectedAgent;
-
     try {
-      await fetch('/api/chat', {
+      const resp = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
@@ -528,6 +795,24 @@ const App: React.FC = () => {
           session_id: activeSessionId
         }),
       });
+      const data = await resp.json();
+      if (data?.status === 'queued') {
+        return;
+      }
+      setAgentStatus((prev) => ({ ...prev, [agentToUse]: 'thinking' }));
+      setAgentStatusText((prev) => ({ ...prev, [agentToUse]: 'Thinking' }));
+      setChatMessages(prev => [
+        ...prev,
+        {
+          role: agentToUse,
+          from: agentToUse,
+          to: 'user',
+          text: 'Thinking...',
+          timestamp: new Date().toLocaleTimeString(),
+          timestampMs: Date.now(),
+          isGenerating: true,
+        },
+      ]);
     } catch (e) {
       addLog(`Error in chat: ${e}`);
     }
@@ -593,7 +878,7 @@ const App: React.FC = () => {
   };
 
   return (
-    <div className="flex flex-col h-screen bg-slate-50 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200 font-sans overflow-hidden">
+    <div className="flex flex-col h-screen bg-slate-100/70 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200 font-sans overflow-hidden">
       {/* Header */}
       <HeaderBar
         projects={projects}
@@ -616,7 +901,7 @@ const App: React.FC = () => {
       <div className="flex-1 flex overflow-hidden">
         
         {/* Left: File Tree */}
-        <aside className="w-64 border-r border-slate-200 dark:border-white/5 flex flex-col bg-white dark:bg-[#0f0f0f]">
+        <aside className="w-72 border-r border-slate-200 dark:border-white/5 flex flex-col bg-white dark:bg-[#0f0f0f]">
           <div className="p-4 border-b border-slate-200 dark:border-white/5 flex items-center justify-between">
             <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-2">
               <Activity size={14} /> Workspace
@@ -626,7 +911,7 @@ const App: React.FC = () => {
         </aside>
 
         {/* Center: Chat */}
-        <main className="flex-1 flex flex-col overflow-hidden bg-slate-50 dark:bg-[#0a0a0a] min-h-0">
+        <main className="flex-1 flex flex-col overflow-hidden bg-slate-100/40 dark:bg-[#0a0a0a] min-h-0">
           <div className="flex-1 p-4 min-h-0">
             <ChatPanel
               chatMessages={chatMessages}
@@ -650,13 +935,14 @@ const App: React.FC = () => {
         </main>
 
         {/* Right: Status */}
-        <aside className="w-80 border-l border-slate-200 dark:border-white/5 flex flex-col bg-slate-50 dark:bg-[#0a0a0a] p-4 gap-4 overflow-y-auto">
+        <aside className="w-80 border-l border-slate-200 dark:border-white/5 flex flex-col bg-slate-100/40 dark:bg-[#0a0a0a] p-4 gap-4 overflow-y-auto">
           <AgentsCard
             agents={agents}
             leadState={leadState}
             isRunning={isRunning}
             selectedAgent={selectedAgent}
             agentStatus={agentStatus}
+            agentStatusText={agentStatusText}
           />
           <ModelsCard models={models} ollamaStatus={ollamaStatus} chatMessages={chatMessages} />
         </aside>

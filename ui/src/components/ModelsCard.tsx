@@ -22,13 +22,13 @@ export const ModelsCard: React.FC<{
           const activeInfo = ollamaStatus?.models.find((om) => om.name.includes(m.model) || m.model.includes(om.name));
 
           return (
-            <div key={m.id} className="bg-slate-50 dark:bg-black/20 p-3 rounded-lg border border-slate-200 dark:border-white/5 space-y-2">
+            <div key={m.id} className="bg-slate-50 dark:bg-black/20 p-3 rounded-xl border border-slate-200 dark:border-white/5 space-y-2">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <div className={cn('w-1.5 h-1.5 rounded-full', isActive ? 'bg-green-500 animate-pulse' : 'bg-slate-500')} />
                   <span className="font-mono font-bold">{m.model}</span>
                 </div>
-                <span className="text-[8px] text-slate-500 uppercase">{m.provider}</span>
+                <span className="text-[9px] text-slate-500 uppercase tracking-wide">{m.provider}</span>
               </div>
 
               {activeInfo && (

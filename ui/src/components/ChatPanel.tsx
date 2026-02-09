@@ -1,7 +1,106 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { MessageSquare, Copy, Eraser, Plus, Send, Activity, ChevronRight, ChevronDown } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { MessageSquare, Copy, Eraser, Plus, Send } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { cn } from '../lib/cn';
 import type { AgentInfo, ChatMessage, QueuedChatItem, SessionInfo, SkillInfo } from '../types';
+
+let mermaidInstance: any = null;
+let mermaidInitialized = false;
+
+async function getMermaid() {
+  if (!mermaidInstance) {
+    const module = await import('mermaid');
+    mermaidInstance = module.default;
+  }
+  if (!mermaidInitialized) {
+    mermaidInstance.initialize({
+      startOnLoad: false,
+      securityLevel: 'loose',
+      theme: 'default',
+    });
+    mermaidInitialized = true;
+  }
+  return mermaidInstance;
+}
+
+const hashText = (text: string) => {
+  let hash = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = (hash * 31 + text.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash).toString(36);
+};
+
+const MermaidBlock: React.FC<{ code: string }> = ({ code }) => {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const idRef = useRef(`chat-mermaid-${hashText(code)}-${Math.random().toString(36).slice(2, 8)}`);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const render = async () => {
+      setError(null);
+      if (!containerRef.current) return;
+      containerRef.current.innerHTML = '<div class="markdown-mermaid-loading">Rendering Mermaid...</div>';
+      try {
+        const mermaid = await getMermaid();
+        const { svg } = await mermaid.render(idRef.current, code.trim());
+        if (!cancelled && containerRef.current) {
+          containerRef.current.innerHTML = svg;
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      }
+    };
+
+    render();
+    return () => {
+      cancelled = true;
+    };
+  }, [code]);
+
+  if (error) {
+    return (
+      <div className="markdown-mermaid-error">
+        Mermaid error: {error}
+      </div>
+    );
+  }
+  return <div className="markdown-mermaid" ref={containerRef} />;
+};
+
+const MarkdownContent: React.FC<{ text: string }> = ({ text }) => (
+  <div className="markdown-body break-words">
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        pre: ({ children }) => <>{children}</>,
+        code: ({ inline, className, children, ...props }: any) => {
+          const raw = String(children ?? '').replace(/\n$/, '');
+          const match = /language-([\w-]+)/.exec(className || '');
+          const lang = match?.[1]?.toLowerCase();
+          if (!inline && lang === 'mermaid') {
+            return <MermaidBlock code={raw} />;
+          }
+          if (inline) {
+            return <code {...props}>{children}</code>;
+          }
+          return (
+            <pre>
+              <code className={className} {...props}>{raw}</code>
+            </pre>
+          );
+        },
+      }}
+    >
+      {normalizeMarkdownish(text)}
+    </ReactMarkdown>
+  </div>
+);
 
 function normalizeMarkdownish(text: string): string {
   // Improve readability when model emits markdown tokens without proper newlines.
@@ -54,59 +153,13 @@ export const ChatPanel: React.FC<{
   const [showAgentDropdown, setShowAgentDropdown] = useState(false);
   const [agentFilter, setAgentFilter] = useState('');
   const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(0);
-  const [expandedToolResults, setExpandedToolResults] = useState<Record<string, boolean>>({});
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const agentSelectRef = useRef<HTMLSelectElement | null>(null);
 
-  type DisplayMessage = {
-    key: string;
-    msg: ChatMessage;
-    toolResults: ChatMessage[];
+  const formatParty = (party?: string) => {
+    if (!party) return '';
+    return party.toUpperCase();
   };
-
-  const displayMessages = useMemo<DisplayMessage[]>(() => {
-    const out: DisplayMessage[] = [];
-    let i = 0;
-    while (i < chatMessages.length) {
-      const msg = chatMessages[i];
-      let toolResults: ChatMessage[] = [];
-      let consumed = false;
-
-      try {
-        const parsed = JSON.parse(msg.text);
-        if (parsed?.type === 'tool' && parsed?.tool && msg.from) {
-          const prefix = `Tool ${parsed.tool}:`;
-          let j = i + 1;
-          while (j < chatMessages.length) {
-            const next = chatMessages[j];
-            if (next.from === 'system' && next.to === msg.from && next.text.startsWith(prefix)) {
-              toolResults.push(next);
-              j += 1;
-            } else {
-              break;
-            }
-          }
-          if (toolResults.length > 0) {
-            i = j - 1;
-            consumed = true;
-          }
-        }
-      } catch (_e) {}
-
-      out.push({
-        key: `${msg.timestamp}-${i}-${msg.from || msg.role}`,
-        msg,
-        toolResults,
-      });
-      i += 1;
-
-      if (consumed) {
-        // no-op, already advanced `i` above and then incremented.
-      }
-    }
-
-    return out;
-  }, [chatMessages]);
 
   const resizeInput = () => {
     if (!inputRef.current) return;
@@ -125,13 +178,20 @@ export const ChatPanel: React.FC<{
     setChatInput('');
     setShowSkillDropdown(false);
     setShowAgentDropdown(false);
-    if (userMessage.trim().toLowerCase().startsWith('@coder ')) {
+
+    const normalized = userMessage.trim().toLowerCase();
+    let mentionAgent: 'lead' | 'coder' | undefined;
+    if (normalized.startsWith('@coder ')) {
+      mentionAgent = 'coder';
       setSelectedAgent('coder');
-    } else if (userMessage.trim().toLowerCase().startsWith('@lead ')) {
+    } else if (normalized.startsWith('@lead ')) {
+      mentionAgent = 'lead';
       setSelectedAgent('lead');
     }
+
     const dropdownAgent = agentSelectRef.current?.value as 'lead' | 'coder' | undefined;
-    onSendMessage(userMessage, dropdownAgent || selectedAgent);
+    const targetAgent = mentionAgent || dropdownAgent || selectedAgent;
+    onSendMessage(userMessage, targetAgent);
     window.setTimeout(resizeInput, 0);
   };
 
@@ -198,7 +258,7 @@ export const ChatPanel: React.FC<{
 
   return (
     <section className="h-full flex flex-col bg-white dark:bg-[#0f0f0f] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm overflow-hidden min-h-0">
-      <div className="p-4 border-b border-slate-200 dark:border-white/5 flex flex-col gap-3">
+      <div className="p-4 border-b border-slate-200 dark:border-white/5 flex flex-col gap-3 bg-gradient-to-r from-slate-50 to-white dark:from-[#121212] dark:to-[#0f0f0f]">
         <div className="flex items-center justify-between">
           <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-2">
             <MessageSquare size={14} /> Unified Chat
@@ -262,83 +322,49 @@ export const ChatPanel: React.FC<{
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-scroll p-4 flex flex-col gap-4 custom-scrollbar min-h-0">
-        {queuedMessages.length > 0 && (
-          <div className="self-stretch rounded-lg border border-amber-300/50 bg-amber-50 dark:bg-amber-500/10 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-200">
-            <div className="font-semibold">Queued messages ({queuedMessages.length})</div>
-            <div className="mt-1 space-y-1">
-              {queuedMessages.map((item) => (
-                <div key={item.id} className="truncate">
-                  [{item.agent_id}] {item.preview}
-                </div>
-              ))}
+      <div className="flex-1 overflow-y-scroll p-4 flex flex-col gap-5 custom-scrollbar min-h-0">
+        {chatMessages.length === 0 && (
+          <div className="self-center mt-12 max-w-md text-center">
+            <div className="text-sm font-semibold text-slate-600 dark:text-slate-300">Start a conversation</div>
+            <div className="mt-2 text-xs text-slate-500">
+              Ask for edits, code review, or use commands like <code>/mode chat</code>.
             </div>
           </div>
         )}
-        {displayMessages.map((item, i) => {
-          const msg = item.msg;
-          const toolToggleKey = `${item.key}-tool`;
+        {chatMessages.map((msg, i) => {
+          const key = `${msg.timestamp}-${i}-${msg.from || msg.role}-${msg.text.slice(0, 24)}`;
+          const isUser = msg.role === 'user';
+          const isStatusLine = msg.text === 'Thinking...' || msg.text.startsWith('Calling tool:');
+          const from = msg.from || msg.role;
+          const to = msg.to || '';
           return (
           <div
-            key={item.key}
-            className={cn('flex flex-col gap-1 max-w-[95%]', msg.role === 'user' ? 'self-end items-end' : 'self-start items-start')}
+            key={key}
+            className={cn('flex flex-col gap-1 max-w-[90%]', isUser ? 'self-end items-end' : 'self-start items-start')}
           >
             <div className="flex items-center gap-1 px-1">
               <span className="text-[9px] font-bold uppercase tracking-tighter text-slate-500">
-                {msg.from || msg.role} {msg.to ? `→ ${msg.to}` : ''}
+                {formatParty(from)} {to ? `→ ${formatParty(to)}` : ''}
               </span>
             </div>
             <div
               className={cn(
-                'px-3 py-2 rounded-xl text-xs leading-relaxed shadow-sm',
-                msg.role === 'user'
-                  ? 'bg-blue-600 text-white rounded-tr-none'
+                'px-3 py-2.5 rounded-2xl text-[13px] leading-relaxed shadow-sm',
+                isUser
+                  ? 'bg-blue-600 text-white rounded-tr-sm'
                   : msg.from === 'lead' && msg.to === 'coder'
-                    ? 'bg-amber-500/10 border border-amber-500/20 text-amber-200 italic'
-                    : 'bg-slate-100 dark:bg-white/5 text-slate-800 dark:text-slate-200 border border-slate-200 dark:border-white/10 rounded-tl-none'
+                    ? 'bg-amber-500/10 border border-amber-500/20 text-amber-900 dark:text-amber-200 rounded-tl-sm'
+                    : isStatusLine
+                      ? 'bg-blue-50 border border-blue-200 text-blue-700 dark:bg-blue-500/10 dark:border-blue-400/20 dark:text-blue-300 rounded-tl-sm italic'
+                      : 'bg-slate-100 dark:bg-white/5 text-slate-800 dark:text-slate-200 border border-slate-200 dark:border-white/10 rounded-tl-sm'
               )}
             >
               {(() => {
-                if (msg.role === 'user') return msg.text;
+                if (isUser || isStatusLine) return msg.text;
                 try {
                   const parsed = JSON.parse(msg.text);
                   if (parsed.type === 'ask' && parsed.question) {
-                    return <div className="whitespace-pre-wrap break-words">{normalizeMarkdownish(parsed.question)}</div>;
-                  }
-                  if (parsed.type === 'tool' && parsed.tool) {
-                    return (
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2 text-blue-500 italic">
-                          <Activity size={12} className="animate-pulse" />
-                          <span>Using tool: {parsed.tool}...</span>
-                          {item.toolResults.length > 0 && (
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setExpandedToolResults((prev) => ({
-                                  ...prev,
-                                  [toolToggleKey]: !prev[toolToggleKey],
-                                }))
-                              }
-                              className="ml-auto inline-flex items-center gap-1 text-[10px] not-italic text-slate-600 dark:text-slate-300 hover:text-blue-500"
-                              title={expandedToolResults[toolToggleKey] ? 'Hide result' : 'Show result'}
-                            >
-                              {expandedToolResults[toolToggleKey] ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-                              <span>result ({item.toolResults.length})</span>
-                            </button>
-                          )}
-                        </div>
-                        {item.toolResults.length > 0 && (
-                          <div className="space-y-1">
-                            {expandedToolResults[toolToggleKey] && (
-                              <div className="rounded-md border border-slate-300 dark:border-white/10 bg-white/70 dark:bg-black/20 p-2 text-[11px] whitespace-pre-wrap break-words">
-                                {item.toolResults.map((r) => r.text).join('\n\n')}
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    );
+                    return <MarkdownContent text={parsed.question} />;
                   }
                   if (parsed.type === 'finalize_task' && parsed.packet) {
                     const packet = parsed.packet;
@@ -372,21 +398,33 @@ export const ChatPanel: React.FC<{
                       </div>
                     );
                   }
-                  return <div className="whitespace-pre-wrap break-words">{normalizeMarkdownish(msg.text)}</div>;
+                  return <MarkdownContent text={msg.text} />;
                 } catch (e) {
-                  return <div className="whitespace-pre-wrap break-words">{normalizeMarkdownish(msg.text)}</div>;
+                  return <MarkdownContent text={msg.text} />;
                 }
               })()}
               {msg.isGenerating && <span className="inline-block w-1.5 h-3.5 bg-blue-500 ml-1 animate-pulse align-middle" />}
             </div>
-            <span className="text-[8px] text-slate-500 px-1">{msg.timestamp}</span>
+            <span className="text-[10px] text-slate-500 px-1">{msg.timestamp}</span>
           </div>
         )})}
         <div ref={chatEndRef} />
       </div>
 
       <div className="p-4 border-t border-slate-200 dark:border-white/5 space-y-3 bg-slate-50 dark:bg-white/[0.02]">
-        <div className="flex gap-2 bg-slate-100 dark:bg-white/5 p-1 rounded-xl border border-slate-200 dark:border-white/10 relative items-center">
+        {queuedMessages.length > 0 && (
+          <div className="rounded-lg border border-amber-300/50 bg-amber-50 dark:bg-amber-500/10 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-200">
+            <div className="font-semibold">Queued messages ({queuedMessages.length})</div>
+            <div className="mt-1 space-y-1">
+              {queuedMessages.map((item) => (
+                <div key={item.id} className="truncate">
+                  [{item.agent_id}] {item.preview}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        <div className="flex gap-2 bg-white dark:bg-black/20 p-2 rounded-2xl border border-slate-300/80 dark:border-white/10 relative items-end shadow-sm">
           {showSkillDropdown && (
             <div className="absolute bottom-full left-0 right-0 mb-2 bg-white dark:bg-[#141414] border border-slate-200 dark:border-white/10 rounded-lg shadow-xl max-h-52 overflow-y-auto z-[70]">
               <div className="px-3 py-2 text-[10px] text-slate-500 border-b border-slate-200 dark:border-white/10">
@@ -441,7 +479,7 @@ export const ChatPanel: React.FC<{
             ref={agentSelectRef}
             value={selectedAgent}
             onChange={(e: any) => setSelectedAgent(e.target.value)}
-            className="text-[10px] bg-white/80 dark:bg-black/20 border border-slate-200 dark:border-white/10 rounded-lg px-2 py-1.5 outline-none"
+            className="text-[11px] bg-slate-50 dark:bg-black/20 border border-slate-200 dark:border-white/10 rounded-xl px-2.5 py-2 outline-none"
           >
             <option value="lead">Lead</option>
             <option value="coder">Coder</option>
@@ -488,11 +526,15 @@ export const ChatPanel: React.FC<{
                 setShowAgentDropdown(false);
               }
             }}
-            placeholder="Message... (use / for skills, @ for agents)"
+            placeholder="Message...  (/ for skills, @ for agents, Shift+Enter for newline)"
             rows={1}
-            className="flex-1 bg-transparent border-none px-3 py-2 text-xs outline-none resize-none min-h-[40px] max-h-[220px] leading-5"
+            className="flex-1 bg-transparent border-none px-2 py-2 text-[13px] outline-none resize-none min-h-[40px] max-h-[220px] leading-5"
           />
-          <button onClick={send} className="w-8 h-8 rounded-lg bg-blue-600 text-white flex items-center justify-center shadow-lg shadow-blue-600/20">
+          <button
+            onClick={send}
+            className="w-9 h-9 rounded-xl bg-blue-600 text-white flex items-center justify-center shadow-lg shadow-blue-600/20 hover:bg-blue-500 transition-colors"
+            title="Send"
+          >
             <Send size={14} />
           </button>
         </div>

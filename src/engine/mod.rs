@@ -1,22 +1,28 @@
+pub mod actions;
 pub mod patch;
+pub mod render;
 pub mod tools;
 
 use crate::agent_manager::models::ModelManager;
 use crate::agent_manager::AgentManager;
 use crate::config::AgentSpec;
 use crate::engine::patch::validate_unified_diff;
-use crate::engine::tools::{ToolCall, ToolResult, Tools};
+use crate::engine::tools::{ToolCall, Tools};
 use crate::ollama::ChatMessage;
 use crate::skills::Skill;
 use anyhow::Result;
 use futures_util::Stream;
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::de::Deserializer;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
+
+pub use actions::{parse_first_action, ModelAction};
+pub use render::{
+    normalize_tool_path_arg, render_tool_result, render_tool_result_public,
+    sanitize_tool_args_for_display, tool_call_signature,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentRole {
@@ -426,6 +432,8 @@ impl AgentEngine {
         let mut read_paths: HashSet<String> = HashSet::new();
         // Guardrail: repeated search with no matches means no progress.
         let mut empty_search_streak = 0usize;
+        // Guardrail: malformed action JSON can cause endless retries.
+        let mut invalid_json_streak = 0usize;
 
         for _ in 0..self.cfg.max_iters {
             // Ask model for the next action as JSON.
@@ -437,6 +445,12 @@ impl AgentEngine {
             let action: ModelAction = match parse_first_action(&raw) {
                 Ok(v) => v,
                 Err(e) => {
+                    invalid_json_streak += 1;
+                    if invalid_json_streak >= 4 {
+                        let question = "I keep returning malformed tool JSON and can't safely continue. I can either switch to plain text guidance or you can retry with a different model.".to_string();
+                        self.active_skill = None;
+                        return Ok(AgentOutcome::Ask(question));
+                    }
                     messages.push(ChatMessage {
                         role: "user".to_string(),
                         content: format!(
@@ -446,20 +460,22 @@ impl AgentEngine {
                     continue;
                 }
             };
+            invalid_json_streak = 0;
 
             match action {
                 ModelAction::Tool { tool, args } => {
-                    info!("Agent requested tool: {} with args: {}", tool, args);
+                    let safe_args = sanitize_tool_args_for_display(&tool, &args);
+                    info!("Agent requested tool: {} with args: {}", tool, safe_args);
                     if tool == "read_file" {
-                        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                            read_paths.insert(path.to_string());
+                        if let Some(path) = normalize_tool_path_arg(&self.cfg.ws_root, &args) {
+                            read_paths.insert(path);
                         }
                     }
 
                     if tool == "write_file" {
-                        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                            let existing = self.cfg.ws_root.join(path).exists();
-                            if existing && !read_paths.contains(path) {
+                        if let Some(path) = normalize_tool_path_arg(&self.cfg.ws_root, &args) {
+                            let existing = self.cfg.ws_root.join(&path).exists();
+                            if existing && !read_paths.contains(&path) {
                                 let rendered = format!(
                                     "tool_error: tool=write_file error=precondition_failed: must call read_file on '{}' before write_file for existing files",
                                     path
@@ -480,7 +496,7 @@ impl AgentEngine {
                         }
                     }
 
-                    let sig = format!("{}|{}", tool, args);
+                    let sig = tool_call_signature(&tool, &args);
                     if let Some(cached) = tool_cache.get(&sig) {
                         self.observations.push(cached.model.clone());
                         // Cached tool call: keep context for the model, but don't keep re-logging
@@ -506,7 +522,7 @@ impl AgentEngine {
                                 content: serde_json::json!({
                                     "type": "tool",
                                     "tool": tool.clone(),
-                                    "args": args.clone()
+                                    "args": safe_args.clone()
                                 })
                                 .to_string(),
                             })
@@ -514,7 +530,7 @@ impl AgentEngine {
                         let tool_msg = serde_json::json!({
                             "type": "tool",
                             "tool": tool.clone(),
-                            "args": args.clone()
+                            "args": safe_args
                         })
                         .to_string();
                         let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
@@ -749,7 +765,9 @@ impl AgentEngine {
                     "You are linggen-agent 'coder'.",
                     "Rules:",
                     "- You can write files directly using the provided tools.",
+                    "- Prefer 'run_command' (alias: Bash) for standard CLI workflows (search, inspect, build, test).",
                     "- Use tools to inspect the repo before making changes.",
+                    "- For file tools, use argument key 'path' (canonical) and follow tool schema exactly.",
                     "- For existing files, ALWAYS call read_file first before write_file.",
                     "- Prefer minimal edits; do not replace an entire existing file unless explicitly asked.",
                     if mode == PromptMode::Structured {
@@ -779,7 +797,7 @@ impl AgentEngine {
                     "You are linggen-agent 'operator'.",
                     "Your goal is to verify implementations and handle releases.",
                     "Rules:",
-                    "- Use 'run_command' to run tests and verify the build state.",
+                    "- Use 'run_command' (alias: Bash) to run tests and verify the build state.",
                     "- Use 'capture_screenshot' to verify UI requirements for web apps.",
                     "- Report success or failure clearly. If tests fail, provide logs to help the Coder.",
                     if mode == PromptMode::Structured {
@@ -860,141 +878,4 @@ impl AgentEngine {
 
         prompt
     }
-}
-
-pub fn render_tool_result(r: &ToolResult) -> String {
-    match r {
-        ToolResult::RepoInfo(v) => format!("repo_info: {}", v),
-        ToolResult::FileList(v) => format!("files:\n{}", v.join("\n")),
-        ToolResult::FileContent {
-            path,
-            content,
-            truncated,
-        } => {
-            format!(
-                "read_file: {} (truncated: {})\n{}",
-                path, truncated, content
-            )
-        }
-        ToolResult::SearchMatches(v) => {
-            let mut out = String::new();
-            out.push_str("search_matches:\n");
-            if v.is_empty() {
-                out.push_str("(no matches)\n");
-            } else {
-                for m in v {
-                    out.push_str(&format!("{}:{}:{}\n", m.path, m.line, m.snippet));
-                }
-            }
-            out
-        }
-        ToolResult::CommandOutput {
-            exit_code,
-            stdout,
-            stderr,
-        } => {
-            format!(
-                "command_output (exit_code: {:?}):\nSTDOUT:\n{}\nSTDERR:\n{}",
-                exit_code, stdout, stderr
-            )
-        }
-        ToolResult::Screenshot { url, base64 } => {
-            format!(
-                "screenshot_captured: {} (base64 length: {})",
-                url,
-                base64.len()
-            )
-        }
-        ToolResult::Success(msg) => format!("success: {}", msg),
-        ToolResult::LockResult { acquired, denied } => {
-            format!("lock_result: acquired={:?}, denied={:?}", acquired, denied)
-        }
-        ToolResult::AgentOutcome(outcome) => {
-            format!("agent_outcome: {:?}", outcome)
-        }
-    }
-}
-
-fn preview_text(content: &str, max_lines: usize, max_chars: usize) -> (String, bool) {
-    let mut out = String::new();
-    let mut lines = 0usize;
-    let mut truncated = false;
-
-    for line in content.lines() {
-        if lines >= max_lines {
-            truncated = true;
-            break;
-        }
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(line);
-        lines += 1;
-
-        if out.len() >= max_chars {
-            truncated = true;
-            out.truncate(max_chars);
-            break;
-        }
-    }
-
-    (out, truncated)
-}
-
-/// Render tool results for DB/UI without dumping large payloads (e.g. full files).
-pub fn render_tool_result_public(r: &ToolResult) -> String {
-    match r {
-        ToolResult::FileContent {
-            path,
-            content,
-            truncated,
-        } => {
-            let (preview, preview_truncated) = preview_text(content, 20, 1200);
-            let shown_note = if preview_truncated { " (preview)" } else { "" };
-            format!(
-                "read_file: {} (truncated: {}){}\n{}\n\n(content omitted in chat; open the file viewer for full text)",
-                path, truncated, shown_note, preview
-            )
-        }
-        other => render_tool_result(other),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-pub enum ModelAction {
-    #[serde(rename = "tool")]
-    Tool {
-        tool: String,
-        args: serde_json::Value,
-    },
-    #[serde(rename = "patch")]
-    Patch { diff: String },
-    #[serde(rename = "finalize_task")]
-    FinalizeTask { packet: TaskPacket },
-    #[serde(rename = "ask")]
-    Ask { question: String },
-}
-
-pub fn parse_first_action(raw: &str) -> Result<ModelAction> {
-    let trimmed = raw.trim();
-
-    // Fast path: a single clean JSON object.
-    if let Ok(action) = serde_json::from_str::<ModelAction>(trimmed) {
-        return Ok(action);
-    }
-
-    // Fallback: models sometimes emit prose + one or more JSON objects.
-    // Scan for JSON object starts and return the first valid ModelAction.
-    for (idx, _) in trimmed.match_indices('{') {
-        let candidate = &trimmed[idx..];
-        let stream = Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
-        for value in stream.flatten() {
-            if let Ok(action) = serde_json::from_value::<ModelAction>(value) {
-                return Ok(action);
-            }
-        }
-    }
-
-    anyhow::bail!("no valid model action found in response")
 }
