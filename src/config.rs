@@ -99,11 +99,6 @@ pub struct LoggingConfig {
 }
 
 impl Config {
-    pub fn load() -> Result<Self> {
-        let (cfg, _path) = Self::load_with_path()?;
-        Ok(cfg)
-    }
-
     pub fn load_with_path() -> Result<(Self, Option<PathBuf>)> {
         let mut candidates = Vec::new();
 

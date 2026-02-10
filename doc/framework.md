@@ -44,6 +44,8 @@ Notes:
 - `write_file` is supported in current runtime (not patch-only).
 - `run_command` does not accept `cwd`; it runs under workspace root.
 - `read_file`/`write_file` accept aliases `file` / `filepath` for `path`.
+- Tool calls are hard-gated per agent using the loaded agent spec (`spec.tools`).
+- Tool aliases are normalized to canonical names before allowlist enforcement (for example: `Read` -> `read_file`, `Grep` -> `search_rg`, `Bash` -> `run_command`).
 
 ## Command safety (`run_command`)
 
@@ -78,6 +80,20 @@ Server publishes SSE events used by UI and sync flows:
 - `QueueUpdated`
 - `Token`
 - `Outcome`
+
+## Run inspection APIs
+
+Run and context inspection APIs used by the web UI:
+
+- `GET /api/agent-runs?project_root=...&session_id=...`
+- `GET /api/agent-children?run_id=...`
+- `GET /api/agent-context?run_id=...&view=summary|raw`
+- `POST /api/agent-cancel` with `{ run_id }`
+
+Notes:
+
+- `agent-context` returns run metadata + message summary; `view=raw` includes run-scoped messages.
+- Run cancellation is tree-based (`parent + active descendants`).
 
 ## Design direction
 

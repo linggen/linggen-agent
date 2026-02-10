@@ -125,7 +125,7 @@ async fn main() -> Result<()> {
 
             let db = Arc::new(db::Db::new()?);
             let skill_manager = Arc::new(skills::SkillManager::new());
-            let (manager, mut rx) =
+            let (manager, rx) =
                 agent_manager::AgentManager::new(config, db, skill_manager.clone());
 
             // Load skills for initial project

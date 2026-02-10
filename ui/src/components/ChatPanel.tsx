@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
-import { MessageSquare, Copy, Eraser, Plus, Send, X, Sparkles } from 'lucide-react';
+import { Copy, Eraser, Plus, Send, X, Sparkles } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { cn } from '../lib/cn';
 import type {
   AgentInfo,
+  AgentRunInfo,
   AgentRunContextMessage,
   AgentRunContextResponse,
   ChatMessage,
@@ -152,6 +153,120 @@ const contextMessageToChatMessage = (msg: AgentRunContextMessage): ChatMessage =
   };
 };
 
+const formatRunLabel = (run: AgentRunInfo) => {
+  const ts = Number(run.started_at || 0);
+  const time = ts > 0 ? new Date(ts * 1000).toLocaleTimeString() : '-';
+  const shortId = run.run_id.length > 10 ? run.run_id.slice(0, 10) : run.run_id;
+  return `${run.status} • ${time} • ${shortId}`;
+};
+
+type TimelineEvent = {
+  ts: number;
+  label: string;
+  detail?: string;
+  kind: 'run' | 'subagent' | 'tool' | 'task';
+};
+
+const formatTs = (ts?: number) => {
+  if (!ts || ts <= 0) return '-';
+  return new Date(ts * 1000).toLocaleTimeString();
+};
+
+const parseToolIntent = (content: string): string | null => {
+  const trimmed = content.trim();
+  if (!trimmed) return null;
+  if (/^Calling tool:/i.test(trimmed)) {
+    return trimmed.replace(/^Calling tool:\s*/i, '').trim() || 'unknown';
+  }
+  if (!trimmed.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (typeof parsed.type === 'string' && parsed.type !== 'ask' && parsed.type !== 'finalize_task') {
+      return parsed.type;
+    }
+  } catch (_e) {
+    // ignore non-json
+  }
+  return null;
+};
+
+const parseTaskEvent = (content: string): string | null => {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed?.type === 'ask') return 'Asked question';
+    if (parsed?.type === 'finalize_task') return 'Finalized task';
+  } catch (_e) {
+    // ignore non-json
+  }
+  return null;
+};
+
+const buildRunTimeline = (
+  run?: AgentRunInfo,
+  messages: AgentRunContextMessage[] = [],
+  children: AgentRunInfo[] = []
+): TimelineEvent[] => {
+  const events: TimelineEvent[] = [];
+  if (run) {
+    events.push({
+      ts: Number(run.started_at || 0),
+      label: `Run started (${run.agent_id})`,
+      kind: 'run',
+    });
+    if (run.ended_at) {
+      events.push({
+        ts: Number(run.ended_at || 0),
+        label: `Run ended (${run.status})`,
+        detail: run.detail || undefined,
+        kind: 'run',
+      });
+    }
+  }
+  for (const child of children) {
+    events.push({
+      ts: Number(child.started_at || 0),
+      label: `Spawned subagent: ${child.agent_id}`,
+      kind: 'subagent',
+    });
+    if (child.ended_at) {
+      events.push({
+        ts: Number(child.ended_at || 0),
+        label: `Subagent returned: ${child.agent_id} (${child.status})`,
+        detail: child.detail || undefined,
+        kind: 'subagent',
+      });
+    }
+  }
+  for (const msg of messages) {
+    const tool = parseToolIntent(msg.content);
+    if (tool) {
+      events.push({
+        ts: Number(msg.timestamp || 0),
+        label: `Tool: ${tool}`,
+        detail: `${msg.from_id}${msg.to_id ? ` -> ${msg.to_id}` : ''}`,
+        kind: 'tool',
+      });
+      continue;
+    }
+    const taskEvent = parseTaskEvent(msg.content);
+    if (taskEvent) {
+      events.push({
+        ts: Number(msg.timestamp || 0),
+        label: taskEvent,
+        detail: msg.from_id,
+        kind: 'task',
+      });
+    }
+  }
+  return events
+    .filter((evt) => evt.ts > 0)
+    .sort((a, b) => a.ts - b.ts)
+    .slice(-40);
+};
+
 export const ChatPanel: React.FC<{
   chatMessages: ChatMessage[];
   queuedMessages: QueuedChatItem[];
@@ -175,6 +290,8 @@ export const ChatPanel: React.FC<{
   subagentRunIds?: Record<string, string>;
   runningMainRunIds?: Record<string, string>;
   runningSubagentRunIds?: Record<string, string>;
+  mainRunHistory?: Record<string, AgentRunInfo[]>;
+  subagentRunHistory?: Record<string, AgentRunInfo[]>;
   cancellingRunIds?: Record<string, boolean>;
   onCancelRun?: (runId: string) => void | Promise<void>;
   onSendMessage: (message: string, targetAgent?: string) => void;
@@ -201,6 +318,8 @@ export const ChatPanel: React.FC<{
   subagentRunIds,
   runningMainRunIds,
   runningSubagentRunIds,
+  mainRunHistory,
+  subagentRunHistory,
   cancellingRunIds,
   onCancelRun,
   onSendMessage,
@@ -212,9 +331,18 @@ export const ChatPanel: React.FC<{
   const [agentFilter, setAgentFilter] = useState('');
   const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(0);
   const [openSubagentId, setOpenSubagentId] = useState<string | null>(null);
+  const [selectedMainRunByAgent, setSelectedMainRunByAgent] = useState<Record<string, string>>({});
+  const [selectedSubagentRunById, setSelectedSubagentRunById] = useState<Record<string, string>>({});
+  const [pinnedMainRunByAgent, setPinnedMainRunByAgent] = useState<Record<string, boolean>>({});
+  const [pinnedSubagentRunById, setPinnedSubagentRunById] = useState<Record<string, boolean>>({});
+  const [mainMessageFilter, setMainMessageFilter] = useState('');
+  const [subagentMessageFilter, setSubagentMessageFilter] = useState('');
   const [runContextById, setRunContextById] = useState<Record<string, AgentRunContextResponse>>({});
   const [loadingContextByRunId, setLoadingContextByRunId] = useState<Record<string, boolean>>({});
   const [contextErrorByRunId, setContextErrorByRunId] = useState<Record<string, string>>({});
+  const [childrenByRunId, setChildrenByRunId] = useState<Record<string, AgentRunInfo[]>>({});
+  const [loadingChildrenByRunId, setLoadingChildrenByRunId] = useState<Record<string, boolean>>({});
+  const [childrenErrorByRunId, setChildrenErrorByRunId] = useState<Record<string, string>>({});
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const agentSelectRef = useRef<HTMLSelectElement | null>(null);
 
@@ -246,13 +374,42 @@ export const ChatPanel: React.FC<{
     () => subagents.find((sub) => sub.id === openSubagentId) || null,
     [subagents, openSubagentId]
   );
-  const selectedMainRunId = mainRunIds?.[normalizeAgentKey(selectedAgent)];
-  const selectedMainRunningRunId = runningMainRunIds?.[normalizeAgentKey(selectedAgent)];
-  const selectedSubagentRunId = selectedSubagent
-    ? subagentRunIds?.[normalizeAgentKey(selectedSubagent.id)]
+  const selectedAgentKey = normalizeAgentKey(selectedAgent);
+  const selectedMainRunOptions = useMemo(
+    () => mainRunHistory?.[selectedAgentKey] || [],
+    [mainRunHistory, selectedAgentKey]
+  );
+  const selectedMainRunOverride = selectedMainRunByAgent[selectedAgentKey];
+  const selectedMainPinned = !!pinnedMainRunByAgent[selectedAgentKey];
+  const selectedMainRunId =
+    selectedMainPinned &&
+    selectedMainRunOverride &&
+    selectedMainRunOptions.some((run) => run.run_id === selectedMainRunOverride)
+      ? selectedMainRunOverride
+      : mainRunIds?.[selectedAgentKey] || selectedMainRunOptions[0]?.run_id;
+  const selectedMainRunningRunId = runningMainRunIds?.[selectedAgentKey];
+  const selectedSubagentKey = selectedSubagent ? normalizeAgentKey(selectedSubagent.id) : '';
+  const selectedSubagentRunOptions = useMemo(
+    () => (selectedSubagent ? subagentRunHistory?.[selectedSubagentKey] || [] : []),
+    [selectedSubagent, subagentRunHistory, selectedSubagentKey]
+  );
+  const selectedSubagentRunOverride = selectedSubagentKey
+    ? selectedSubagentRunById[selectedSubagentKey]
     : undefined;
+  const selectedSubagentPinned = selectedSubagentKey
+    ? !!pinnedSubagentRunById[selectedSubagentKey]
+    : false;
+  const selectedSubagentRunId =
+    selectedSubagent &&
+    selectedSubagentPinned &&
+    selectedSubagentRunOverride &&
+    selectedSubagentRunOptions.some((run) => run.run_id === selectedSubagentRunOverride)
+      ? selectedSubagentRunOverride
+      : selectedSubagent
+        ? subagentRunIds?.[selectedSubagentKey] || selectedSubagentRunOptions[0]?.run_id
+        : undefined;
   const selectedSubagentRunningRunId = selectedSubagent
-    ? runningSubagentRunIds?.[normalizeAgentKey(selectedSubagent.id)]
+    ? runningSubagentRunIds?.[selectedSubagentKey]
     : undefined;
   const selectedMainContext = selectedMainRunId ? runContextById[selectedMainRunId] : undefined;
   const selectedSubagentContext = selectedSubagentRunId ? runContextById[selectedSubagentRunId] : undefined;
@@ -266,6 +423,26 @@ export const ChatPanel: React.FC<{
   const selectedSubagentContextLoading = selectedSubagentRunId
     ? !!loadingContextByRunId[selectedSubagentRunId]
     : false;
+  const selectedMainChildren = useMemo(
+    () => (selectedMainRunId ? childrenByRunId[selectedMainRunId] || [] : []),
+    [selectedMainRunId, childrenByRunId]
+  );
+  const selectedSubagentChildren = useMemo(
+    () => (selectedSubagentRunId ? childrenByRunId[selectedSubagentRunId] || [] : []),
+    [selectedSubagentRunId, childrenByRunId]
+  );
+  const selectedMainChildrenLoading = selectedMainRunId
+    ? !!loadingChildrenByRunId[selectedMainRunId]
+    : false;
+  const selectedSubagentChildrenLoading = selectedSubagentRunId
+    ? !!loadingChildrenByRunId[selectedSubagentRunId]
+    : false;
+  const selectedMainChildrenError = selectedMainRunId
+    ? childrenErrorByRunId[selectedMainRunId]
+    : undefined;
+  const selectedSubagentChildrenError = selectedSubagentRunId
+    ? childrenErrorByRunId[selectedSubagentRunId]
+    : undefined;
   const subagentMessages = useMemo(() => {
     if (!selectedSubagent) return [];
     const id = normalizeAgentKey(selectedSubagent.id);
@@ -286,6 +463,40 @@ export const ChatPanel: React.FC<{
   const displayedMainMessages = mainContextMessages.length > 0 ? mainContextMessages : visibleMessages;
   const displayedSubagentMessages =
     selectedSubagentContextMessages.length > 0 ? selectedSubagentContextMessages : subagentMessages;
+  const filteredMainMessages = useMemo(() => {
+    const q = mainMessageFilter.trim().toLowerCase();
+    if (!q) return displayedMainMessages;
+    return displayedMainMessages.filter((msg) => {
+      const from = normalizeAgentKey(msg.from || msg.role);
+      const to = normalizeAgentKey(msg.to || '');
+      return (
+        msg.text.toLowerCase().includes(q) ||
+        from.includes(q) ||
+        to.includes(q)
+      );
+    });
+  }, [displayedMainMessages, mainMessageFilter]);
+  const filteredSubagentMessages = useMemo(() => {
+    const q = subagentMessageFilter.trim().toLowerCase();
+    if (!q) return displayedSubagentMessages;
+    return displayedSubagentMessages.filter((msg) => {
+      const from = normalizeAgentKey(msg.from || msg.role);
+      const to = normalizeAgentKey(msg.to || '');
+      return (
+        msg.text.toLowerCase().includes(q) ||
+        from.includes(q) ||
+        to.includes(q)
+      );
+    });
+  }, [displayedSubagentMessages, subagentMessageFilter]);
+  const selectedMainTimeline = useMemo(
+    () => buildRunTimeline(selectedMainContext?.run, selectedMainContext?.messages || [], selectedMainChildren),
+    [selectedMainContext, selectedMainChildren]
+  );
+  const selectedSubagentTimeline = useMemo(
+    () => buildRunTimeline(selectedSubagentContext?.run, selectedSubagentContext?.messages || [], selectedSubagentChildren),
+    [selectedSubagentContext, selectedSubagentChildren]
+  );
 
   const fetchRunContext = useCallback(
     (runId?: string, force = false) => {
@@ -322,12 +533,76 @@ export const ChatPanel: React.FC<{
     [runContextById, loadingContextByRunId]
   );
 
+  const fetchRunChildren = useCallback(
+    (runId?: string, force = false) => {
+      if (!runId) return;
+      if (loadingChildrenByRunId[runId]) return;
+      if (!force && childrenByRunId[runId]) return;
+      setLoadingChildrenByRunId((prev) => ({ ...prev, [runId]: true }));
+      setChildrenErrorByRunId((prev) => {
+        const next = { ...prev };
+        delete next[runId];
+        return next;
+      });
+      void (async () => {
+        try {
+          const url = new URL('/api/agent-children', window.location.origin);
+          url.searchParams.append('run_id', runId);
+          const resp = await fetch(url.toString());
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          const data = (await resp.json()) as AgentRunInfo[];
+          setChildrenByRunId((prev) => ({ ...prev, [runId]: Array.isArray(data) ? data : [] }));
+        } catch (e) {
+          const errorMessage = e instanceof Error ? e.message : String(e);
+          setChildrenErrorByRunId((prev) => ({ ...prev, [runId]: errorMessage }));
+        } finally {
+          setLoadingChildrenByRunId((prev) => {
+            const next = { ...prev };
+            delete next[runId];
+            return next;
+          });
+        }
+      })();
+    },
+    [childrenByRunId, loadingChildrenByRunId]
+  );
+
   useEffect(() => {
     if (!openSubagentId) return;
     if (!subagents.some((sub) => sub.id === openSubagentId)) {
       setOpenSubagentId(null);
     }
   }, [openSubagentId, subagents]);
+
+  useEffect(() => {
+    if (!selectedMainPinned || !selectedMainRunOverride) return;
+    if (selectedMainRunOptions.some((run) => run.run_id === selectedMainRunOverride)) return;
+    setPinnedMainRunByAgent((prev) => {
+      const next = { ...prev };
+      delete next[selectedAgentKey];
+      return next;
+    });
+    setSelectedMainRunByAgent((prev) => {
+      const next = { ...prev };
+      delete next[selectedAgentKey];
+      return next;
+    });
+  }, [selectedMainPinned, selectedMainRunOverride, selectedMainRunOptions, selectedAgentKey]);
+
+  useEffect(() => {
+    if (!selectedSubagentKey || !selectedSubagentPinned || !selectedSubagentRunOverride) return;
+    if (selectedSubagentRunOptions.some((run) => run.run_id === selectedSubagentRunOverride)) return;
+    setPinnedSubagentRunById((prev) => {
+      const next = { ...prev };
+      delete next[selectedSubagentKey];
+      return next;
+    });
+    setSelectedSubagentRunById((prev) => {
+      const next = { ...prev };
+      delete next[selectedSubagentKey];
+      return next;
+    });
+  }, [selectedSubagentKey, selectedSubagentPinned, selectedSubagentRunOverride, selectedSubagentRunOptions]);
 
   useEffect(() => {
     fetchRunContext(selectedMainRunId);
@@ -338,13 +613,23 @@ export const ChatPanel: React.FC<{
   }, [selectedSubagentRunId, fetchRunContext]);
 
   useEffect(() => {
+    fetchRunChildren(selectedMainRunId);
+  }, [selectedMainRunId, fetchRunChildren]);
+
+  useEffect(() => {
+    fetchRunChildren(selectedSubagentRunId);
+  }, [selectedSubagentRunId, fetchRunChildren]);
+
+  useEffect(() => {
     if (!selectedMainRunningRunId && !selectedSubagentRunningRunId) return;
     const id = window.setInterval(() => {
       if (selectedMainRunningRunId) fetchRunContext(selectedMainRunningRunId, true);
       if (selectedSubagentRunningRunId) fetchRunContext(selectedSubagentRunningRunId, true);
+      if (selectedMainRunningRunId) fetchRunChildren(selectedMainRunningRunId, true);
+      if (selectedSubagentRunningRunId) fetchRunChildren(selectedSubagentRunningRunId, true);
     }, 2000);
     return () => window.clearInterval(id);
-  }, [selectedMainRunningRunId, selectedSubagentRunningRunId, fetchRunContext]);
+  }, [selectedMainRunningRunId, selectedSubagentRunningRunId, fetchRunContext, fetchRunChildren]);
 
   const formatParty = (party?: string) => {
     if (!party) return '';
@@ -448,11 +733,23 @@ export const ChatPanel: React.FC<{
 
   return (
     <section className="h-full flex flex-col bg-white dark:bg-[#0f0f0f] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm overflow-hidden min-h-0 relative">
-      <div className="p-4 border-b border-slate-200 dark:border-white/5 flex flex-col gap-3 bg-gradient-to-r from-slate-50 to-white dark:from-[#121212] dark:to-[#0f0f0f]">
-        <div className="flex items-center justify-between">
-          <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-2">
-            <MessageSquare size={14} /> Main Agent Context
-          </h2>
+      <div className="p-3 border-b border-slate-200 dark:border-white/5 flex flex-col gap-2 bg-gradient-to-r from-slate-50 to-white dark:from-[#121212] dark:to-[#0f0f0f]">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <select
+              ref={agentSelectRef}
+              value={selectedAgent}
+              onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setSelectedAgent(e.target.value)}
+              className="text-[11px] bg-white dark:bg-black/20 border border-slate-200 dark:border-white/10 rounded-xl px-2.5 py-1.5 outline-none min-w-[8.5rem]"
+              title="Select active main agent"
+            >
+              {mainAgents.map((agent) => (
+                <option key={agent.name} value={normalizeAgentKey(agent.name)}>
+                  {agent.name}
+                </option>
+              ))}
+            </select>
+          </div>
           <div className="flex items-center gap-2">
             <button
               onClick={copyChat}
@@ -548,6 +845,54 @@ export const ChatPanel: React.FC<{
             <div className="flex flex-wrap items-center gap-2">
               <span className="font-semibold uppercase tracking-widest text-slate-500">Run</span>
               <span className="font-mono">{selectedMainRunId}</span>
+              {selectedMainRunOptions.length > 1 && (
+                <select
+                  value={selectedMainRunId}
+                  onChange={(e) => {
+                    const runId = e.target.value;
+                    setSelectedMainRunByAgent((prev) => ({ ...prev, [selectedAgentKey]: runId }));
+                    setPinnedMainRunByAgent((prev) => ({ ...prev, [selectedAgentKey]: true }));
+                  }}
+                  className="text-[10px] bg-white dark:bg-black/30 border border-slate-200 dark:border-white/10 rounded px-2 py-1 outline-none min-w-[10rem]"
+                  title="Select run context"
+                >
+                  {selectedMainRunOptions.map((run) => (
+                    <option key={run.run_id} value={run.run_id}>
+                      {formatRunLabel(run)}
+                    </option>
+                  ))}
+                </select>
+              )}
+              {selectedMainRunId && (
+                <button
+                  onClick={() => {
+                    if (selectedMainPinned) {
+                      setPinnedMainRunByAgent((prev) => {
+                        const next = { ...prev };
+                        delete next[selectedAgentKey];
+                        return next;
+                      });
+                      setSelectedMainRunByAgent((prev) => {
+                        const next = { ...prev };
+                        delete next[selectedAgentKey];
+                        return next;
+                      });
+                    } else {
+                      setSelectedMainRunByAgent((prev) => ({ ...prev, [selectedAgentKey]: selectedMainRunId }));
+                      setPinnedMainRunByAgent((prev) => ({ ...prev, [selectedAgentKey]: true }));
+                    }
+                  }}
+                  className={cn(
+                    'px-2 py-1 rounded border text-[10px] font-semibold',
+                    selectedMainPinned
+                      ? 'bg-slate-100 text-slate-600 border-slate-300'
+                      : 'bg-blue-50 text-blue-600 border-blue-200'
+                  )}
+                  title={selectedMainPinned ? 'Unpin run selection' : 'Pin this run selection'}
+                >
+                  {selectedMainPinned ? 'Unpin' : 'Pin'}
+                </button>
+              )}
               {selectedMainContext?.run?.status && (
                 <span className={cn('px-1.5 py-0.5 rounded-full uppercase tracking-wide', statusBadgeClass(selectedMainContext.run.status))}>
                   {selectedMainContext.run.status}
@@ -555,6 +900,8 @@ export const ChatPanel: React.FC<{
               )}
               {selectedMainContextLoading && <span className="text-blue-500">Loading context...</span>}
               {selectedMainContextError && <span className="text-red-500">Context error: {selectedMainContextError}</span>}
+              {selectedMainChildrenLoading && <span className="text-blue-500">Loading child runs...</span>}
+              {selectedMainChildrenError && <span className="text-red-500">Children error: {selectedMainChildrenError}</span>}
             </div>
             {selectedMainContext?.summary && (
               <div className="mt-1.5 text-slate-500 dark:text-slate-400">
@@ -600,7 +947,34 @@ export const ChatPanel: React.FC<{
       </div>
 
       <div className="flex-1 overflow-y-scroll p-4 flex flex-col gap-5 custom-scrollbar min-h-0">
-        {displayedMainMessages.length === 0 && (
+        <div className="rounded-lg border border-slate-200 dark:border-white/10 bg-slate-50/70 dark:bg-white/[0.03] px-3 py-2 space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-[10px] uppercase tracking-widest text-slate-500">Context Tools</div>
+            <input
+              value={mainMessageFilter}
+              onChange={(e) => setMainMessageFilter(e.target.value)}
+              placeholder="Filter messages"
+              className="w-52 text-[11px] bg-white dark:bg-black/30 border border-slate-200 dark:border-white/10 rounded px-2 py-1 outline-none"
+            />
+          </div>
+          {selectedMainTimeline.length > 0 && (
+            <details>
+              <summary className="cursor-pointer text-[11px] font-semibold text-slate-600 dark:text-slate-300">
+                Timeline ({selectedMainTimeline.length})
+              </summary>
+              <div className="mt-1.5 space-y-1.5 max-h-36 overflow-auto custom-scrollbar">
+                {selectedMainTimeline.map((evt, idx) => (
+                  <div key={`${evt.ts}-${evt.label}-${idx}`} className="text-[11px] text-slate-600 dark:text-slate-300">
+                    <span className="font-mono text-[10px] text-slate-500 mr-2">{formatTs(evt.ts)}</span>
+                    <span className="font-semibold">{evt.label}</span>
+                    {evt.detail && <span className="text-slate-500"> • {evt.detail}</span>}
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+        </div>
+        {filteredMainMessages.length === 0 && (
           <div className="self-center mt-12 max-w-md text-center">
             <div className="text-sm font-semibold text-slate-600 dark:text-slate-300">
               No messages for {selectedAgent}
@@ -610,7 +984,7 @@ export const ChatPanel: React.FC<{
             </div>
           </div>
         )}
-        {displayedMainMessages.map((msg, i) => {
+        {filteredMainMessages.map((msg, i) => {
           const key = `${msg.timestamp}-${i}-${msg.from || msg.role}-${msg.text.slice(0, 24)}`;
           const isUser = msg.role === 'user';
           const hasActivity = !isUser && Array.isArray(msg.activityEntries) && msg.activityEntries.length > 0;
@@ -773,18 +1147,6 @@ export const ChatPanel: React.FC<{
                 ))}
             </div>
           )}
-          <select
-            ref={agentSelectRef}
-            value={selectedAgent}
-            onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setSelectedAgent(e.target.value)}
-            className="text-[11px] bg-slate-50 dark:bg-black/20 border border-slate-200 dark:border-white/10 rounded-xl px-2.5 py-2 outline-none"
-          >
-            {mainAgents.map((agent) => (
-              <option key={agent.name} value={normalizeAgentKey(agent.name)}>
-                {agent.name}
-              </option>
-            ))}
-          </select>
           <textarea
             ref={inputRef}
             value={chatInput}
@@ -896,6 +1258,58 @@ export const ChatPanel: React.FC<{
             {selectedSubagentRunId && (
               <div className="rounded-lg border border-slate-200 dark:border-white/10 bg-slate-50 dark:bg-white/5 px-2.5 py-2 text-[10px] text-slate-500 dark:text-slate-400">
                 <div className="font-mono text-slate-600 dark:text-slate-300 break-all">{selectedSubagentRunId}</div>
+                {selectedSubagentRunOptions.length > 1 && (
+                  <div className="mt-1">
+                    <select
+                      value={selectedSubagentRunId}
+                      onChange={(e) => {
+                        const runId = e.target.value;
+                        if (!selectedSubagentKey) return;
+                        setSelectedSubagentRunById((prev) => ({ ...prev, [selectedSubagentKey]: runId }));
+                        setPinnedSubagentRunById((prev) => ({ ...prev, [selectedSubagentKey]: true }));
+                      }}
+                      className="w-full text-[10px] bg-white dark:bg-black/30 border border-slate-200 dark:border-white/10 rounded px-2 py-1 outline-none"
+                      title="Select subagent run context"
+                    >
+                      {selectedSubagentRunOptions.map((run) => (
+                        <option key={run.run_id} value={run.run_id}>
+                          {formatRunLabel(run)}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+                {selectedSubagentKey && selectedSubagentRunId && (
+                  <div className="mt-1">
+                    <button
+                      onClick={() => {
+                        if (selectedSubagentPinned) {
+                          setPinnedSubagentRunById((prev) => {
+                            const next = { ...prev };
+                            delete next[selectedSubagentKey];
+                            return next;
+                          });
+                          setSelectedSubagentRunById((prev) => {
+                            const next = { ...prev };
+                            delete next[selectedSubagentKey];
+                            return next;
+                          });
+                        } else {
+                          setSelectedSubagentRunById((prev) => ({ ...prev, [selectedSubagentKey]: selectedSubagentRunId }));
+                          setPinnedSubagentRunById((prev) => ({ ...prev, [selectedSubagentKey]: true }));
+                        }
+                      }}
+                      className={cn(
+                        'px-2 py-1 rounded border text-[10px] font-semibold',
+                        selectedSubagentPinned
+                          ? 'bg-slate-100 text-slate-600 border-slate-300'
+                          : 'bg-blue-50 text-blue-600 border-blue-200'
+                      )}
+                    >
+                      {selectedSubagentPinned ? 'Unpin' : 'Pin'}
+                    </button>
+                  </div>
+                )}
                 {selectedSubagentContext?.summary && (
                   <div className="mt-1">
                     messages: {selectedSubagentContext.summary.message_count} • user: {selectedSubagentContext.summary.user_messages} • agent: {selectedSubagentContext.summary.agent_messages} • system: {selectedSubagentContext.summary.system_messages}
@@ -903,12 +1317,41 @@ export const ChatPanel: React.FC<{
                 )}
                 {selectedSubagentContextLoading && <div className="mt-1 text-blue-500">Loading context...</div>}
                 {selectedSubagentContextError && <div className="mt-1 text-red-500">Context error: {selectedSubagentContextError}</div>}
+                {selectedSubagentChildrenLoading && <div className="mt-1 text-blue-500">Loading child runs...</div>}
+                {selectedSubagentChildrenError && <div className="mt-1 text-red-500">Children error: {selectedSubagentChildrenError}</div>}
               </div>
             )}
-            {displayedSubagentMessages.length === 0 && (
+            <div className="rounded-lg border border-slate-200 dark:border-white/10 bg-slate-50/70 dark:bg-white/[0.03] px-2.5 py-2 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-[10px] uppercase tracking-widest text-slate-500">Context Tools</div>
+                <input
+                  value={subagentMessageFilter}
+                  onChange={(e) => setSubagentMessageFilter(e.target.value)}
+                  placeholder="Filter messages"
+                  className="w-40 text-[11px] bg-white dark:bg-black/30 border border-slate-200 dark:border-white/10 rounded px-2 py-1 outline-none"
+                />
+              </div>
+              {selectedSubagentTimeline.length > 0 && (
+                <details>
+                  <summary className="cursor-pointer text-[11px] font-semibold text-slate-600 dark:text-slate-300">
+                    Timeline ({selectedSubagentTimeline.length})
+                  </summary>
+                  <div className="mt-1.5 space-y-1.5 max-h-28 overflow-auto custom-scrollbar">
+                    {selectedSubagentTimeline.map((evt, idx) => (
+                      <div key={`${evt.ts}-${evt.label}-${idx}`} className="text-[11px] text-slate-600 dark:text-slate-300">
+                        <span className="font-mono text-[10px] text-slate-500 mr-2">{formatTs(evt.ts)}</span>
+                        <span className="font-semibold">{evt.label}</span>
+                        {evt.detail && <span className="text-slate-500"> • {evt.detail}</span>}
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )}
+            </div>
+            {filteredSubagentMessages.length === 0 && (
               <div className="text-xs italic text-slate-500">No context messages captured for this subagent yet.</div>
             )}
-            {displayedSubagentMessages.slice(-20).map((msg, idx) => (
+            {filteredSubagentMessages.slice(-20).map((msg, idx) => (
               <div key={`${msg.timestamp}-${idx}-${msg.from || msg.role}`} className="rounded-lg border border-slate-200 dark:border-white/10 bg-slate-50 dark:bg-white/5 p-2.5">
                 <div className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">
                   {(msg.from || msg.role).toUpperCase()} {msg.to ? `→ ${msg.to.toUpperCase()}` : ''}

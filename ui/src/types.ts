@@ -118,6 +118,16 @@ export interface AgentRunInfo {
   ended_at?: number | null;
 }
 
+export interface AgentRunSummary {
+  run_id: string;
+  status: string;
+  started_at: number;
+  ended_at?: number | null;
+  child_count: number;
+  timeline_events: number;
+  last_event_at: number;
+}
+
 export interface AgentRunContextSummary {
   message_count: number;
   user_messages: number;

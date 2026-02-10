@@ -44,13 +44,6 @@ impl StateFs {
         Self { root }
     }
 
-    pub fn ensure_dirs(&self) -> Result<()> {
-        fs::create_dir_all(&self.root)?;
-        fs::create_dir_all(self.root.join("tasks"))?;
-        fs::create_dir_all(self.root.join("sessions"))?;
-        Ok(())
-    }
-
     pub fn read_file(&self, rel_path: &str) -> Result<(StateFile, String)> {
         let path = self.root.join(rel_path);
         let content = fs::read_to_string(&path)?;
@@ -134,33 +127,4 @@ impl StateFs {
         Ok((state, body))
     }
 
-    pub fn read_messages(&self, session_id: Option<&str>) -> Result<Vec<(StateFile, String)>> {
-        let path = if let Some(sid) = session_id {
-            self.root.join("sessions").join(format!("{}.md", sid))
-        } else {
-            self.root.join("messages.md")
-        };
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let content = fs::read_to_string(path)?;
-        let mut messages = Vec::new();
-
-        // Split by "---" but handle the fact that each message has two "---"
-        // A better way is to split and then group
-        let parts: Vec<&str> = content.split("---").collect();
-        // parts[0] is likely empty or whitespace before first ---
-        // parts[1] is yaml, parts[2] is body, parts[3] is yaml, parts[4] is body...
-        let mut i = 1;
-        while i + 1 < parts.len() {
-            let yaml = parts[i];
-            let body = parts[i + 1].trim();
-            if let Ok(state) = serde_yaml::from_str::<StateFile>(yaml) {
-                messages.push((state, body.to_string()));
-            }
-            i += 2;
-        }
-
-        Ok(messages)
-    }
 }

@@ -1,7 +1,12 @@
 import React from 'react';
 import { User, Bot } from 'lucide-react';
 import { cn } from '../lib/cn';
-import type { AgentInfo, AgentWorkInfo, LeadState } from '../types';
+import type { AgentInfo, AgentRunSummary, AgentWorkInfo, LeadState } from '../types';
+
+const formatTime = (ts?: number | null) => {
+  if (!ts || ts <= 0) return '-';
+  return new Date(ts * 1000).toLocaleTimeString();
+};
 
 export const AgentsCard: React.FC<{
   agents: AgentInfo[];
@@ -11,7 +16,8 @@ export const AgentsCard: React.FC<{
   agentStatus?: Record<string, 'idle' | 'model_loading' | 'thinking' | 'calling_tool' | 'working'>;
   agentStatusText?: Record<string, string>;
   agentWork?: Record<string, AgentWorkInfo>;
-}> = ({ agents, leadState, isRunning, selectedAgent, agentStatus, agentStatusText, agentWork }) => {
+  agentRunSummary?: Record<string, AgentRunSummary>;
+}> = ({ agents, leadState, isRunning, selectedAgent, agentStatus, agentStatusText, agentWork, agentRunSummary }) => {
   return (
     <section className="bg-white dark:bg-[#141414] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm flex flex-col overflow-hidden">
       <div className="px-4 py-2 border-b border-slate-200 dark:border-white/5 bg-slate-50 dark:bg-white/[0.02] flex items-center justify-between">
@@ -24,6 +30,7 @@ export const AgentsCard: React.FC<{
         {agents.map((agent) => {
           const status = agentStatus?.[agent.name] ?? ((isRunning && selectedAgent === agent.name) ? 'thinking' : 'idle');
           const work = agentWork?.[agent.name];
+          const run = agentRunSummary?.[agent.name.toLowerCase()];
           const statusText =
             agentStatusText?.[agent.name] ||
             (status === 'calling_tool'
@@ -74,6 +81,33 @@ export const AgentsCard: React.FC<{
                 {work?.file || '-'}
                 {work && work.activeCount > 1 ? ` (+${work.activeCount - 1})` : ''}
               </div>
+              {run && (
+                <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                  <span
+                    className={cn(
+                      'text-[9px] px-1.5 py-0.5 rounded-full uppercase tracking-wide font-semibold',
+                      run.status === 'running'
+                        ? 'bg-green-500/20 text-green-600 dark:text-green-400'
+                        : run.status === 'failed'
+                          ? 'bg-red-500/20 text-red-600 dark:text-red-400'
+                          : run.status === 'cancelled'
+                            ? 'bg-amber-500/20 text-amber-600 dark:text-amber-400'
+                            : 'bg-slate-500/20 text-slate-600 dark:text-slate-300'
+                    )}
+                  >
+                    run {run.status}
+                  </span>
+                  <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 font-semibold">
+                    timeline {run.timeline_events}
+                  </span>
+                  <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-purple-500/10 text-purple-600 dark:text-purple-400 font-semibold">
+                    sub {run.child_count}
+                  </span>
+                  <span className="text-[9px] text-slate-500 dark:text-slate-400">
+                    @{formatTime(run.last_event_at)}
+                  </span>
+                </div>
+              )}
             </div>
           </div>
         )})}

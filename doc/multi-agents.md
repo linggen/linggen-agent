@@ -7,7 +7,7 @@ Current runtime contract for main agents, subagents, and UI-facing events/APIs.
 - `doc/product-spec.md`: product goals and mode behavior (`chat` / `auto`).
 - `doc/framework.md`: tool/router/safety implementation details.
 
-## Agent taxonomy
+## Agent types
 
 - Main agents:
   - Long-lived, can receive user tasks, can message other main agents.
@@ -26,6 +26,7 @@ Current runtime contract for main agents, subagents, and UI-facing events/APIs.
 5. `subagent -> spawn(*)` is denied.
 6. Delegation depth is fixed at 1.
 7. Parent cancellation cascades to active children.
+8. Tool usage is enforced per-agent by `spec.tools` (hard gate, not prompt-only).
 
 ## Run model
 
@@ -89,6 +90,11 @@ Supporting routes used by the same UI flow:
 - Append status/tool activity into that message instead of adding many transient bubbles.
 - Render tool activity as a compact summary row with expandable details.
 - On final assistant message, replace the temporary in-progress body but preserve activity summary.
+- Expose run history for each main agent and subagent.
+- Allow pinning a selected run so context does not auto-switch to newer runs.
+- Provide per-run timeline details (run start/end, child spawn/return, tool/task milestones).
+- Provide message filtering inside run context panels.
+- Show compact run/timeline/subagent badges in the right-side agent status cards.
 
 ## Near-term improvements
 

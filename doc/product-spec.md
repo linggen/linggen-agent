@@ -3,7 +3,7 @@
 ### Human Intent
 
 Linggen Agent is basically an extended web version of Claude Code with a local-model runtime.
-I will try other like socical agent in thie framework.
+The framework should support additional specialized agents over time.
 
 ### Summary
 
@@ -44,6 +44,11 @@ Mode controls response behavior; safety is enforced by policy/tool constraints.
   - Session-based chat.
   - Agent status (`model_loading`, `thinking`, `calling_tool`, `working`, `idle`).
   - Agent hierarchy and context inspection.
+  - Per-agent run history selector (main + subagent).
+  - Run pin/unpin to keep a specific context stable while new runs arrive.
+  - Run timeline panel (start/end, subagent spawn/return, tool/task milestones).
+  - Context message filtering.
+  - Right-side agent cards show compact run/timeline/subagent badges.
 
 ### Safety requirements
 
