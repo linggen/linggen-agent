@@ -120,10 +120,6 @@ impl AgentEngine {
         self.spec = Some(spec);
     }
 
-    pub fn get_spec(&self) -> Option<&AgentSpec> {
-        self.spec.as_ref()
-    }
-
     pub fn set_manager_context(&mut self, manager: Arc<AgentManager>) {
         if let Some(agent_id) = &self.agent_id {
             let kind = self
@@ -204,6 +200,7 @@ impl AgentEngine {
             role: "system".to_string(),
             content: self.system_prompt_with_mode(mode),
         }];
+        let allowed_tools = self.allowed_tool_names();
 
         // Add workspace context to the first message if history is short
         if self.chat_history.len() == 0 {
@@ -214,7 +211,7 @@ impl AgentEngine {
                     self.cfg.ws_root.display(),
                     self.role,
                     self.task.as_deref().unwrap_or("No task set yet."),
-                    tools::tool_schema_json()
+                    tools::tool_schema_json(allowed_tools.as_ref())
                 ),
             });
         }
@@ -310,10 +307,6 @@ impl AgentEngine {
         });
 
         Ok(())
-    }
-
-    pub async fn chat(&mut self, _message: &str, _session_id: Option<&str>) -> Result<String> {
-        anyhow::bail!("chat() is deprecated, use chat_stream()")
     }
 
     pub async fn manager_db_add_observation(&self, tool: &str, rendered: &str, session_id: Option<&str>) -> Result<()> {
@@ -417,6 +410,7 @@ impl AgentEngine {
         }
 
         let system = self.system_prompt();
+        let allowed_tools = self.allowed_tool_names();
         let mut messages = vec![ChatMessage {
             role: "system".to_string(),
             content: system,
@@ -430,7 +424,7 @@ impl AgentEngine {
                 self.cfg.ws_root.display(),
                 self.role,
                 task,
-                tools::tool_schema_json()
+                tools::tool_schema_json(allowed_tools.as_ref())
             ),
         });
 
@@ -447,7 +441,6 @@ impl AgentEngine {
         #[derive(Clone)]
         struct CachedToolObs {
             model: String,
-            public: String,
         }
 
         // Cache tool results by (tool,args) to prevent repetition loops.
@@ -492,15 +485,47 @@ impl AgentEngine {
 
             match action {
                 ModelAction::Tool { tool, args } => {
-                    let safe_args = sanitize_tool_args_for_display(&tool, &args);
-                    info!("Agent requested tool: {} with args: {}", tool, safe_args);
-                    if tool == "read_file" {
+                    let canonical_tool =
+                        tools::canonical_tool_name(&tool).unwrap_or(tool.as_str()).to_string();
+
+                    if let Some(allowed) = &allowed_tools {
+                        if !self.is_tool_allowed(allowed, &tool) {
+                            let mut allowed_list = allowed.iter().cloned().collect::<Vec<_>>();
+                            allowed_list.sort();
+                            let rendered = format!(
+                                "tool_not_allowed: tool={} canonical={} allowed={}",
+                                tool,
+                                canonical_tool,
+                                allowed_list.join(",")
+                            );
+                            self.observations.push(rendered.clone());
+                            let _ = self
+                                .manager_db_add_observation(&canonical_tool, &rendered, session_id)
+                                .await;
+                            messages.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: format!(
+                                    "Tool '{}' is not allowed for this agent. Use one of [{}].",
+                                    tool,
+                                    allowed_list.join(", ")
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+
+                    let safe_args = sanitize_tool_args_for_display(&canonical_tool, &args);
+                    info!(
+                        "Agent requested tool: {} (requested: {}) with args: {}",
+                        canonical_tool, tool, safe_args
+                    );
+                    if canonical_tool == "read_file" {
                         if let Some(path) = normalize_tool_path_arg(&self.cfg.ws_root, &args) {
                             read_paths.insert(path);
                         }
                     }
 
-                    if tool == "write_file" {
+                    if canonical_tool == "write_file" {
                         if let Some(path) = normalize_tool_path_arg(&self.cfg.ws_root, &args) {
                             let existing = self.cfg.ws_root.join(&path).exists();
                             if existing && !read_paths.contains(&path) {
@@ -524,7 +549,7 @@ impl AgentEngine {
                         }
                     }
 
-                    let sig = tool_call_signature(&tool, &args);
+                    let sig = tool_call_signature(&canonical_tool, &args);
                     if let Some(cached) = tool_cache.get(&sig) {
                         self.observations.push(cached.model.clone());
                         // Cached tool call: keep context for the model, but don't keep re-logging
@@ -550,7 +575,7 @@ impl AgentEngine {
                                 to: target.clone(),
                                 content: serde_json::json!({
                                     "type": "tool",
-                                    "tool": tool.clone(),
+                                    "tool": canonical_tool.clone(),
                                     "args": safe_args.clone()
                                 })
                                 .to_string(),
@@ -558,7 +583,7 @@ impl AgentEngine {
                             .await;
                         let tool_msg = serde_json::json!({
                             "type": "tool",
-                            "tool": tool.clone(),
+                            "tool": canonical_tool.clone(),
                             "args": safe_args
                         })
                         .to_string();
@@ -578,7 +603,7 @@ impl AgentEngine {
                     }
 
                     let call = ToolCall {
-                        tool: tool.clone(),
+                        tool: canonical_tool.clone(),
                         args,
                     };
                     match self.tools.execute(call) {
@@ -589,14 +614,13 @@ impl AgentEngine {
                                 sig,
                                 CachedToolObs {
                                     model: rendered_model.clone(),
-                                    public: rendered_public.clone(),
                                 },
                             );
                             self.observations.push(rendered_model.clone());
 
                             // Record observation in DB
                             let _ = self
-                                .manager_db_add_observation(&tool, &rendered_public, session_id)
+                                .manager_db_add_observation(&canonical_tool, &rendered_public, session_id)
                                 .await;
                             if let Some(manager) = self.tools.get_manager() {
                                 // Trigger a UI refresh via the server's SSE bridge.
@@ -610,7 +634,7 @@ impl AgentEngine {
                                 content: format!("Observation:\n{}", rendered_model),
                             });
 
-                            if tool == "search_rg" && rendered_model.contains("(no matches)") {
+                            if canonical_tool == "search_rg" && rendered_model.contains("(no matches)") {
                                 empty_search_streak += 1;
                             } else {
                                 empty_search_streak = 0;
@@ -622,21 +646,23 @@ impl AgentEngine {
                             }
                         }
                         Err(e) => {
-                            warn!("Tool execution failed ({}): {}", tool, e);
-                            let rendered = format!("tool_error: tool={} error={}", tool, e);
+                            warn!("Tool execution failed ({}): {}", canonical_tool, e);
+                            let rendered = format!("tool_error: tool={} error={}", canonical_tool, e);
                             tool_cache.insert(
                                 sig,
                                 CachedToolObs {
                                     model: rendered.clone(),
-                                    public: rendered.clone(),
                                 },
                             );
                             self.observations.push(rendered.clone());
-                            let _ = self.manager_db_add_observation(&tool, &rendered, session_id).await;
+                            let _ = self
+                                .manager_db_add_observation(&canonical_tool, &rendered, session_id)
+                                .await;
                             messages.push(ChatMessage {
                                 role: "user".to_string(),
                                 content: format!(
-                                    "Tool execution failed for tool='{tool}'. Error: {e}. Choose a valid tool+args from the tool schema and try again."
+                                    "Tool execution failed for tool='{}'. Error: {}. Choose a valid tool+args from the tool schema and try again.",
+                                    canonical_tool, e
                                 ),
                             });
                         }
@@ -772,6 +798,27 @@ impl AgentEngine {
         }
 
         "user".to_string()
+    }
+
+    fn allowed_tool_names(&self) -> Option<HashSet<String>> {
+        let spec = self.spec.as_ref()?;
+        if spec.tools.is_empty() {
+            return None;
+        }
+
+        let allowed = spec
+            .tools
+            .iter()
+            .filter_map(|tool| tools::canonical_tool_name(tool).map(str::to_string))
+            .collect::<HashSet<String>>();
+
+        Some(allowed)
+    }
+
+    fn is_tool_allowed(&self, allowed: &HashSet<String>, requested_tool: &str) -> bool {
+        tools::canonical_tool_name(requested_tool)
+            .map(|tool| allowed.contains(tool))
+            .unwrap_or(false)
     }
 
     fn system_prompt(&self) -> String {

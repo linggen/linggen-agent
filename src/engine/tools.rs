@@ -782,54 +782,81 @@ fn first_segment_token(segment: &str) -> Option<&str> {
         .map(|token| token.trim_start_matches('('))
 }
 
-pub fn tool_schema_json() -> String {
-    let schema = serde_json::json!({
-        "tools": [
-            {
-                "name": "get_repo_info",
-                "args": {},
-                "returns": "string"
-            },
-            {
-                "name": "list_files",
-                "args": {"globs": "string[]?", "max_results": "number?"},
-                "returns": "string[]"
-            },
-            {
-                "name": "read_file",
-                "args": {"path": "string", "max_bytes": "number?", "line_range": "[number,number]?"},
-                "returns": "{path,content,truncated}",
-                "notes": "Path aliases accepted: path, file, filepath."
-            },
-            {
-                "name": "search_rg",
-                "args": {"query": "string", "globs": "string[]?", "max_results": "number?"},
-                "returns": "{matches:[{path,line,snippet}]}"
-            },
-            {
-                "name": "write_file",
-                "args": {"path": "string", "content": "string"},
-                "returns": "success",
-                "notes": "Path aliases accepted: path, file, filepath."
-            },
-            {
-                "name": "run_command",
-                "args": {"cmd": "string", "timeout_ms": "number?"},
-                "returns": "{exit_code,stdout,stderr}",
-                "notes": "Alias: Bash. Supports common dev/search/build CLI commands with per-segment allowlist checks."
-            },
-            {
-                "name": "capture_screenshot",
-                "args": {"url": "string", "delay_ms": "number?"},
-                "returns": "{url,base64}"
-            },
-            {
-                "name": "delegate_to_agent",
-                "args": {"target_agent_id": "string", "task": "string"},
-                "returns": "{agent_outcome}",
-                "notes": "Only main agents can delegate. Subagents cannot spawn subagents."
-            }
-        ]
-    });
-    schema.to_string()
+pub fn canonical_tool_name(tool: &str) -> Option<&'static str> {
+    Some(match tool {
+        "get_repo_info" => "get_repo_info",
+        "list_files" | "Glob" => "list_files",
+        "read_file" | "Read" => "read_file",
+        "search_rg" | "Grep" => "search_rg",
+        "write_file" | "Write" => "write_file",
+        "run_command" | "Bash" => "run_command",
+        "capture_screenshot" => "capture_screenshot",
+        "lock_paths" | "acquire_locks" => "lock_paths",
+        "unlock_paths" => "unlock_paths",
+        "delegate_to_agent" => "delegate_to_agent",
+        _ => return None,
+    })
+}
+
+fn full_tool_schema_entries() -> Vec<Value> {
+    vec![
+        serde_json::json!({
+            "name": "get_repo_info",
+            "args": {},
+            "returns": "string"
+        }),
+        serde_json::json!({
+            "name": "list_files",
+            "args": {"globs": "string[]?", "max_results": "number?"},
+            "returns": "string[]"
+        }),
+        serde_json::json!({
+            "name": "read_file",
+            "args": {"path": "string", "max_bytes": "number?", "line_range": "[number,number]?"},
+            "returns": "{path,content,truncated}",
+            "notes": "Path aliases accepted: path, file, filepath."
+        }),
+        serde_json::json!({
+            "name": "search_rg",
+            "args": {"query": "string", "globs": "string[]?", "max_results": "number?"},
+            "returns": "{matches:[{path,line,snippet}]}"
+        }),
+        serde_json::json!({
+            "name": "write_file",
+            "args": {"path": "string", "content": "string"},
+            "returns": "success",
+            "notes": "Path aliases accepted: path, file, filepath."
+        }),
+        serde_json::json!({
+            "name": "run_command",
+            "args": {"cmd": "string", "timeout_ms": "number?"},
+            "returns": "{exit_code,stdout,stderr}",
+            "notes": "Alias: Bash. Supports common dev/search/build CLI commands with per-segment allowlist checks."
+        }),
+        serde_json::json!({
+            "name": "capture_screenshot",
+            "args": {"url": "string", "delay_ms": "number?"},
+            "returns": "{url,base64}"
+        }),
+        serde_json::json!({
+            "name": "delegate_to_agent",
+            "args": {"target_agent_id": "string", "task": "string"},
+            "returns": "{agent_outcome}",
+            "notes": "Only main agents can delegate. Subagents cannot spawn subagents."
+        }),
+    ]
+}
+
+pub fn tool_schema_json(allowed_tools: Option<&HashSet<String>>) -> String {
+    let mut tools = full_tool_schema_entries();
+    if let Some(allowed) = allowed_tools {
+        tools.retain(|entry| {
+            entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|name| allowed.contains(name))
+                .unwrap_or(false)
+        });
+    }
+    serde_json::json!({ "tools": tools }).to_string()
 }

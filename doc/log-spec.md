@@ -10,7 +10,7 @@
 
 - Debug console (service runtime / terminal).
 - Browser console (for web-facing components and dashboards).
-- File logs (persistent records for troubleshooting and audits). Rotate in 30 days.
+- File logs (persistent records for troubleshooting and audits). Current runtime rotates daily and applies retention cleanup (default 30 days).
 
 ## Required Logging Coverage
 

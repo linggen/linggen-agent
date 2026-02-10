@@ -20,7 +20,6 @@ pub mod locks;
 pub mod models;
 
 pub struct ProjectContext {
-    pub root: PathBuf,
     pub agents: Mutex<HashMap<String, Arc<Mutex<AgentEngine>>>>,
     pub state_fs: StateFs,
     pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
@@ -112,7 +111,6 @@ impl AgentManager {
 
         let state_fs = StateFs::new(root.clone());
         let ctx = Arc::new(ProjectContext {
-            root: root.clone(),
             agents: Mutex::new(HashMap::new()),
             state_fs,
             watcher: Mutex::new(None),

@@ -24,6 +24,12 @@ pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Option<Path
     let _ = cleanup_old_logs(&log_dir, retention_days);
 
     let rotation = settings.rotation.unwrap_or(ROTATION_DAILY);
+    if rotation != ROTATION_DAILY {
+        eprintln!(
+            "Unsupported log rotation '{}' (only '{}' is supported). Falling back to daily.",
+            rotation, ROTATION_DAILY
+        );
+    }
     // Ensure guard is kept alive by not using `let _ =`
     let file_appender = tracing_appender::rolling::daily(&log_dir, LOG_FILE_PREFIX);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
@@ -75,15 +81,6 @@ pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Option<Path
         .try_init();
 
     Some(log_dir)
-}
-
-pub fn setup_tracing() -> Option<PathBuf> {
-    setup_tracing_with_settings(LoggingSettings {
-        level: None,
-        directory: None,
-        rotation: None,
-        retention_days: None,
-    })
 }
 
 fn resolve_log_dir(configured: Option<&str>) -> Result<PathBuf> {

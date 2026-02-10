@@ -1,4 +1,4 @@
-import React, { useMemo, useState, useEffect, useRef } from 'react';
+import React, { useCallback, useMemo, useState, useEffect, useRef } from 'react';
 import { Activity } from 'lucide-react';
 import { AgentTree } from './components/AgentTree';
 import { AgentsCard } from './components/AgentsCard';
@@ -10,6 +10,7 @@ import type {
   AgentInfo,
   AgentTreeItem,
   AgentRunInfo,
+  AgentRunSummary,
   AgentWorkInfo,
   ChatMessage,
   LeadState,
@@ -406,36 +407,84 @@ const App: React.FC = () => {
     }
     return out;
   }, [sortedAgentRuns]);
+  const mainRunHistory = useMemo(() => {
+    const out: Record<string, AgentRunInfo[]> = {};
+    for (const run of sortedAgentRuns) {
+      const agentId = run.agent_id.toLowerCase();
+      if (run.agent_kind !== 'main') continue;
+      if (!out[agentId]) out[agentId] = [];
+      out[agentId].push(run);
+    }
+    return out;
+  }, [sortedAgentRuns]);
+  const subagentRunHistory = useMemo(() => {
+    const out: Record<string, AgentRunInfo[]> = {};
+    for (const run of sortedAgentRuns) {
+      const agentId = run.agent_id.toLowerCase();
+      if (run.agent_kind !== 'subagent') continue;
+      if (!out[agentId]) out[agentId] = [];
+      out[agentId].push(run);
+    }
+    return out;
+  }, [sortedAgentRuns]);
+  const agentRunSummary = useMemo(() => {
+    const out: Record<string, AgentRunSummary> = {};
+    for (const agent of mainAgents) {
+      const agentId = agent.name.toLowerCase();
+      const latest = mainRunHistory[agentId]?.[0];
+      if (!latest) continue;
+      const children = sortedAgentRuns.filter((run) => run.parent_run_id === latest.run_id);
+      const timelineEvents =
+        1 +
+        (latest.ended_at ? 1 : 0) +
+        children.reduce((count, child) => count + 1 + (child.ended_at ? 1 : 0), 0);
+      const lastEventAt = Math.max(
+        Number(latest.ended_at || 0),
+        Number(latest.started_at || 0),
+        ...children.flatMap((child) => [Number(child.started_at || 0), Number(child.ended_at || 0)])
+      );
+      out[agentId] = {
+        run_id: latest.run_id,
+        status: latest.status,
+        started_at: latest.started_at,
+        ended_at: latest.ended_at,
+        child_count: children.length,
+        timeline_events: timelineEvents,
+        last_event_at: lastEventAt,
+      };
+    }
+    return out;
+  }, [mainAgents, mainRunHistory, sortedAgentRuns]);
 
-  const addLog = (msg: string) => {
+  const addLog = useCallback((msg: string) => {
     setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
-  };
+  }, []);
 
-  const shouldHideInternalChatMessage = (from?: string, text?: string) => {
+  const shouldHideInternalChatMessage = useCallback((from?: string, text?: string) => {
     if (!text) return false;
     if (isToolResultMessage(from, text)) return true;
     const toolName = parseToolNameFromMessage(text);
     if (toolName) return true;
     if (from !== 'system') return false;
     return text.startsWith('Starting autonomous loop for task:');
-  };
+  }, []);
 
-  const chatMessageKey = (msg: ChatMessage) => {
+  const chatMessageKey = useCallback((msg: ChatMessage) => {
     const from = msg.from || msg.role;
     const to = msg.to || '';
     const ts = msg.timestampMs ?? 0;
     return `${from}|${to}|${ts}|${msg.text}`;
-  };
+  }, []);
 
-  const sameMessageContent = (a: ChatMessage, b: ChatMessage) => {
+  const sameMessageContent = useCallback((a: ChatMessage, b: ChatMessage) => {
     const fromA = a.from || a.role;
     const fromB = b.from || b.role;
     const toA = a.to || '';
     const toB = b.to || '';
     return fromA === fromB && toA === toB && a.text === b.text;
-  };
+  }, []);
 
-  const isStructuredAgentMessage = (msg: ChatMessage) => {
+  const isStructuredAgentMessage = useCallback((msg: ChatMessage) => {
     if ((msg.from || msg.role) === 'user') return false;
     try {
       const parsed = JSON.parse(msg.text);
@@ -443,18 +492,18 @@ const App: React.FC = () => {
     } catch (_e) {
       return false;
     }
-  };
+  }, []);
 
-  const likelySameMessage = (a: ChatMessage, b: ChatMessage) => {
+  const likelySameMessage = useCallback((a: ChatMessage, b: ChatMessage) => {
     if (!sameMessageContent(a, b)) return false;
     if (isStructuredAgentMessage(a) || isStructuredAgentMessage(b)) return true;
     const ta = a.timestampMs ?? 0;
     const tb = b.timestampMs ?? 0;
     if (ta === 0 || tb === 0) return true;
     return Math.abs(ta - tb) <= 120_000;
-  };
+  }, [sameMessageContent, isStructuredAgentMessage]);
 
-  const mergeChatMessages = (persisted: ChatMessage[], live: ChatMessage[]) => {
+  const mergeChatMessages = useCallback((persisted: ChatMessage[], live: ChatMessage[]) => {
     if (persisted.length === 0) return live;
     if (live.length === 0) return persisted;
 
@@ -492,7 +541,7 @@ const App: React.FC = () => {
       seen.add(key);
       return true;
     });
-  };
+  }, [chatMessageKey, likelySameMessage]);
 
   useEffect(() => {
     if (chatMessages.length > lastChatCountRef.current) {
@@ -501,18 +550,18 @@ const App: React.FC = () => {
     lastChatCountRef.current = chatMessages.length;
   }, [chatMessages.length]);
 
-  const fetchProjects = async () => {
+  const fetchProjects = useCallback(async () => {
     try {
       const resp = await fetch('/api/projects');
       const data = await resp.json();
       setProjects(data);
-      if (data.length > 0 && !selectedProjectRoot) {
-        setSelectedProjectRoot(data[0].path);
+      if (data.length > 0) {
+        setSelectedProjectRoot((prev) => prev || data[0].path);
       }
     } catch (e) {
       addLog(`Error fetching projects: ${e}`);
     }
-  };
+  }, [addLog]);
 
   const addProject = async () => {
     if (!newProjectPath.trim()) return;
@@ -560,7 +609,7 @@ const App: React.FC = () => {
     }
   };
 
-  const fetchAgentTree = async () => {
+  const fetchAgentTree = useCallback(async () => {
     if (!selectedProjectRoot) return;
     try {
       const resp = await fetch(`/api/workspace/tree?project_root=${encodeURIComponent(selectedProjectRoot)}`);
@@ -569,9 +618,9 @@ const App: React.FC = () => {
     } catch (e) {
       addLog(`Error fetching agent tree: ${e}`);
     }
-  };
+  }, [selectedProjectRoot, addLog]);
 
-  const fetchFiles = async (path = '') => {
+  const fetchFiles = useCallback(async (path = '') => {
     if (!selectedProjectRoot) return;
     try {
       const resp = await fetch(`/api/files?project_root=${encodeURIComponent(selectedProjectRoot)}&path=${encodeURIComponent(path)}`);
@@ -581,7 +630,7 @@ const App: React.FC = () => {
     } catch (e) {
       addLog(`Error fetching files: ${e}`);
     }
-  };
+  }, [selectedProjectRoot, addLog]);
 
   const readFile = async (path: string) => {
     if (!selectedProjectRoot) return;
@@ -600,7 +649,7 @@ const App: React.FC = () => {
     setSelectedFileContent(null);
   };
 
-  const fetchLeadState = async () => {
+  const fetchLeadState = useCallback(async () => {
     if (!selectedProjectRoot) return;
     try {
       const url = new URL('/api/lead/state', window.location.origin);
@@ -640,9 +689,9 @@ const App: React.FC = () => {
     } catch (e) {
       addLog(`Error fetching Lead state: ${e}`);
     }
-  };
+  }, [selectedProjectRoot, activeSessionId, shouldHideInternalChatMessage, mergeChatMessages, addLog]);
 
-  const fetchSessions = async () => {
+  const fetchSessions = useCallback(async () => {
     if (!selectedProjectRoot) return;
     try {
       const resp = await fetch(`/api/sessions?project_root=${encodeURIComponent(selectedProjectRoot)}`);
@@ -651,7 +700,7 @@ const App: React.FC = () => {
     } catch (e) {
       console.error('Failed to fetch sessions:', e);
     }
-  };
+  }, [selectedProjectRoot]);
 
   const createSession = async () => {
     if (!selectedProjectRoot) return;
@@ -687,7 +736,7 @@ const App: React.FC = () => {
     }
   };
 
-  const fetchSkills = async () => {
+  const fetchSkills = useCallback(async () => {
     try {
       const resp = await fetch('/api/skills');
       const data = await resp.json();
@@ -695,9 +744,9 @@ const App: React.FC = () => {
     } catch (e) {
       console.error('Failed to fetch skills:', e);
     }
-  };
+  }, []);
 
-  const fetchAgents = async () => {
+  const fetchAgents = useCallback(async () => {
     try {
       const resp = await fetch('/api/agents');
       const data = await resp.json();
@@ -705,9 +754,9 @@ const App: React.FC = () => {
     } catch (e) {
       console.error('Failed to fetch agents:', e);
     }
-  };
+  }, []);
 
-  const fetchModels = async () => {
+  const fetchModels = useCallback(async () => {
     try {
       const resp = await fetch('/api/models');
       const data = await resp.json();
@@ -715,9 +764,9 @@ const App: React.FC = () => {
     } catch (e) {
       console.error('Failed to fetch models:', e);
     }
-  };
+  }, []);
 
-  const fetchOllamaStatus = async () => {
+  const fetchOllamaStatus = useCallback(async () => {
     try {
       const resp = await fetch('/api/utils/ollama-status');
       if (resp.ok) {
@@ -727,9 +776,9 @@ const App: React.FC = () => {
     } catch (e) {
       console.error('Failed to fetch Ollama status:', e);
     }
-  };
+  }, []);
 
-  const fetchSettings = async () => {
+  const fetchSettings = useCallback(async () => {
     if (!selectedProjectRoot) return;
     try {
       const resp = await fetch(`/api/settings?project_root=${encodeURIComponent(selectedProjectRoot)}`);
@@ -739,9 +788,9 @@ const App: React.FC = () => {
     } catch (e) {
       console.error('Failed to fetch settings:', e);
     }
-  };
+  }, [selectedProjectRoot]);
 
-  const fetchAgentRuns = async () => {
+  const fetchAgentRuns = useCallback(async () => {
     if (!selectedProjectRoot) return;
     try {
       const url = new URL('/api/agent-runs', window.location.origin);
@@ -754,7 +803,7 @@ const App: React.FC = () => {
     } catch (e) {
       addLog(`Error fetching agent runs: ${e}`);
     }
-  };
+  }, [selectedProjectRoot, activeSessionId, addLog]);
 
   const cancelAgentRun = async (runId: string) => {
     if (!runId) return;
@@ -802,7 +851,7 @@ const App: React.FC = () => {
     const interval = setInterval(fetchOllamaStatus, 5000);
     fetchOllamaStatus();
     return () => clearInterval(interval);
-  }, []);
+  }, [fetchProjects, fetchSkills, fetchAgents, fetchModels, fetchOllamaStatus]);
 
   useEffect(() => {
     if (selectedProjectRoot) {
@@ -816,7 +865,7 @@ const App: React.FC = () => {
       setAgentStatusText({});
       setQueuedMessages([]);
     }
-  }, [selectedProjectRoot]);
+  }, [selectedProjectRoot, fetchFiles, fetchLeadState, fetchAgentTree, fetchAgentRuns, fetchSessions, fetchSettings]);
 
   useEffect(() => {
     if (selectedProjectRoot) {
@@ -824,7 +873,7 @@ const App: React.FC = () => {
       fetchAgentRuns();
       setQueuedMessages([]);
     }
-  }, [activeSessionId]);
+  }, [activeSessionId, selectedProjectRoot, fetchLeadState, fetchAgentRuns]);
 
   useEffect(() => {
     if (!selectedProjectRoot) return;
@@ -833,7 +882,7 @@ const App: React.FC = () => {
       fetchAgentRuns();
     }, 2000);
     return () => window.clearInterval(interval);
-  }, [selectedProjectRoot, activeSessionId]);
+  }, [selectedProjectRoot, activeSessionId, fetchLeadState, fetchAgentRuns]);
 
   useEffect(() => {
     window.localStorage.setItem(SELECTED_AGENT_STORAGE_KEY, selectedAgent);
@@ -1040,7 +1089,7 @@ const App: React.FC = () => {
     };
 
     return () => events.close();
-  }, [currentPath, selectedProjectRoot, activeSessionId]);
+  }, [currentPath, selectedProjectRoot, activeSessionId, fetchLeadState, fetchFiles, fetchAgentTree, fetchAgentRuns, shouldHideInternalChatMessage]);
 
   const sendChatMessage = async (userMessage: string, targetAgent?: string) => {
     if (!userMessage.trim() || !selectedProjectRoot) return;
@@ -1224,6 +1273,8 @@ const App: React.FC = () => {
               subagentRunIds={subagentRunIds}
               runningMainRunIds={runningMainRunIds}
               runningSubagentRunIds={runningSubagentRunIds}
+              mainRunHistory={mainRunHistory}
+              subagentRunHistory={subagentRunHistory}
               cancellingRunIds={cancellingRunIds}
               onCancelRun={cancelAgentRun}
               onSendMessage={sendChatMessage}
@@ -1241,6 +1292,7 @@ const App: React.FC = () => {
             agentStatus={agentStatus}
             agentStatusText={agentStatusText}
             agentWork={agentWork}
+            agentRunSummary={agentRunSummary}
           />
           <ModelsCard models={models} ollamaStatus={ollamaStatus} chatMessages={chatMessages} />
         </aside>

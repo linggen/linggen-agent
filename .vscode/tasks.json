@@ -1,0 +1,35 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "cargo build agent",
+      "type": "shell",
+      "command": "cargo build",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "npm: dev - agent ui",
+      "type": "shell",
+      "command": "npm run dev -- --host 127.0.0.1 --port 5173",
+      "options": {
+        "cwd": "${workspaceFolder}/ui"
+      },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "custom",
+        "pattern": {
+          "regexp": "^$"
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".",
+          "endsPattern": "Local:.*5173"
+        }
+      }
+    }
+  ]
+}

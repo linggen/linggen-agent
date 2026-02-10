@@ -41,14 +41,6 @@ impl ModelManager {
         instance.client.chat_json(&instance.config.model, messages).await
     }
 
-    pub async fn chat_text(&self, model_id: &str, messages: &[ChatMessage]) -> Result<String> {
-        let instance = self.models.get(model_id)
-            .ok_or_else(|| anyhow::anyhow!("Model {} not found", model_id))?;
-        
-        let _permit = instance.semaphore.acquire().await?;
-        instance.client.chat_text(&instance.config.model, messages).await
-    }
-
     pub async fn chat_text_stream(
         &self,
         model_id: &str,
