@@ -1,12 +1,13 @@
 use crate::server::{ServerEvent, ServerState};
 use crate::state_fs::StateFile;
+use crate::config::AgentKind;
 use axum::{
     extract::State,
     http::StatusCode,
     response::IntoResponse,
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,6 +23,22 @@ pub(crate) async fn set_task(
     Json(req): Json<TaskRequest>,
 ) -> impl IntoResponse {
     let root = PathBuf::from(&req.project_root);
+    let kind = state
+        .manager
+        .resolve_agent_kind(&req.agent_id)
+        .await
+        .unwrap_or(AgentKind::Main);
+
+    if kind == AgentKind::Subagent {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "subagent tasks must be created via delegate_to_agent from a main agent"
+            })),
+        )
+            .into_response();
+    }
+
     match state
         .manager
         .get_or_create_agent(&root, &req.agent_id)
@@ -50,9 +67,9 @@ pub(crate) async fn set_task(
                 }
             }
 
-            StatusCode::OK
+            StatusCode::OK.into_response()
         }
-        Err(_) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -61,6 +78,16 @@ pub(crate) struct RunRequest {
     project_root: String,
     agent_id: String,
     session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct CancelRunRequest {
+    run_id: String,
+}
+
+#[derive(Serialize)]
+struct CancelRunResponse {
+    cancelled_run_ids: Vec<String>,
 }
 
 pub(crate) async fn run_agent(
@@ -73,6 +100,22 @@ pub(crate) async fn run_agent(
     let events_tx = state.events_tx.clone();
     let manager = state.manager.clone();
 
+    let kind = state
+        .manager
+        .resolve_agent_kind(&req.agent_id)
+        .await
+        .unwrap_or(AgentKind::Main);
+
+    if kind == AgentKind::Subagent {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "subagents cannot be run directly; delegate from a main agent"
+            })),
+        )
+            .into_response();
+    }
+
     match state
         .manager
         .get_or_create_agent(&root, &req.agent_id)
@@ -80,21 +123,52 @@ pub(crate) async fn run_agent(
     {
         Ok(agent) => {
             tokio::spawn(async move {
+                let run_id = match manager
+                    .begin_agent_run(
+                        &root,
+                        session_id.as_deref(),
+                        &agent_id,
+                        None,
+                        Some("api/run".to_string()),
+                    )
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(_) => format!("run-{}-fallback", agent_id),
+                };
                 let _ = events_tx.send(ServerEvent::AgentStatus {
                     agent_id: agent_id.clone(),
                     status: "working".to_string(),
                     detail: Some("Running".to_string()),
                 });
                 let mut engine = agent.lock().await;
-                let outcome = engine
-                    .run_agent_loop(session_id.as_deref())
-                    .await
-                    .unwrap_or(crate::engine::AgentOutcome::None);
+                engine.set_parent_agent(None);
+                engine.set_run_id(Some(run_id.clone()));
+                let run_result = engine.run_agent_loop(session_id.as_deref()).await;
+                engine.set_run_id(None);
+                let outcome = match run_result {
+                    Ok(outcome) => {
+                        let _ = manager.finish_agent_run(&run_id, "completed", None).await;
+                        outcome
+                    }
+                    Err(err) => {
+                        let msg = err.to_string();
+                        let status = if msg.to_lowercase().contains("cancel") {
+                            "cancelled"
+                        } else {
+                            "failed"
+                        };
+                        let _ = manager
+                            .finish_agent_run(&run_id, status, Some(msg))
+                            .await;
+                        crate::engine::AgentOutcome::None
+                    }
+                };
 
                 // If Lead finalized a task, save it
                 if agent_id == "lead" {
                     if let crate::engine::AgentOutcome::Task(packet) = &outcome {
-                        if let Ok(ctx) = manager.get_or_create_project(root).await {
+                        if let Ok(ctx) = manager.get_or_create_project(root.clone()).await {
                             let task_id = format!(
                                 "task-{}",
                                 std::time::SystemTime::now()
@@ -138,5 +212,28 @@ pub(crate) async fn run_agent(
             Json(serde_json::json!({ "status": "started" })).into_response()
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+pub(crate) async fn cancel_agent_run(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<CancelRunRequest>,
+) -> impl IntoResponse {
+    match state.manager.cancel_run_tree(&req.run_id).await {
+        Ok(runs) => {
+            for run in &runs {
+                let _ = state.events_tx.send(ServerEvent::AgentStatus {
+                    agent_id: run.agent_id.clone(),
+                    status: "idle".to_string(),
+                    detail: Some("Cancelled".to_string()),
+                });
+            }
+            let _ = state.events_tx.send(ServerEvent::StateUpdated);
+            Json(CancelRunResponse {
+                cancelled_run_ids: runs.into_iter().map(|r| r.run_id).collect(),
+            })
+            .into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

@@ -6,6 +6,8 @@ export interface ChatMessage {
   timestamp: string;
   timestampMs?: number;
   isGenerating?: boolean;
+  activitySummary?: string;
+  activityEntries?: string[];
 }
 
 export interface QueuedChatItem {
@@ -40,7 +42,26 @@ export interface AgentTreeItem {
   agent?: string;
   status?: string;
   path?: string;
+  last_modified?: number;
   children?: Record<string, AgentTreeItem>;
+}
+
+export interface AgentWorkInfo {
+  path: string;
+  file: string;
+  folder: string;
+  status: string;
+  activeCount: number;
+}
+
+export interface SubagentInfo {
+  id: string;
+  status: string;
+  path: string;
+  file: string;
+  folder: string;
+  activeCount: number;
+  paths: string[];
 }
 
 export interface SkillInfo {
@@ -52,6 +73,7 @@ export interface SkillInfo {
 export interface AgentInfo {
   name: string;
   description: string;
+  kind?: 'main' | 'subagent';
 }
 
 export interface ModelInfo {
@@ -81,4 +103,43 @@ export interface SessionInfo {
   repo_path: string;
   title: string;
   created_at: number;
+}
+
+export interface AgentRunInfo {
+  run_id: string;
+  repo_path: string;
+  session_id: string;
+  agent_id: string;
+  agent_kind: 'main' | 'subagent' | string;
+  parent_run_id?: string | null;
+  status: 'running' | 'completed' | 'failed' | 'cancelled' | string;
+  detail?: string | null;
+  started_at: number;
+  ended_at?: number | null;
+}
+
+export interface AgentRunContextSummary {
+  message_count: number;
+  user_messages: number;
+  agent_messages: number;
+  system_messages: number;
+  started_at: number;
+  ended_at?: number | null;
+}
+
+export interface AgentRunContextMessage {
+  repo_path: string;
+  session_id: string;
+  agent_id: string;
+  from_id: string;
+  to_id: string;
+  content: string;
+  timestamp: number;
+  is_observation: boolean;
+}
+
+export interface AgentRunContextResponse {
+  run: AgentRunInfo;
+  summary: AgentRunContextSummary;
+  messages?: AgentRunContextMessage[] | null;
 }

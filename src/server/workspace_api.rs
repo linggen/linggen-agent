@@ -149,6 +149,7 @@ pub(crate) async fn get_agent_tree(
                                 "agent": act.agent_id,
                                 "status": act.status,
                                 "path": act.file_path,
+                                "last_modified": act.last_modified,
                             }),
                         );
                     } else {

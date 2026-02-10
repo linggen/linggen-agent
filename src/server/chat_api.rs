@@ -1,4 +1,5 @@
 use crate::engine::PromptMode;
+use crate::config::AgentKind;
 use crate::server::chat_helpers::{
     emit_outcome_event, emit_queue_updated, extract_tool_path_arg, queue_key, queue_preview,
     sanitize_tool_args_for_display,
@@ -60,6 +61,51 @@ fn mode_label(mode: PromptMode) -> &'static str {
     } else {
         "auto"
     }
+}
+
+async fn run_loop_with_tracking(
+    manager: &Arc<crate::agent_manager::AgentManager>,
+    root: &PathBuf,
+    engine: &mut crate::engine::AgentEngine,
+    agent_id: &str,
+    session_id: Option<&str>,
+    detail: &str,
+) -> Result<crate::engine::AgentOutcome, anyhow::Error> {
+    let run_id = manager
+        .begin_agent_run(
+            root,
+            session_id,
+            agent_id,
+            None,
+            Some(detail.to_string()),
+        )
+        .await
+        .ok();
+
+    engine.set_run_id(run_id.clone());
+    let result = engine.run_agent_loop(session_id).await;
+    engine.set_run_id(None);
+
+    if let Some(run_id) = run_id {
+        match &result {
+            Ok(_) => {
+                let _ = manager.finish_agent_run(&run_id, "completed", None).await;
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                let status = if msg.to_lowercase().contains("cancel") {
+                    "cancelled"
+                } else {
+                    "failed"
+                };
+                let _ = manager
+                    .finish_agent_run(&run_id, status, Some(msg))
+                    .await;
+            }
+        }
+    }
+
+    result
 }
 
 pub(crate) async fn get_settings_api(
@@ -147,6 +193,21 @@ pub(crate) async fn chat_handler(
     let target_id = target_id.to_string();
     let clean_msg = clean_msg.to_string();
     let trimmed_msg = clean_msg.trim();
+
+    let kind = state
+        .manager
+        .resolve_agent_kind(&target_id)
+        .await
+        .unwrap_or(AgentKind::Main);
+    if kind == AgentKind::Subagent {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "subagents cannot be chatted with directly; send requests to a main agent"
+            })),
+        )
+            .into_response();
+    }
 
     match state.manager.get_or_create_agent(&root, &target_id).await {
         Ok(agent) => {
@@ -334,8 +395,8 @@ pub(crate) async fn chat_handler(
 
                 let _ = events_tx_clone.send(ServerEvent::AgentStatus {
                     agent_id: target_id_clone.clone(),
-                    status: "thinking".to_string(),
-                    detail: Some("Thinking".to_string()),
+                    status: "model_loading".to_string(),
+                    detail: Some("Model loading".to_string()),
                 });
                 if let Ok(settings) = manager.get_project_settings(&root_clone).await {
                     engine.set_prompt_mode(prompt_mode_from_string(&settings.mode));
@@ -392,7 +453,15 @@ pub(crate) async fn chat_handler(
                         });
                     }
 
-                    let outcome = engine.run_agent_loop(session_id.as_deref()).await;
+                    let outcome = run_loop_with_tracking(
+                        &manager,
+                        &root_clone,
+                        &mut engine,
+                        &target_id_clone,
+                        session_id.as_deref(),
+                        "chat:skill",
+                    )
+                    .await;
                     if let Err(e) = outcome {
                         tracing::warn!("Skill loop failed: {}", e);
                         let _ = events_tx_clone.send(ServerEvent::Message {
@@ -445,6 +514,11 @@ pub(crate) async fn chat_handler(
                     .await
                 {
                     Ok(mut stream) => {
+                        let _ = events_tx_clone.send(ServerEvent::AgentStatus {
+                            agent_id: target_id_clone.clone(),
+                            status: "thinking".to_string(),
+                            detail: Some("Thinking".to_string()),
+                        });
                         while let Some(token_result) = stream.next().await {
                             if let Ok(token) = token_result {
                                 full_response.push_str(&token);
@@ -626,7 +700,15 @@ pub(crate) async fn chat_handler(
                                             // continue through tool loop after first tool, not plain-text-only followup.
                                             let task_for_loop = clean_msg_clone.clone();
                                             engine.task = Some(task_for_loop);
-                                            let outcome = engine.run_agent_loop(session_id.as_deref()).await;
+                                            let outcome = run_loop_with_tracking(
+                                                &manager,
+                                                &root_clone,
+                                                &mut engine,
+                                                &target_id_clone,
+                                                session_id.as_deref(),
+                                                "chat:auto-followup",
+                                            )
+                                            .await;
                                             if let Ok(outcome) = &outcome {
                                                 emit_outcome_event(outcome, &events_tx_clone, &target_id_clone);
                                             } else if let Err(err) = outcome {
@@ -702,7 +784,15 @@ pub(crate) async fn chat_handler(
                                         };
                                         engine.task = Some(task_for_loop);
                                         // Ask the model again with the error + schema.
-                                        let outcome = engine.run_agent_loop(session_id.as_deref()).await;
+                                        let outcome = run_loop_with_tracking(
+                                            &manager,
+                                            &root_clone,
+                                            &mut engine,
+                                            &target_id_clone,
+                                            session_id.as_deref(),
+                                            "chat:error-retry",
+                                        )
+                                        .await;
                                         if let Ok(outcome) = &outcome {
                                             emit_outcome_event(outcome, &events_tx_clone, &target_id_clone);
                                         } else {

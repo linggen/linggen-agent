@@ -1,4 +1,5 @@
 use crate::agent_manager::AgentManager;
+use crate::config::AgentKind;
 use anyhow::Result;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use grep::regex::RegexMatcher;
@@ -60,6 +61,8 @@ pub struct Tools {
     root: PathBuf,
     manager: Option<Arc<AgentManager>>,
     agent_id: Option<String>,
+    agent_kind: AgentKind,
+    run_id: Option<String>,
 }
 
 impl Tools {
@@ -68,12 +71,19 @@ impl Tools {
             root,
             manager: None,
             agent_id: None,
+            agent_kind: AgentKind::Main,
+            run_id: None,
         })
     }
 
-    pub fn set_context(&mut self, manager: Arc<AgentManager>, agent_id: String) {
+    pub fn set_context(&mut self, manager: Arc<AgentManager>, agent_id: String, agent_kind: AgentKind) {
         self.manager = Some(manager);
         self.agent_id = Some(agent_id);
+        self.agent_kind = agent_kind;
+    }
+
+    pub fn set_run_id(&mut self, run_id: Option<String>) {
+        self.run_id = run_id;
     }
 
     pub fn get_manager(&self) -> Option<Arc<AgentManager>> {
@@ -470,13 +480,98 @@ impl Tools {
             .manager
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Delegation requires AgentManager context"))?;
+        let caller_id = self
+            .agent_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Delegation requires caller agent id"))?;
+        let target_agent_id = args.target_agent_id;
+        let task = args.task;
+
+        if self.agent_kind == AgentKind::Subagent {
+            anyhow::bail!(
+                "Delegation denied: subagent '{}' cannot spawn subagents (max delegation depth is 1)",
+                caller_id
+            );
+        }
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let agent = manager.get_or_create_agent(&self.root, &args.target_agent_id).await?;
+                let target_kind = manager
+                    .resolve_agent_kind(&target_agent_id)
+                    .await
+                    .unwrap_or(AgentKind::Main);
+                let parent_run_id = if target_kind == AgentKind::Subagent {
+                    self.run_id.clone()
+                } else {
+                    None
+                };
+                let run_id = manager
+                    .begin_agent_run(
+                        &self.root,
+                        None,
+                        &target_agent_id,
+                        parent_run_id,
+                        Some(format!("delegated by {}", caller_id)),
+                    )
+                    .await?;
+
+                manager
+                    .send_event(crate::agent_manager::AgentEvent::Message {
+                        from: caller_id.clone(),
+                        to: target_agent_id.clone(),
+                        content: format!("Delegated task: {}", task),
+                    })
+                    .await;
+
+                if target_kind == AgentKind::Subagent {
+                    manager
+                        .send_event(crate::agent_manager::AgentEvent::SubagentSpawned {
+                            parent_id: caller_id.clone(),
+                            subagent_id: target_agent_id.clone(),
+                            task: task.clone(),
+                        })
+                        .await;
+                }
+
+                let agent = manager.get_or_create_agent(&self.root, &target_agent_id).await?;
                 let mut engine = agent.lock().await;
-                engine.set_task(args.task);
-                let outcome = engine.run_agent_loop(None).await?;
+                if target_kind == AgentKind::Subagent {
+                    engine.set_parent_agent(Some(caller_id.clone()));
+                } else {
+                    engine.set_parent_agent(None);
+                }
+                engine.set_run_id(Some(run_id.clone()));
+                engine.set_task(task);
+                let run_result = engine.run_agent_loop(None).await;
+                engine.set_run_id(None);
+                engine.set_parent_agent(None);
+
+                let (outcome, status, detail) = match run_result {
+                    Ok(outcome) => (outcome, "completed", None),
+                    Err(err) => {
+                        let msg = err.to_string();
+                        let status = if msg.to_lowercase().contains("cancel") {
+                            "cancelled"
+                        } else {
+                            "failed"
+                        };
+                        let _ = manager
+                            .finish_agent_run(&run_id, status, Some(msg))
+                            .await;
+                        return Err(err);
+                    }
+                };
+                let _ = manager.finish_agent_run(&run_id, status, detail).await;
+
+                if target_kind == AgentKind::Subagent {
+                    manager
+                        .send_event(crate::agent_manager::AgentEvent::SubagentResult {
+                            parent_id: caller_id,
+                            subagent_id: target_agent_id,
+                            outcome: outcome.clone(),
+                        })
+                        .await;
+                }
                 Ok(ToolResult::AgentOutcome(outcome))
             })
         })
@@ -727,6 +822,12 @@ pub fn tool_schema_json() -> String {
                 "name": "capture_screenshot",
                 "args": {"url": "string", "delay_ms": "number?"},
                 "returns": "{url,base64}"
+            },
+            {
+                "name": "delegate_to_agent",
+                "args": {"target_agent_id": "string", "task": "string"},
+                "returns": "{agent_outcome}",
+                "notes": "Only main agents can delegate. Subagents cannot spawn subagents."
             }
         ]
     });
