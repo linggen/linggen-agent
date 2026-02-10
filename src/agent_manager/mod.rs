@@ -1,7 +1,7 @@
 use crate::agent_manager::locks::LockManager;
 use crate::agent_manager::models::ModelManager;
-use crate::config::{AgentSpec, Config};
-use crate::db::{Db, ProjectSettings};
+use crate::config::{AgentKind, AgentSpec, Config};
+use crate::db::{AgentRunRecord, Db, ProjectSettings};
 use crate::engine::{AgentEngine, AgentOutcome, AgentRole, EngineConfig, PromptMode};
 use crate::skills::SkillManager;
 use crate::state_fs::{StateFile, StateFs};
@@ -10,7 +10,7 @@ use globset::Glob;
 use ignore::gitignore::GitignoreBuilder;
 use notify::{EventKind, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -33,6 +33,7 @@ pub struct AgentManager {
     pub models: Arc<ModelManager>,
     pub db: Arc<Db>,
     pub skill_manager: Arc<SkillManager>,
+    cancelled_runs: Mutex<HashSet<String>>,
     events: mpsc::UnboundedSender<AgentEvent>,
 }
 
@@ -51,10 +52,32 @@ pub enum AgentEvent {
         to: String,
         content: String,
     },
+    SubagentSpawned {
+        parent_id: String,
+        subagent_id: String,
+        task: String,
+    },
+    SubagentResult {
+        parent_id: String,
+        subagent_id: String,
+        outcome: AgentOutcome,
+    },
     StateUpdated,
 }
 
 impl AgentManager {
+    fn make_run_id(agent_id: &str) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!(
+            "run-{}-{}-{}",
+            agent_id,
+            now.as_secs(),
+            now.subsec_nanos()
+        )
+    }
+
     pub fn new(
         config: Config,
         db: Arc<Db>,
@@ -70,6 +93,7 @@ impl AgentManager {
                 models,
                 db,
                 skill_manager,
+                cancelled_runs: Mutex::new(HashSet::new()),
                 events: tx,
             }),
             rx,
@@ -324,6 +348,140 @@ impl AgentManager {
             }
         }
         Ok(result)
+    }
+
+    pub async fn resolve_agent_kind(&self, agent_id: &str) -> Option<AgentKind> {
+        let agent_ref = self.config.agents.iter().find(|a| a.id == agent_id)?;
+        let spec_path = PathBuf::from(&agent_ref.spec_path);
+        let Ok((spec, _)) = AgentSpec::from_markdown(&spec_path) else {
+            return None;
+        };
+        Some(spec.kind)
+    }
+
+    pub async fn begin_agent_run(
+        &self,
+        project_root: &PathBuf,
+        session_id: Option<&str>,
+        agent_id: &str,
+        parent_run_id: Option<String>,
+        detail: Option<String>,
+    ) -> Result<String> {
+        let project_root = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.clone());
+        let kind = self
+            .resolve_agent_kind(agent_id)
+            .await
+            .unwrap_or(AgentKind::Main);
+        let run_id = Self::make_run_id(agent_id);
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+
+        let record = AgentRunRecord {
+            run_id: run_id.clone(),
+            repo_path: project_root.to_string_lossy().to_string(),
+            session_id: session_id.unwrap_or("default").to_string(),
+            agent_id: agent_id.to_string(),
+            agent_kind: match kind {
+                AgentKind::Main => "main".to_string(),
+                AgentKind::Subagent => "subagent".to_string(),
+            },
+            parent_run_id,
+            status: "running".to_string(),
+            detail,
+            started_at,
+            ended_at: None,
+        };
+        self.db.add_agent_run(record)?;
+        self.cancelled_runs.lock().await.remove(&run_id);
+        Ok(run_id)
+    }
+
+    pub async fn finish_agent_run(
+        &self,
+        run_id: &str,
+        status: &str,
+        detail: Option<String>,
+    ) -> Result<()> {
+        let ended_at = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+        );
+        self.db.update_agent_run(run_id, status, detail, ended_at)?;
+        self.cancelled_runs.lock().await.remove(run_id);
+        Ok(())
+    }
+
+    pub async fn list_agent_runs(
+        &self,
+        project_root: &PathBuf,
+        session_id: Option<&str>,
+    ) -> Result<Vec<AgentRunRecord>> {
+        let project_root = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.clone());
+        self.db
+            .list_agent_runs(&project_root.to_string_lossy(), session_id)
+            .map_err(Into::into)
+    }
+
+    pub async fn list_agent_children(&self, parent_run_id: &str) -> Result<Vec<AgentRunRecord>> {
+        self.db.list_agent_children(parent_run_id).map_err(Into::into)
+    }
+
+    pub async fn get_agent_run(&self, run_id: &str) -> Result<Option<AgentRunRecord>> {
+        self.db.get_agent_run(run_id).map_err(Into::into)
+    }
+
+    pub async fn is_run_cancelled(&self, run_id: &str) -> bool {
+        self.cancelled_runs.lock().await.contains(run_id)
+    }
+
+    pub async fn cancel_run_tree(&self, run_id: &str) -> Result<Vec<AgentRunRecord>> {
+        let mut stack = vec![run_id.to_string()];
+        let mut seen = HashSet::new();
+        let mut runs = Vec::new();
+
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Some(run) = self.db.get_agent_run(&id)? else {
+                continue;
+            };
+            for child in self.db.list_agent_children(&id)? {
+                stack.push(child.run_id.clone());
+            }
+            runs.push(run);
+        }
+
+        let to_cancel: Vec<AgentRunRecord> = runs
+            .into_iter()
+            .filter(|run| run.status == "running")
+            .collect();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        {
+            let mut cancelled = self.cancelled_runs.lock().await;
+            for run in &to_cancel {
+                cancelled.insert(run.run_id.clone());
+            }
+        }
+        for run in &to_cancel {
+            let _ = self.db.update_agent_run(
+                &run.run_id,
+                "cancelled",
+                Some("cancelled by user".to_string()),
+                Some(now),
+            );
+        }
+
+        Ok(to_cancel)
     }
 
     pub fn get_config(&self) -> &Config {

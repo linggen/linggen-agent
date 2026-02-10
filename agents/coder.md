@@ -3,6 +3,7 @@ name: coder
 description: Coder agent. Implements tasks and produces code changes.
 tools: [Read, Write, Bash, Grep, Glob]
 model: inherit
+kind: main
 work_globs: ["**/*"]
 ---
 

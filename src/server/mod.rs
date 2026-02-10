@@ -28,11 +28,13 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tracing::info;
 
-use agent_api::{run_agent, set_task};
+use agent_api::{cancel_agent_run, run_agent, set_task};
 use chat_api::{chat_handler, clear_chat_history_api, get_settings_api, update_settings_api};
 use projects_api::{
-    add_project, create_session, list_agents_api, list_models_api, list_projects, list_sessions,
-    list_skills, remove_project, remove_session_api,
+    add_project, create_session, get_agent_context_api, list_agent_children_api,
+    list_agent_runs_api, list_agents_api, list_models_api, list_projects, list_sessions,
+    list_skills, remove_project,
+    remove_session_api,
 };
 use workspace_api::{get_agent_tree, get_lead_state, list_files, read_file_api};
 
@@ -67,6 +69,16 @@ pub enum ServerEvent {
         from: String,
         to: String,
         content: String,
+    },
+    SubagentSpawned {
+        parent_id: String,
+        subagent_id: String,
+        task: String,
+    },
+    SubagentResult {
+        parent_id: String,
+        subagent_id: String,
+        outcome: crate::engine::AgentOutcome,
     },
     AgentStatus {
         agent_id: String,
@@ -115,6 +127,24 @@ pub async fn start_server(
                     crate::agent_manager::AgentEvent::Message { from, to, content } => {
                         Some(ServerEvent::Message { from, to, content })
                     }
+                    crate::agent_manager::AgentEvent::SubagentSpawned {
+                        parent_id,
+                        subagent_id,
+                        task,
+                    } => Some(ServerEvent::SubagentSpawned {
+                        parent_id,
+                        subagent_id,
+                        task,
+                    }),
+                    crate::agent_manager::AgentEvent::SubagentResult {
+                        parent_id,
+                        subagent_id,
+                        outcome,
+                    } => Some(ServerEvent::SubagentResult {
+                        parent_id,
+                        subagent_id,
+                        outcome,
+                    }),
                     crate::agent_manager::AgentEvent::Outcome { agent_id, outcome } => {
                         Some(ServerEvent::Outcome { agent_id, outcome })
                     }
@@ -146,6 +176,9 @@ pub async fn start_server(
         .route("/api/projects", post(add_project))
         .route("/api/projects", delete(remove_project))
         .route("/api/agents", get(list_agents_api))
+        .route("/api/agent-runs", get(list_agent_runs_api))
+        .route("/api/agent-children", get(list_agent_children_api))
+        .route("/api/agent-context", get(get_agent_context_api))
         .route("/api/models", get(list_models_api))
         .route("/api/skills", get(list_skills))
         .route("/api/sessions", get(list_sessions))
@@ -155,6 +188,7 @@ pub async fn start_server(
         .route("/api/settings", post(update_settings_api))
         .route("/api/task", post(set_task))
         .route("/api/run", post(run_agent))
+        .route("/api/agent-cancel", post(cancel_agent_run))
         .route("/api/chat", post(chat_handler))
         .route("/api/chat/clear", post(clear_chat_history_api))
         .route("/api/workspace/tree", get(get_agent_tree))

@@ -32,3 +32,13 @@ model = "local_ollama"
 id = "coder"
 spec_path = "agents/coder.md"
 model = "local_ollama"
+
+[[agents]]
+id = "search"
+spec_path = "agents/search.md"
+model = "local_ollama"
+
+[[agents]]
+id = "plan"
+spec_path = "agents/plan.md"
+model = "local_ollama"

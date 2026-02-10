@@ -1,71 +1,116 @@
-import React, { useState } from 'react';
-import { FileText, Folder, ChevronRight, ChevronDown } from 'lucide-react';
-import { cn } from '../lib/cn';
+import React from 'react';
+import { Activity, FileText, FolderOpen } from 'lucide-react';
 import type { AgentTreeItem } from '../types';
 
-const TreeNode: React.FC<{ name: string; item: AgentTreeItem; depth?: number; onSelect: (path: string) => void }> = ({ name, item, depth = 0, onSelect }) => {
-  const [isOpen, setIsOpen] = useState(true);
+type ActivityEntry = {
+  path: string;
+  agent: string;
+  status: string;
+  lastModified: number;
+};
 
-  if (item.type === 'file') {
-    return (
-      <button
-        onClick={() => onSelect(item.path || name)}
-        className="w-full flex items-center justify-between px-2 py-1 rounded text-xs hover:bg-slate-100 dark:hover:bg-white/5 transition-colors"
-        style={{ paddingLeft: `${depth * 12 + 8}px` }}
-      >
-        <div className="flex items-center gap-2 truncate">
-          <FileText size={12} className="text-slate-400 shrink-0" />
-          <span className="truncate">{name}</span>
-        </div>
-        {item.agent && (
-          <span
-            className={cn(
-              "text-[8px] font-bold px-1.5 py-0.5 rounded-full uppercase tracking-tighter shrink-0 ml-2",
-              item.status === 'working' ? 'bg-blue-500/20 text-blue-500' : 'bg-slate-500/20 text-slate-500'
-            )}
-          >
-            {item.agent} {item.status === 'working' ? '...' : ''}
-          </span>
-        )}
-      </button>
-    );
-  }
+const splitPath = (path: string) => {
+  const idx = path.lastIndexOf('/');
+  if (idx < 0) return { folder: '.', file: path };
+  return { folder: path.slice(0, idx) || '.', file: path.slice(idx + 1) };
+};
 
-  return (
-    <div>
-      <button
-        onClick={() => setIsOpen(!isOpen)}
-        className="w-full flex items-center gap-2 px-2 py-1 rounded text-xs hover:bg-slate-100 dark:hover:bg-white/5 transition-colors text-slate-500"
-        style={{ paddingLeft: `${depth * 12 + 8}px` }}
-      >
-        {isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-        <Folder size={12} className="text-blue-400 shrink-0" />
-        <span className="truncate font-bold">{name}</span>
-      </button>
-      {isOpen && item.children && (
-        <div className="flex flex-col">
-          {Object.entries(item.children).map(([childName, childItem]) => (
-            <TreeNode key={childName} name={childName} item={childItem} depth={depth + 1} onSelect={onSelect} />
-          ))}
-        </div>
-      )}
-    </div>
-  );
+const collectEntries = (
+  nodeMap: Record<string, AgentTreeItem> | undefined,
+  out: ActivityEntry[]
+) => {
+  if (!nodeMap) return;
+  Object.values(nodeMap).forEach((item) => {
+    if (item.type === 'file') {
+      if (!item.path || !item.agent) return;
+      out.push({
+        path: item.path,
+        agent: item.agent,
+        status: item.status || 'idle',
+        lastModified: Number(item.last_modified || 0),
+      });
+      return;
+    }
+    collectEntries(item.children, out);
+  });
 };
 
 export const AgentTree: React.FC<{ agentTree: Record<string, AgentTreeItem>; onSelect: (path: string) => void }> = ({
   agentTree,
   onSelect,
 }) => {
+  const entries: ActivityEntry[] = [];
+  collectEntries(agentTree, entries);
+
+  const working = entries
+    .filter((entry) => entry.status === 'working')
+    .sort((a, b) => b.lastModified - a.lastModified);
+  const visible = working;
+  const groups = visible.reduce<Record<string, ActivityEntry[]>>((acc, entry) => {
+    if (!acc[entry.agent]) acc[entry.agent] = [];
+    acc[entry.agent].push(entry);
+    return acc;
+  }, {});
+
+  const repoName = Object.keys(agentTree)[0] || 'repo';
+
   return (
     <div className="flex-1 overflow-y-auto p-2">
-      {Object.entries(agentTree).length === 0 && (
+      <div className="px-2 py-1.5 text-[10px] uppercase tracking-wider text-slate-500 dark:text-slate-400">
+        {repoName}
+      </div>
+      {visible.length === 0 && (
         <div className="p-4 text-xs text-slate-500 italic text-center">
-          No files tracked yet. Agents will appear here as they work.
+          No active paths yet. Paths will appear when agents start working.
         </div>
       )}
-      {Object.entries(agentTree).map(([name, item]) => (
-        <TreeNode key={name} name={name} item={item} onSelect={onSelect} />
+      {Object.entries(groups).map(([agent, agentEntries]) => (
+        <section
+          key={agent}
+          className="mb-2 rounded-xl border border-slate-200 dark:border-white/5 bg-white dark:bg-black/20 overflow-hidden"
+        >
+          <div className="px-3 py-2 text-[10px] font-bold uppercase tracking-widest flex items-center justify-between border-b border-slate-200 dark:border-white/5">
+            <span className="text-slate-600 dark:text-slate-300">{agent}</span>
+            <span className="text-[9px] text-blue-500 flex items-center gap-1">
+              <Activity size={10} />
+              active
+            </span>
+          </div>
+          <div className="p-1.5 space-y-1">
+            {agentEntries.map((entry) => {
+              const parts = splitPath(entry.path);
+              return (
+                <button
+                  key={`${agent}:${entry.path}`}
+                  onClick={() => onSelect(entry.path)}
+                  className="w-full text-left px-2 py-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-white/5 transition-colors"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="text-xs font-medium text-slate-800 dark:text-slate-100 flex items-center gap-1.5">
+                        <FileText size={12} className="shrink-0 text-blue-500" />
+                        <span className="truncate">{parts.file}</span>
+                      </div>
+                      <div className="text-[10px] text-slate-500 dark:text-slate-400 truncate flex items-center gap-1.5 mt-0.5">
+                        <FolderOpen size={11} className="shrink-0" />
+                        <span>{parts.folder}</span>
+                      </div>
+                    </div>
+                    <span
+                      className={`text-[9px] px-1.5 py-0.5 rounded-full uppercase tracking-wide shrink-0 ${
+                        entry.status === 'working'
+                          ? 'bg-blue-500/20 text-blue-600 dark:text-blue-400'
+                          : 'bg-slate-500/20 text-slate-500'
+                      }`}
+                    >
+                      active
+                    </span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </section>
       ))}
     </div>
   );

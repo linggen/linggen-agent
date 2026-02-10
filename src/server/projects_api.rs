@@ -6,7 +6,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,6 +27,119 @@ pub(crate) async fn list_agents_api(State(state): State<Arc<ServerState>>) -> im
         Ok(agents) => Json(agents).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AgentRunsQuery {
+    project_root: String,
+    session_id: Option<String>,
+}
+
+pub(crate) async fn list_agent_runs_api(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<AgentRunsQuery>,
+) -> impl IntoResponse {
+    let root = PathBuf::from(&query.project_root);
+    match state
+        .manager
+        .list_agent_runs(&root, query.session_id.as_deref())
+        .await
+    {
+        Ok(runs) => Json(runs).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AgentChildrenQuery {
+    run_id: String,
+}
+
+pub(crate) async fn list_agent_children_api(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<AgentChildrenQuery>,
+) -> impl IntoResponse {
+    match state.manager.list_agent_children(&query.run_id).await {
+        Ok(runs) => Json(runs).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AgentContextQuery {
+    run_id: String,
+    view: Option<String>, // "summary" | "raw"
+}
+
+#[derive(Serialize)]
+struct AgentContextSummary {
+    message_count: usize,
+    user_messages: usize,
+    agent_messages: usize,
+    system_messages: usize,
+    started_at: u64,
+    ended_at: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct AgentContextResponse {
+    run: crate::db::AgentRunRecord,
+    summary: AgentContextSummary,
+    messages: Option<Vec<crate::db::ChatMessageRecord>>,
+}
+
+pub(crate) async fn get_agent_context_api(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<AgentContextQuery>,
+) -> impl IntoResponse {
+    let run = match state.manager.get_agent_run(&query.run_id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let all_messages = match state
+        .manager
+        .db
+        .get_chat_history(&run.repo_path, &run.session_id, Some(&run.agent_id))
+    {
+        Ok(messages) => messages,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let end_ts = run.ended_at.unwrap_or(u64::MAX);
+    let messages: Vec<crate::db::ChatMessageRecord> = all_messages
+        .into_iter()
+        .filter(|m| m.timestamp >= run.started_at && m.timestamp <= end_ts)
+        .collect();
+
+    let user_messages = messages.iter().filter(|m| m.from_id == "user").count();
+    let system_messages = messages.iter().filter(|m| m.from_id == "system").count();
+    let agent_messages = messages
+        .len()
+        .saturating_sub(user_messages)
+        .saturating_sub(system_messages);
+    let summary = AgentContextSummary {
+        message_count: messages.len(),
+        user_messages,
+        agent_messages,
+        system_messages,
+        started_at: run.started_at,
+        ended_at: run.ended_at,
+    };
+
+    let is_raw = query
+        .view
+        .as_deref()
+        .map(|v| v.eq_ignore_ascii_case("raw"))
+        .unwrap_or(false);
+
+    Json(AgentContextResponse {
+        run,
+        summary,
+        messages: if is_raw { Some(messages) } else { None },
+    })
+    .into_response()
 }
 
 pub(crate) async fn list_models_api(State(state): State<Arc<ServerState>>) -> impl IntoResponse {

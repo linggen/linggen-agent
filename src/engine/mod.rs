@@ -5,7 +5,7 @@ pub mod tools;
 
 use crate::agent_manager::models::ModelManager;
 use crate::agent_manager::AgentManager;
-use crate::config::AgentSpec;
+use crate::config::{AgentKind, AgentSpec};
 use crate::engine::patch::validate_unified_diff;
 use crate::engine::tools::{ToolCall, Tools};
 use crate::ollama::ChatMessage;
@@ -66,6 +66,8 @@ pub struct AgentEngine {
     // Active skill if any
     pub active_skill: Option<Skill>,
     pub prompt_mode: PromptMode,
+    pub parent_agent_id: Option<String>,
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +110,8 @@ impl AgentEngine {
             chat_history: Vec::new(),
             active_skill: None,
             prompt_mode: PromptMode::Structured,
+            parent_agent_id: None,
+            run_id: None,
         })
     }
 
@@ -122,7 +126,12 @@ impl AgentEngine {
 
     pub fn set_manager_context(&mut self, manager: Arc<AgentManager>) {
         if let Some(agent_id) = &self.agent_id {
-            self.tools.set_context(manager, agent_id.clone());
+            let kind = self
+                .spec
+                .as_ref()
+                .map(|s| s.kind)
+                .unwrap_or(crate::config::AgentKind::Main);
+            self.tools.set_context(manager, agent_id.clone(), kind);
         }
     }
 
@@ -136,6 +145,15 @@ impl AgentEngine {
         self.task = Some(task);
         self.observations.clear();
         self.chat_history.clear();
+    }
+
+    pub fn set_parent_agent(&mut self, parent_agent_id: Option<String>) {
+        self.parent_agent_id = parent_agent_id;
+    }
+
+    pub fn set_run_id(&mut self, run_id: Option<String>) {
+        self.run_id = run_id.clone();
+        self.tools.set_run_id(run_id);
     }
 
     pub fn get_task(&self) -> Option<String> {
@@ -264,6 +282,7 @@ impl AgentEngine {
 
         // Record assistant response in DB
         if let Some(manager) = self.tools.get_manager() {
+            let target = self.outbound_target();
             let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
                 repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
                 session_id: session_id.unwrap_or("default").to_string(),
@@ -275,7 +294,7 @@ impl AgentEngine {
                     .agent_id
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
-                to_id: "user".to_string(),
+                to_id: target,
                 content: final_content.clone(),
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -332,12 +351,13 @@ impl AgentEngine {
                 .agent_id
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
+            let target = self.outbound_target();
             let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
                 repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
                 session_id: session_id.unwrap_or("default").to_string(),
                 agent_id: agent_id.clone(),
                 from_id: agent_id.clone(),
-                to_id: "user".to_string(),
+                to_id: target,
                 content: content.to_string(),
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -355,6 +375,10 @@ impl AgentEngine {
     }
 
     pub async fn run_agent_loop(&mut self, session_id: Option<&str>) -> Result<AgentOutcome> {
+        if self.is_cancelled().await {
+            anyhow::bail!("run cancelled");
+        }
+
         // Sync world state before running the loop if we have a manager
         if let Some(manager) = self.tools.get_manager() {
             let _ = manager.sync_world_state(&self.cfg.ws_root).await;
@@ -436,6 +460,10 @@ impl AgentEngine {
         let mut invalid_json_streak = 0usize;
 
         for _ in 0..self.cfg.max_iters {
+            if self.is_cancelled().await {
+                anyhow::bail!("run cancelled");
+            }
+
             // Ask model for the next action as JSON.
             let raw = self
                 .model_manager
@@ -515,10 +543,11 @@ impl AgentEngine {
                             .agent_id
                             .clone()
                             .unwrap_or_else(|| "unknown".to_string());
+                        let target = self.outbound_target();
                         let _ = manager
                             .send_event(crate::agent_manager::AgentEvent::Message {
                                 from: from.clone(),
-                                to: "user".to_string(),
+                                to: target.clone(),
                                 content: serde_json::json!({
                                     "type": "tool",
                                     "tool": tool.clone(),
@@ -538,7 +567,7 @@ impl AgentEngine {
                             session_id: session_id.unwrap_or("default").to_string(),
                             agent_id: from.clone(),
                             from_id: from,
-                            to_id: "user".to_string(),
+                            to_id: target,
                             content: tool_msg,
                             timestamp: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -716,6 +745,33 @@ impl AgentEngine {
             "I couldn't complete this automatically within the current tool loop limit. Please refine the request or switch to `/mode chat` for a direct answer."
                 .to_string(),
         ))
+    }
+
+    async fn is_cancelled(&self) -> bool {
+        let Some(run_id) = &self.run_id else {
+            return false;
+        };
+        let Some(manager) = self.tools.get_manager() else {
+            return false;
+        };
+        manager.is_run_cancelled(run_id).await
+    }
+
+    fn outbound_target(&self) -> String {
+        let kind = self
+            .spec
+            .as_ref()
+            .map(|s| s.kind)
+            .unwrap_or(AgentKind::Main);
+
+        if kind == AgentKind::Subagent {
+            return self
+                .parent_agent_id
+                .clone()
+                .unwrap_or_else(|| "user".to_string());
+        }
+
+        "user".to_string()
     }
 
     fn system_prompt(&self) -> String {

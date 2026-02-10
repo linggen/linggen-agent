@@ -10,6 +10,7 @@ const FILE_ACTIVITY_TABLE: TableDefinition<&str, &str> = TableDefinition::new("f
 const SESSIONS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sessions");
 const CHAT_HISTORY_TABLE: TableDefinition<&str, &str> = TableDefinition::new("chat_history");
 const PROJECT_SETTINGS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("project_settings");
+const AGENT_RUNS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("agent_runs");
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProjectInfo {
@@ -53,6 +54,20 @@ pub struct ProjectSettings {
     pub mode: String, // "chat" | "auto"
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AgentRunRecord {
+    pub run_id: String,
+    pub repo_path: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub agent_kind: String, // "main" | "subagent"
+    pub parent_run_id: Option<String>,
+    pub status: String, // "running" | "completed" | "failed" | "cancelled"
+    pub detail: Option<String>,
+    pub started_at: u64,
+    pub ended_at: Option<u64>,
+}
+
 pub struct Db {
     db: Arc<Database>,
 }
@@ -77,6 +92,7 @@ impl Db {
             let _ = write_txn.open_table(SESSIONS_TABLE)?;
             let _ = write_txn.open_table(CHAT_HISTORY_TABLE)?;
             let _ = write_txn.open_table(PROJECT_SETTINGS_TABLE)?;
+            let _ = write_txn.open_table(AGENT_RUNS_TABLE)?;
         }
         write_txn.commit()?;
 
@@ -319,6 +335,98 @@ impl Db {
         tracing::debug!("Chat Message Recorded: {} -> {}", msg.from_id, msg.to_id);
 
         Ok(())
+    }
+
+    pub fn add_agent_run(&self, run: AgentRunRecord) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(AGENT_RUNS_TABLE)?;
+            let val = serde_json::to_string(&run)?;
+            table.insert(run.run_id.as_str(), val.as_str())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn update_agent_run(
+        &self,
+        run_id: &str,
+        status: &str,
+        detail: Option<String>,
+        ended_at: Option<u64>,
+    ) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(AGENT_RUNS_TABLE)?;
+            let existing = table
+                .get(run_id)?
+                .map(|val| val.value().to_string());
+            if let Some(json) = existing {
+                let mut run: AgentRunRecord = serde_json::from_str(&json)?;
+                run.status = status.to_string();
+                if detail.is_some() {
+                    run.detail = detail;
+                }
+                if ended_at.is_some() {
+                    run.ended_at = ended_at;
+                }
+                let next = serde_json::to_string(&run)?;
+                table.insert(run_id, next.as_str())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn list_agent_runs(
+        &self,
+        repo_path: &str,
+        session_id: Option<&str>,
+    ) -> Result<Vec<AgentRunRecord>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(AGENT_RUNS_TABLE)?;
+        let mut runs = Vec::new();
+        for res in table.iter()? {
+            let (_key, val) = res?;
+            let run: AgentRunRecord = serde_json::from_str(val.value())?;
+            if run.repo_path != repo_path {
+                continue;
+            }
+            if let Some(sid) = session_id {
+                if run.session_id != sid {
+                    continue;
+                }
+            }
+            runs.push(run);
+        }
+        runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        Ok(runs)
+    }
+
+    pub fn list_agent_children(&self, parent_run_id: &str) -> Result<Vec<AgentRunRecord>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(AGENT_RUNS_TABLE)?;
+        let mut runs = Vec::new();
+        for res in table.iter()? {
+            let (_key, val) = res?;
+            let run: AgentRunRecord = serde_json::from_str(val.value())?;
+            if run.parent_run_id.as_deref() == Some(parent_run_id) {
+                runs.push(run);
+            }
+        }
+        runs.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+        Ok(runs)
+    }
+
+    pub fn get_agent_run(&self, run_id: &str) -> Result<Option<AgentRunRecord>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(AGENT_RUNS_TABLE)?;
+        if let Some(val) = table.get(run_id)? {
+            let run: AgentRunRecord = serde_json::from_str(val.value())?;
+            Ok(Some(run))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn get_chat_history(

@@ -38,9 +38,24 @@ pub struct AgentSpec {
     pub tools: Vec<String>,
     pub model: Option<String>,
     #[serde(default)]
+    pub kind: AgentKind,
+    #[serde(default)]
     pub work_globs: Vec<String>,
     #[serde(default)]
     pub default_lock_globs: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    Main,
+    Subagent,
+}
+
+impl Default for AgentKind {
+    fn default() -> Self {
+        Self::Main
+    }
 }
 
 impl AgentSpec {
