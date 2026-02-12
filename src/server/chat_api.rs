@@ -63,6 +63,7 @@ fn mode_label(mode: PromptMode) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn looks_like_file_or_path_request(message: &str) -> bool {
     let msg = message.trim();
     if msg.is_empty() {
@@ -704,50 +705,9 @@ pub(crate) async fn chat_handler(
                     return;
                 }
 
-                // In chat mode, file/path-oriented requests often require tools. If we rely on the
-                // streaming chat response, many models will narrate ("Indexing workspace...") and stop.
-                // For these requests, jump straight into the structured tool loop so the agent actually
-                // searches/reads and produces a real answer.
-                if prompt_mode == crate::engine::PromptMode::Chat
-                    && looks_like_file_or_path_request(&clean_msg_clone)
-                {
-                    state_clone
-                        .send_agent_status(
-                            target_id_clone.clone(),
-                            "thinking".to_string(),
-                            Some("Thinking".to_string()),
-                        )
-                        .await;
-                    let task_for_loop = clean_msg_clone.trim().to_string();
-                    engine.task = Some(task_for_loop);
-                    let outcome = run_loop_with_tracking(
-                        &manager,
-                        &root_clone,
-                        &mut engine,
-                        &target_id_clone,
-                        session_id.as_deref(),
-                        "chat:direct-loop",
-                    )
-                    .await;
-                    if let Ok(outcome) = &outcome {
-                        emit_outcome_event(outcome, &events_tx_clone, &target_id_clone);
-                    } else if let Err(err) = outcome {
-                        let _ = events_tx_clone.send(ServerEvent::Message {
-                            from: target_id_clone.clone(),
-                            to: "user".to_string(),
-                            content: format!("Error: {}", err),
-                        });
-                    }
-                    let _ = events_tx_clone.send(ServerEvent::StateUpdated);
-                    state_clone
-                        .send_agent_status(
-                            target_id_clone.clone(),
-                            "idle".to_string(),
-                            Some("Idle".to_string()),
-                        )
-                        .await;
-                    return;
-                }
+                // In chat mode, avoid jumping into the structured multi-step loop for file/path
+                // requests. We prefer one-tool execution + plain-text follow-up to prevent
+                // exhausting max tool iterations on simple read/search requests.
 
                 match engine
                     .chat_stream(&clean_msg_clone, session_id.as_deref(), prompt_mode)
@@ -896,10 +856,9 @@ pub(crate) async fn chat_handler(
                                             .await;
 
                                         if prompt_mode == crate::engine::PromptMode::Chat {
-                                            // Chat mode:
-                                            // - For writes, summarize the change in plain text.
-                                            // - For non-write tools, continue through the structured tool loop so the
-                                            //   agent can take additional steps (read -> search -> write, etc).
+                                            // Chat mode: always summarize tool observation directly in plain text.
+                                            // This avoids re-entering structured loops for simple read/search/list
+                                            // requests, which can hit max_iters without producing user-facing output.
                                             if matches!(tool.as_str(), "write_file" | "Write") {
                                                 let mut observation_for_summary = rendered_public.clone();
                                                 if let Some(path) = write_path {
@@ -976,29 +935,44 @@ pub(crate) async fn chat_handler(
                                                 }
                                                 let _ = events_tx_clone.send(ServerEvent::StateUpdated);
                                             } else {
-                                                let task_for_loop =
-                                                    clean_msg_clone.trim().to_string();
-                                                engine.task = Some(task_for_loop);
-                                                let outcome = run_loop_with_tracking(
-                                                    &manager,
-                                                    &root_clone,
-                                                    &mut engine,
-                                                    &target_id_clone,
-                                                    session_id.as_deref(),
-                                                    "chat:auto-followup",
-                                                )
-                                                .await;
-                                                if let Ok(outcome) = &outcome {
-                                                    emit_outcome_event(
-                                                        outcome,
-                                                        &events_tx_clone,
-                                                        &target_id_clone,
-                                                    );
-                                                } else if let Err(err) = outcome {
+                                                let followup_prompt = format!(
+                                                    "Use the observation below to answer the user's request in plain text.\n\nUser request: {}\n\nObservation:\n{}\n\nRequirements:\n- Be concise but concrete.\n- If you ran a command, summarize key results.\n- If you read files, mention the file path(s) and key findings.",
+                                                    clean_msg_clone,
+                                                    rendered_public
+                                                );
+
+                                                let mut followup_response = String::new();
+                                                if let Ok(mut followup_stream) =
+                                                    engine
+                                                        .chat_stream(
+                                                            &followup_prompt,
+                                                            session_id.as_deref(),
+                                                            crate::engine::PromptMode::Chat,
+                                                        )
+                                                        .await
+                                                {
+                                                    while let Some(token_result) = followup_stream.next().await {
+                                                        if let Ok(token) = token_result {
+                                                            followup_response.push_str(&token);
+                                                            let _ = events_tx_clone.send(ServerEvent::Token {
+                                                                agent_id: target_id_clone.clone(),
+                                                                token,
+                                                            });
+                                                        }
+                                                    }
+
+                                                    let _ = engine
+                                                        .finalize_chat(
+                                                            &followup_prompt,
+                                                            &followup_response,
+                                                            session_id.as_deref(),
+                                                            crate::engine::PromptMode::Chat,
+                                                        )
+                                                        .await;
                                                     let _ = events_tx_clone.send(ServerEvent::Message {
                                                         from: target_id_clone.clone(),
                                                         to: "user".to_string(),
-                                                        content: format!("Error: {}", err),
+                                                        content: followup_response.clone(),
                                                     });
                                                 }
                                                 let _ = events_tx_clone.send(ServerEvent::StateUpdated);
