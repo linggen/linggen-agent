@@ -3,6 +3,7 @@ id = "local_ollama"
 provider = "ollama"
 url = "http://127.0.0.1:11434"
 model = "qwen3-coder-next"
+keep_alive = "20m"
 
 
 # [[models]]
@@ -17,6 +18,7 @@ port = 6666
 
 [agent]
 max_iters = 10
+prompt_loop_breaker = "You are repeatedly calling '{}' with the same arguments and not making progress. Use a different tool/arguments and continue automatically."
 
 [logging]
 level = "debug"

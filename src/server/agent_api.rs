@@ -99,6 +99,7 @@ pub(crate) async fn run_agent(
     let session_id = req.session_id.clone();
     let events_tx = state.events_tx.clone();
     let manager = state.manager.clone();
+    let state_clone = state.clone();
 
     let kind = state
         .manager
@@ -136,11 +137,13 @@ pub(crate) async fn run_agent(
                     Ok(id) => id,
                     Err(_) => format!("run-{}-fallback", agent_id),
                 };
-                let _ = events_tx.send(ServerEvent::AgentStatus {
-                    agent_id: agent_id.clone(),
-                    status: "working".to_string(),
-                    detail: Some("Running".to_string()),
-                });
+                state_clone
+                    .send_agent_status(
+                        agent_id.clone(),
+                        "working".to_string(),
+                        Some("Running".to_string()),
+                    )
+                    .await;
                 let mut engine = agent.lock().await;
                 engine.set_parent_agent(None);
                 engine.set_run_id(Some(run_id.clone()));
@@ -202,11 +205,13 @@ pub(crate) async fn run_agent(
                     agent_id: agent_id.clone(),
                     outcome,
                 });
-                let _ = events_tx.send(ServerEvent::AgentStatus {
-                    agent_id: agent_id.clone(),
-                    status: "idle".to_string(),
-                    detail: Some("Idle".to_string()),
-                });
+                state_clone
+                    .send_agent_status(
+                        agent_id.clone(),
+                        "idle".to_string(),
+                        Some("Idle".to_string()),
+                    )
+                    .await;
             });
 
             Json(serde_json::json!({ "status": "started" })).into_response()
@@ -222,11 +227,13 @@ pub(crate) async fn cancel_agent_run(
     match state.manager.cancel_run_tree(&req.run_id).await {
         Ok(runs) => {
             for run in &runs {
-                let _ = state.events_tx.send(ServerEvent::AgentStatus {
-                    agent_id: run.agent_id.clone(),
-                    status: "idle".to_string(),
-                    detail: Some("Cancelled".to_string()),
-                });
+                state
+                    .send_agent_status(
+                        run.agent_id.clone(),
+                        "idle".to_string(),
+                        Some("Cancelled".to_string()),
+                    )
+                    .await;
             }
             let _ = state.events_tx.send(ServerEvent::StateUpdated);
             Json(CancelRunResponse {

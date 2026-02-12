@@ -1,4 +1,5 @@
 use crate::server::ServerState;
+use crate::server::chat_helpers::sanitize_message_for_ui;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -6,6 +7,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -97,8 +99,9 @@ pub(crate) async fn get_lead_state(
         // Map ChatMessageRecord to the format expected by the UI
         let mapped_messages: Vec<(crate::state_fs::StateFile, String)> = messages
             .into_iter()
-            .map(|m| {
-                (
+            .filter_map(|m| {
+                let cleaned = sanitize_message_for_ui(&m.from_id, &m.content)?;
+                Some((
                     crate::state_fs::StateFile::Message {
                         id: format!("msg-{}", m.timestamp),
                         from: m.from_id,
@@ -106,8 +109,8 @@ pub(crate) async fn get_lead_state(
                         ts: m.timestamp,
                         task_id: None,
                     },
-                    m.content,
-                )
+                    cleaned,
+                ))
             })
             .collect();
 
@@ -132,55 +135,69 @@ pub(crate) async fn get_agent_tree(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    let running_agents: HashSet<String> = state
+        .manager
+        .list_agent_runs(&root_path, None)
+        .await
+        .map(|runs| {
+            runs.into_iter()
+                .filter(|run| run.status == "running")
+                .map(|run| run.agent_id)
+                .collect()
+        })
+        .unwrap_or_default();
 
-    match state.manager.db.get_repo_activity(&query.project_root) {
-        Ok(activities) => {
-            // Build a simple tree structure from activities
-            let mut tree = serde_json::Map::new();
-            for act in activities {
-                let parts: Vec<&str> = act.file_path.split('/').collect();
-                let mut current = &mut tree;
-                for (i, part) in parts.iter().enumerate() {
-                    if i == parts.len() - 1 {
-                        current.insert(
-                            part.to_string(),
-                            serde_json::json!({
-                                "type": "file",
-                                "agent": act.agent_id,
-                                "status": act.status,
-                                "path": act.file_path,
-                                "last_modified": act.last_modified,
-                            }),
-                        );
-                    } else {
-                        let entry = current
-                            .entry(part.to_string())
-                            .or_insert(serde_json::json!({
-                                "type": "dir",
-                                "children": {}
-                            }));
-                        current = entry
-                            .as_object_mut()
-                            .unwrap()
-                            .get_mut("children")
-                            .unwrap()
-                            .as_object_mut()
-                            .unwrap();
-                    }
-                }
-            }
+    let activities = state
+        .manager
+        .list_working_places_for_repo(&query.project_root)
+        .await;
 
-            // Wrap in a root node for the repo
-            let root_tree = serde_json::json!({
-                repo_name: {
-                    "type": "dir",
-                    "path": query.project_root,
-                    "children": tree
-                }
-            });
-
-            Json(root_tree).into_response()
+    // Build a simple tree structure from in-memory working-place entries.
+    let mut tree = serde_json::Map::new();
+    for act in activities {
+        if !running_agents.contains(&act.agent_id) {
+            continue;
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        let parts: Vec<&str> = act.file_path.split('/').collect();
+        let mut current = &mut tree;
+        for (i, part) in parts.iter().enumerate() {
+            if i == parts.len() - 1 {
+                current.insert(
+                    part.to_string(),
+                    serde_json::json!({
+                        "type": "file",
+                        "agent": act.agent_id,
+                        "status": "working",
+                        "path": act.file_path,
+                        "last_modified": act.last_modified,
+                    }),
+                );
+            } else {
+                let entry = current
+                    .entry(part.to_string())
+                    .or_insert(serde_json::json!({
+                        "type": "dir",
+                        "children": {}
+                    }));
+                current = entry
+                    .as_object_mut()
+                    .unwrap()
+                    .get_mut("children")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap();
+            }
+        }
     }
+
+    // Wrap in a root node for the repo
+    let root_tree = serde_json::json!({
+        repo_name: {
+            "type": "dir",
+            "path": query.project_root,
+            "children": tree
+        }
+    });
+
+    Json(root_tree).into_response()
 }

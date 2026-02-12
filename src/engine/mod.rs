@@ -13,12 +13,13 @@ use crate::skills::Skill;
 use anyhow::Result;
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-pub use actions::{parse_first_action, ModelAction};
+pub use actions::{model_message_log_parts, parse_first_action, ModelAction};
 pub use render::{
     normalize_tool_path_arg, render_tool_result, render_tool_result_public,
     sanitize_tool_args_for_display, tool_call_signature,
@@ -47,6 +48,46 @@ pub struct EngineConfig {
     pub max_iters: usize,
     #[allow(dead_code)]
     pub stream: bool,
+    pub write_safety_mode: crate::config::WriteSafetyMode,
+    pub prompt_loop_breaker: Option<String>,
+}
+
+const CONTEXT_SOFT_TOKEN_LIMIT: usize = 8_000;
+const CONTEXT_SOFT_MESSAGE_LIMIT: usize = 72;
+const CONTEXT_KEEP_TAIL_MESSAGES: usize = 28;
+const CONTEXT_MAX_SUMMARY_PASSES: usize = 3;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextType {
+    System,
+    UserInput,
+    AssistantReply,
+    ToolCall,
+    ToolResult,
+    Observation,
+    Status,
+    Error,
+    Summary,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObservationRecord {
+    pub observation_type: String,
+    pub name: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextRecord {
+    pub id: u64,
+    pub ts: u64,
+    pub context_type: ContextType,
+    pub name: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub content: String,
+    pub meta: JsonValue,
 }
 
 pub struct AgentEngine {
@@ -58,9 +99,12 @@ pub struct AgentEngine {
     pub task: Option<String>,
     // Agent spec and runtime context
     pub spec: Option<AgentSpec>,
+    pub spec_system_prompt: Option<String>,
     pub agent_id: Option<String>,
-    // Rolling tool observations that we feed back to the model.
-    pub observations: Vec<String>,
+    // Rolling observations with metadata that we feed back to the model.
+    pub observations: Vec<ObservationRecord>,
+    pub context_records: Vec<ContextRecord>,
+    pub next_context_id: u64,
     // Conversational history for chat.
     pub chat_history: Vec<ChatMessage>,
     // Active skill if any
@@ -83,8 +127,6 @@ pub enum AgentOutcome {
     Task(TaskPacket),
     #[serde(rename = "patch")]
     Patch(String),
-    #[serde(rename = "ask")]
-    Ask(String),
     #[serde(rename = "none")]
     None,
 }
@@ -105,8 +147,11 @@ impl AgentEngine {
             role,
             task: None,
             spec: None,
+            spec_system_prompt: None,
             agent_id: None,
             observations: Vec::new(),
+            context_records: Vec::new(),
+            next_context_id: 1,
             chat_history: Vec::new(),
             active_skill: None,
             prompt_mode: PromptMode::Structured,
@@ -115,9 +160,10 @@ impl AgentEngine {
         })
     }
 
-    pub fn set_spec(&mut self, agent_id: String, spec: AgentSpec) {
+    pub fn set_spec(&mut self, agent_id: String, spec: AgentSpec, system_prompt: String) {
         self.agent_id = Some(agent_id);
         self.spec = Some(spec);
+        self.spec_system_prompt = Some(system_prompt);
     }
 
     pub fn set_manager_context(&mut self, manager: Arc<AgentManager>) {
@@ -134,12 +180,16 @@ impl AgentEngine {
     pub fn set_role(&mut self, role: AgentRole) {
         self.role = role;
         self.observations.clear();
+        self.context_records.clear();
+        self.next_context_id = 1;
         self.chat_history.clear();
     }
 
     pub fn set_task(&mut self, task: String) {
         self.task = Some(task);
         self.observations.clear();
+        self.context_records.clear();
+        self.next_context_id = 1;
         self.chat_history.clear();
     }
 
@@ -198,8 +248,16 @@ impl AgentEngine {
 
         let mut messages = vec![ChatMessage {
             role: "system".to_string(),
-            content: self.system_prompt_with_mode(mode),
+            content: self.system_prompt(),
         }];
+        self.push_context_record(
+            ContextType::System,
+            Some("chat_stream_prompt".to_string()),
+            None,
+            None,
+            messages[0].content.clone(),
+            serde_json::json!({ "mode": format!("{:?}", mode) }),
+        );
         let allowed_tools = self.allowed_tool_names();
 
         // Add workspace context to the first message if history is short
@@ -221,6 +279,17 @@ impl AgentEngine {
             role: "user".to_string(),
             content: clean_message,
         });
+        self.push_context_record(
+            ContextType::UserInput,
+            Some("chat_stream_input".to_string()),
+            Some("user".to_string()),
+            self.agent_id.clone(),
+            messages.last().map(|m| m.content.clone()).unwrap_or_default(),
+            serde_json::json!({ "source": "chat_stream" }),
+        );
+        let summary_count = self.maybe_compact_model_messages(&mut messages, "chat_stream");
+        self.emit_context_usage_event("chat_stream", &messages, summary_count)
+            .await;
 
         let stream = self
             .model_manager
@@ -249,16 +318,39 @@ impl AgentEngine {
 
         self.chat_history.push(ChatMessage {
             role: "user".to_string(),
-            content: clean_message,
+            content: clean_message.clone(),
         });
+        let already_recorded_user_input = self
+            .context_records
+            .last()
+            .map(|r| r.context_type == ContextType::UserInput && r.content == clean_message)
+            .unwrap_or(false);
+        if !already_recorded_user_input {
+            self.push_context_record(
+                ContextType::UserInput,
+                Some("chat_input".to_string()),
+                Some("user".to_string()),
+                self.agent_id.clone(),
+                clean_message.clone(),
+                serde_json::json!({ "source": "finalize_chat" }),
+            );
+        }
 
         let final_content = if mode == PromptMode::Chat {
-            assistant_response.to_string()
+            // Strip XML-style tags like <search_indexing> from chat responses if they leak
+            let mut cleaned = assistant_response.to_string();
+            while let Some(start) = cleaned.find('<') {
+                if let Some(end) = cleaned[start..].find('>') {
+                    cleaned.replace_range(start..start + end + 1, "");
+                } else {
+                    break;
+                }
+            }
+            cleaned.trim().to_string()
         } else {
-            // Try to parse the response as JSON to extract the question if the model followed the system prompt
+            // Try to parse the response as JSON to extract a user-facing summary.
             if let Ok(action) = serde_json::from_str::<ModelAction>(assistant_response) {
                 match action {
-                    ModelAction::Ask { question } => question,
                     ModelAction::FinalizeTask { packet } => {
                         format!(
                             "I've finalized the task: {}. You can review it in the Planning section.",
@@ -273,6 +365,9 @@ impl AgentEngine {
                     }
                 }
             } else {
+                // If JSON parsing fails, it might be because of leaked tags. 
+                // We don't strip them here because we want to see the error, 
+                // but for the final display we can be more lenient.
                 assistant_response.to_string()
             }
         };
@@ -303,8 +398,16 @@ impl AgentEngine {
 
         self.chat_history.push(ChatMessage {
             role: "assistant".to_string(),
-            content: final_content,
+            content: final_content.clone(),
         });
+        self.push_context_record(
+            ContextType::AssistantReply,
+            Some("chat_reply".to_string()),
+            self.agent_id.clone(),
+            Some("user".to_string()),
+            final_content,
+            serde_json::json!({ "mode": format!("{:?}", mode) }),
+        );
 
         Ok(())
     }
@@ -345,6 +448,15 @@ impl AgentEngine {
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
             let target = self.outbound_target();
+            // Emit to UI immediately (SSE), so structured terminal messages are visible
+            // even when no outer chat handler emits an explicit Outcome event.
+            manager
+                .send_event(crate::agent_manager::AgentEvent::Message {
+                    from: agent_id.clone(),
+                    to: target.clone(),
+                    content: content.to_string(),
+                })
+                .await;
             let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
                 repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
                 session_id: session_id.unwrap_or("default").to_string(),
@@ -372,6 +484,20 @@ impl AgentEngine {
             anyhow::bail!("run cancelled");
         }
 
+        if let Some(manager) = self.tools.get_manager() {
+            let agent_id = self
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            manager
+                .send_event(crate::agent_manager::AgentEvent::AgentStatus {
+                    agent_id,
+                    status: "working".to_string(),
+                    detail: Some("Running".to_string()),
+                })
+                .await;
+        }
+
         // Sync world state before running the loop if we have a manager
         if let Some(manager) = self.tools.get_manager() {
             let _ = manager.sync_world_state(&self.cfg.ws_root).await;
@@ -384,6 +510,14 @@ impl AgentEngine {
         info!(
             "Starting agent loop for role {:?} with task: {}",
             self.role, task
+        );
+        self.push_context_record(
+            ContextType::Status,
+            Some("autonomous_loop_start".to_string()),
+            self.agent_id.clone(),
+            None,
+            format!("Starting autonomous loop for task: {}", task),
+            serde_json::json!({ "mode": "structured" }),
         );
 
         // Record start of loop in DB
@@ -415,28 +549,47 @@ impl AgentEngine {
             role: "system".to_string(),
             content: system,
         }];
+        self.push_context_record(
+            ContextType::System,
+            Some("structured_loop_prompt".to_string()),
+            None,
+            None,
+            messages[0].content.clone(),
+            serde_json::json!({ "mode": "structured" }),
+        );
 
-        // Provide tool schema + workspace info.
+        // Include chat history so the model has context of the current conversation.
+        // IMPORTANT: We append the structured bootstrap *after* history+observations so the
+        // last message is always a fresh user instruction for the current task.
+        messages.extend(self.chat_history.clone());
+
+        for obs in &self.observations {
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: Self::observation_for_model(obs),
+            });
+        }
+
+        // Provide tool schema + workspace info (last user message, so the model starts the task
+        // instead of continuing a prior assistant greeting from chat_history).
         messages.push(ChatMessage {
             role: "user".to_string(),
             content: format!(
-                "Workspace root: {}\n\nCurrent Role: {:?}\n\nTask: {}\n\nTool schema (respond with a single JSON object per turn):\n{}",
+                "Autonomous agent loop started. Ignore any prior greetings or small talk.\n\nWorkspace root: {}\n\nCurrent Role: {:?}\n\nTask: {}\n\nTool schema (respond with a single JSON object per turn):\n{}",
                 self.cfg.ws_root.display(),
                 self.role,
                 task,
                 tools::tool_schema_json(allowed_tools.as_ref())
             ),
         });
-
-        // Include chat history so the model has context of the current conversation
-        messages.extend(self.chat_history.clone());
-
-        for obs in &self.observations {
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: format!("Observation:\n{}", obs),
-            });
-        }
+        self.push_context_record(
+            ContextType::UserInput,
+            Some("structured_bootstrap".to_string()),
+            Some("system".to_string()),
+            self.agent_id.clone(),
+            messages.last().map(|m| m.content.clone()).unwrap_or_default(),
+            serde_json::json!({ "source": "run_agent_loop" }),
+        );
 
         #[derive(Clone)]
         struct CachedToolObs {
@@ -447,15 +600,81 @@ impl AgentEngine {
         let mut tool_cache: HashMap<String, CachedToolObs> = HashMap::new();
         // Guardrails: track files read in this loop so writes to existing files are never blind.
         let mut read_paths: HashSet<String> = HashSet::new();
+
+        // Pre-populate read_paths from prior context if we've already read files in this session.
+        // IMPORTANT: read_file results are stored as observations, not in chat_history.
+        let mut ingest_read_file_text = |text: &str| {
+            if !text.contains("read_file:") || text.contains("tool_error:") {
+                return;
+            }
+            if let Some(start) = text.find("read_file: ") {
+                let path_part = &text[start + 11..];
+                let raw_path = path_part.split_whitespace().next().unwrap_or("");
+                if raw_path.is_empty() {
+                    return;
+                }
+                let clean_path = raw_path
+                    .trim_end_matches(')')
+                    .trim_end_matches(',')
+                    .trim_end_matches('.')
+                    .to_string();
+                if clean_path.is_empty() {
+                    return;
+                }
+                read_paths.insert(clean_path.clone());
+
+                // Also insert normalized relative form if possible
+                if let Ok(abs) = self.cfg.ws_root.join(&clean_path).canonicalize() {
+                    if let Ok(rel) = abs.strip_prefix(&self.cfg.ws_root) {
+                        read_paths.insert(rel.to_string_lossy().to_string());
+                    }
+                }
+            }
+        };
+
+        for obs in &self.observations {
+            if obs.name == "read_file" || obs.name == "Read" {
+                ingest_read_file_text(&obs.content);
+            }
+        }
+        for msg in &self.chat_history {
+            ingest_read_file_text(&msg.content);
+        }
+
         // Guardrail: repeated search with no matches means no progress.
         let mut empty_search_streak = 0usize;
+        // Guardrail: repeated get_repo_info or other redundant calls.
+        let mut redundant_tool_streak = 0usize;
+        let mut last_tool_sig = String::new();
         // Guardrail: malformed action JSON can cause endless retries.
         let mut invalid_json_streak = 0usize;
+        // Guardrail: identical assistant responses (looping).
+        let mut last_assistant_response = String::new();
+        let mut identical_response_streak = 0usize;
+        let mut loop_nudge_count = 0usize;
 
         for _ in 0..self.cfg.max_iters {
             if self.is_cancelled().await {
                 anyhow::bail!("run cancelled");
             }
+
+            if let Some(manager) = self.tools.get_manager() {
+                let agent_id = self
+                    .agent_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                manager
+                    .send_event(crate::agent_manager::AgentEvent::AgentStatus {
+                        agent_id,
+                        status: "thinking".to_string(),
+                        detail: Some("Thinking".to_string()),
+                    })
+                    .await;
+            }
+
+            let summary_count = self.maybe_compact_model_messages(&mut messages, "loop_iter");
+            self.emit_context_usage_event("loop_iter", &messages, summary_count)
+                .await;
 
             // Ask model for the next action as JSON.
             let raw = self
@@ -463,14 +682,69 @@ impl AgentEngine {
                 .chat_json(&self.model_id, &messages)
                 .await?;
 
+            // Debug log: split model output into text + json (truncated).
+            let (text_part, json_part) = crate::engine::model_message_log_parts(&raw, 100, 100);
+            let json_rendered = json_part
+                .as_ref()
+                .and_then(|v| serde_json::to_string(v).ok())
+                .unwrap_or_else(|| "null".to_string());
+            info!(
+                "Model response split: text='{}' json={}",
+                text_part.replace('\n', "\\n"),
+                json_rendered
+            );
+
+            // Repetition check
+            if raw == last_assistant_response {
+                identical_response_streak += 1;
+            } else {
+                identical_response_streak = 0;
+                last_assistant_response = raw.clone();
+            }
+
+            if identical_response_streak >= 3 {
+                loop_nudge_count += 1;
+                if loop_nudge_count >= 2 {
+                    let message = format!(
+                        "I couldn't continue automatically because I got stuck in a repetition loop (same response {} times).",
+                        identical_response_streak + 1
+                    );
+                    let _ = self
+                        .manager_db_add_assistant_message(&message, session_id)
+                        .await;
+                    self.active_skill = None;
+                    return Ok(AgentOutcome::None);
+                }
+
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: "It looks like you are trapped in a loop, sending the same response multiple times. Please try a different approach or tool to make progress.".to_string(),
+                });
+                self.push_context_record(
+                    ContextType::Error,
+                    Some("loop_detected".to_string()),
+                    self.agent_id.clone(),
+                    None,
+                    "Model trapped in a loop. Nudging with a warning message.".to_string(),
+                    serde_json::json!({ "streak": identical_response_streak + 1 }),
+                );
+                // Reset streak after nudging so we don't immediately trigger it again next turn
+                // but keep last_assistant_response to detect if it continues after the nudge.
+                identical_response_streak = 0;
+                continue;
+            }
+
             let action: ModelAction = match parse_first_action(&raw) {
                 Ok(v) => v,
                 Err(e) => {
                     invalid_json_streak += 1;
                     if invalid_json_streak >= 4 {
-                        let question = "I keep returning malformed tool JSON and can't safely continue. I can either switch to plain text guidance or you can retry with a different model.".to_string();
+                        let message = "I couldn't continue automatically because the model kept returning malformed structured output.".to_string();
+                        let _ = self
+                            .manager_db_add_assistant_message(&message, session_id)
+                            .await;
                         self.active_skill = None;
-                        return Ok(AgentOutcome::Ask(question));
+                        return Ok(AgentOutcome::None);
                     }
                     messages.push(ChatMessage {
                         role: "user".to_string(),
@@ -478,6 +752,14 @@ impl AgentEngine {
                             "Your previous response was not valid JSON ({e}). Respond again with ONE JSON object matching the tool schema. Raw was:\n{raw}"
                         ),
                     });
+                    self.push_context_record(
+                        ContextType::Error,
+                        Some("invalid_json".to_string()),
+                        self.agent_id.clone(),
+                        None,
+                        format!("invalid_json: {}", e),
+                        serde_json::json!({ "raw": raw }),
+                    );
                     continue;
                 }
             };
@@ -498,7 +780,7 @@ impl AgentEngine {
                                 canonical_tool,
                                 allowed_list.join(",")
                             );
-                            self.observations.push(rendered.clone());
+                            self.upsert_observation("error", &canonical_tool, rendered.clone());
                             let _ = self
                                 .manager_db_add_observation(&canonical_tool, &rendered, session_id)
                                 .await;
@@ -515,6 +797,14 @@ impl AgentEngine {
                     }
 
                     let safe_args = sanitize_tool_args_for_display(&canonical_tool, &args);
+                    self.upsert_context_record_by_type_name(
+                        ContextType::ToolCall,
+                        &canonical_tool,
+                        self.agent_id.clone(),
+                        Some(self.outbound_target()),
+                        serde_json::to_string(&safe_args).unwrap_or_else(|_| "{}".to_string()),
+                        serde_json::json!({ "args": safe_args.clone() }),
+                    );
                     info!(
                         "Agent requested tool: {} (requested: {}) with args: {}",
                         canonical_tool, tool, safe_args
@@ -529,34 +819,90 @@ impl AgentEngine {
                         if let Some(path) = normalize_tool_path_arg(&self.cfg.ws_root, &args) {
                             let existing = self.cfg.ws_root.join(&path).exists();
                             if existing && !read_paths.contains(&path) {
-                                let rendered = format!(
-                                    "tool_error: tool=write_file error=precondition_failed: must call read_file on '{}' before write_file for existing files",
-                                    path
-                                );
-                                self.observations.push(rendered.clone());
-                                let _ = self
-                                    .manager_db_add_observation("write_file", &rendered, session_id)
-                                    .await;
-                                messages.push(ChatMessage {
-                                    role: "user".to_string(),
-                                    content: format!(
-                                        "Tool execution blocked for safety: {}. Read the existing file first, then write a minimal update.",
-                                        rendered
-                                    ),
-                                });
-                                continue;
+                                match self.cfg.write_safety_mode {
+                                    crate::config::WriteSafetyMode::Strict => {
+                                        let rendered = format!(
+                                            "tool_error: tool=write_file error=precondition_failed: must call read_file on '{}' before write_file for existing files",
+                                            path
+                                        );
+                                        self.upsert_observation("error", "write_file", rendered.clone());
+                                        let _ = self
+                                            .manager_db_add_observation("write_file", &rendered, session_id)
+                                            .await;
+                                        messages.push(ChatMessage {
+                                            role: "user".to_string(),
+                                            content: format!(
+                                                "Tool execution blocked for safety: {}. Read the existing file first, then write a minimal update.",
+                                                rendered
+                                            ),
+                                        });
+                                        continue;
+                                    }
+                                    crate::config::WriteSafetyMode::Warn => {
+                                        let rendered = format!(
+                                            "tool_warning: tool=write_file warning=writing_existing_file_without_prior_read path='{}'",
+                                            path
+                                        );
+                                        self.upsert_observation("warning", "write_file", rendered.clone());
+                                        let _ = self
+                                            .manager_db_add_observation("write_file", &rendered, session_id)
+                                            .await;
+                                        // Allow the write to proceed.
+                                    }
+                                    crate::config::WriteSafetyMode::Off => {
+                                        // Allow writes without read.
+                                    }
+                                }
                             }
                         }
                     }
 
                     let sig = tool_call_signature(&canonical_tool, &args);
+                    if sig == last_tool_sig {
+                        redundant_tool_streak += 1;
+                    } else {
+                        redundant_tool_streak = 0;
+                        last_tool_sig = sig.clone();
+                    }
+
+                    if redundant_tool_streak >= 3 {
+                        let loop_breaker_prompt = self
+                            .cfg
+                            .prompt_loop_breaker
+                            .as_deref()
+                            .map(|template| Self::render_loop_breaker_prompt(template, &canonical_tool))
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "You are repeatedly calling '{}' with the same arguments and not making progress. Use a different tool/arguments and continue automatically.",
+                                    canonical_tool
+                                )
+                            });
+                        messages.push(ChatMessage {
+                            role: "user".to_string(),
+                            content: loop_breaker_prompt,
+                        });
+                        self.push_context_record(
+                            ContextType::Error,
+                            Some("redundant_tool_loop".to_string()),
+                            self.agent_id.clone(),
+                            None,
+                            format!(
+                                "Repeated tool call loop detected for '{}'; nudging model to change approach.",
+                                canonical_tool
+                            ),
+                            serde_json::json!({ "tool": canonical_tool, "streak": redundant_tool_streak + 1 }),
+                        );
+                        redundant_tool_streak = 0;
+                        continue;
+                    }
+
                     if let Some(cached) = tool_cache.get(&sig) {
-                        self.observations.push(cached.model.clone());
+                        self.upsert_observation("tool", &canonical_tool, cached.model.clone());
                         // Cached tool call: keep context for the model, but don't keep re-logging
                         // identical observation rows to DB/UI.
                         messages.push(ChatMessage {
                             role: "user".to_string(),
-                            content: format!("Observation:\n{}", cached.model),
+                            content: Self::observation_text("tool", &canonical_tool, &cached.model),
                         });
                         // Don't re-run identical tool calls.
                         continue;
@@ -569,6 +915,13 @@ impl AgentEngine {
                             .clone()
                             .unwrap_or_else(|| "unknown".to_string());
                         let target = self.outbound_target();
+                        let _ = manager
+                            .send_event(crate::agent_manager::AgentEvent::AgentStatus {
+                                agent_id: from.clone(),
+                                status: "calling_tool".to_string(),
+                                detail: Some(format!("Calling {}", canonical_tool)),
+                            })
+                            .await;
                         let _ = manager
                             .send_event(crate::agent_manager::AgentEvent::Message {
                                 from: from.clone(),
@@ -604,19 +957,20 @@ impl AgentEngine {
 
                     let call = ToolCall {
                         tool: canonical_tool.clone(),
-                        args,
+                        args: args.clone(),
                     };
                     match self.tools.execute(call) {
                         Ok(result) => {
                             let rendered_model = render_tool_result(&result);
                             let rendered_public = render_tool_result_public(&result);
+
                             tool_cache.insert(
                                 sig,
                                 CachedToolObs {
                                     model: rendered_model.clone(),
                                 },
                             );
-                            self.observations.push(rendered_model.clone());
+                            self.upsert_observation("tool", &canonical_tool, rendered_model.clone());
 
                             // Record observation in DB
                             let _ = self
@@ -627,11 +981,48 @@ impl AgentEngine {
                                 manager
                                     .send_event(crate::agent_manager::AgentEvent::StateUpdated)
                                     .await;
+
+                                // After tool completes, we're back to thinking.
+                                let agent_id = self
+                                    .agent_id
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                manager
+                                    .send_event(crate::agent_manager::AgentEvent::AgentStatus {
+                                        agent_id,
+                                        status: "thinking".to_string(),
+                                        detail: Some("Thinking".to_string()),
+                                    })
+                                    .await;
+                            }
+
+                            // For writes, emit a brief user-visible summary line immediately.
+                            if canonical_tool == "write_file"
+                                && (rendered_public.starts_with("File written:")
+                                    || rendered_public.starts_with("File unchanged"))
+                            {
+                                let msg = if rendered_public.starts_with("File unchanged") {
+                                    if let Some(idx) = rendered_public.rfind(':') {
+                                        let path = rendered_public[idx + 1..].trim();
+                                        format!("No changes to `{}` (content identical).", path)
+                                    } else {
+                                        "No file changes (content identical).".to_string()
+                                    }
+                                } else if let Some(idx) = rendered_public.rfind(':') {
+                                    let rest = rendered_public[idx + 1..].trim();
+                                    let path = rest.split_whitespace().next().unwrap_or(rest);
+                                    format!("Updated `{}`.", path)
+                                } else {
+                                    "File updated.".to_string()
+                                };
+                                let _ = self
+                                    .manager_db_add_assistant_message(&msg, session_id)
+                                    .await;
                             }
 
                             messages.push(ChatMessage {
                                 role: "user".to_string(),
-                                content: format!("Observation:\n{}", rendered_model),
+                                content: Self::observation_text("tool", &canonical_tool, &rendered_model),
                             });
 
                             if canonical_tool == "search_rg" && rendered_model.contains("(no matches)") {
@@ -640,9 +1031,19 @@ impl AgentEngine {
                                 empty_search_streak = 0;
                             }
                             if empty_search_streak >= 4 {
-                                let question = "I searched several times and found no matches, so I'm not making progress. I can proceed by editing the file directly after reading it, or you can provide the exact target symbol/line.".to_string();
-                                self.active_skill = None;
-                                return Ok(AgentOutcome::Ask(question));
+                                messages.push(ChatMessage {
+                                    role: "user".to_string(),
+                                    content: "Search returned no matches repeatedly. Change strategy and continue automatically (for example: read likely files directly, broaden search terms, or inspect repo structure).".to_string(),
+                                });
+                                self.push_context_record(
+                                    ContextType::Error,
+                                    Some("empty_search_loop".to_string()),
+                                    self.agent_id.clone(),
+                                    None,
+                                    "Repeated no-match search loop detected; nudging model to change strategy.".to_string(),
+                                    serde_json::json!({ "streak": empty_search_streak }),
+                                );
+                                empty_search_streak = 0;
                             }
                         }
                         Err(e) => {
@@ -654,10 +1055,23 @@ impl AgentEngine {
                                     model: rendered.clone(),
                                 },
                             );
-                            self.observations.push(rendered.clone());
+                            self.upsert_observation("error", &canonical_tool, rendered.clone());
                             let _ = self
                                 .manager_db_add_observation(&canonical_tool, &rendered, session_id)
                                 .await;
+                            if let Some(manager) = self.tools.get_manager() {
+                                let agent_id = self
+                                    .agent_id
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                manager
+                                    .send_event(crate::agent_manager::AgentEvent::AgentStatus {
+                                        agent_id,
+                                        status: "thinking".to_string(),
+                                        detail: Some("Thinking".to_string()),
+                                    })
+                                    .await;
+                            }
                             messages.push(ChatMessage {
                                 role: "user".to_string(),
                                 content: format!(
@@ -675,6 +1089,14 @@ impl AgentEngine {
                             "Agent tried to propose a patch while in role {:?}",
                             self.role
                         );
+                        self.push_context_record(
+                            ContextType::Error,
+                            Some("patch_not_allowed".to_string()),
+                            self.agent_id.clone(),
+                            None,
+                            "Only coder can propose patches.".to_string(),
+                            serde_json::json!({ "role": format!("{:?}", self.role) }),
+                        );
                         messages.push(ChatMessage {
                             role: "user".to_string(),
                             content: "Error: Only the 'coder' role can propose patches. You are currently in the PM role. Use 'finalize_task' to finish planning.".to_string(),
@@ -684,6 +1106,14 @@ impl AgentEngine {
                     let errs = validate_unified_diff(&diff);
                     if !errs.is_empty() {
                         warn!("Patch validation failed with {} errors", errs.len());
+                        self.push_context_record(
+                            ContextType::Error,
+                            Some("patch_validation".to_string()),
+                            self.agent_id.clone(),
+                            None,
+                            errs.join("\n"),
+                            serde_json::json!({ "error_count": errs.len() }),
+                        );
                         messages.push(ChatMessage {
                             role: "user".to_string(),
                             content: format!(
@@ -732,6 +1162,14 @@ impl AgentEngine {
                     info!("Agent finalized task: {}", packet.title);
                     if self.role != AgentRole::Lead {
                         warn!("Agent tried to finalize task while in role {:?}", self.role);
+                        self.push_context_record(
+                            ContextType::Error,
+                            Some("finalize_not_allowed".to_string()),
+                            self.agent_id.clone(),
+                            None,
+                            "Only lead can finalize tasks.".to_string(),
+                            serde_json::json!({ "role": format!("{:?}", self.role) }),
+                        );
                         messages.push(ChatMessage {
                             role: "user".to_string(),
                             content: "Error: Only the 'lead' role can finalize tasks.".to_string(),
@@ -745,32 +1183,37 @@ impl AgentEngine {
                         .await;
                     self.chat_history.push(ChatMessage {
                         role: "assistant".to_string(),
-                        content: msg,
+                        content: msg.clone(),
                     });
+                    self.push_context_record(
+                        ContextType::AssistantReply,
+                        Some("finalize_task".to_string()),
+                        self.agent_id.clone(),
+                        Some("user".to_string()),
+                        msg,
+                        serde_json::json!({ "kind": "finalize_task" }),
+                    );
                     self.active_skill = None;
                     return Ok(AgentOutcome::Task(packet));
-                }
-                ModelAction::Ask { question } => {
-                    info!("Agent asked a question: {}", question);
-                    let msg = serde_json::json!({ "type": "ask", "question": question }).to_string();
-                    let _ = self
-                        .manager_db_add_assistant_message(&msg, session_id)
-                        .await;
-                    self.chat_history.push(ChatMessage {
-                        role: "assistant".to_string(),
-                        content: msg,
-                    });
-                    self.active_skill = None;
-                    return Ok(AgentOutcome::Ask(question));
                 }
             }
         }
 
         self.active_skill = None;
-        Ok(AgentOutcome::Ask(
-            "I couldn't complete this automatically within the current tool loop limit. Please refine the request or switch to `/mode chat` for a direct answer."
-                .to_string(),
-        ))
+        let fallback = "I couldn't complete this automatically within the current tool loop limit. Please refine the request or switch to `/mode chat` for a direct answer."
+            .to_string();
+        self.push_context_record(
+            ContextType::Status,
+            Some("loop_limit_reached".to_string()),
+            self.agent_id.clone(),
+            Some("user".to_string()),
+            fallback.clone(),
+            serde_json::json!({ "max_iters": self.cfg.max_iters }),
+        );
+        let _ = self
+            .manager_db_add_assistant_message(&fallback, session_id)
+            .await;
+        Ok(AgentOutcome::None)
     }
 
     async fn is_cancelled(&self) -> bool {
@@ -800,6 +1243,267 @@ impl AgentEngine {
         "user".to_string()
     }
 
+    fn now_ts_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn estimate_tokens_for_text(text: &str) -> usize {
+        let chars = text.chars().count();
+        if chars == 0 {
+            0
+        } else {
+            (chars + 3) / 4
+        }
+    }
+
+    fn estimate_chars_for_messages(messages: &[ChatMessage]) -> usize {
+        messages.iter().map(|m| m.content.chars().count()).sum()
+    }
+
+    fn estimate_tokens_for_messages(messages: &[ChatMessage]) -> usize {
+        messages
+            .iter()
+            .map(|m| Self::estimate_tokens_for_text(&m.content))
+            .sum()
+    }
+
+    fn summarize_message_window(window: &[ChatMessage]) -> String {
+        let mut user_count = 0usize;
+        let mut assistant_count = 0usize;
+        let mut system_count = 0usize;
+        for msg in window {
+            match msg.role.as_str() {
+                "user" => user_count += 1,
+                "assistant" => assistant_count += 1,
+                "system" => system_count += 1,
+                _ => {}
+            }
+        }
+
+        let highlights = window
+            .iter()
+            .rev()
+            .filter_map(|msg| {
+                let snippet = msg
+                    .content
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())?;
+                let mut short = snippet.to_string();
+                if short.chars().count() > 140 {
+                    short = short.chars().take(140).collect::<String>() + "...";
+                }
+                Some(format!("{}: {}", msg.role, short))
+            })
+            .take(5)
+            .collect::<Vec<_>>();
+
+        let mut summary = format!(
+            "Context summary (compressed older messages).\nCounts: user={}, assistant={}, system={}.",
+            user_count, assistant_count, system_count
+        );
+        if !highlights.is_empty() {
+            summary.push_str("\nRecent highlights:");
+            for h in highlights.into_iter().rev() {
+                summary.push_str("\n- ");
+                summary.push_str(&h);
+            }
+        }
+        summary
+    }
+
+    fn maybe_compact_model_messages(&mut self, messages: &mut Vec<ChatMessage>, stage: &str) -> usize {
+        let mut summary_count = 0usize;
+
+        loop {
+            let token_est = Self::estimate_tokens_for_messages(messages);
+            let over_budget = token_est > CONTEXT_SOFT_TOKEN_LIMIT
+                || messages.len() > CONTEXT_SOFT_MESSAGE_LIMIT;
+            if !over_budget || summary_count >= CONTEXT_MAX_SUMMARY_PASSES {
+                break;
+            }
+
+            if messages.len() <= CONTEXT_KEEP_TAIL_MESSAGES + 2 {
+                break;
+            }
+
+            let start = 1usize; // Keep the leading system prompt.
+            let end = messages.len().saturating_sub(CONTEXT_KEEP_TAIL_MESSAGES);
+            if end <= start {
+                break;
+            }
+
+            let window = messages[start..end].to_vec();
+            let dropped_messages = window.len();
+            let dropped_chars: usize = window.iter().map(|m| m.content.chars().count()).sum();
+            let dropped_tokens = Self::estimate_tokens_for_messages(&window);
+            let summary = Self::summarize_message_window(&window);
+
+            messages.drain(start..end);
+            messages.insert(
+                start,
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: summary.clone(),
+                },
+            );
+
+            summary_count += 1;
+            self.push_context_record(
+                ContextType::Summary,
+                Some(format!("{}_summary_{}", stage, summary_count)),
+                Some("system".to_string()),
+                self.agent_id.clone(),
+                summary,
+                serde_json::json!({
+                    "stage": stage,
+                    "dropped_messages": dropped_messages,
+                    "dropped_chars": dropped_chars,
+                    "dropped_estimated_tokens": dropped_tokens
+                }),
+            );
+        }
+
+        summary_count
+    }
+
+    async fn emit_context_usage_event(
+        &self,
+        stage: &str,
+        messages: &[ChatMessage],
+        summary_count: usize,
+    ) {
+        let Some(manager) = self.tools.get_manager() else {
+            return;
+        };
+        let token_limit = self
+            .model_manager
+            .context_window(&self.model_id)
+            .await
+            .ok()
+            .flatten();
+        let _ = manager
+            .send_event(crate::agent_manager::AgentEvent::ContextUsage {
+                agent_id: self
+                    .agent_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                stage: stage.to_string(),
+                message_count: messages.len(),
+                char_count: Self::estimate_chars_for_messages(messages),
+                estimated_tokens: Self::estimate_tokens_for_messages(messages),
+                token_limit,
+                compressed: summary_count > 0,
+                summary_count,
+            })
+            .await;
+    }
+
+    fn push_context_record(
+        &mut self,
+        context_type: ContextType,
+        name: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+        content: String,
+        meta: JsonValue,
+    ) {
+        let rec = ContextRecord {
+            id: self.next_context_id,
+            ts: Self::now_ts_secs(),
+            context_type,
+            name,
+            from,
+            to,
+            content,
+            meta,
+        };
+        self.next_context_id = self.next_context_id.saturating_add(1);
+        self.context_records.push(rec);
+    }
+
+    fn upsert_context_record_by_type_name(
+        &mut self,
+        context_type: ContextType,
+        name: &str,
+        from: Option<String>,
+        to: Option<String>,
+        content: String,
+        meta: JsonValue,
+    ) {
+        self.context_records.retain(|existing| {
+            if existing.context_type != context_type {
+                return true;
+            }
+            if let Some(existing_name) = &existing.name {
+                !existing_name.eq_ignore_ascii_case(name)
+            } else {
+                true
+            }
+        });
+        self.push_context_record(
+            context_type,
+            Some(name.to_string()),
+            from,
+            to,
+            content,
+            meta,
+        );
+    }
+
+    fn observation_text(observation_type: &str, name: &str, content: &str) -> String {
+        format!(
+            "Observation:\ntype: {}\nname: {}\ncontent:\n{}",
+            observation_type, name, content
+        )
+    }
+
+    fn observation_for_model(obs: &ObservationRecord) -> String {
+        Self::observation_text(&obs.observation_type, &obs.name, &obs.content)
+    }
+
+    fn render_loop_breaker_prompt(template: &str, tool: &str) -> String {
+        let mut rendered = template.replace("{tool}", tool);
+        if rendered.contains("{}") {
+            rendered = rendered.replacen("{}", tool, 1);
+        }
+        rendered
+    }
+
+    pub(crate) fn upsert_observation(&mut self, observation_type: &str, name: &str, content: String) {
+        let context_type = if observation_type.eq_ignore_ascii_case("tool") {
+            ContextType::ToolResult
+        } else if observation_type.eq_ignore_ascii_case("error") {
+            ContextType::Error
+        } else if observation_type.eq_ignore_ascii_case("status") {
+            ContextType::Status
+        } else if observation_type.eq_ignore_ascii_case("summary") {
+            ContextType::Summary
+        } else {
+            ContextType::Observation
+        };
+        self.upsert_context_record_by_type_name(
+            context_type,
+            name,
+            Some("system".to_string()),
+            self.agent_id.clone(),
+            content.clone(),
+            serde_json::json!({ "observation_type": observation_type }),
+        );
+        self.observations.retain(|existing| {
+            !(existing.observation_type.eq_ignore_ascii_case(observation_type)
+                && existing.name.eq_ignore_ascii_case(name))
+        });
+        self.observations.push(ObservationRecord {
+            observation_type: observation_type.to_string(),
+            name: name.to_string(),
+            content,
+        });
+    }
+
     fn allowed_tool_names(&self) -> Option<HashSet<String>> {
         let spec = self.spec.as_ref()?;
         if spec.tools.is_empty() {
@@ -822,152 +1526,13 @@ impl AgentEngine {
     }
 
     fn system_prompt(&self) -> String {
-        self.system_prompt_with_mode(PromptMode::Structured)
-    }
-
-    fn system_prompt_with_mode(&self, mode: PromptMode) -> String {
-        let mut prompt = if let Some(spec) = &self.spec {
-            // Use the spec-defined system prompt if available
-            let base = match self.role {
-                AgentRole::Lead => [
-                    "You are linggen-agent 'Lead'.",
-                    "Your goal is to translate high-level human goals into structured user stories and acceptance criteria.",
-                    "Rules:",
-                    "- Use tools to inspect the repo to understand the current state before planning.",
-                    "- When you have a clear plan, respond with a JSON object of type 'finalize_task' containing the TaskPacket.",
-                    "- If UI is involved, include a Mermaid wireframe in the TaskPacket.",
-                    if mode == PromptMode::Structured {
-                        "- Respond with EXACTLY one JSON object each turn."
-                    } else {
-                        "- You may respond in plain text."
-                    },
-                    if mode == PromptMode::Structured {
-                        ""
-                    } else {
-                        "- In plain-text mode, format output using Markdown (headings, bullets, short paragraphs, fenced code blocks when needed)."
-                    },
-                    if mode == PromptMode::Structured {
-                        "- Allowed JSON variants:"
-                    } else {
-                        "- If you need to use a tool, respond with EXACTLY one JSON object:"
-                    },
-                    "  {\"type\":\"tool\",\"tool\":<string>,\"args\":<object>}",
-                    if mode == PromptMode::Structured {
-                        "  {\"type\":\"finalize_task\",\"packet\":{\"title\":<string>,\"user_stories\":[<string>],\"acceptance_criteria\":[<string>],\"mermaid_wireframe\":<string|null>}}"
-                    } else {
-                        "  (Otherwise respond in plain text)"
-                    },
-                    if mode == PromptMode::Structured {
-                        "  {\"type\":\"ask\",\"question\":<string>}"
-                    } else {
-                        ""
-                    },
-                ]
-                .join("\n"),
-                AgentRole::Coder => [
-                    "You are linggen-agent 'coder'.",
-                    "Rules:",
-                    "- You can write files directly using the provided tools.",
-                    "- Prefer 'run_command' (alias: Bash) for standard CLI workflows (search, inspect, build, test).",
-                    "- Use tools to inspect the repo before making changes.",
-                    "- For file tools, use argument key 'path' (canonical) and follow tool schema exactly.",
-                    "- For existing files, ALWAYS call read_file first before write_file.",
-                    "- Prefer minimal edits; do not replace an entire existing file unless explicitly asked.",
-                    if mode == PromptMode::Structured {
-                        "- Respond with EXACTLY one JSON object each turn."
-                    } else {
-                        "- You may respond in plain text."
-                    },
-                    if mode == PromptMode::Structured {
-                        ""
-                    } else {
-                        "- In plain-text mode, format output using Markdown (headings, bullets, short paragraphs, fenced code blocks when needed)."
-                    },
-                    if mode == PromptMode::Structured {
-                        "- Allowed JSON variants:"
-                    } else {
-                        "- If you need to use a tool, respond with EXACTLY one JSON object:"
-                    },
-                    "  {\"type\":\"tool\",\"tool\":<string>,\"args\":<object>}",
-                    if mode == PromptMode::Structured {
-                        "  {\"type\":\"ask\",\"question\":<string>}"
-                    } else {
-                        "  (Otherwise respond in plain text)"
-                    },
-                ]
-                .join("\n"),
-                AgentRole::Operator => [
-                    "You are linggen-agent 'operator'.",
-                    "Your goal is to verify implementations and handle releases.",
-                    "Rules:",
-                    "- Use 'run_command' (alias: Bash) to run tests and verify the build state.",
-                    "- Use 'capture_screenshot' to verify UI requirements for web apps.",
-                    "- Report success or failure clearly. If tests fail, provide logs to help the Coder.",
-                    if mode == PromptMode::Structured {
-                        "- Respond with EXACTLY one JSON object each turn."
-                    } else {
-                        "- You may respond in plain text."
-                    },
-                    if mode == PromptMode::Structured {
-                        ""
-                    } else {
-                        "- In plain-text mode, format output using Markdown (headings, bullets, short paragraphs, fenced code blocks when needed)."
-                    },
-                    if mode == PromptMode::Structured {
-                        "- Allowed JSON variants:"
-                    } else {
-                        "- If you need to use a tool, respond with EXACTLY one JSON object:"
-                    },
-                    "  {\"type\":\"tool\",\"tool\":<string>,\"args\":<object>}",
-                    if mode == PromptMode::Structured {
-                        "  {\"type\":\"ask\",\"question\":<string>}"
-                    } else {
-                        "  (Otherwise respond in plain text)"
-                    },
-                ]
-                .join("\n"),
-            };
-            format!(
-                "{}\n\nAgent ID: {}\nDescription: {}",
-                base,
-                self.agent_id.as_deref().unwrap_or("unknown"),
-                spec.description
-            )
-        } else {
-            "You are a helpful AI assistant.".to_string()
-        };
-
-        // Inject runtime context
-        prompt.push_str("\n\n--- RUNTIME CONTEXT ---");
-        prompt.push_str(&format!("\nWorkspaceRoot: {}", self.cfg.ws_root.display()));
-        if let Some(spec) = &self.spec {
-            prompt.push_str(&format!(
-                "\nWorkScope (allowed write globs): {:?}",
-                spec.work_globs
-            ));
-        }
-
-        // Dynamic held locks
-        let held_locks = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                if let (Some(manager), Some(agent_id)) = (self.tools.get_manager(), &self.agent_id)
-                {
-                    let locks = manager.locks.lock().await;
-                    // Filter locks owned by this agent
-                    locks
-                        .locks
-                        .iter()
-                        .filter(|(_, info)| &info.owner_id == agent_id)
-                        .map(|(glob, _): (&String, _)| glob.clone())
-                        .collect::<Vec<String>>()
-                } else {
-                    Vec::new()
-                }
-            })
-        });
-
-        prompt.push_str(&format!("\nHeldLocks: {:?}", held_locks));
-        prompt.push_str("\n-----------------------");
+        let mut prompt = self
+            .spec_system_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "You are a helpful AI assistant.".to_string());
 
         if let Some(skill) = &self.active_skill {
             prompt.push_str("\n\n--- ACTIVE SKILL ---");

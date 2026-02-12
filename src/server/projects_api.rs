@@ -1,4 +1,5 @@
 use crate::server::ServerState;
+use crate::server::chat_helpers::sanitize_message_for_ui;
 use crate::skills::Skill;
 use axum::{
     extract::{Query, State},
@@ -134,10 +135,20 @@ pub(crate) async fn get_agent_context_api(
         .map(|v| v.eq_ignore_ascii_case("raw"))
         .unwrap_or(false);
 
+    let ui_messages: Vec<crate::db::ChatMessageRecord> = messages
+        .iter()
+        .cloned()
+        .filter_map(|mut m| {
+            let cleaned = sanitize_message_for_ui(&m.from_id, &m.content)?;
+            m.content = cleaned;
+            Some(m)
+        })
+        .collect();
+
     Json(AgentContextResponse {
         run,
         summary,
-        messages: if is_raw { Some(messages) } else { None },
+        messages: if is_raw { Some(ui_messages) } else { None },
     })
     .into_response()
 }
