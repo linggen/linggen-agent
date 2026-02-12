@@ -207,7 +207,7 @@ const formatCompletedToolLine = (call?: ToolCallMeta): string | null => {
       ? args.globs.filter((v: unknown) => typeof v === 'string').map((v: string) => v.trim()).filter(Boolean)
       : [];
     if (globs.length > 0) return `Listed files in ${previewText(globs.join(', '), 110)}`;
-    return 'Listed files';
+    return 'Listed files in .';
   }
   if (tool === 'run_command' || tool === 'bash') {
     const cmd = firstStringArg(args, ['cmd', 'command']);
@@ -220,7 +220,7 @@ const formatCompletedToolLine = (call?: ToolCallMeta): string | null => {
   return `Used ${tool}`;
 };
 
-const summarizeActivityEntries = (entries: string[]): string | undefined => {
+const summarizeActivityEntries = (entries: string[], inProgress = false): string | undefined => {
   if (entries.length === 0) return undefined;
   const tools = entries
     .filter((line) => /^Calling tool:/i.test(line))
@@ -237,7 +237,7 @@ const summarizeActivityEntries = (entries: string[]): string | undefined => {
     if (readCount > 0) parts.push(`${readCount} file${readCount > 1 ? 's' : ''}`);
     if (searchCount > 0) parts.push(`${searchCount} search${searchCount > 1 ? 'es' : ''}`);
     if (listCount > 0) parts.push(`${listCount} list${listCount > 1 ? 's' : ''}`);
-    return `Explored ${parts.join(', ')}`;
+    return `${inProgress ? 'Exploring' : 'Explored'} ${parts.join(', ')}`;
   }
   const phaseSummary =
     phases.length > 1 ? `${phases[0]} -> ${phases[phases.length - 1]}` : phases[0] || '';
@@ -263,7 +263,7 @@ const addActivityEntry = (msg: ChatMessage, entry: string): ChatMessage => {
   return {
     ...msg,
     activityEntries: entries,
-    activitySummary: summarizeActivityEntries(entries),
+    activitySummary: summarizeActivityEntries(entries, Boolean(msg.isGenerating)),
   };
 };
 
@@ -1174,7 +1174,12 @@ const App: React.FC = () => {
               const idx = findLastGeneratingMessageIndex(prev, event.agent_id);
               if (idx < 0 || !isStatusLineText(prev[idx].text)) return prev;
               const next = [...prev];
-              next[idx] = { ...next[idx], isGenerating: false };
+              const entries = Array.isArray(next[idx].activityEntries) ? next[idx].activityEntries : [];
+              next[idx] = {
+                ...next[idx],
+                isGenerating: false,
+                activitySummary: summarizeActivityEntries(entries, false) || next[idx].activitySummary,
+              };
               return next;
             });
           }
@@ -1276,11 +1281,16 @@ const App: React.FC = () => {
             const generatingIdx = findLastGeneratingMessageIndex(prev, event.from);
             if (generatingIdx >= 0) {
               const next = [...prev];
+              const existingEntries = Array.isArray(next[generatingIdx].activityEntries)
+                ? next[generatingIdx].activityEntries
+                : [];
               next[generatingIdx] = {
                 ...next[generatingIdx],
                 text: cleanedContent,
                 to: event.to || next[generatingIdx].to || 'user',
                 isGenerating: false,
+                activitySummary:
+                  summarizeActivityEntries(existingEntries, false) || next[generatingIdx].activitySummary,
               };
               return next;
             }

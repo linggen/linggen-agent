@@ -272,7 +272,7 @@ const isProgressLineText = (text?: string) => {
   );
 };
 
-const summarizeCollapsedActivity = (entries: string[]) => {
+const summarizeCollapsedActivity = (entries: string[], inProgress = false) => {
   const normalized = entries.map((entry) => entry.toLowerCase());
   const readCount = normalized.filter((v) => v.startsWith('read ') || v.includes('reading file') || v.includes('read_file')).length;
   const searchCount = normalized.filter((v) => v.startsWith('searched for ') || v.includes('searching') || v.includes('search_rg') || v.includes('grep') || v.includes('smart_search') || v.includes('find_file')).length;
@@ -286,7 +286,7 @@ const summarizeCollapsedActivity = (entries: string[]) => {
     if (readCount > 0) parts.push(`${readCount} file${readCount > 1 ? 's' : ''}`);
     if (searchCount > 0) parts.push(`${searchCount} search${searchCount > 1 ? 'es' : ''}`);
     if (listCount > 0) parts.push(`${listCount} list${listCount > 1 ? 's' : ''}`);
-    return `Explored ${parts.join(', ')}`;
+    return `${inProgress ? 'Exploring' : 'Explored'} ${parts.join(', ')}`;
   }
 
   const parts: string[] = [];
@@ -303,12 +303,10 @@ const summarizeCollapsedActivity = (entries: string[]) => {
 };
 
 const activityHeadline = (msg: ChatMessage, entries: string[]) => {
-  const summary = msg.activitySummary || summarizeCollapsedActivity(entries);
+  const computed = summarizeCollapsedActivity(entries, msg.isGenerating);
+  const summary = msg.isGenerating ? (computed || msg.activitySummary || '') : (msg.activitySummary || computed || '');
   if (!msg.isGenerating) return summary;
-  const current = entries[entries.length - 1];
-  if (!summary) return current || '';
-  if (!current || current === summary) return summary;
-  return `${summary} -> ${current}`;
+  return summary || entries[entries.length - 1] || '';
 };
 
 const activityEntriesForDetails = (msg: ChatMessage, entries: string[]) => {
@@ -351,7 +349,7 @@ const collapseProgressMessages = (messages: ChatMessage[]): ChatMessage[] => {
       timestampMs: ts,
       isGenerating,
       activityEntries: deduped,
-      activitySummary: summarizeCollapsedActivity(deduped),
+      activitySummary: summarizeCollapsedActivity(deduped, isGenerating),
     });
     pendingByAgent.delete(agentId);
     pendingTsByAgent.delete(agentId);
@@ -401,7 +399,7 @@ const collapseProgressMessages = (messages: ChatMessage[]): ChatMessage[] => {
         activityEntries: merged.length > 0 ? merged : msg.activityEntries,
         activitySummary:
           merged.length > 0
-            ? summarizeCollapsedActivity(merged)
+            ? summarizeCollapsedActivity(merged, isGenerating)
             : msg.activitySummary,
       });
       continue;
@@ -412,7 +410,7 @@ const collapseProgressMessages = (messages: ChatMessage[]): ChatMessage[] => {
       activityEntries: entries.length > 0 ? entries : msg.activityEntries,
       activitySummary:
         entries.length > 0
-          ? (msg.activitySummary || summarizeCollapsedActivity(entries))
+          ? summarizeCollapsedActivity(entries, !!msg.isGenerating)
           : msg.activitySummary,
     });
   }
@@ -1220,7 +1218,7 @@ export const ChatPanel: React.FC<{
           const hasActivitySummary = !isUser && (hasActivity || !!msg.activitySummary);
           const isStatusLine = isProgressLineText(msg.text);
           const activitySummaryText = hasActivitySummary
-            ? (msg.activitySummary || (hasActivity ? summarizeCollapsedActivity(activityEntries) : ''))
+            ? (hasActivity ? summarizeCollapsedActivity(activityEntries, !!msg.isGenerating) : (msg.activitySummary || ''))
             : '';
           const hideStatusBodyText = hasActivitySummary && (
             isStatusLine ||
