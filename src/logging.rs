@@ -21,7 +21,9 @@ pub struct LoggingSettings<'a> {
 pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Option<PathBuf> {
     let log_dir = resolve_log_dir(settings.directory).ok()?;
     let retention_days = settings.retention_days.unwrap_or(RETENTION_DAYS);
-    let _ = cleanup_old_logs(&log_dir, retention_days);
+    if let Err(e) = cleanup_old_logs(&log_dir, retention_days) {
+        eprintln!("Failed to cleanup old logs: {e}");
+    }
 
     let rotation = settings.rotation.unwrap_or(ROTATION_DAILY);
     if rotation != ROTATION_DAILY {
@@ -111,7 +113,10 @@ fn cleanup_old_logs(log_dir: &PathBuf, retention_days: u64) -> Result<()> {
     for entry in std::fs::read_dir(log_dir)? {
         let entry = match entry {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!("Failed to read directory entry: {e}");
+                continue;
+            }
         };
         let path = entry.path();
         if !path.is_file() {
@@ -126,14 +131,22 @@ fn cleanup_old_logs(log_dir: &PathBuf, retention_days: u64) -> Result<()> {
         }
         let modified = match entry.metadata().and_then(|m| m.modified()) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!("Failed to get metadata for {:?}: {e}", path);
+                continue;
+            }
         };
         let age = match now.duration_since(modified) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!("Failed to calculate age for {:?}: {e}", path);
+                continue;
+            }
         };
         if age > max_age {
-            let _ = std::fs::remove_file(path);
+            if let Err(e) = std::fs::remove_file(&path) {
+                eprintln!("Failed to remove old log file {:?}: {e}", path);
+            }
         }
     }
     Ok(())

@@ -76,7 +76,12 @@ impl Tools {
         })
     }
 
-    pub fn set_context(&mut self, manager: Arc<AgentManager>, agent_id: String, agent_kind: AgentKind) {
+    pub fn set_context(
+        &mut self,
+        manager: Arc<AgentManager>,
+        agent_id: String,
+        agent_kind: AgentKind,
+    ) {
         self.manager = Some(manager);
         self.agent_id = Some(agent_id);
         self.agent_kind = agent_kind;
@@ -122,13 +127,19 @@ impl Tools {
                     .map_err(|e| anyhow::anyhow!("invalid args for search_rg: {}", e))?;
                 self.search_rg(args)
             }
+            "smart_search" | "find_file" => {
+                let args: SmartSearchArgs = serde_json::from_value(normalized_args)
+                    .map_err(|e| anyhow::anyhow!("invalid args for smart_search: {}", e))?;
+                self.smart_search(args)
+            }
             "run_command" | "Bash" => {
-                let args: RunCommandArgs = serde_json::from_value(normalized_args).map_err(|e| {
-                    anyhow::anyhow!(
-                        "invalid args for run_command: {}. Expected keys: cmd|timeout_ms",
-                        e
-                    )
-                })?;
+                let args: RunCommandArgs =
+                    serde_json::from_value(normalized_args).map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid args for run_command: {}. Expected keys: cmd|timeout_ms",
+                            e
+                        )
+                    })?;
                 self.run_command(args)
             }
             "capture_screenshot" => {
@@ -164,7 +175,7 @@ impl Tools {
         }
     }
 
-    fn list_files(&self, args: ListFilesArgs) -> Result<ToolResult> {
+    pub fn list_files(&self, args: ListFilesArgs) -> Result<ToolResult> {
         let globset = build_globset(args.globs.as_deref())?;
         let max_results = args.max_results.unwrap_or(200);
 
@@ -199,31 +210,227 @@ impl Tools {
     }
 
     fn read_file(&self, args: ReadFileArgs) -> Result<ToolResult> {
-        let rel = sanitize_rel_path(&self.root, &args.path)?;
+        let rel = sanitize_rel_path(&self.root, &args.path).unwrap_or_else(|_| args.path.clone());
+        let filename = Path::new(&rel)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&rel);
         let path = self.root.join(&rel);
-        if !path.exists() {
-            // Return a structured "not found" message instead of hard erroring.
-            // This helps the model self-correct (e.g. by calling Glob first).
-            return Ok(ToolResult::Success(format!(
-                "file_not_found: {} (tip: use Glob to list available files first)",
+        
+        if path.exists() && path.is_dir() {
+            anyhow::bail!(
+                "path '{}' is a directory. Use list_files to enumerate files, then read_file with an exact file path.",
                 rel
+            );
+        }
+
+        if path.exists() && path.is_file() {
+            return self.do_read_file(&rel, &path, args.max_bytes, args.line_range);
+        }
+
+        // File not found, try smart search candidates.
+        info!("File not found: {}. Attempting smart search...", rel);
+        let candidates = self.smart_search_candidates(&rel, 10)?;
+        if let Some(best_match) = candidates.first() {
+            let full_path = self.root.join(best_match);
+            let note = if candidates.len() > 1 {
+                format!(
+                    "Note: Original path '{}' not found. Found {} candidate files, reading '{}'. Others: {}",
+                    rel,
+                    candidates.len(),
+                    best_match,
+                    candidates[1..].join(", ")
+                )
+            } else {
+                format!(
+                    "Note: Original path '{}' not found. Automatically found and read '{}' instead.",
+                    rel, best_match
+                )
+            };
+            return self.do_read_file_with_note(
+                best_match,
+                &full_path,
+                args.max_bytes,
+                args.line_range,
+                &note,
+            );
+        }
+
+        // 3. Last resort: tell the model we searched everywhere
+        Ok(ToolResult::Success(format!(
+            "file_not_found: {} - I searched the whole repository for '{}' (including case-insensitive and partial matches) but found nothing. Please verify the filename or use 'list_files' to explore the directory structure.",
+            rel, filename
+        )))
+    }
+
+    fn smart_search(&self, args: SmartSearchArgs) -> Result<ToolResult> {
+        let query = sanitize_rel_path(&self.root, &args.query).unwrap_or(args.query.clone());
+        let max_results = args.max_results.unwrap_or(20);
+        let matches = self.smart_search_candidates(&query, max_results)?;
+        if matches.is_empty() {
+            return Ok(ToolResult::Success(format!(
+                "smart_search: no file candidates found for '{}'",
+                query
             )));
         }
-        let file = fs::File::open(&path)?;
-        let max = args.max_bytes.unwrap_or(64 * 1024);
-        let mut buf = Vec::new();
-        use std::io::Read;
-        file.take(max as u64 + 1).read_to_end(&mut buf)?;
-        let truncated = buf.len() > max;
-        if truncated {
-            buf.truncate(max);
+        Ok(ToolResult::FileList(matches))
+    }
+
+    fn smart_search_candidates(&self, query: &str, max_results: usize) -> Result<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let limit = max_results.max(1);
+
+        let filename = Path::new(query)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(query);
+
+        // 1) Exact basename matches anywhere in the repo.
+        if !filename.is_empty() {
+            let glob_pattern = format!("**/{}", filename);
+            if let Ok(ToolResult::FileList(matches)) = self.list_files(ListFilesArgs {
+                globs: Some(vec![glob_pattern]),
+                max_results: Some(limit),
+            }) {
+                for m in matches {
+                    if seen.insert(m.clone()) {
+                        out.push(m);
+                        if out.len() >= limit {
+                            return Ok(out);
+                        }
+                    }
+                }
+            }
         }
-        let content = String::from_utf8_lossy(&buf).to_string();
+
+        // 2) Case-insensitive filename/path contains matches.
+        let query_lower = query.to_lowercase();
+        let filename_lower = filename.to_lowercase();
+        let walker = WalkBuilder::new(&self.root)
+            .standard_filters(true)
+            .hidden(true)
+            .build();
+
+        for entry in walker {
+            let entry = match entry {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let path = entry.path();
+            let rel = match to_rel_string(&self.root, path) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let rel_lower = rel.to_lowercase();
+            let name_lower = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+
+            let name_match = !filename_lower.is_empty()
+                && !name_lower.is_empty()
+                && (name_lower == filename_lower
+                    || name_lower.contains(&filename_lower)
+                    || filename_lower.contains(&name_lower));
+            let path_match = !query_lower.is_empty() && rel_lower.contains(&query_lower);
+            if (name_match || path_match) && seen.insert(rel.clone()) {
+                out.push(rel);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    fn do_read_file(
+        &self,
+        rel: &str,
+        path: &Path,
+        max_bytes: Option<usize>,
+        line_range: Option<[usize; 2]>,
+    ) -> Result<ToolResult> {
+        let max = max_bytes.unwrap_or(64 * 1024);
+
+        let (content, truncated) = if let Some([start, end]) = line_range {
+            if start == 0 || end < start {
+                anyhow::bail!(
+                    "invalid line_range [{}, {}]; expected 1-based inclusive range with start <= end",
+                    start,
+                    end
+                );
+            }
+
+            use std::io::BufRead;
+            let file = fs::File::open(path)?;
+            let reader = std::io::BufReader::new(file);
+            let mut out = String::new();
+            let mut truncated = false;
+
+            for (idx, line_res) in reader.lines().enumerate() {
+                let line_no = idx + 1;
+                if line_no < start {
+                    continue;
+                }
+                if line_no > end {
+                    break;
+                }
+                let line = line_res?;
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&line);
+                if out.len() > max {
+                    out.truncate(max);
+                    truncated = true;
+                    break;
+                }
+            }
+
+            (out, truncated)
+        } else {
+            let file = fs::File::open(path)?;
+            let mut buf = Vec::new();
+            use std::io::Read;
+            file.take(max as u64 + 1).read_to_end(&mut buf)?;
+            let truncated = buf.len() > max;
+            if truncated {
+                buf.truncate(max);
+            }
+            (String::from_utf8_lossy(&buf).to_string(), truncated)
+        };
+
         Ok(ToolResult::FileContent {
-            path: rel,
+            path: rel.to_string(),
             content,
             truncated,
         })
+    }
+
+    fn do_read_file_with_note(
+        &self,
+        rel: &str,
+        path: &Path,
+        max_bytes: Option<usize>,
+        line_range: Option<[usize; 2]>,
+        note: &str,
+    ) -> Result<ToolResult> {
+        match self.do_read_file(rel, path, max_bytes, line_range)? {
+            ToolResult::FileContent { path, content, truncated } => {
+                Ok(ToolResult::FileContent {
+                    path: format!("{} ({})", path, note),
+                    content: format!("/* {} */\n\n{}", note, content),
+                    truncated,
+                })
+            }
+            other => Ok(other),
+        }
     }
 
     fn search_rg(&self, args: SearchArgs) -> Result<ToolResult> {
@@ -259,7 +466,7 @@ impl Tools {
                 }
             }
             let mut file_matches = Vec::new();
-            
+
             let _ = searcher.search_path(
                 &matcher,
                 path,
@@ -286,6 +493,12 @@ impl Tools {
     }
 
     fn run_command(&self, args: RunCommandArgs) -> Result<ToolResult> {
+        if self.agent_kind == AgentKind::Main && is_repo_discovery_command(&args.cmd) {
+            anyhow::bail!(
+                "Policy: main agents must delegate repository discovery to subagent 'search' via delegate_to_agent"
+            );
+        }
+
         // Hybrid shell mode: support common dev/inspection tools while enforcing
         // an allowlist on every shell segment.
         validate_shell_command(&args.cmd)?;
@@ -414,6 +627,21 @@ impl Tools {
                     .unwrap()
                     .as_secs(),
             });
+
+            // Live working-place map for active-path UI (in-memory source of truth).
+            if self.run_id.is_some() {
+                let repo_path = self.root.to_string_lossy().to_string();
+                let run_id = self.run_id.clone();
+                let rel_for_map = rel.clone();
+                let agent_for_map = agent_id.clone();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        manager
+                            .upsert_working_place(&repo_path, &agent_for_map, &rel_for_map, run_id)
+                            .await;
+                    })
+                });
+            }
         }
 
         if let Some(parent) = path.parent() {
@@ -533,7 +761,9 @@ impl Tools {
                         .await;
                 }
 
-                let agent = manager.get_or_create_agent(&self.root, &target_agent_id).await?;
+                let agent = manager
+                    .get_or_create_agent(&self.root, &target_agent_id)
+                    .await?;
                 let mut engine = agent.lock().await;
                 if target_kind == AgentKind::Subagent {
                     engine.set_parent_agent(Some(caller_id.clone()));
@@ -555,9 +785,7 @@ impl Tools {
                         } else {
                             "failed"
                         };
-                        let _ = manager
-                            .finish_agent_run(&run_id, status, Some(msg))
-                            .await;
+                        let _ = manager.finish_agent_run(&run_id, status, Some(msg)).await;
                         return Err(err);
                     }
                 };
@@ -607,7 +835,6 @@ struct ReadFileArgs {
     #[serde(alias = "file", alias = "filepath")]
     path: String,
     max_bytes: Option<usize>,
-    #[allow(dead_code)]
     line_range: Option<[usize; 2]>,
 }
 
@@ -615,6 +842,13 @@ struct ReadFileArgs {
 struct SearchArgs {
     query: String,
     globs: Option<Vec<String>>,
+    max_results: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SmartSearchArgs {
+    #[serde(alias = "path", alias = "file", alias = "filepath")]
+    query: String,
     max_results: Option<usize>,
 }
 
@@ -669,7 +903,10 @@ fn sanitize_rel_path(root: &Path, path: &str) -> Result<String> {
     if rel_path.as_os_str().is_empty() {
         anyhow::bail!("empty path");
     }
-    if rel_path.components().any(|c| matches!(c, Component::ParentDir)) {
+    if rel_path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
         anyhow::bail!("path traversal not allowed");
     }
     if rel_path
@@ -697,7 +934,10 @@ fn summarize_tool_args(tool: &str, args: &Value) -> String {
                     let line_count = content.lines().count();
                     obj.insert(
                         "content".to_string(),
-                        serde_json::json!(format!("<omitted:{} bytes, {} lines>", byte_len, line_count)),
+                        serde_json::json!(format!(
+                            "<omitted:{} bytes, {} lines>",
+                            byte_len, line_count
+                        )),
                     );
                 }
             }
@@ -720,11 +960,34 @@ fn summarize_tool_args(tool: &str, args: &Value) -> String {
 fn normalize_tool_args(tool: &str, args: &Value) -> Value {
     let mut normalized = args.clone();
     if let Some(obj) = normalized.as_object_mut() {
-        if matches!(tool, "read_file" | "Read" | "write_file" | "Write") && !obj.contains_key("path") {
+        if matches!(tool, "read_file" | "Read" | "write_file" | "Write")
+            && !obj.contains_key("path")
+        {
             if let Some(fp) = obj.get("filepath").cloned() {
                 obj.insert("path".to_string(), fp);
             } else if let Some(file) = obj.get("file").cloned() {
                 obj.insert("path".to_string(), file);
+            }
+        }
+
+        if matches!(tool, "smart_search" | "find_file") && !obj.contains_key("query") {
+            if let Some(path) = obj.get("path").cloned() {
+                obj.insert("query".to_string(), path);
+            } else if let Some(fp) = obj.get("filepath").cloned() {
+                obj.insert("query".to_string(), fp);
+            } else if let Some(file) = obj.get("file").cloned() {
+                obj.insert("query".to_string(), file);
+            }
+        }
+
+        if matches!(tool, "search_rg" | "Grep" | "list_files" | "Glob")
+            && obj
+                .get("globs")
+                .map(|v| v.is_string())
+                .unwrap_or(false)
+        {
+            if let Some(glob) = obj.get("globs").and_then(|v| v.as_str()) {
+                obj.insert("globs".to_string(), serde_json::json!([glob]));
             }
         }
     }
@@ -766,6 +1029,24 @@ fn validate_shell_command(cmd: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_repo_discovery_command(cmd: &str) -> bool {
+    split_shell_segments(cmd).iter().any(|segment| {
+        let Some(token) = first_segment_token(segment) else {
+            return false;
+        };
+
+        if matches!(token, "rg" | "grep" | "fd" | "find") {
+            return true;
+        }
+
+        if token == "git" {
+            return segment.split_whitespace().any(|part| part == "grep");
+        }
+
+        false
+    })
+}
+
 fn split_shell_segments(cmd: &str) -> Vec<&str> {
     cmd.split(|c| c == '|' || c == ';')
         .flat_map(|part| part.split("&&"))
@@ -787,6 +1068,7 @@ pub fn canonical_tool_name(tool: &str) -> Option<&'static str> {
         "get_repo_info" => "get_repo_info",
         "list_files" | "Glob" => "list_files",
         "read_file" | "Read" => "read_file",
+        "smart_search" | "find_file" => "smart_search",
         "search_rg" | "Grep" => "search_rg",
         "write_file" | "Write" => "write_file",
         "run_command" | "Bash" => "run_command",
@@ -815,6 +1097,12 @@ fn full_tool_schema_entries() -> Vec<Value> {
             "args": {"path": "string", "max_bytes": "number?", "line_range": "[number,number]?"},
             "returns": "{path,content,truncated}",
             "notes": "Path aliases accepted: path, file, filepath."
+        }),
+        serde_json::json!({
+            "name": "smart_search",
+            "args": {"query": "string", "max_results": "number?"},
+            "returns": "string[]",
+            "notes": "Find likely file paths by filename/path similarity. Aliases accepted for query: query, path, file, filepath."
         }),
         serde_json::json!({
             "name": "search_rg",

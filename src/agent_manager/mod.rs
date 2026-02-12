@@ -32,6 +32,7 @@ pub struct AgentManager {
     pub models: Arc<ModelManager>,
     pub db: Arc<Db>,
     pub skill_manager: Arc<SkillManager>,
+    working_places: Mutex<HashMap<String, HashMap<String, WorkingPlaceEntry>>>,
     cancelled_runs: Mutex<HashSet<String>>,
     events: mpsc::UnboundedSender<AgentEvent>,
 }
@@ -51,6 +52,11 @@ pub enum AgentEvent {
         to: String,
         content: String,
     },
+    AgentStatus {
+        agent_id: String,
+        status: String,
+        detail: Option<String>,
+    },
     SubagentSpawned {
         parent_id: String,
         subagent_id: String,
@@ -61,7 +67,27 @@ pub enum AgentEvent {
         subagent_id: String,
         outcome: AgentOutcome,
     },
+    ContextUsage {
+        agent_id: String,
+        stage: String,
+        message_count: usize,
+        char_count: usize,
+        estimated_tokens: usize,
+        #[serde(default)]
+        token_limit: Option<usize>,
+        compressed: bool,
+        summary_count: usize,
+    },
     StateUpdated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkingPlaceEntry {
+    pub repo_path: String,
+    pub file_path: String,
+    pub agent_id: String,
+    pub run_id: Option<String>,
+    pub last_modified: u64,
 }
 
 impl AgentManager {
@@ -92,6 +118,7 @@ impl AgentManager {
                 models,
                 db,
                 skill_manager,
+                working_places: Mutex::new(HashMap::new()),
                 cancelled_runs: Mutex::new(HashSet::new()),
                 events: tx,
             }),
@@ -250,7 +277,7 @@ impl AgentManager {
             .find(|a| a.id == agent_id)
             .ok_or_else(|| anyhow::anyhow!("Agent {} not found in config", agent_id))?;
 
-        let (spec, _system_prompt) =
+        let (spec, system_prompt) =
             AgentSpec::from_markdown(&PathBuf::from(&agent_ref.spec_path))?;
 
         let model_id = agent_ref
@@ -277,13 +304,15 @@ impl AgentManager {
                 ws_root: project_root.clone(),
                 max_iters: self.config.agent.max_iters,
                 stream: true,
+                write_safety_mode: self.config.agent.write_safety_mode,
+                prompt_loop_breaker: self.config.agent.prompt_loop_breaker.clone(),
             },
             self.models.clone(),
             model_id,
             role,
         )?;
 
-        engine.set_spec(agent_id.to_string(), spec);
+        engine.set_spec(agent_id.to_string(), spec, system_prompt);
         engine.set_manager_context(self.clone());
         if let Ok(settings) = self
             .db
@@ -357,6 +386,60 @@ impl AgentManager {
         Some(spec.kind)
     }
 
+    pub async fn upsert_working_place(
+        &self,
+        repo_path: &str,
+        agent_id: &str,
+        file_path: &str,
+        run_id: Option<String>,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let entry = WorkingPlaceEntry {
+            repo_path: repo_path.to_string(),
+            file_path: file_path.to_string(),
+            agent_id: agent_id.to_string(),
+            run_id,
+            last_modified: now,
+        };
+        let mut places = self.working_places.lock().await;
+        let repo = places.entry(repo_path.to_string()).or_default();
+        repo.insert(agent_id.to_string(), entry);
+    }
+
+    pub async fn clear_working_place_for_agent(&self, repo_path: &str, agent_id: &str) {
+        let mut places = self.working_places.lock().await;
+        if let Some(repo_map) = places.get_mut(repo_path) {
+            repo_map.remove(agent_id);
+            if repo_map.is_empty() {
+                places.remove(repo_path);
+            }
+        }
+    }
+
+    pub async fn clear_working_place_for_run(&self, run_id: &str) {
+        let mut places = self.working_places.lock().await;
+        let repos: Vec<String> = places.keys().cloned().collect();
+        for repo in repos {
+            if let Some(repo_map) = places.get_mut(&repo) {
+                repo_map.retain(|_, entry| entry.run_id.as_deref() != Some(run_id));
+                if repo_map.is_empty() {
+                    places.remove(&repo);
+                }
+            }
+        }
+    }
+
+    pub async fn list_working_places_for_repo(&self, repo_path: &str) -> Vec<WorkingPlaceEntry> {
+        let places = self.working_places.lock().await;
+        places
+            .get(repo_path)
+            .map(|repo| repo.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub async fn begin_agent_run(
         &self,
         project_root: &PathBuf,
@@ -376,10 +459,11 @@ impl AgentManager {
         let started_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
+        let repo_path = project_root.to_string_lossy().to_string();
 
         let record = AgentRunRecord {
             run_id: run_id.clone(),
-            repo_path: project_root.to_string_lossy().to_string(),
+            repo_path: repo_path.clone(),
             session_id: session_id.unwrap_or("default").to_string(),
             agent_id: agent_id.to_string(),
             agent_kind: match kind {
@@ -393,6 +477,7 @@ impl AgentManager {
             ended_at: None,
         };
         self.db.add_agent_run(record)?;
+        self.clear_working_place_for_agent(&repo_path, agent_id).await;
         self.cancelled_runs.lock().await.remove(&run_id);
         Ok(run_id)
     }
@@ -409,6 +494,8 @@ impl AgentManager {
                 .as_secs(),
         );
         self.db.update_agent_run(run_id, status, detail, ended_at)?;
+        self.clear_working_place_for_run(run_id).await;
+        let _ = self.events.send(AgentEvent::StateUpdated);
         self.cancelled_runs.lock().await.remove(run_id);
         Ok(())
     }
@@ -477,6 +564,10 @@ impl AgentManager {
                 Some("cancelled by user".to_string()),
                 Some(now),
             );
+            self.clear_working_place_for_run(&run.run_id).await;
+        }
+        if !to_cancel.is_empty() {
+            let _ = self.events.send(AgentEvent::StateUpdated);
         }
 
         Ok(to_cancel)

@@ -74,6 +74,7 @@ impl App {
             url: cfg.ollama_url,
             model: cfg.model,
             api_key: None,
+            keep_alive: None,
         }]));
         let ws_root = cfg.ws_root.clone();
         let engine = AgentEngine::new(
@@ -81,6 +82,8 @@ impl App {
                 ws_root: cfg.ws_root,
                 max_iters: cfg.max_iters,
                 stream: cfg.stream,
+                write_safety_mode: crate::config::WriteSafetyMode::Warn,
+                prompt_loop_breaker: None,
             },
             model_manager,
             "repl".to_string(),
@@ -178,9 +181,6 @@ impl App {
                     self.log.push("--- PATCH BEGIN ---".to_string());
                     self.log.push(diff);
                     self.log.push("--- PATCH END ---".to_string());
-                }
-                Ok(AgentOutcome::Ask(question)) => {
-                    self.log.push(format!("Agent question: {}", question));
                 }
                 Ok(AgentOutcome::None) => {
                     self.log.push("No outcome produced.".to_string());

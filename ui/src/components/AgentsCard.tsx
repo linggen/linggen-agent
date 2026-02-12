@@ -8,6 +8,20 @@ const formatTime = (ts?: number | null) => {
   return new Date(ts * 1000).toLocaleTimeString();
 };
 
+const contextPercent = (tokens: number, tokenLimit?: number) => {
+  const limit = tokenLimit && tokenLimit > 0 ? tokenLimit : undefined;
+  if (!limit || !tokens || tokens <= 0) return null;
+  return Math.round((tokens / limit) * 100);
+};
+
+const formatCompactInt = (n: number) => {
+  if (!Number.isFinite(n)) return '';
+  if (n >= 1_000_000) return `${Math.round(n / 100_000) / 10}m`;
+  if (n >= 10_000) return `${Math.round(n / 1000)}k`;
+  if (n >= 1_000) return `${Math.round(n / 100) / 10}k`;
+  return `${n}`;
+};
+
 export const AgentsCard: React.FC<{
   agents: AgentInfo[];
   leadState: LeadState | null;
@@ -17,7 +31,8 @@ export const AgentsCard: React.FC<{
   agentStatusText?: Record<string, string>;
   agentWork?: Record<string, AgentWorkInfo>;
   agentRunSummary?: Record<string, AgentRunSummary>;
-}> = ({ agents, leadState, isRunning, selectedAgent, agentStatus, agentStatusText, agentWork, agentRunSummary }) => {
+  agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
+}> = ({ agents, leadState, isRunning, selectedAgent, agentStatus, agentStatusText, agentWork, agentRunSummary, agentContext }) => {
   return (
     <section className="bg-white dark:bg-[#141414] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm flex flex-col overflow-hidden">
       <div className="px-4 py-2 border-b border-slate-200 dark:border-white/5 bg-slate-50 dark:bg-white/[0.02] flex items-center justify-between">
@@ -31,6 +46,7 @@ export const AgentsCard: React.FC<{
           const status = agentStatus?.[agent.name] ?? ((isRunning && selectedAgent === agent.name) ? 'thinking' : 'idle');
           const work = agentWork?.[agent.name];
           const run = agentRunSummary?.[agent.name.toLowerCase()];
+          const context = agentContext?.[agent.name.toLowerCase()];
           const statusText =
             agentStatusText?.[agent.name] ||
             (status === 'calling_tool'
@@ -81,6 +97,23 @@ export const AgentsCard: React.FC<{
                 {work?.file || '-'}
                 {work && work.activeCount > 1 ? ` (+${work.activeCount - 1})` : ''}
               </div>
+              {context && (
+                (() => {
+                  const pct = contextPercent(context.tokens, context.tokenLimit);
+                  if (pct === null) return null;
+                  const limit = Number(context.tokenLimit);
+                  return (
+                    <div
+                      className="mt-1 flex items-center gap-2 text-blue-500/80 font-medium"
+                      title={`${context.tokens.toLocaleString()} tokens • ${context.messages} msgs (model max ctx ~${limit.toLocaleString()} tokens)`}
+                    >
+                      <span className="flex items-center gap-1">
+                        <span className="font-semibold">Context:</span> {pct}% ({formatCompactInt(context.tokens)} / {formatCompactInt(limit)})
+                      </span>
+                    </div>
+                  );
+                })()
+              )}
               {run && (
                 <div className="mt-2 flex flex-wrap items-center gap-1.5">
                   <span

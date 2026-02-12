@@ -48,8 +48,17 @@ pub struct ServerState {
     pub events_tx: broadcast::Sender<ServerEvent>,
     pub skill_manager: Arc<crate::skills::SkillManager>,
     pub queued_chats: Arc<Mutex<HashMap<String, Vec<QueuedChatItem>>>>,
+    status_seq: AtomicU64,
+    active_statuses: Arc<Mutex<HashMap<String, ActiveStatusRecord>>>,
     pub queue_seq: AtomicU64,
     pub event_seq: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveStatusRecord {
+    status_id: String,
+    status: String,
+    detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,6 +93,10 @@ pub enum ServerEvent {
         agent_id: String,
         status: String,
         detail: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lifecycle: Option<String>, // "doing" | "done"
     },
     SettingsUpdated {
         project_root: String,
@@ -99,10 +112,94 @@ pub enum ServerEvent {
         agent_id: String,
         token: String,
     },
+    ContextUsage {
+        agent_id: String,
+        stage: String,
+        message_count: usize,
+        char_count: usize,
+        estimated_tokens: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_limit: Option<usize>,
+        compressed: bool,
+        summary_count: usize,
+    },
     Outcome {
         agent_id: String,
         outcome: crate::engine::AgentOutcome,
     },
+}
+
+impl ServerState {
+    pub async fn send_agent_status(&self, agent_id: String, status: String, detail: Option<String>) {
+        let mut done_event: Option<ServerEvent> = None;
+        let mut status_id: Option<String> = None;
+        let mut lifecycle: Option<String> = None;
+
+        {
+            let mut active = self.active_statuses.lock().await;
+            if status.eq_ignore_ascii_case("idle") {
+                if let Some(prev) = active.remove(&agent_id) {
+                    done_event = Some(ServerEvent::AgentStatus {
+                        agent_id: agent_id.clone(),
+                        status: prev.status,
+                        detail: prev.detail,
+                        status_id: Some(prev.status_id),
+                        lifecycle: Some("done".to_string()),
+                    });
+                }
+            } else {
+                if let Some(prev) = active.get(&agent_id).cloned() {
+                    if !prev.status.eq_ignore_ascii_case(&status) {
+                        done_event = Some(ServerEvent::AgentStatus {
+                            agent_id: agent_id.clone(),
+                            status: prev.status,
+                            detail: prev.detail,
+                            status_id: Some(prev.status_id),
+                            lifecycle: Some("done".to_string()),
+                        });
+                        active.remove(&agent_id);
+                    } else {
+                        status_id = Some(prev.status_id.clone());
+                        lifecycle = Some("doing".to_string());
+                        active.insert(
+                            agent_id.clone(),
+                            ActiveStatusRecord {
+                                status_id: prev.status_id,
+                                status: status.clone(),
+                                detail: detail.clone(),
+                            },
+                        );
+                    }
+                }
+
+                if status_id.is_none() {
+                    let next_id = format!("status-{}", self.status_seq.fetch_add(1, Ordering::Relaxed));
+                    status_id = Some(next_id.clone());
+                    lifecycle = Some("doing".to_string());
+                    active.insert(
+                        agent_id.clone(),
+                        ActiveStatusRecord {
+                            status_id: next_id,
+                            status: status.clone(),
+                            detail: detail.clone(),
+                        },
+                    );
+                }
+            }
+        }
+
+        if let Some(done) = done_event {
+            let _ = self.events_tx.send(done);
+        }
+
+        let _ = self.events_tx.send(ServerEvent::AgentStatus {
+            agent_id,
+            status,
+            detail,
+            status_id,
+            lifecycle,
+        });
+    }
 }
 
 pub async fn start_server(
@@ -117,59 +214,95 @@ pub async fn start_server(
     // SSE can be bursty (tokens, tool steps). Use a larger buffer to reduce lag drops.
     let (events_tx, _) = broadcast::channel(4096);
 
-    // Bridge internal AgentManager events to SSE for the UI.
-    {
-        let events_tx = events_tx.clone();
-        tokio::spawn(async move {
-            while let Some(event) = agent_events_rx.recv().await {
-                let mapped = match event {
-                    crate::agent_manager::AgentEvent::StateUpdated => Some(ServerEvent::StateUpdated),
-                    crate::agent_manager::AgentEvent::Message { from, to, content } => {
-                        Some(ServerEvent::Message { from, to, content })
-                    }
-                    crate::agent_manager::AgentEvent::SubagentSpawned {
-                        parent_id,
-                        subagent_id,
-                        task,
-                    } => Some(ServerEvent::SubagentSpawned {
-                        parent_id,
-                        subagent_id,
-                        task,
-                    }),
-                    crate::agent_manager::AgentEvent::SubagentResult {
-                        parent_id,
-                        subagent_id,
-                        outcome,
-                    } => Some(ServerEvent::SubagentResult {
-                        parent_id,
-                        subagent_id,
-                        outcome,
-                    }),
-                    crate::agent_manager::AgentEvent::Outcome { agent_id, outcome } => {
-                        Some(ServerEvent::Outcome { agent_id, outcome })
-                    }
-                    crate::agent_manager::AgentEvent::TaskUpdate { .. } => {
-                        // UI will refresh state from DB
-                        Some(ServerEvent::StateUpdated)
-                    }
-                };
-
-                if let Some(ev) = mapped {
-                    let _ = events_tx.send(ev);
-                }
-            }
-        });
-    }
-
     let state = Arc::new(ServerState {
         manager,
         dev_mode,
         events_tx,
         skill_manager,
         queued_chats: Arc::new(Mutex::new(HashMap::new())),
+        status_seq: AtomicU64::new(1),
+        active_statuses: Arc::new(Mutex::new(HashMap::new())),
         queue_seq: AtomicU64::new(1),
         event_seq: AtomicU64::new(1),
     });
+
+    // Bridge internal AgentManager events to SSE for the UI.
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            while let Some(event) = agent_events_rx.recv().await {
+                match event {
+                    crate::agent_manager::AgentEvent::StateUpdated => {
+                        let _ = state_clone.events_tx.send(ServerEvent::StateUpdated);
+                    }
+                    crate::agent_manager::AgentEvent::Message { from, to, content } => {
+                        let _ = state_clone
+                            .events_tx
+                            .send(ServerEvent::Message { from, to, content });
+                    }
+                    crate::agent_manager::AgentEvent::AgentStatus {
+                        agent_id,
+                        status,
+                        detail,
+                    } => {
+                        state_clone.send_agent_status(agent_id, status, detail).await;
+                    }
+                    crate::agent_manager::AgentEvent::SubagentSpawned {
+                        parent_id,
+                        subagent_id,
+                        task,
+                    } => {
+                        let _ = state_clone.events_tx.send(ServerEvent::SubagentSpawned {
+                            parent_id,
+                            subagent_id,
+                            task,
+                        });
+                    }
+                    crate::agent_manager::AgentEvent::SubagentResult {
+                        parent_id,
+                        subagent_id,
+                        outcome,
+                    } => {
+                        let _ = state_clone.events_tx.send(ServerEvent::SubagentResult {
+                            parent_id,
+                            subagent_id,
+                            outcome,
+                        });
+                    }
+                    crate::agent_manager::AgentEvent::Outcome { agent_id, outcome } => {
+                        let _ = state_clone
+                            .events_tx
+                            .send(ServerEvent::Outcome { agent_id, outcome });
+                    }
+                    crate::agent_manager::AgentEvent::ContextUsage {
+                        agent_id,
+                        stage,
+                        message_count,
+                        char_count,
+                        estimated_tokens,
+                        token_limit,
+                        compressed,
+                        summary_count,
+                    } => {
+                        let _ = state_clone.events_tx.send(ServerEvent::ContextUsage {
+                            agent_id,
+                            stage,
+                            message_count,
+                            char_count,
+                            estimated_tokens,
+                            token_limit,
+                            compressed,
+                            summary_count,
+                        });
+                    }
+                    crate::agent_manager::AgentEvent::TaskUpdate { .. } => {
+                        // UI will refresh state from DB
+                        let _ = state_clone.events_tx.send(ServerEvent::StateUpdated);
+                    }
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/api/projects", get(list_projects))
@@ -267,32 +400,24 @@ async fn events_handler(
     }
 
     let rx = state.events_tx.subscribe();
-    let stream = BroadcastStream::new(rx).map(move |msg| match msg {
-        Ok(event) => {
-            let seq = state.event_seq.fetch_add(1, Ordering::Relaxed);
-            let (project_root, session_id) = infer_event_context(&event);
-            let envelope = SseEnvelope {
-                seq,
-                project_root,
-                session_id,
-                event,
-            };
-            let data = serde_json::to_string(&envelope).unwrap_or_default();
-            Ok(Event::default().data(data))
-        }
-        // If the broadcast stream lags/drops messages, emit a parseable event that
-        // prompts the UI to refresh from DB instead of sending non-JSON "error".
-        Err(_) => {
-            let seq = state.event_seq.fetch_add(1, Ordering::Relaxed);
-            let envelope = SseEnvelope {
-                seq,
-                project_root: None,
-                session_id: None,
-                event: ServerEvent::StateUpdated,
-            };
-            let data = serde_json::to_string(&envelope).unwrap_or_default();
-            Ok(Event::default().data(data))
-        }
+    let stream = BroadcastStream::new(rx).filter_map(move |msg| {
+        let event = match msg {
+            Ok(event) => event,
+            // If the broadcast stream lags/drops messages, emit a parseable event that
+            // prompts the UI to refresh from DB instead of sending non-JSON "error".
+            Err(_) => ServerEvent::StateUpdated,
+        };
+        let filtered = crate::server::chat_helpers::sanitize_server_event_for_ui(event)?;
+        let seq = state.event_seq.fetch_add(1, Ordering::Relaxed);
+        let (project_root, session_id) = infer_event_context(&filtered);
+        let envelope = SseEnvelope {
+            seq,
+            project_root,
+            session_id,
+            event: filtered,
+        };
+        let data = serde_json::to_string(&envelope).unwrap_or_default();
+        Some(Ok(Event::default().data(data)))
     });
 
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())

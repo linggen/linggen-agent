@@ -8,6 +8,8 @@ export interface ChatMessage {
   isGenerating?: boolean;
   activitySummary?: string;
   activityEntries?: string[];
+  contextTokens?: number;
+  messageCount?: number;
 }
 
 export interface QueuedChatItem {

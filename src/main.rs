@@ -103,6 +103,7 @@ async fn main() -> Result<()> {
                     url: "http://127.0.0.1:11434".to_string(),
                     model: "qwen3-coder".to_string(),
                     api_key: None,
+                    keep_alive: None,
                 });
             let cfg = repl::CoderConfig {
                 ws_root,

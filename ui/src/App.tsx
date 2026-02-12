@@ -1,5 +1,5 @@
 import React, { useCallback, useMemo, useState, useEffect, useRef } from 'react';
-import { Activity } from 'lucide-react';
+import { Activity, Folder, RefreshCw, Trash2 } from 'lucide-react';
 import { AgentTree } from './components/AgentTree';
 import { AgentsCard } from './components/AgentsCard';
 import { ModelsCard } from './components/ModelsCard';
@@ -26,20 +26,32 @@ import type {
 const SELECTED_AGENT_STORAGE_KEY = 'linggen-agent:selected-agent';
 const LIVE_MESSAGE_GRACE_MS = 10_000;
 
-const parseToolNameFromParsedPayload = (parsed: any): string | null => {
+type ToolCallMeta = {
+  tool: string;
+  args?: any;
+};
+
+const parseToolCallFromParsedPayload = (parsed: any): ToolCallMeta | null => {
   if (!parsed || typeof parsed !== 'object') return null;
-  if (parsed?.type === 'tool' && typeof parsed?.tool === 'string') return parsed.tool;
+  if (parsed?.type === 'tool' && typeof parsed?.tool === 'string') {
+    return {
+      tool: parsed.tool,
+      args: parsed.args && typeof parsed.args === 'object' ? parsed.args : undefined,
+    };
+  }
   if (
     typeof parsed?.type === 'string' &&
-    parsed.type !== 'ask' &&
     parsed.type !== 'finalize_task' &&
     parsed.args &&
     typeof parsed.args === 'object'
   ) {
-    return parsed.type;
+    return { tool: parsed.type, args: parsed.args };
   }
   return null;
 };
+
+const parseToolNameFromParsedPayload = (parsed: any): string | null =>
+  parseToolCallFromParsedPayload(parsed)?.tool || null;
 
 const parseToolNameFromMessage = (text: string): string | null => {
   try {
@@ -49,6 +61,65 @@ const parseToolNameFromMessage = (text: string): string | null => {
     // Non-JSON messages are ignored.
   }
   return null;
+};
+
+const parseToolCallFromMessage = (text: string): ToolCallMeta | null => {
+  try {
+    const parsed = JSON.parse(text);
+    return parseToolCallFromParsedPayload(parsed);
+  } catch (_e) {
+    // Non-JSON messages are ignored.
+  }
+  return null;
+};
+
+const parseToolCallFromText = (text: string): ToolCallMeta | null => {
+  const direct = parseToolCallFromMessage(text.trim());
+  if (direct) return direct;
+  const lines = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const parsed = parseToolCallFromMessage(lines[i]);
+    if (parsed) return parsed;
+  }
+  return null;
+};
+
+const TOOL_JSON_EMBEDDED_RE = /\{"type":"tool","tool":"([^"]+)","args":\{[\s\S]*?\}\}/g;
+const TOOL_RESULT_LINE_RE = /^(Tool\s+[A-Za-z0-9_.:-]+\s*:|tool_error:|tool_not_allowed:)/i;
+
+const statusLineForTool = (toolName?: string) => {
+  const name = (toolName || '').trim().toLowerCase();
+  if (name === 'read_file' || name === 'read') return 'Reading file...';
+  if (name === 'write_file' || name === 'write') return 'Writing file...';
+  if (name === 'run_command' || name === 'bash') return 'Running command...';
+  if (name === 'search_rg' || name === 'grep' || name === 'smart_search' || name === 'find_file')
+    return 'Searching...';
+  if (name === 'list_files' || name === 'glob') return 'Listing files...';
+  if (name === 'delegate_to_agent') return 'Delegating...';
+  return name ? `Calling tool: ${name}` : 'Calling tool...';
+};
+
+const extractToolNamesFromText = (text: string): string[] => {
+  const names: string[] = [];
+  const direct = parseToolNameFromMessage(text.trim());
+  if (direct) names.push(direct);
+  const lines = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (const line of lines) {
+    const n = parseToolNameFromMessage(line);
+    if (n) names.push(n);
+  }
+  let m: RegExpExecArray | null = null;
+  TOOL_JSON_EMBEDDED_RE.lastIndex = 0;
+  while ((m = TOOL_JSON_EMBEDDED_RE.exec(text)) !== null) {
+    if (m[1]) names.push(m[1]);
+  }
+  return Array.from(new Set(names));
 };
 
 const extractToolNameFromRawText = (text: string): string | null => {
@@ -63,24 +134,91 @@ const extractToolNameFromRawText = (text: string): string | null => {
 };
 
 const stripToolPayloadLines = (text: string): string => {
-  const cleaned = text
+  const withoutEmbedded = text.replace(TOOL_JSON_EMBEDDED_RE, '').trim();
+  const cleaned = withoutEmbedded
     .split('\n')
     .map((line) => line.trimEnd())
-    .filter((line) => !parseToolNameFromMessage(line.trim()))
+    .filter((line) => {
+      const t = line.trim();
+      if (!t) return false;
+      if (parseToolNameFromMessage(t)) return false;
+      if (TOOL_RESULT_LINE_RE.test(t)) return false;
+      return true;
+    })
     .join('\n')
     .trim();
   return cleaned;
 };
 
 const isToolResultMessage = (from?: string, text?: string) => {
-  return from === 'system' && !!text && text.startsWith('Tool ');
+  if (!text) return false;
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  return TOOL_RESULT_LINE_RE.test(trimmed) || (from === 'system' && trimmed.startsWith('Tool '));
 };
 
 const isStatusLineText = (text: string) =>
-  text === 'Thinking...' || text === 'Model loading...' || text.startsWith('Calling tool:');
+  text === 'Thinking...' ||
+  text === 'Model loading...' ||
+  text === 'Reading file...' ||
+  text === 'Writing file...' ||
+  text === 'Running command...' ||
+  text.startsWith('Running command:') ||
+  text === 'Searching...' ||
+  text === 'Listing files...' ||
+  text === 'Delegating...' ||
+  text.startsWith('Delegating to subagent:') ||
+  text === 'Calling tool...' ||
+  text.startsWith('Calling tool:');
 
 const roleFromAgentId = (agentId: string): ChatMessage['role'] =>
   agentId === 'lead' ? 'lead' : agentId === 'coder' ? 'coder' : 'agent';
+
+const previewText = (value: string, maxChars = 120) =>
+  value.length <= maxChars ? value : `${value.slice(0, maxChars)}...`;
+
+const firstStringArg = (args: any, keys: string[]) => {
+  if (!args || typeof args !== 'object') return '';
+  for (const key of keys) {
+    const value = args[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+};
+
+const formatCompletedToolLine = (call?: ToolCallMeta): string | null => {
+  if (!call || !call.tool) return null;
+  const tool = call.tool.trim().toLowerCase();
+  const args = call.args;
+  if (tool === 'read_file' || tool === 'read') {
+    const path = firstStringArg(args, ['path', 'file', 'filepath']);
+    return path ? `Read ${path}` : 'Read file';
+  }
+  if (tool === 'write_file' || tool === 'write') {
+    const path = firstStringArg(args, ['path', 'file', 'filepath']);
+    return path ? `Wrote ${path}` : 'Wrote file';
+  }
+  if (tool === 'search_rg' || tool === 'grep' || tool === 'smart_search' || tool === 'find_file') {
+    const query = firstStringArg(args, ['query', 'pattern', 'q']);
+    return query ? `Searched for ${previewText(query, 110)}` : 'Searched';
+  }
+  if (tool === 'list_files' || tool === 'glob') {
+    const globs = Array.isArray(args?.globs)
+      ? args.globs.filter((v: unknown) => typeof v === 'string').map((v: string) => v.trim()).filter(Boolean)
+      : [];
+    if (globs.length > 0) return `Listed files in ${previewText(globs.join(', '), 110)}`;
+    return 'Listed files';
+  }
+  if (tool === 'run_command' || tool === 'bash') {
+    const cmd = firstStringArg(args, ['cmd', 'command']);
+    return cmd ? `Ran command: ${previewText(cmd, 110)}` : 'Ran command';
+  }
+  if (tool === 'delegate_to_agent') {
+    const target = firstStringArg(args, ['target_agent_id']);
+    return target ? `Delegated to ${target}` : 'Delegated to subagent';
+  }
+  return `Used ${tool}`;
+};
 
 const summarizeActivityEntries = (entries: string[]): string | undefined => {
   if (entries.length === 0) return undefined;
@@ -90,6 +228,17 @@ const summarizeActivityEntries = (entries: string[]): string | undefined => {
     .filter(Boolean);
   const uniqueTools = Array.from(new Set(tools));
   const phases = entries.filter((line) => !/^Calling tool:/i.test(line));
+  const normalized = entries.map((line) => line.toLowerCase());
+  const readCount = normalized.filter((v) => v.startsWith('read ') || v.includes('reading file') || v.includes('read_file')).length;
+  const searchCount = normalized.filter((v) => v.startsWith('searched for ') || v.includes('searching') || v.includes('search_rg') || v.includes('grep') || v.includes('smart_search') || v.includes('find_file')).length;
+  const listCount = normalized.filter((v) => v.startsWith('listed files') || v.includes('listing files') || v.includes('list_files') || v.includes('glob')).length;
+  if (readCount > 0 || searchCount > 0 || listCount > 0) {
+    const parts: string[] = [];
+    if (readCount > 0) parts.push(`${readCount} file${readCount > 1 ? 's' : ''}`);
+    if (searchCount > 0) parts.push(`${searchCount} search${searchCount > 1 ? 'es' : ''}`);
+    if (listCount > 0) parts.push(`${listCount} list${listCount > 1 ? 's' : ''}`);
+    return `Explored ${parts.join(', ')}`;
+  }
   const phaseSummary =
     phases.length > 1 ? `${phases[0]} -> ${phases[phases.length - 1]}` : phases[0] || '';
   const toolSummary =
@@ -315,6 +464,7 @@ const App: React.FC = () => {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [selectedProjectRoot, setSelectedProjectRoot] = useState<string>('');
   const [agentTree, setAgentTree] = useState<Record<string, AgentTreeItem>>({});
+  const [agentTreesByProject, setAgentTreesByProject] = useState<Record<string, Record<string, AgentTreeItem>>>({});
   const [newProjectPath, setNewProjectPath] = useState('');
   const [showAddProject, setShowAddProject] = useState(false);
 
@@ -352,6 +502,8 @@ const App: React.FC = () => {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const lastChatCountRef = useRef(0);
   const lastSseSeqRef = useRef(0);
+  const lastAgentStatusRef = useRef<Record<string, string>>({});
+  const pendingToolByAgentRef = useRef<Record<string, ToolCallMeta>>({});
   const mainAgents = useMemo(() => {
     const mains = agents.filter((agent) => (agent.kind || 'main') !== 'subagent');
     return mains.length > 0 ? mains : agents;
@@ -460,11 +612,20 @@ const App: React.FC = () => {
     setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
   }, []);
 
+  const [agentContext, setAgentContext] = useState<Record<string, { tokens: number; messages: number; tokenLimit?: number }>>({});
+
   const shouldHideInternalChatMessage = useCallback((from?: string, text?: string) => {
     if (!text) return false;
-    if (isToolResultMessage(from, text)) return true;
-    const toolName = parseToolNameFromMessage(text);
-    if (toolName) return true;
+    const stripped = stripToolPayloadLines(text);
+    const hasToolPayload = extractToolNamesFromText(text).length > 0;
+    const isToolResult = isToolResultMessage(from, text);
+    
+    // Hide tool results and tool payloads that have no other text
+    if ((isToolResult || hasToolPayload) && !stripped) return true;
+    
+    // Explicitly hide any message that looks like a raw read_file output if it's from 'system'
+    if (from === 'system' && text.includes('read_file:')) return true;
+
     if (from !== 'system') return false;
     return text.startsWith('Starting autonomous loop for task:');
   }, []);
@@ -528,6 +689,7 @@ const App: React.FC = () => {
       (m) => {
         if (m.isGenerating) return true;
         if (persistedWithActivity.some((p) => likelySameMessage(p, m))) return false;
+        if (m.role === 'user' || m.from === 'user') return true;
         const ts = m.timestampMs ?? now;
         // Keep non-persisted live messages briefly to bridge DB/state lag.
         return now - ts <= LIVE_MESSAGE_GRACE_MS;
@@ -545,7 +707,7 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (chatMessages.length > lastChatCountRef.current) {
-      chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      chatEndRef.current?.scrollIntoView({ behavior: 'auto', block: 'nearest', inline: 'nearest' });
     }
     lastChatCountRef.current = chatMessages.length;
   }, [chatMessages.length]);
@@ -555,9 +717,19 @@ const App: React.FC = () => {
       const resp = await fetch('/api/projects');
       const data = await resp.json();
       setProjects(data);
-      if (data.length > 0) {
-        setSelectedProjectRoot((prev) => prev || data[0].path);
-      }
+      setAgentTreesByProject((prev) => {
+        const valid = new Set<string>(data.map((p: ProjectInfo) => p.path));
+        const next: Record<string, Record<string, AgentTreeItem>> = {};
+        Object.entries(prev).forEach(([path, tree]) => {
+          if (valid.has(path)) next[path] = tree;
+        });
+        return next;
+      });
+      setSelectedProjectRoot((prev) => {
+        if (data.length === 0) return '';
+        if (prev && data.some((p: ProjectInfo) => p.path === prev)) return prev;
+        return data[0].path;
+      });
     } catch (e) {
       addLog(`Error fetching projects: ${e}`);
     }
@@ -609,16 +781,25 @@ const App: React.FC = () => {
     }
   };
 
-  const fetchAgentTree = useCallback(async () => {
-    if (!selectedProjectRoot) return;
+  const fetchAgentTree = useCallback(async (projectRoot?: string) => {
+    const root = projectRoot || selectedProjectRoot;
+    if (!root) return;
     try {
-      const resp = await fetch(`/api/workspace/tree?project_root=${encodeURIComponent(selectedProjectRoot)}`);
+      const resp = await fetch(`/api/workspace/tree?project_root=${encodeURIComponent(root)}`);
       const data = await resp.json();
-      setAgentTree(data);
+      setAgentTreesByProject((prev) => ({ ...prev, [root]: data }));
+      if (root === selectedProjectRoot || !projectRoot) {
+        setAgentTree(data);
+      }
     } catch (e) {
-      addLog(`Error fetching agent tree: ${e}`);
+      addLog(`Error fetching agent tree (${root}): ${e}`);
     }
   }, [selectedProjectRoot, addLog]);
+
+  const fetchAllAgentTrees = useCallback(async () => {
+    if (projects.length === 0) return;
+    await Promise.all(projects.map((project) => fetchAgentTree(project.path)));
+  }, [projects, fetchAgentTree]);
 
   const fetchFiles = useCallback(async (path = '') => {
     if (!selectedProjectRoot) return;
@@ -632,16 +813,24 @@ const App: React.FC = () => {
     }
   }, [selectedProjectRoot, addLog]);
 
-  const readFile = async (path: string) => {
-    if (!selectedProjectRoot) return;
+  const readFile = async (path: string, projectRootOverride?: string) => {
+    const root = projectRootOverride || selectedProjectRoot;
+    if (!root) return;
     try {
-      const resp = await fetch(`/api/file?project_root=${encodeURIComponent(selectedProjectRoot)}&path=${encodeURIComponent(path)}`);
+      const resp = await fetch(`/api/file?project_root=${encodeURIComponent(root)}&path=${encodeURIComponent(path)}`);
       const data = await resp.json();
       setSelectedFileContent(data.content);
       setSelectedFilePath(path);
     } catch (e) {
       addLog(`Error reading file: ${e}`);
     }
+  };
+
+  const selectAgentPathFromTree = (projectRoot: string, path: string) => {
+    if (projectRoot !== selectedProjectRoot) {
+      setSelectedProjectRoot(projectRoot);
+    }
+    readFile(path, projectRoot);
   };
 
   const closeFilePreview = () => {
@@ -814,7 +1003,7 @@ const App: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ run_id: runId }),
       });
-      await Promise.all([fetchAgentRuns(), fetchLeadState(), fetchAgentTree()]);
+      await Promise.all([fetchAgentRuns(), fetchLeadState(), fetchAllAgentTrees()]);
     } catch (e) {
       addLog(`Error cancelling run ${runId}: ${e}`);
     } finally {
@@ -857,7 +1046,7 @@ const App: React.FC = () => {
     if (selectedProjectRoot) {
       fetchFiles();
       fetchLeadState();
-      fetchAgentTree();
+      fetchAgentTree(selectedProjectRoot);
       fetchAgentRuns();
       fetchSessions();
       fetchSettings();
@@ -866,6 +1055,11 @@ const App: React.FC = () => {
       setQueuedMessages([]);
     }
   }, [selectedProjectRoot, fetchFiles, fetchLeadState, fetchAgentTree, fetchAgentRuns, fetchSessions, fetchSettings]);
+
+  useEffect(() => {
+    if (projects.length === 0) return;
+    fetchAllAgentTrees();
+  }, [projects, fetchAllAgentTrees]);
 
   useEffect(() => {
     if (selectedProjectRoot) {
@@ -907,9 +1101,10 @@ const App: React.FC = () => {
         if (event.type === 'StateUpdated') {
           fetchLeadState();
           fetchFiles(currentPath);
-          fetchAgentTree();
+          fetchAllAgentTrees();
           fetchAgentRuns();
         } else if (event.type === 'AgentStatus') {
+          const lifecycle = typeof event.lifecycle === 'string' ? event.lifecycle.trim().toLowerCase() : '';
           const nextStatus: 'idle' | 'model_loading' | 'thinking' | 'calling_tool' | 'working' =
             event.status === 'calling_tool'
               ? 'calling_tool'
@@ -920,6 +1115,30 @@ const App: React.FC = () => {
                 : event.status === 'working'
                   ? 'working'
                   : 'idle';
+          const prevStatus = lastAgentStatusRef.current[event.agent_id] || 'idle';
+          if (lifecycle === 'done') {
+            if (nextStatus === 'calling_tool') {
+              const completed = formatCompletedToolLine(pendingToolByAgentRef.current[event.agent_id]);
+              if (completed) {
+                setChatMessages((prev) => appendGeneratingActivity(prev, event.agent_id, completed));
+              }
+              delete pendingToolByAgentRef.current[event.agent_id];
+            }
+            return;
+          }
+
+          if (nextStatus === 'calling_tool') {
+            const tool = normalizeToolStatusDetail(event.detail);
+            if (tool) {
+              pendingToolByAgentRef.current[event.agent_id] = pendingToolByAgentRef.current[event.agent_id] || { tool };
+            }
+          } else if (!lifecycle && (nextStatus === 'thinking' || nextStatus === 'idle') && prevStatus === 'calling_tool') {
+            const completed = formatCompletedToolLine(pendingToolByAgentRef.current[event.agent_id]);
+            if (completed) {
+              setChatMessages((prev) => appendGeneratingActivity(prev, event.agent_id, completed));
+            }
+            delete pendingToolByAgentRef.current[event.agent_id];
+          }
           setAgentStatus((prev) => ({
             ...prev,
             [event.agent_id]: nextStatus,
@@ -943,7 +1162,7 @@ const App: React.FC = () => {
             const toolName = normalizeToolStatusDetail(event.detail);
             const placeholder =
               nextStatus === 'calling_tool'
-                ? `Calling tool: ${toolName || '...'}`
+                ? statusLineForTool(toolName || '')
                 : nextStatus === 'model_loading'
                   ? 'Model loading...'
                   : 'Thinking...';
@@ -959,6 +1178,16 @@ const App: React.FC = () => {
               return next;
             });
           }
+          lastAgentStatusRef.current[event.agent_id] = nextStatus;
+        } else if (event.type === 'ContextUsage') {
+          setAgentContext((prev) => ({
+            ...prev,
+            [event.agent_id]: {
+              tokens: Number(event.estimated_tokens || 0),
+              messages: Number(event.message_count || 0),
+              tokenLimit: typeof event.token_limit === 'number' ? Number(event.token_limit) : prev[event.agent_id]?.tokenLimit,
+            },
+          }));
         } else if (event.type === 'SettingsUpdated') {
           if (event.project_root === selectedProjectRoot) {
             setCurrentMode(event.mode === 'chat' ? 'chat' : 'auto');
@@ -1015,18 +1244,31 @@ const App: React.FC = () => {
             ];
           });
         } else if (event.type === 'Message') {
-          const toolName = parseToolNameFromMessage(event.content || '');
-          if (toolName) {
-            setChatMessages((prev) => appendGeneratingActivity(prev, event.from, `Calling tool: ${toolName}`));
-            return;
+          const content = event.content || '';
+          const toolNames = extractToolNamesFromText(content);
+          if (toolNames.length > 0) {
+            const toolCall = parseToolCallFromText(content);
+            if (toolCall) {
+              pendingToolByAgentRef.current[event.from] = toolCall;
+            }
+            setChatMessages((prev) => {
+              let next = prev;
+              for (const name of toolNames) {
+                next = appendGeneratingActivity(next, event.from, statusLineForTool(name));
+              }
+              return next;
+            });
+            if (!stripToolPayloadLines(content)) {
+              return;
+            }
           }
-          if (shouldHideInternalChatMessage(event.from, event.content)) {
+          if (shouldHideInternalChatMessage(event.from, content)) {
             return;
           }
           const cleanedContent =
             event.from === 'user'
-              ? (event.content || '')
-              : stripToolPayloadLines(event.content || '');
+              ? content
+              : stripToolPayloadLines(content);
           if (event.from !== 'user' && !cleanedContent) {
             return;
           }
@@ -1089,7 +1331,7 @@ const App: React.FC = () => {
     };
 
     return () => events.close();
-  }, [currentPath, selectedProjectRoot, activeSessionId, fetchLeadState, fetchFiles, fetchAgentTree, fetchAgentRuns, shouldHideInternalChatMessage]);
+  }, [currentPath, selectedProjectRoot, activeSessionId, fetchLeadState, fetchFiles, fetchAllAgentTrees, fetchAgentRuns, shouldHideInternalChatMessage]);
 
   const sendChatMessage = async (userMessage: string, targetAgent?: string) => {
     if (!userMessage.trim() || !selectedProjectRoot) return;
@@ -1167,6 +1409,7 @@ const App: React.FC = () => {
         }),
       });
       setChatMessages([]);
+      setQueuedMessages([]);
       fetchLeadState();
     } catch (e) {
       addLog(`Error clearing chat: ${e}`);
@@ -1209,7 +1452,7 @@ const App: React.FC = () => {
     if (!selectedProjectRoot) return;
     fetchLeadState();
     fetchFiles(currentPath);
-    fetchAgentTree();
+    fetchAllAgentTrees();
     fetchSessions();
     fetchSettings();
   };
@@ -1218,20 +1461,27 @@ const App: React.FC = () => {
     <div className="flex flex-col h-screen bg-slate-100/70 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200 font-sans overflow-hidden">
       {/* Header */}
       <HeaderBar
-        projects={projects}
-        selectedProjectRoot={selectedProjectRoot}
-        setSelectedProjectRoot={setSelectedProjectRoot}
         showAddProject={showAddProject}
-        setShowAddProject={setShowAddProject}
         newProjectPath={newProjectPath}
         setNewProjectPath={setNewProjectPath}
         addProject={addProject}
-        removeProject={removeProject}
         pickFolder={pickFolder}
-        refreshPageState={refreshPageState}
+        selectedAgent={selectedAgent}
+        setSelectedAgent={setSelectedAgent}
+        mainAgents={mainAgents}
+        agentStatus={agentStatus}
+        sessions={sessions}
+        activeSessionId={activeSessionId}
+        setActiveSessionId={setActiveSessionId}
+        createSession={createSession}
+        copyChat={copyChat}
+        copyChatStatus={copyChatStatus}
+        clearChat={clearChat}
+        removeSession={removeSession}
         isRunning={isRunning}
         currentMode={currentMode}
         onModeChange={updateMode}
+        agentContext={agentContext}
       />
 
       {/* Main Layout */}
@@ -1243,31 +1493,54 @@ const App: React.FC = () => {
             <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-2">
               <Activity size={14} /> Active Paths
             </h2>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={refreshPageState}
+                disabled={!selectedProjectRoot || isRunning}
+                className="p-1.5 hover:bg-blue-500/10 hover:text-blue-500 rounded-lg text-slate-500 transition-colors disabled:opacity-50"
+                title="Refresh page state"
+              >
+                <RefreshCw size={14} className={isRunning ? 'animate-spin' : ''} />
+              </button>
+              <button
+                onClick={() => setShowAddProject(!showAddProject)}
+                className="p-1.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded-lg text-slate-500"
+                title="Manage Projects"
+              >
+                <Folder size={14} />
+              </button>
+              {selectedProjectRoot && (
+                <button
+                  onClick={() => removeProject(selectedProjectRoot)}
+                  className="p-1.5 hover:bg-red-500/10 hover:text-red-500 rounded-lg text-slate-500 transition-colors"
+                  title="Remove Current Project"
+                >
+                  <Trash2 size={14} />
+                </button>
+              )}
+            </div>
           </div>
-          <AgentTree agentTree={agentTree} onSelect={readFile} />
+          <AgentTree
+            projects={projects}
+            selectedProjectRoot={selectedProjectRoot}
+            treesByProject={agentTreesByProject}
+            onSelectProject={setSelectedProjectRoot}
+            onSelectPath={selectAgentPathFromTree}
+          />
         </aside>
 
         {/* Center: Chat */}
         <main className="flex-1 flex flex-col overflow-hidden bg-slate-100/40 dark:bg-[#0a0a0a] min-h-0">
-          <div className="flex-1 p-4 min-h-0">
+          <div className="flex-1 p-2 min-h-0">
             <ChatPanel
               chatMessages={chatMessages}
               queuedMessages={queuedMessages}
               chatEndRef={chatEndRef}
-              copyChat={copyChat}
-              copyChatStatus={copyChatStatus}
-              clearChat={clearChat}
-              createSession={createSession}
-              removeSession={removeSession}
-              sessions={sessions}
-              activeSessionId={activeSessionId}
-              setActiveSessionId={setActiveSessionId}
               selectedAgent={selectedAgent}
               setSelectedAgent={setSelectedAgent}
               skills={skills}
               agents={agents}
               mainAgents={mainAgents}
-              agentStatus={agentStatus}
               subagents={subagents}
               mainRunIds={mainRunIds}
               subagentRunIds={subagentRunIds}
@@ -1293,6 +1566,7 @@ const App: React.FC = () => {
             agentStatusText={agentStatusText}
             agentWork={agentWork}
             agentRunSummary={agentRunSummary}
+            agentContext={agentContext}
           />
           <ModelsCard models={models} ollamaStatus={ollamaStatus} chatMessages={chatMessages} />
         </aside>

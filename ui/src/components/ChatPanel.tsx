@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
-import { Copy, Eraser, Plus, Send, X, Sparkles } from 'lucide-react';
+import { Send, X, Sparkles } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { cn } from '../lib/cn';
@@ -10,7 +10,6 @@ import type {
   AgentRunContextResponse,
   ChatMessage,
   QueuedChatItem,
-  SessionInfo,
   SkillInfo,
   SubagentInfo,
 } from '../types';
@@ -90,14 +89,15 @@ const MarkdownContent: React.FC<{ text: string }> = ({ text }) => (
       remarkPlugins={[remarkGfm]}
       components={{
         pre: ({ children }) => <>{children}</>,
-        code: ({ inline, className, children, ...props }: any) => {
+        code: ({ inline, className, children, node: _node, ...props }: any) => {
           const raw = String(children ?? '').replace(/\n$/, '');
           const match = /language-([\w-]+)/.exec(className || '');
           const lang = match?.[1]?.toLowerCase();
           if (!inline && lang === 'mermaid') {
             return <MermaidBlock code={raw} />;
           }
-          if (inline) {
+          const isInlineCode = Boolean(inline) || (!className && !raw.includes('\n'));
+          if (isInlineCode) {
             return <code {...props}>{children}</code>;
           }
           return (
@@ -141,16 +141,287 @@ const roleFromSender = (sender: string): ChatMessage['role'] => {
   return 'agent';
 };
 
+const TOOL_JSON_EMBEDDED_RE = /\{"type":"tool","tool":"([^"]+)","args":\{[\s\S]*?\}\}/g;
+const TOOL_RESULT_LINE_RE = /^(Tool\s+[A-Za-z0-9_.:-]+\s*:|tool_error:|tool_not_allowed:)/i;
+const START_AUTONOMOUS_LINE_RE = /^Starting autonomous loop for task:/i;
+const CONTENT_OMITTED_LINE_RE = /^\(content omitted in chat; open the file viewer for full text\)$/i;
+
+const parseToolNameFromLine = (line: string): string | null => {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed?.type === 'tool' && typeof parsed?.tool === 'string') return parsed.tool;
+    if (
+      typeof parsed?.type === 'string' &&
+      parsed.type !== 'finalize_task' &&
+      parsed.args &&
+      typeof parsed.args === 'object'
+    ) {
+      return parsed.type;
+    }
+  } catch (_e) {
+    // ignore non-json
+  }
+  return null;
+};
+
+const looksLikeCodeLine = (line: string) =>
+  /^\s*(\/\/|#include|use\s+\w|import\s+\w|fn\s+\w|class\s+\w|def\s+\w|const\s+\w|let\s+\w|pub\s+\w|impl\s+\w|struct\s+\w|enum\s+\w|mod\s+\w|[{}[\]();]|<\/?\w+|[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_])/.test(
+    line
+  );
+
+const sanitizeAgentMessageText = (text: string) => {
+  if (!text) return '';
+  // Optimization: if it's a raw tool result from system, we often want to hide it entirely
+  if (text.startsWith('read_file:') || text.startsWith('Tool read_file:')) return '';
+  
+  const withoutEmbedded = text.replace(TOOL_JSON_EMBEDDED_RE, '').trim();
+  const lines = withoutEmbedded.split('\n');
+  const readFileRelated = /read_file|content omitted in chat/i.test(withoutEmbedded);
+  const kept: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      if (kept.length > 0 && kept[kept.length - 1] !== '') kept.push('');
+      continue;
+    }
+    if (parseToolNameFromLine(trimmed)) continue;
+    if (TOOL_RESULT_LINE_RE.test(trimmed)) continue;
+    if (START_AUTONOMOUS_LINE_RE.test(trimmed)) continue;
+    if (CONTENT_OMITTED_LINE_RE.test(trimmed)) continue;
+    if (readFileRelated && looksLikeCodeLine(trimmed)) continue;
+    kept.push(line);
+  }
+  return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+};
+
 const contextMessageToChatMessage = (msg: AgentRunContextMessage): ChatMessage => {
   const timestampMs = Number(msg.timestamp || 0) * 1000;
+  const role = roleFromSender(msg.from_id);
+  const content = role === 'user' ? msg.content : sanitizeAgentMessageText(msg.content);
   return {
-    role: roleFromSender(msg.from_id),
+    role,
     from: msg.from_id,
     to: msg.to_id || undefined,
-    text: msg.content,
+    text: content,
     timestamp: timestampMs > 0 ? new Date(timestampMs).toLocaleTimeString() : '',
     timestampMs,
   };
+};
+
+const sameMessageIdentity = (a: ChatMessage, b: ChatMessage) => {
+  const aFrom = normalizeAgentKey(a.from || a.role);
+  const bFrom = normalizeAgentKey(b.from || b.role);
+  const aTo = normalizeAgentKey(a.to || '');
+  const bTo = normalizeAgentKey(b.to || '');
+  if (aFrom !== bFrom || aTo !== bTo) return false;
+  if (a.text.trim() !== b.text.trim()) return false;
+  const ta = a.timestampMs ?? 0;
+  const tb = b.timestampMs ?? 0;
+  if (ta <= 0 || tb <= 0) return true;
+  return Math.abs(ta - tb) <= 120_000;
+};
+
+const mergeMessageStreams = (contextMessages: ChatMessage[], liveMessages: ChatMessage[]) => {
+  if (contextMessages.length === 0) return liveMessages;
+  if (liveMessages.length === 0) return contextMessages;
+  const merged = [...contextMessages];
+  for (const live of liveMessages) {
+    if (merged.some((contextMsg) => sameMessageIdentity(contextMsg, live))) continue;
+    merged.push(live);
+  }
+  return merged.sort((a, b) => {
+    const ta = a.timestampMs ?? 0;
+    const tb = b.timestampMs ?? 0;
+    if (ta <= 0 && tb <= 0) return 0;
+    if (ta <= 0) return 1;
+    if (tb <= 0) return -1;
+    return ta - tb;
+  });
+};
+
+const dedupeActivityEntries = (entries: string[]) => {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of entries) {
+    const clean = String(raw || '').trim();
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    out.push(clean);
+  }
+  return out;
+};
+
+const isProgressLineText = (text?: string) => {
+  const t = String(text || '').trim();
+  if (!t) return false;
+  return (
+    t === 'Thinking...' ||
+    t === 'Model loading...' ||
+    t === 'Reading file...' ||
+    t === 'Writing file...' ||
+    t === 'Running command...' ||
+    t.startsWith('Running command:') ||
+    t === 'Searching...' ||
+    t === 'Listing files...' ||
+    t === 'Delegating...' ||
+    t.startsWith('Delegating to subagent:') ||
+    t === 'Calling tool...' ||
+    t.startsWith('Calling tool:')
+  );
+};
+
+const summarizeCollapsedActivity = (entries: string[]) => {
+  const normalized = entries.map((entry) => entry.toLowerCase());
+  const readCount = normalized.filter((v) => v.startsWith('read ') || v.includes('reading file') || v.includes('read_file')).length;
+  const searchCount = normalized.filter((v) => v.startsWith('searched for ') || v.includes('searching') || v.includes('search_rg') || v.includes('grep') || v.includes('smart_search') || v.includes('find_file')).length;
+  const runCount = normalized.filter((v) => v.startsWith('ran command') || v.includes('running command')).length;
+  const delegateCount = normalized.filter((v) => v.startsWith('delegated to ') || v.includes('delegating')).length;
+  const writeCount = normalized.filter((v) => v.startsWith('wrote ') || v.includes('writing file') || v.includes('write_file')).length;
+  const listCount = normalized.filter((v) => v.startsWith('listed files') || v.includes('listing files') || v.includes('list_files') || v.includes('glob')).length;
+
+  if (readCount > 0 || searchCount > 0 || listCount > 0) {
+    const parts: string[] = [];
+    if (readCount > 0) parts.push(`${readCount} file${readCount > 1 ? 's' : ''}`);
+    if (searchCount > 0) parts.push(`${searchCount} search${searchCount > 1 ? 'es' : ''}`);
+    if (listCount > 0) parts.push(`${listCount} list${listCount > 1 ? 's' : ''}`);
+    return `Explored ${parts.join(', ')}`;
+  }
+
+  const parts: string[] = [];
+  if (runCount > 0) parts.push(`${runCount} command${runCount > 1 ? 's' : ''}`);
+  if (delegateCount > 0) parts.push(`${delegateCount} delegation${delegateCount > 1 ? 's' : ''}`);
+  if (writeCount > 0) parts.push(`${writeCount} file write${writeCount > 1 ? 's' : ''}`);
+  if (listCount > 0) parts.push(`${listCount} listing${listCount > 1 ? 's' : ''}`);
+  if (parts.length > 0) return `Worked: ${parts.join(', ')}`;
+  
+  const first = entries[0];
+  const last = entries[entries.length - 1];
+  if (first === last) return last;
+  return `${first} -> ${last}`;
+};
+
+const activityHeadline = (msg: ChatMessage, entries: string[]) => {
+  const summary = msg.activitySummary || summarizeCollapsedActivity(entries);
+  if (!msg.isGenerating) return summary;
+  const current = entries[entries.length - 1];
+  if (!summary) return current || '';
+  if (!current || current === summary) return summary;
+  return `${summary} -> ${current}`;
+};
+
+const activityEntriesForDetails = (msg: ChatMessage, entries: string[]) => {
+  if (msg.isGenerating) return entries;
+  // Hide transient "doing" phases once work is done.
+  return entries.filter((entry) => !isProgressLineText(entry));
+};
+
+const activityEntriesForMessage = (msg: ChatMessage): string[] => {
+  const entries = Array.isArray(msg.activityEntries) ? msg.activityEntries : [];
+  if (entries.length > 0) return dedupeActivityEntries(entries);
+  if (isProgressLineText(msg.text)) return dedupeActivityEntries([msg.text]);
+  return [];
+};
+
+const collapseProgressMessages = (messages: ChatMessage[]): ChatMessage[] => {
+  const out: ChatMessage[] = [];
+  const pendingByAgent = new Map<string, string[]>();
+  const pendingTsByAgent = new Map<string, number>();
+  const pendingGeneratingByAgent = new Map<string, boolean>();
+
+  const appendPendingToOutput = (agentId: string, to?: string) => {
+    const pending = pendingByAgent.get(agentId);
+    if (!pending || pending.length === 0) return;
+    const ts = pendingTsByAgent.get(agentId);
+    const isGenerating = !!pendingGeneratingByAgent.get(agentId);
+    const deduped = dedupeActivityEntries(pending);
+    if (deduped.length === 0) {
+      pendingByAgent.delete(agentId);
+      pendingTsByAgent.delete(agentId);
+      pendingGeneratingByAgent.delete(agentId);
+      return;
+    }
+    out.push({
+      role: roleFromSender(agentId),
+      from: agentId,
+      to: to || 'user',
+      text: '',
+      timestamp: ts ? new Date(ts).toLocaleTimeString() : '',
+      timestampMs: ts,
+      isGenerating,
+      activityEntries: deduped,
+      activitySummary: summarizeCollapsedActivity(deduped),
+    });
+    pendingByAgent.delete(agentId);
+    pendingTsByAgent.delete(agentId);
+    pendingGeneratingByAgent.delete(agentId);
+  };
+
+  for (const msg of messages) {
+    if (msg.role === 'user') {
+      for (const key of Array.from(pendingByAgent.keys())) {
+        appendPendingToOutput(key, msg.to);
+      }
+      out.push(msg);
+      continue;
+    }
+
+    const agentId = normalizeAgentKey(msg.from || msg.role);
+    const entries = activityEntriesForMessage(msg);
+    const body = String(msg.text || '').trim();
+    const onlyProgress = !body || isProgressLineText(body);
+
+    if (onlyProgress) {
+      if (entries.length > 0) {
+        const existing = pendingByAgent.get(agentId) || [];
+        pendingByAgent.set(agentId, dedupeActivityEntries([...existing, ...entries]));
+        if (!pendingTsByAgent.has(agentId) && msg.timestampMs) {
+          pendingTsByAgent.set(agentId, msg.timestampMs);
+        }
+        if (msg.isGenerating) {
+          pendingGeneratingByAgent.set(agentId, true);
+        }
+      }
+      continue;
+    }
+
+    if (pendingByAgent.has(agentId)) {
+      const isGenerating = !!pendingGeneratingByAgent.get(agentId) || !!msg.isGenerating;
+      const merged = dedupeActivityEntries([
+        ...(pendingByAgent.get(agentId) || []),
+        ...entries,
+      ]);
+      pendingByAgent.delete(agentId);
+      pendingTsByAgent.delete(agentId);
+      pendingGeneratingByAgent.delete(agentId);
+      out.push({
+        ...msg,
+        isGenerating,
+        activityEntries: merged.length > 0 ? merged : msg.activityEntries,
+        activitySummary:
+          merged.length > 0
+            ? summarizeCollapsedActivity(merged)
+            : msg.activitySummary,
+      });
+      continue;
+    }
+
+    out.push({
+      ...msg,
+      activityEntries: entries.length > 0 ? entries : msg.activityEntries,
+      activitySummary:
+        entries.length > 0
+          ? (msg.activitySummary || summarizeCollapsedActivity(entries))
+          : msg.activitySummary,
+    });
+  }
+
+  for (const key of Array.from(pendingByAgent.keys())) {
+    appendPendingToOutput(key);
+  }
+
+  return out;
 };
 
 const formatRunLabel = (run: AgentRunInfo) => {
@@ -167,23 +438,58 @@ type TimelineEvent = {
   kind: 'run' | 'subagent' | 'tool' | 'task';
 };
 
+type ToolIntent = {
+  name: string;
+  detail?: string;
+};
+
 const formatTs = (ts?: number) => {
   if (!ts || ts <= 0) return '-';
   return new Date(ts * 1000).toLocaleTimeString();
 };
 
-const parseToolIntent = (content: string): string | null => {
+const previewValue = (value: string, maxChars = 100) =>
+  value.length <= maxChars ? value : `${value.slice(0, maxChars)}... (${value.length} chars)`;
+
+const parseToolIntent = (content: string): ToolIntent | null => {
   const trimmed = content.trim();
   if (!trimmed) return null;
   if (/^Calling tool:/i.test(trimmed)) {
-    return trimmed.replace(/^Calling tool:\s*/i, '').trim() || 'unknown';
+    const name = trimmed.replace(/^Calling tool:\s*/i, '').trim();
+    return { name: name || 'unknown' };
+  }
+  if (/^Running command:/i.test(trimmed)) {
+    const cmd = trimmed.replace(/^Running command:\s*/i, '').trim();
+    return { name: 'run_command', detail: cmd || undefined };
+  }
+  if (/^Delegating to subagent:/i.test(trimmed)) {
+    const target = trimmed.replace(/^Delegating to subagent:\s*/i, '').trim();
+    return { name: 'delegate_to_agent', detail: target ? `target=${target}` : undefined };
   }
   if (!trimmed.startsWith('{')) return null;
   try {
     const parsed = JSON.parse(trimmed);
     if (!parsed || typeof parsed !== 'object') return null;
-    if (typeof parsed.type === 'string' && parsed.type !== 'ask' && parsed.type !== 'finalize_task') {
-      return parsed.type;
+    const type = typeof parsed.type === 'string' ? parsed.type : '';
+    if (type === 'tool') {
+      const tool = typeof parsed.tool === 'string' ? parsed.tool : 'tool';
+      if (tool === 'run_command' || tool === 'bash') {
+        const cmd = typeof parsed.args?.cmd === 'string' ? parsed.args.cmd.trim() : '';
+        return { name: tool, detail: cmd ? previewValue(cmd) : undefined };
+      }
+      if (tool === 'delegate_to_agent') {
+        const target = typeof parsed.args?.target_agent_id === 'string'
+          ? parsed.args.target_agent_id.trim()
+          : '';
+        return {
+          name: tool,
+          detail: target ? `target=${target}` : undefined,
+        };
+      }
+      return { name: tool };
+    }
+    if (type && type !== 'finalize_task') {
+      return { name: type };
     }
   } catch (_e) {
     // ignore non-json
@@ -196,12 +502,46 @@ const parseTaskEvent = (content: string): string | null => {
   if (!trimmed.startsWith('{')) return null;
   try {
     const parsed = JSON.parse(trimmed);
-    if (parsed?.type === 'ask') return 'Asked question';
     if (parsed?.type === 'finalize_task') return 'Finalized task';
   } catch (_e) {
     // ignore non-json
   }
   return null;
+};
+
+const hasReadFileActivity = (entries?: string[]) =>
+  Array.isArray(entries) &&
+  entries.some((entry) => /^Calling tool:\s*read_file\b/i.test(String(entry || '').trim()));
+
+const looksLikeFileDump = (text: string) => {
+  const lines = text.split('\n');
+  if (lines.length < 40) return false;
+  const codeish = lines.filter((line) =>
+    /^\s*(\/\/|#include|use\s+\w|import\s+\w|fn\s+\w|class\s+\w|def\s+\w|const\s+\w|let\s+\w|pub\s+\w|[{}();]|<\/?\w+)/.test(
+      line
+    )
+  ).length;
+  return codeish >= Math.min(25, Math.floor(lines.length * 0.4));
+};
+
+const redactFileDumpForReadFile = (text: string) => {
+  let changed = false;
+  const redactedBlocks = text.replace(/```[\s\S]*?```/g, (block) => {
+    const blockLines = block.split('\n').length;
+    if (blockLines < 12) return block;
+    changed = true;
+    return '```text\n[file content omitted]\n```';
+  });
+  if (changed) return redactedBlocks;
+  if (looksLikeFileDump(text)) return '[file content omitted]';
+  return text;
+};
+
+const visibleMessageText = (msg: ChatMessage) => {
+  if (msg.role === 'user') return msg.text;
+  const sanitized = sanitizeAgentMessageText(msg.text);
+  if (!hasReadFileActivity(msg.activityEntries)) return sanitized;
+  return redactFileDumpForReadFile(sanitized);
 };
 
 const buildRunTimeline = (
@@ -245,8 +585,10 @@ const buildRunTimeline = (
     if (tool) {
       events.push({
         ts: Number(msg.timestamp || 0),
-        label: `Tool: ${tool}`,
-        detail: `${msg.from_id}${msg.to_id ? ` -> ${msg.to_id}` : ''}`,
+        label: `Tool: ${tool.name}`,
+        detail: [tool.detail, `${msg.from_id}${msg.to_id ? ` -> ${msg.to_id}` : ''}`]
+          .filter(Boolean)
+          .join(' • '),
         kind: 'tool',
       });
       continue;
@@ -271,20 +613,11 @@ export const ChatPanel: React.FC<{
   chatMessages: ChatMessage[];
   queuedMessages: QueuedChatItem[];
   chatEndRef: React.RefObject<HTMLDivElement | null>;
-  copyChat: () => void;
-  copyChatStatus: 'idle' | 'copied' | 'error';
-  clearChat: () => void;
-  createSession: () => void;
-  removeSession: (id: string) => void;
-  sessions: SessionInfo[];
-  activeSessionId: string | null;
-  setActiveSessionId: (value: string | null) => void;
   selectedAgent: string;
   setSelectedAgent: (value: string) => void;
   skills: SkillInfo[];
   agents: AgentInfo[];
   mainAgents: AgentInfo[];
-  agentStatus?: Record<string, 'idle' | 'model_loading' | 'thinking' | 'calling_tool' | 'working'>;
   subagents: SubagentInfo[];
   mainRunIds?: Record<string, string>;
   subagentRunIds?: Record<string, string>;
@@ -299,20 +632,11 @@ export const ChatPanel: React.FC<{
   chatMessages,
   queuedMessages,
   chatEndRef,
-  copyChat,
-  copyChatStatus,
-  clearChat,
-  createSession,
-  removeSession,
-  sessions,
-  activeSessionId,
-  setActiveSessionId,
   selectedAgent,
   setSelectedAgent,
   skills,
   agents,
   mainAgents,
-  agentStatus,
   subagents,
   mainRunIds,
   subagentRunIds,
@@ -344,7 +668,6 @@ export const ChatPanel: React.FC<{
   const [loadingChildrenByRunId, setLoadingChildrenByRunId] = useState<Record<string, boolean>>({});
   const [childrenErrorByRunId, setChildrenErrorByRunId] = useState<Record<string, string>>({});
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
-  const agentSelectRef = useRef<HTMLSelectElement | null>(null);
 
   const mainAgentIds = useMemo(
     () => mainAgents.map((agent) => normalizeAgentKey(agent.name)),
@@ -460,17 +783,26 @@ export const ChatPanel: React.FC<{
     () => (selectedSubagentContext?.messages || []).map(contextMessageToChatMessage),
     [selectedSubagentContext]
   );
-  const displayedMainMessages = mainContextMessages.length > 0 ? mainContextMessages : visibleMessages;
-  const displayedSubagentMessages =
-    selectedSubagentContextMessages.length > 0 ? selectedSubagentContextMessages : subagentMessages;
+  const displayedMainMessages = useMemo(
+    () => collapseProgressMessages(mergeMessageStreams(mainContextMessages, visibleMessages)),
+    [mainContextMessages, visibleMessages]
+  );
+  const displayedSubagentMessages = useMemo(
+    () => mergeMessageStreams(selectedSubagentContextMessages, subagentMessages),
+    [selectedSubagentContextMessages, subagentMessages]
+  );
   const filteredMainMessages = useMemo(() => {
     const q = mainMessageFilter.trim().toLowerCase();
     if (!q) return displayedMainMessages;
     return displayedMainMessages.filter((msg) => {
       const from = normalizeAgentKey(msg.from || msg.role);
       const to = normalizeAgentKey(msg.to || '');
+      const activitySummary = (msg.activitySummary || '').toLowerCase();
+      const activityLines = (msg.activityEntries || []).join('\n').toLowerCase();
       return (
         msg.text.toLowerCase().includes(q) ||
+        activitySummary.includes(q) ||
+        activityLines.includes(q) ||
         from.includes(q) ||
         to.includes(q)
       );
@@ -631,11 +963,6 @@ export const ChatPanel: React.FC<{
     return () => window.clearInterval(id);
   }, [selectedMainRunningRunId, selectedSubagentRunningRunId, fetchRunContext, fetchRunChildren]);
 
-  const formatParty = (party?: string) => {
-    if (!party) return '';
-    return party.toUpperCase();
-  };
-
   const resizeInput = () => {
     if (!inputRef.current) return;
     inputRef.current.style.height = '0px';
@@ -664,8 +991,7 @@ export const ChatPanel: React.FC<{
       }
     }
 
-    const dropdownAgent = agentSelectRef.current?.value;
-    const targetAgent = mentionAgent || dropdownAgent || selectedAgent;
+    const targetAgent = mentionAgent || selectedAgent;
     onSendMessage(userMessage, targetAgent);
     window.setTimeout(resizeInput, 0);
   };
@@ -732,119 +1058,20 @@ export const ChatPanel: React.FC<{
   };
 
   return (
-    <section className="h-full flex flex-col bg-white dark:bg-[#0f0f0f] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm overflow-hidden min-h-0 relative">
-      <div className="p-3 border-b border-slate-200 dark:border-white/5 flex flex-col gap-2 bg-gradient-to-r from-slate-50 to-white dark:from-[#121212] dark:to-[#0f0f0f]">
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <select
-              ref={agentSelectRef}
-              value={selectedAgent}
-              onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setSelectedAgent(e.target.value)}
-              className="text-[11px] bg-white dark:bg-black/20 border border-slate-200 dark:border-white/10 rounded-xl px-2.5 py-1.5 outline-none min-w-[8.5rem]"
-              title="Select active main agent"
-            >
-              {mainAgents.map((agent) => (
-                <option key={agent.name} value={normalizeAgentKey(agent.name)}>
-                  {agent.name}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={copyChat}
-              className={cn(
-                'p-1.5 rounded-lg transition-colors text-slate-500',
-                copyChatStatus === 'copied'
-                  ? 'bg-green-500/10 text-green-600'
-                  : copyChatStatus === 'error'
-                    ? 'bg-red-500/10 text-red-500'
-                    : 'hover:bg-slate-100 dark:hover:bg-white/5'
-              )}
-              title={
-                copyChatStatus === 'copied'
-                  ? 'Copied'
-                  : copyChatStatus === 'error'
-                    ? 'Copy failed'
-                    : 'Copy Chat'
-              }
-            >
-              <Copy size={16} />
-            </button>
-            <button
-              onClick={clearChat}
-              className="p-1.5 hover:bg-red-500/10 hover:text-red-500 rounded-lg text-slate-500 transition-colors"
-              title="Clear Chat"
-            >
-              <Eraser size={16} />
-            </button>
-            <button
-              onClick={createSession}
-              className="p-1.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded-lg text-blue-500 transition-colors"
-              title="New Session"
-            >
-              <Plus size={16} />
-            </button>
-            <select
-              value={activeSessionId || ''}
-              onChange={(e) => setActiveSessionId(e.target.value || null)}
-              className="text-[10px] bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded px-2 py-1 outline-none w-44"
-            >
-              <option value="">Default Session</option>
-              {sessions.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.title}
-                </option>
-              ))}
-            </select>
-          </div>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          {mainAgents.map((agent) => {
-            const id = normalizeAgentKey(agent.name);
-            const isSelected = id === normalizeAgentKey(selectedAgent);
-            const status = agentStatus?.[id] || 'idle';
-            return (
-              <button
-                key={agent.name}
-                onClick={() => setSelectedAgent(id)}
-                className={cn(
-                  'px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider border transition-colors',
-                  isSelected
-                    ? 'bg-blue-600 text-white border-blue-600'
-                    : 'bg-white dark:bg-black/20 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/5'
-                )}
-              >
-                {agent.name}
-                <span className={cn('ml-2 px-1.5 py-0.5 rounded-full text-[9px]', statusBadgeClass(status))}>
-                  {status}
-                </span>
-              </button>
-            );
-          })}
-          {selectedMainRunningRunId && onCancelRun && (
-            <button
-              onClick={() => onCancelRun(selectedMainRunningRunId)}
-              disabled={!!cancellingRunIds?.[selectedMainRunningRunId]}
-              className={cn(
-                'ml-auto px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider border transition-colors',
-                cancellingRunIds?.[selectedMainRunningRunId]
-                  ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
-                  : 'bg-red-50 text-red-600 border-red-200 hover:bg-red-100'
-              )}
-              title={selectedMainRunningRunId}
-            >
-              {cancellingRunIds?.[selectedMainRunningRunId] ? 'Cancelling...' : 'Cancel Run'}
-            </button>
-          )}
-        </div>
-
+    <section className="h-full flex flex-col bg-white dark:bg-[#0f0f0f] rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden min-h-0 relative">
+      <div className="px-1.5 py-1 border-b border-slate-200 dark:border-white/5 bg-slate-50/70 dark:bg-white/[0.02] space-y-1">
         {selectedMainRunId && (
-          <div className="rounded-xl border border-slate-200 dark:border-white/10 bg-slate-50/80 dark:bg-white/[0.03] px-3 py-2 text-[10px] text-slate-600 dark:text-slate-300">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="font-semibold uppercase tracking-widest text-slate-500">Run</span>
-              <span className="font-mono">{selectedMainRunId}</span>
+          <details className="rounded-md border border-slate-200 dark:border-white/10 bg-white/80 dark:bg-black/20 px-2 py-1 text-[10px] text-slate-600 dark:text-slate-300">
+            <summary className="cursor-pointer flex flex-wrap items-center gap-2">
+              <span className="font-semibold uppercase tracking-wider text-slate-500">Run</span>
+              <span className="font-mono truncate">{selectedMainRunId}</span>
+              {selectedMainContext?.run?.status && (
+                <span className={cn('px-1.5 py-0.5 rounded-full uppercase tracking-wide', statusBadgeClass(selectedMainContext.run.status))}>
+                  {selectedMainContext.run.status}
+                </span>
+              )}
+            </summary>
+            <div className="mt-1.5 flex flex-wrap items-center gap-2">
               {selectedMainRunOptions.length > 1 && (
                 <select
                   value={selectedMainRunId}
@@ -863,40 +1090,48 @@ export const ChatPanel: React.FC<{
                   ))}
                 </select>
               )}
-              {selectedMainRunId && (
+              <button
+                onClick={() => {
+                  if (selectedMainPinned) {
+                    setPinnedMainRunByAgent((prev) => {
+                      const next = { ...prev };
+                      delete next[selectedAgentKey];
+                      return next;
+                    });
+                    setSelectedMainRunByAgent((prev) => {
+                      const next = { ...prev };
+                      delete next[selectedAgentKey];
+                      return next;
+                    });
+                  } else {
+                    setSelectedMainRunByAgent((prev) => ({ ...prev, [selectedAgentKey]: selectedMainRunId }));
+                    setPinnedMainRunByAgent((prev) => ({ ...prev, [selectedAgentKey]: true }));
+                  }
+                }}
+                className={cn(
+                  'px-2 py-1 rounded border text-[10px] font-semibold',
+                  selectedMainPinned
+                    ? 'bg-slate-100 text-slate-600 border-slate-300'
+                    : 'bg-blue-50 text-blue-600 border-blue-200'
+                )}
+                title={selectedMainPinned ? 'Unpin run selection' : 'Pin this run selection'}
+              >
+                {selectedMainPinned ? 'Unpin' : 'Pin'}
+              </button>
+              {selectedMainRunningRunId && onCancelRun && (
                 <button
-                  onClick={() => {
-                    if (selectedMainPinned) {
-                      setPinnedMainRunByAgent((prev) => {
-                        const next = { ...prev };
-                        delete next[selectedAgentKey];
-                        return next;
-                      });
-                      setSelectedMainRunByAgent((prev) => {
-                        const next = { ...prev };
-                        delete next[selectedAgentKey];
-                        return next;
-                      });
-                    } else {
-                      setSelectedMainRunByAgent((prev) => ({ ...prev, [selectedAgentKey]: selectedMainRunId }));
-                      setPinnedMainRunByAgent((prev) => ({ ...prev, [selectedAgentKey]: true }));
-                    }
-                  }}
+                  onClick={() => onCancelRun(selectedMainRunningRunId)}
+                  disabled={!!cancellingRunIds?.[selectedMainRunningRunId]}
                   className={cn(
-                    'px-2 py-1 rounded border text-[10px] font-semibold',
-                    selectedMainPinned
-                      ? 'bg-slate-100 text-slate-600 border-slate-300'
-                      : 'bg-blue-50 text-blue-600 border-blue-200'
+                    'px-2 py-1 rounded border text-[10px] font-semibold transition-colors',
+                    cancellingRunIds?.[selectedMainRunningRunId]
+                      ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+                      : 'bg-red-50 text-red-600 border-red-200 hover:bg-red-100'
                   )}
-                  title={selectedMainPinned ? 'Unpin run selection' : 'Pin this run selection'}
+                  title={selectedMainRunningRunId}
                 >
-                  {selectedMainPinned ? 'Unpin' : 'Pin'}
+                  {cancellingRunIds?.[selectedMainRunningRunId] ? 'Cancelling...' : 'Cancel Run'}
                 </button>
-              )}
-              {selectedMainContext?.run?.status && (
-                <span className={cn('px-1.5 py-0.5 rounded-full uppercase tracking-wide', statusBadgeClass(selectedMainContext.run.status))}>
-                  {selectedMainContext.run.status}
-                </span>
               )}
               {selectedMainContextLoading && <span className="text-blue-500">Loading context...</span>}
               {selectedMainContextError && <span className="text-red-500">Context error: {selectedMainContextError}</span>}
@@ -904,75 +1139,65 @@ export const ChatPanel: React.FC<{
               {selectedMainChildrenError && <span className="text-red-500">Children error: {selectedMainChildrenError}</span>}
             </div>
             {selectedMainContext?.summary && (
-              <div className="mt-1.5 text-slate-500 dark:text-slate-400">
-                messages: {selectedMainContext.summary.message_count} • user: {selectedMainContext.summary.user_messages} • agent: {selectedMainContext.summary.agent_messages} • system: {selectedMainContext.summary.system_messages}
+              <div className="mt-1 text-slate-500 dark:text-slate-400">
+                msgs {selectedMainContext.summary.message_count} • user {selectedMainContext.summary.user_messages} • agent {selectedMainContext.summary.agent_messages} • system {selectedMainContext.summary.system_messages}
               </div>
             )}
-          </div>
+          </details>
         )}
 
         {subagents.length > 0 && (
-          <div className="flex flex-wrap items-center gap-2 rounded-xl border border-slate-200 dark:border-white/10 bg-white/80 dark:bg-black/20 px-2 py-2">
-            <span className="text-[10px] font-bold uppercase tracking-widest text-slate-500 dark:text-slate-400 flex items-center gap-1">
+          <details className="rounded-md border border-slate-200 dark:border-white/10 bg-white/80 dark:bg-black/20 px-2 py-1 text-[10px]">
+            <summary className="cursor-pointer font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 flex items-center gap-1">
               <Sparkles size={11} />
-              Subagents
-            </span>
-            {subagents.map((sub) => (
-              <button
-                key={sub.id}
-                onClick={() => setOpenSubagentId(sub.id)}
-                className={cn(
-                  'px-2.5 py-1 rounded-lg text-[10px] border transition-colors flex items-center gap-1.5',
-                  openSubagentId === sub.id
-                    ? 'bg-blue-600 text-white border-blue-600'
-                    : 'bg-slate-100 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:bg-slate-200 dark:hover:bg-white/10'
-                )}
-              >
-                <span className="font-semibold">{sub.id}</span>
-                <span className={cn('px-1.5 py-0.5 rounded-full uppercase tracking-wide', statusBadgeClass(sub.status))}>
-                  {sub.status}
-                </span>
-              </button>
-            ))}
-          </div>
+              Subagents ({subagents.length})
+            </summary>
+            <div className="mt-1 flex flex-wrap items-center gap-1.5">
+              {subagents.map((sub) => (
+                <button
+                  key={sub.id}
+                  onClick={() => setOpenSubagentId(sub.id)}
+                  className={cn(
+                    'px-2 py-1 rounded-md text-[10px] border transition-colors flex items-center gap-1',
+                    openSubagentId === sub.id
+                      ? 'bg-blue-600 text-white border-blue-600'
+                      : 'bg-slate-100 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:bg-slate-200 dark:hover:bg-white/10'
+                  )}
+                >
+                  <span className="font-semibold">{sub.id}</span>
+                  <span className={cn('px-1.5 py-0.5 rounded-full uppercase tracking-wide', statusBadgeClass(sub.status))}>
+                    {sub.status}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </details>
         )}
-
-        <div className="flex flex-col gap-1">
-          {activeSessionId && (
-            <button onClick={() => removeSession(activeSessionId)} className="text-[8px] text-red-500 hover:underline text-right">
-              Delete Session
-            </button>
-          )}
-        </div>
       </div>
 
-      <div className="flex-1 overflow-y-scroll p-4 flex flex-col gap-5 custom-scrollbar min-h-0">
-        <div className="rounded-lg border border-slate-200 dark:border-white/10 bg-slate-50/70 dark:bg-white/[0.03] px-3 py-2 space-y-2">
-          <div className="flex items-center justify-between gap-2">
-            <div className="text-[10px] uppercase tracking-widest text-slate-500">Context Tools</div>
-            <input
-              value={mainMessageFilter}
-              onChange={(e) => setMainMessageFilter(e.target.value)}
-              placeholder="Filter messages"
-              className="w-52 text-[11px] bg-white dark:bg-black/30 border border-slate-200 dark:border-white/10 rounded px-2 py-1 outline-none"
-            />
-          </div>
-          {selectedMainTimeline.length > 0 && (
-            <details>
-              <summary className="cursor-pointer text-[11px] font-semibold text-slate-600 dark:text-slate-300">
-                Timeline ({selectedMainTimeline.length})
-              </summary>
-              <div className="mt-1.5 space-y-1.5 max-h-36 overflow-auto custom-scrollbar">
+      <div className="flex-1 overflow-y-scroll px-2 py-1.5 flex flex-col gap-2 custom-scrollbar min-h-0">
+        <div className="flex items-center justify-between gap-2 mb-1">
+          {selectedMainTimeline.length > 0 ? (
+            <details className="text-[10px] text-slate-500">
+              <summary className="cursor-pointer">Timeline ({selectedMainTimeline.length})</summary>
+              <div className="mt-1 space-y-1 max-h-28 overflow-auto custom-scrollbar pr-2">
                 {selectedMainTimeline.map((evt, idx) => (
-                  <div key={`${evt.ts}-${evt.label}-${idx}`} className="text-[11px] text-slate-600 dark:text-slate-300">
-                    <span className="font-mono text-[10px] text-slate-500 mr-2">{formatTs(evt.ts)}</span>
-                    <span className="font-semibold">{evt.label}</span>
-                    {evt.detail && <span className="text-slate-500"> • {evt.detail}</span>}
+                  <div key={`${evt.ts}-${evt.label}-${idx}`} className="text-[10px] text-slate-500 dark:text-slate-400">
+                    {formatTs(evt.ts)} • {evt.label}
+                    {evt.detail ? ` • ${evt.detail}` : ''}
                   </div>
                 ))}
               </div>
             </details>
+          ) : (
+            <div />
           )}
+          <input
+            value={mainMessageFilter}
+            onChange={(e) => setMainMessageFilter(e.target.value)}
+            placeholder="Filter messages"
+            className="w-52 text-[11px] bg-white dark:bg-black/30 border border-slate-200 dark:border-white/10 rounded px-2 py-1 outline-none"
+          />
         </div>
         {filteredMainMessages.length === 0 && (
           <div className="self-center mt-12 max-w-md text-center">
@@ -987,56 +1212,71 @@ export const ChatPanel: React.FC<{
         {filteredMainMessages.map((msg, i) => {
           const key = `${msg.timestamp}-${i}-${msg.from || msg.role}-${msg.text.slice(0, 24)}`;
           const isUser = msg.role === 'user';
-          const hasActivity = !isUser && Array.isArray(msg.activityEntries) && msg.activityEntries.length > 0;
-          const isStatusLine =
-            msg.text === 'Thinking...' ||
-            msg.text === 'Model loading...' ||
-            msg.text.startsWith('Calling tool:');
-          const hideStatusBodyText = hasActivity && isStatusLine;
-          const from = msg.from || msg.role;
-          const to = msg.to || '';
+          const displayText = visibleMessageText(msg);
+          const activityEntries = activityEntriesForMessage(msg);
+          const hasActivity = !isUser && activityEntries.length > 0;
+          const detailActivityEntries = hasActivity ? activityEntriesForDetails(msg, activityEntries) : [];
+          const hasActivityDetails = !isUser && detailActivityEntries.length > 0;
+          const hasActivitySummary = !isUser && (hasActivity || !!msg.activitySummary);
+          const isStatusLine = isProgressLineText(msg.text);
+          const activitySummaryText = hasActivitySummary
+            ? (msg.activitySummary || (hasActivity ? summarizeCollapsedActivity(activityEntries) : ''))
+            : '';
+          const hideStatusBodyText = hasActivitySummary && (
+            isStatusLine ||
+            displayText.trim().length === 0 ||
+            displayText.trim() === activitySummaryText
+          );
+          const messageClass = isUser
+            ? 'bg-slate-100 dark:bg-white/10 text-slate-900 dark:text-slate-100 rounded-md px-2.5 py-1.5'
+            : msg.from === 'lead' && msg.to === 'coder'
+              ? 'bg-amber-500/10 text-amber-900 dark:text-amber-200 rounded-md px-2.5 py-1.5'
+              : isStatusLine && !hasActivity
+                ? 'text-blue-700 dark:text-blue-300 italic'
+                : 'text-slate-800 dark:text-slate-200';
           return (
           <div
             key={key}
-            className={cn('flex flex-col gap-1 max-w-[90%]', isUser ? 'self-end items-end' : 'self-start items-start')}
+            className={cn('w-full flex', isUser ? 'justify-end' : 'justify-start')}
           >
-            <div className="flex items-center gap-1 px-1">
-              <span className="text-[9px] font-bold uppercase tracking-tighter text-slate-500">
-                {formatParty(from)} {to ? `→ ${formatParty(to)}` : ''}
-              </span>
-            </div>
             <div
               className={cn(
-                'px-3 py-2.5 rounded-2xl text-[13px] leading-relaxed shadow-sm',
-                isUser
-                  ? 'bg-blue-600 text-white rounded-tr-sm'
-                  : msg.from === 'lead' && msg.to === 'coder'
-                    ? 'bg-amber-500/10 border border-amber-500/20 text-amber-900 dark:text-amber-200 rounded-tl-sm'
-                    : isStatusLine && !hasActivity
-                      ? 'bg-blue-50 border border-blue-200 text-blue-700 dark:bg-blue-500/10 dark:border-blue-400/20 dark:text-blue-300 rounded-tl-sm italic'
-                      : 'bg-slate-100 dark:bg-white/5 text-slate-800 dark:text-slate-200 border border-slate-200 dark:border-white/10 rounded-tl-sm'
+                'max-w-[96%] text-[13px] leading-relaxed',
+                messageClass
               )}
             >
-              {hasActivity && (
-                <details className="mb-1.5">
-                  <summary className="cursor-pointer text-[11px] text-slate-600 dark:text-slate-300 font-medium">
-                    {msg.activitySummary || `${msg.activityEntries?.length || 0} activity events`}
-                  </summary>
-                  <div className="mt-1 pl-2 border-l border-slate-300/80 dark:border-white/20 text-[11px] text-slate-500 dark:text-slate-400 space-y-0.5">
-                    {(msg.activityEntries || []).map((entry, idx) => (
-                      <div key={`${key}-activity-${idx}`}>{entry}</div>
-                    ))}
+              {hasActivitySummary && (
+                hasActivityDetails ? (
+                  <details className="mb-1 text-[11px] text-slate-500 dark:text-slate-400" open={msg.isGenerating}>
+                    <summary className="cursor-pointer select-none flex items-center gap-1.5">
+                      {msg.isGenerating && (
+                        <span className="flex gap-0.5">
+                          <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce [animation-delay:-0.3s]" />
+                          <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce [animation-delay:-0.15s]" />
+                          <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce" />
+                        </span>
+                      )}
+                      <span>{activityHeadline(msg, activityEntries)}</span>
+                    </summary>
+                    <div className="mt-1 space-y-0.5 pl-2 border-l border-slate-300/60 dark:border-white/15">
+                      {detailActivityEntries.map((entry, idx) => (
+                        <div key={`${idx}-${entry}`} className="truncate">
+                          {entry}
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                ) : (
+                  <div className="mb-1 text-[11px] text-slate-500 dark:text-slate-400">
+                    {activityHeadline(msg, activityEntries)}
                   </div>
-                </details>
+                )
               )}
               {(() => {
-                if (isUser || (isStatusLine && !hasActivity)) return msg.text;
+                if (isUser || (isStatusLine && !hasActivity)) return displayText;
                 if (hideStatusBodyText) return null;
                 try {
-                  const parsed = JSON.parse(msg.text);
-                  if (parsed.type === 'ask' && parsed.question) {
-                    return <MarkdownContent text={parsed.question} />;
-                  }
+                  const parsed = JSON.parse(displayText);
                   if (parsed.type === 'finalize_task' && parsed.packet) {
                     const packet = parsed.packet;
                     const userStories: string[] = Array.isArray(packet.user_stories) ? packet.user_stories : [];
@@ -1069,22 +1309,21 @@ export const ChatPanel: React.FC<{
                       </div>
                     );
                   }
-                  return <MarkdownContent text={msg.text} />;
+                  return <MarkdownContent text={displayText} />;
                 } catch (_e) {
-                  return <MarkdownContent text={msg.text} />;
+                  return <MarkdownContent text={displayText} />;
                 }
               })()}
               {msg.isGenerating && <span className="inline-block w-1.5 h-3.5 bg-blue-500 ml-1 animate-pulse align-middle" />}
             </div>
-            <span className="text-[10px] text-slate-500 px-1">{msg.timestamp}</span>
           </div>
         )})}
         <div ref={chatEndRef} />
       </div>
 
-      <div className="p-4 border-t border-slate-200 dark:border-white/5 space-y-3 bg-slate-50 dark:bg-white/[0.02]">
+      <div className="sticky bottom-0 z-10 p-2 border-t border-slate-200 dark:border-white/5 space-y-2 bg-slate-50 dark:bg-white/[0.02]">
         {visibleQueued.length > 0 && (
-          <div className="rounded-lg border border-amber-300/50 bg-amber-50 dark:bg-amber-500/10 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-200">
+          <div className="rounded-md border border-amber-300/50 bg-amber-50 dark:bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-800 dark:text-amber-200">
             <div className="font-semibold">Queued messages ({visibleQueued.length})</div>
             <div className="mt-1 space-y-1">
               {visibleQueued.map((item) => (
@@ -1095,7 +1334,7 @@ export const ChatPanel: React.FC<{
             </div>
           </div>
         )}
-        <div className="flex gap-2 bg-white dark:bg-black/20 p-2 rounded-2xl border border-slate-300/80 dark:border-white/10 relative items-end shadow-sm">
+        <div className="flex gap-2 bg-white dark:bg-black/20 p-1.5 rounded-xl border border-slate-300/80 dark:border-white/10 relative items-end">
           {showSkillDropdown && (
             <div className="absolute bottom-full left-0 right-0 mb-2 bg-white dark:bg-[#141414] border border-slate-200 dark:border-white/10 rounded-lg shadow-xl max-h-52 overflow-y-auto z-[70]">
               <div className="px-3 py-2 text-[10px] text-slate-500 border-b border-slate-200 dark:border-white/10">
@@ -1191,11 +1430,11 @@ export const ChatPanel: React.FC<{
             }}
             placeholder="Message...  (/ for skills, @ for agents, Shift+Enter for newline)"
             rows={1}
-            className="flex-1 bg-transparent border-none px-2 py-2 text-[13px] outline-none resize-none min-h-[40px] max-h-[220px] leading-5"
+            className="flex-1 bg-transparent border-none px-1.5 py-1.5 text-[13px] outline-none resize-none min-h-[34px] max-h-[200px] leading-5"
           />
           <button
             onClick={send}
-            className="w-9 h-9 rounded-xl bg-blue-600 text-white flex items-center justify-center shadow-lg shadow-blue-600/20 hover:bg-blue-500 transition-colors"
+            className="w-8 h-8 rounded-lg bg-blue-600 text-white flex items-center justify-center hover:bg-blue-500 transition-colors"
             title="Send"
           >
             <Send size={14} />

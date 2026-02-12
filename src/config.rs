@@ -22,6 +22,7 @@ pub struct ModelConfig {
     pub url: String,
     pub model: String,
     pub api_key: Option<String>,
+    pub keep_alive: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -88,6 +89,25 @@ pub struct ServerConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AgentConfig {
     pub max_iters: usize,
+    #[serde(default)]
+    pub write_safety_mode: WriteSafetyMode,
+    #[serde(default)]
+    pub prompt_loop_breaker: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteSafetyMode {
+    Strict,
+    Warn,
+    Off,
+}
+
+impl Default for WriteSafetyMode {
+    fn default() -> Self {
+        // User-selected default for this repo: warn (allow write, but emit warnings).
+        WriteSafetyMode::Warn
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -137,9 +157,14 @@ impl Default for Config {
                 url: "http://127.0.0.1:11434".to_string(),
                 model: "qwen3-coder".to_string(),
                 api_key: None,
+                keep_alive: None,
             }],
             server: ServerConfig { port: 8080 },
-            agent: AgentConfig { max_iters: 10 },
+            agent: AgentConfig {
+                max_iters: 10,
+                write_safety_mode: WriteSafetyMode::default(),
+                prompt_loop_breaker: None,
+            },
             logging: LoggingConfig {
                 level: None,
                 directory: None,
