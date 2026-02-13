@@ -154,6 +154,15 @@ impl Tools {
                 })?;
                 self.write_file(args)
             }
+            "Edit" => {
+                let args: EditFileArgs = serde_json::from_value(normalized_args).map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid args for Edit: {}. Expected keys: path|old_string|new_string|replace_all?",
+                        e
+                    )
+                })?;
+                self.edit_file(args)
+            }
             "lock_paths" => {
                 let args: LockPathsArgs = serde_json::from_value(normalized_args)
                     .map_err(|e| anyhow::anyhow!("invalid args for lock_paths: {}", e))?;
@@ -567,24 +576,18 @@ impl Tools {
         })
     }
 
-    fn write_file(&self, args: WriteFileArgs) -> Result<ToolResult> {
-        let rel = sanitize_rel_path(&self.root, &args.path)?;
-        let path = self.root.join(&rel);
-        let new_content = args.content;
-
-        // Enforcement check
+    fn enforce_write_access(&self, rel: &str) -> Result<()> {
         if let (Some(manager), Some(agent_id)) = (&self.manager, &self.agent_id) {
             // 1. Check work_globs
             let allowed = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
-                    .block_on(async { manager.is_path_allowed(&self.root, agent_id, &rel).await })
+                    .block_on(async { manager.is_path_allowed(&self.root, agent_id, rel).await })
             });
 
             if !allowed {
                 anyhow::bail!(
                     "Path {} is outside the allowed WorkScope for agent {}",
-                    rel,
-                    agent_id
+                    rel, agent_id
                 );
             }
 
@@ -606,7 +609,7 @@ impl Tools {
             // Record activity in DB
             let _ = manager.db.record_activity(crate::db::FileActivity {
                 repo_path: self.root.to_string_lossy().to_string(),
-                file_path: rel.clone(),
+                file_path: rel.to_string(),
                 agent_id: agent_id.clone(),
                 status: "working".to_string(),
                 last_modified: std::time::SystemTime::now()
@@ -619,7 +622,7 @@ impl Tools {
             if self.run_id.is_some() {
                 let repo_path = self.root.to_string_lossy().to_string();
                 let run_id = self.run_id.clone();
-                let rel_for_map = rel.clone();
+                let rel_for_map = rel.to_string();
                 let agent_for_map = agent_id.clone();
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
@@ -630,6 +633,14 @@ impl Tools {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn write_file(&self, args: WriteFileArgs) -> Result<ToolResult> {
+        let rel = sanitize_rel_path(&self.root, &args.path)?;
+        let path = self.root.join(&rel);
+        let new_content = args.content;
+        self.enforce_write_access(&rel)?;
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -650,6 +661,63 @@ impl Tools {
         Ok(ToolResult::Success(format!(
             "File written: {} ({} bytes)",
             rel, bytes
+        )))
+    }
+
+    fn edit_file(&self, args: EditFileArgs) -> Result<ToolResult> {
+        let rel = sanitize_rel_path(&self.root, &args.path)?;
+        if args.old_string.is_empty() {
+            anyhow::bail!("old_string must not be empty");
+        }
+
+        let path = self.root.join(&rel);
+        if !path.exists() {
+            anyhow::bail!("file not found: {}", rel);
+        }
+        if path.is_dir() {
+            anyhow::bail!(
+                "path '{}' is a directory. Use Glob to enumerate files, then Edit with an exact file path.",
+                rel
+            );
+        }
+
+        self.enforce_write_access(&rel)?;
+
+        let existing = fs::read_to_string(&path)?;
+        let match_count = existing.matches(&args.old_string).count();
+        if match_count == 0 {
+            anyhow::bail!("old_string was not found in file: {}", rel);
+        }
+
+        let replace_all = args.replace_all.unwrap_or(false);
+        if match_count > 1 && !replace_all {
+            anyhow::bail!(
+                "old_string matched {} locations in {}. Provide a more specific old_string or set replace_all=true.",
+                match_count,
+                rel
+            );
+        }
+
+        let updated = if replace_all {
+            existing.replace(&args.old_string, &args.new_string)
+        } else {
+            existing.replacen(&args.old_string, &args.new_string, 1)
+        };
+
+        if updated == existing {
+            return Ok(ToolResult::Success(format!(
+                "File unchanged (no effective edit): {}",
+                rel
+            )));
+        }
+
+        fs::write(&path, updated)?;
+        let replaced = if replace_all { match_count } else { 1 };
+        Ok(ToolResult::Success(format!(
+            "Edited file: {} ({} replacement{})",
+            rel,
+            replaced,
+            if replaced == 1 { "" } else { "s" }
         )))
     }
 
@@ -824,6 +892,30 @@ struct WriteFileArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct EditFileArgs {
+    #[serde(alias = "file", alias = "filepath")]
+    path: String,
+    #[serde(
+        alias = "old",
+        alias = "old_text",
+        alias = "oldText",
+        alias = "search",
+        alias = "from"
+    )]
+    old_string: String,
+    #[serde(
+        alias = "new",
+        alias = "new_text",
+        alias = "newText",
+        alias = "replace",
+        alias = "to"
+    )]
+    new_string: String,
+    #[serde(alias = "all")]
+    replace_all: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct LockPathsArgs {
     globs: Vec<String>,
     ttl_ms: Option<u64>,
@@ -944,6 +1036,21 @@ fn summarize_tool_args(tool: &str, args: &Value) -> String {
                     );
                 }
             }
+            "Edit" => {
+                for key in ["old_string", "new_string", "old", "new", "old_text", "new_text", "oldText", "newText", "search", "replace", "from", "to"] {
+                    if let Some(content) = obj.get(key).and_then(|v| v.as_str()) {
+                        let byte_len = content.len();
+                        let line_count = content.lines().count();
+                        obj.insert(
+                            key.to_string(),
+                            serde_json::json!(format!(
+                                "<omitted:{} bytes, {} lines>",
+                                byte_len, line_count
+                            )),
+                        );
+                    }
+                }
+            }
             "Bash" => {
                 if let Some(cmd) = obj.get("cmd").and_then(|v| v.as_str()) {
                     let preview = if cmd.len() > 160 {
@@ -963,11 +1070,51 @@ fn summarize_tool_args(tool: &str, args: &Value) -> String {
 fn normalize_tool_args(tool: &str, args: &Value) -> Value {
     let mut normalized = args.clone();
     if let Some(obj) = normalized.as_object_mut() {
-        if matches!(tool, "Read" | "Write") && !obj.contains_key("path") {
+        if matches!(tool, "Bash") && !obj.contains_key("cmd") {
+            if let Some(command) = obj.get("command").cloned() {
+                obj.insert("cmd".to_string(), command);
+            }
+        }
+
+        if matches!(tool, "Read" | "Write" | "Edit") && !obj.contains_key("path") {
             if let Some(fp) = obj.get("filepath").cloned() {
                 obj.insert("path".to_string(), fp);
             } else if let Some(file) = obj.get("file").cloned() {
                 obj.insert("path".to_string(), file);
+            }
+        }
+
+        if matches!(tool, "Edit") {
+            if !obj.contains_key("old_string") {
+                if let Some(v) = obj.get("old").cloned() {
+                    obj.insert("old_string".to_string(), v);
+                } else if let Some(v) = obj.get("old_text").cloned() {
+                    obj.insert("old_string".to_string(), v);
+                } else if let Some(v) = obj.get("oldText").cloned() {
+                    obj.insert("old_string".to_string(), v);
+                } else if let Some(v) = obj.get("search").cloned() {
+                    obj.insert("old_string".to_string(), v);
+                } else if let Some(v) = obj.get("from").cloned() {
+                    obj.insert("old_string".to_string(), v);
+                }
+            }
+            if !obj.contains_key("new_string") {
+                if let Some(v) = obj.get("new").cloned() {
+                    obj.insert("new_string".to_string(), v);
+                } else if let Some(v) = obj.get("new_text").cloned() {
+                    obj.insert("new_string".to_string(), v);
+                } else if let Some(v) = obj.get("newText").cloned() {
+                    obj.insert("new_string".to_string(), v);
+                } else if let Some(v) = obj.get("replace").cloned() {
+                    obj.insert("new_string".to_string(), v);
+                } else if let Some(v) = obj.get("to").cloned() {
+                    obj.insert("new_string".to_string(), v);
+                }
+            }
+            if !obj.contains_key("replace_all") {
+                if let Some(v) = obj.get("all").cloned() {
+                    obj.insert("replace_all".to_string(), v);
+                }
             }
         }
 
@@ -1068,6 +1215,7 @@ pub fn canonical_tool_name(tool: &str) -> Option<&'static str> {
         "Read" => "Read",
         "Grep" => "Grep",
         "Write" => "Write",
+        "Edit" => "Edit",
         "Bash" => "Bash",
         "capture_screenshot" => "capture_screenshot",
         "lock_paths" => "lock_paths",
@@ -1108,10 +1256,16 @@ fn full_tool_schema_entries() -> Vec<Value> {
             "notes": "Path aliases accepted: path, file, filepath."
         }),
         serde_json::json!({
+            "name": "Edit",
+            "args": {"path": "string", "old_string": "string", "new_string": "string", "replace_all": "boolean?"},
+            "returns": "success",
+            "notes": "Applies an exact string replacement. Path aliases accepted: path, file, filepath."
+        }),
+        serde_json::json!({
             "name": "Bash",
             "args": {"cmd": "string", "timeout_ms": "number?"},
             "returns": "{exit_code,stdout,stderr}",
-            "notes": "Runs allowlisted dev/search/build shell commands with per-segment validation."
+            "notes": "Runs allowlisted dev/search/build shell commands with per-segment validation. Command alias accepted: command."
         }),
         serde_json::json!({
             "name": "capture_screenshot",

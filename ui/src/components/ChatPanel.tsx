@@ -182,6 +182,163 @@ const looksLikeCodeLine = (line: string) =>
     line
   );
 
+type RenderChunk =
+  | { type: 'text'; text: string }
+  | { type: 'bash'; exitCode?: string; stdout: string; stderr: string };
+
+const BASH_OUTPUT_HEADER_RE = /^Bash output \(exit_code:\s*([^)]+)\):\s*$/i;
+const TOOL_BASH_OUTPUT_HEADER_RE =
+  /^Tool\s+Bash\s*:\s*Bash output \(exit_code:\s*([^)]+)\):\s*$/i;
+
+const trimTrailingEmptyLines = (lines: string[]) => {
+  const out = [...lines];
+  while (out.length > 0 && out[out.length - 1].trim() === '') out.pop();
+  return out;
+};
+
+const normalizeExitCode = (raw?: string) => {
+  const value = String(raw || '').trim();
+  if (!value) return undefined;
+  const someMatch = /^Some\(([-+]?\d+)\)$/.exec(value);
+  if (someMatch?.[1]) return someMatch[1];
+  if (value === 'None') return 'n/a';
+  return value;
+};
+
+const parseBashOutputChunks = (text: string): RenderChunk[] => {
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  const chunks: RenderChunk[] = [];
+  let plainBuffer: string[] = [];
+  let i = 0;
+
+  const flushText = () => {
+    if (plainBuffer.length === 0) return;
+    const chunk = plainBuffer.join('\n').trim();
+    if (chunk) chunks.push({ type: 'text', text: chunk });
+    plainBuffer = [];
+  };
+
+  while (i < lines.length) {
+    const line = lines[i] || '';
+    const trimmed = line.trim();
+    let exitCode: string | undefined;
+    let atStdout = false;
+
+    const headerMatch = BASH_OUTPUT_HEADER_RE.exec(trimmed) || TOOL_BASH_OUTPUT_HEADER_RE.exec(trimmed);
+    if (headerMatch) {
+      exitCode = normalizeExitCode(headerMatch[1]);
+      if (i + 1 < lines.length && lines[i + 1].trim() === 'STDOUT:') {
+        atStdout = true;
+        i += 1;
+      } else {
+        plainBuffer.push(line);
+        i += 1;
+        continue;
+      }
+    } else if (trimmed === 'STDOUT:') {
+      atStdout = true;
+    }
+
+    if (!atStdout) {
+      plainBuffer.push(line);
+      i += 1;
+      continue;
+    }
+
+    flushText();
+    i += 1; // move after STDOUT:
+
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    let parsingStderr = false;
+
+    while (i < lines.length) {
+      const current = lines[i] || '';
+      const currentTrimmed = current.trim();
+      if (!parsingStderr && currentTrimmed === 'STDERR:') {
+        parsingStderr = true;
+        i += 1;
+        continue;
+      }
+      // Heuristic boundary for duplicated command output blocks.
+      if (currentTrimmed === 'STDOUT:' && (stdoutLines.length > 0 || stderrLines.length > 0)) {
+        break;
+      }
+      if (BASH_OUTPUT_HEADER_RE.test(currentTrimmed) || TOOL_BASH_OUTPUT_HEADER_RE.test(currentTrimmed)) {
+        const next = lines[i + 1] || '';
+        if (next.trim() === 'STDOUT:') break;
+      }
+      if (parsingStderr) stderrLines.push(current);
+      else stdoutLines.push(current);
+      i += 1;
+    }
+
+    chunks.push({
+      type: 'bash',
+      exitCode,
+      stdout: trimTrailingEmptyLines(stdoutLines).join('\n'),
+      stderr: trimTrailingEmptyLines(stderrLines).join('\n'),
+    });
+  }
+
+  flushText();
+  return chunks.length > 0 ? chunks : [{ type: 'text', text }];
+};
+
+const lineCount = (text: string) => {
+  if (!text) return 0;
+  return text.split('\n').length;
+};
+
+const renderAgentMessageBody = (text: string) => {
+  const chunks = parseBashOutputChunks(text);
+  if (chunks.length === 1 && chunks[0]?.type === 'text') {
+    return <MarkdownContent text={chunks[0].text} />;
+  }
+  return (
+    <div className="space-y-2">
+      {chunks.map((chunk, idx) => {
+        if (chunk.type === 'text') {
+          return <MarkdownContent key={`text-${idx}`} text={chunk.text} />;
+        }
+        const stdoutLines = lineCount(chunk.stdout);
+        const stderrLines = lineCount(chunk.stderr);
+        return (
+          <details
+            key={`bash-${idx}`}
+            className="rounded-md border border-slate-200 dark:border-white/10 bg-slate-50/80 dark:bg-white/[0.03] text-[11px]"
+          >
+            <summary className="cursor-pointer px-2 py-1.5 text-slate-600 dark:text-slate-300 select-none flex flex-wrap items-center gap-2">
+              <span className="font-semibold">Bash output</span>
+              {chunk.exitCode && <span className="font-mono text-[10px]">exit {chunk.exitCode}</span>}
+              <span className="text-[10px]">stdout {stdoutLines} line{stdoutLines === 1 ? '' : 's'}</span>
+              <span className="text-[10px]">stderr {stderrLines} line{stderrLines === 1 ? '' : 's'}</span>
+            </summary>
+            <div className="px-2 pb-2 space-y-1.5">
+              <div className="rounded border border-slate-200/80 dark:border-white/10 bg-white dark:bg-black/30">
+                <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-200/70 dark:border-white/10">
+                  Stdout
+                </div>
+                <pre className="m-0 max-h-80 overflow-auto custom-scrollbar p-2 font-mono text-[11px] leading-5 whitespace-pre-wrap break-words">
+                  {chunk.stdout || '(empty)'}
+                </pre>
+              </div>
+              <div className="rounded border border-slate-200/80 dark:border-white/10 bg-white dark:bg-black/30">
+                <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-200/70 dark:border-white/10">
+                  Stderr
+                </div>
+                <pre className="m-0 max-h-64 overflow-auto custom-scrollbar p-2 font-mono text-[11px] leading-5 whitespace-pre-wrap break-words">
+                  {chunk.stderr || '(empty)'}
+                </pre>
+              </div>
+            </div>
+          </details>
+        );
+      })}
+    </div>
+  );
+};
+
 const sanitizeAgentMessageText = (text: string) => {
   if (!text) return '';
   // Optimization: if it's a raw tool result from system, we often want to hide it entirely
@@ -198,6 +355,10 @@ const sanitizeAgentMessageText = (text: string) => {
       continue;
     }
     if (parseToolNameFromLine(trimmed)) continue;
+    if (/^Tool\s+Bash\s*:\s*Bash output \(exit_code:/i.test(trimmed)) {
+      kept.push(trimmed.replace(/^Tool\s+Bash\s*:\s*/i, ''));
+      continue;
+    }
     if (TOOL_RESULT_LINE_RE.test(trimmed)) continue;
     if (START_AUTONOMOUS_LINE_RE.test(trimmed)) continue;
     if (CONTENT_OMITTED_LINE_RE.test(trimmed)) continue;
@@ -273,11 +434,15 @@ const isProgressLineText = (text?: string) => {
     t === 'Thinking...' ||
     t === 'Model loading...' ||
     t === 'Reading file...' ||
+    t.startsWith('Reading file:') ||
     t === 'Writing file...' ||
+    t.startsWith('Writing file:') ||
     t === 'Running command...' ||
     t.startsWith('Running command:') ||
     t === 'Searching...' ||
+    t.startsWith('Searching:') ||
     t === 'Listing files...' ||
+    t.startsWith('Listing files:') ||
     t === 'Delegating...' ||
     t.startsWith('Delegating to subagent:') ||
     t === 'Calling tool...' ||
@@ -522,7 +687,10 @@ const parseTaskEvent = (content: string): string | null => {
 
 const hasReadFileActivity = (entries?: string[]) =>
   Array.isArray(entries) &&
-  entries.some((entry) => /^Calling tool:\s*read\b/i.test(String(entry || '').trim()));
+  entries.some((entry) => {
+    const t = String(entry || '').trim();
+    return /^Calling tool:\s*read\b/i.test(t) || /^Reading file(?::|\.\.\.)/i.test(t);
+  });
 
 const looksLikeFileDump = (text: string) => {
   const lines = text.split('\n');
@@ -1318,9 +1486,9 @@ export const ChatPanel: React.FC<{
                       </div>
                     );
                   }
-                  return <MarkdownContent text={displayText} />;
+                  return renderAgentMessageBody(displayText);
                 } catch (_e) {
-                  return <MarkdownContent text={displayText} />;
+                  return renderAgentMessageBody(displayText);
                 }
               })()}
               {msg.isGenerating && <span className="inline-block w-1.5 h-3.5 bg-blue-500 ml-1 animate-pulse align-middle" />}
@@ -1604,8 +1772,8 @@ export const ChatPanel: React.FC<{
                 <div className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">
                   {(msg.from || msg.role).toUpperCase()} {msg.to ? `→ ${msg.to.toUpperCase()}` : ''}
                 </div>
-                <div className="text-[12px] text-slate-700 dark:text-slate-200 whitespace-pre-wrap break-words">
-                  {msg.text}
+                <div className="text-[12px] text-slate-700 dark:text-slate-200 break-words">
+                  {renderAgentMessageBody(visibleMessageText(msg))}
                 </div>
               </div>
             ))}

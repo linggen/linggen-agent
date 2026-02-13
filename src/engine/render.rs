@@ -138,6 +138,17 @@ pub fn sanitize_tool_args_for_display(tool: &str, args: &serde_json::Value) -> s
                     serde_json::json!(format!("<omitted:{} bytes, {} lines>", bytes, lines)),
                 );
             }
+        } else if matches!(tool, "Edit") {
+            for key in ["old_string", "new_string", "old", "new", "old_text", "new_text", "oldText", "newText", "search", "replace", "from", "to"] {
+                if let Some(content) = obj.get(key).and_then(|v| v.as_str()) {
+                    let bytes = content.len();
+                    let lines = content.lines().count();
+                    obj.insert(
+                        key.to_string(),
+                        serde_json::json!(format!("<omitted:{} bytes, {} lines>", bytes, lines)),
+                    );
+                }
+            }
         }
     }
     safe
@@ -163,6 +174,43 @@ pub fn tool_call_signature(tool: &str, args: &serde_json::Value) -> String {
             path,
             hasher.finish(),
             content.len()
+        );
+    }
+    if matches!(tool, "Edit") {
+        let path = args
+            .get("path")
+            .or_else(|| args.get("file"))
+            .or_else(|| args.get("filepath"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let old_string = args
+            .get("old_string")
+            .or_else(|| args.get("old"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let new_string = args
+            .get("new_string")
+            .or_else(|| args.get("new"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let replace_all = args
+            .get("replace_all")
+            .or_else(|| args.get("all"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut old_hasher = DefaultHasher::new();
+        old_string.hash(&mut old_hasher);
+        let mut new_hasher = DefaultHasher::new();
+        new_string.hash(&mut new_hasher);
+        return format!(
+            "{}|path={}|old_hash={:x}|new_hash={:x}|old_len={}|new_len={}|all={}",
+            tool,
+            path,
+            old_hasher.finish(),
+            new_hasher.finish(),
+            old_string.len(),
+            new_string.len(),
+            replace_all
         );
     }
     format!("{}|{}", tool, args)

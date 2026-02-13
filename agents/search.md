@@ -41,6 +41,13 @@ PromptMode: chat (tool call)
 
 {"type":"tool","tool":"Grep","args":{"query":"keep_alive","globs":["src/**"],"max_results":50}}
 
+PromptMode: chat (tool calls by tool)
+
+{"type":"tool","tool":"get_repo_info","args":{}}
+{"type":"tool","tool":"Glob","args":{"globs":["src/**/*.rs"],"max_results":100}}
+{"type":"tool","tool":"Grep","args":{"query":"setup_tracing_with_settings","globs":["src/**"],"max_results":50}}
+{"type":"tool","tool":"Read","args":{"path":"src/logging.rs","max_bytes":8000}}
+
 PromptMode: structured
 
 {"type":"tool","tool":"Read","args":{"path":"src/server/chat_api.rs","max_bytes":8000}}

@@ -1,6 +1,6 @@
 mod agent_api;
 mod chat_api;
-mod chat_helpers;
+pub(crate) mod chat_helpers;
 mod projects_api;
 mod workspace_api;
 
