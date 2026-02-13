@@ -1,5 +1,5 @@
 use crate::agent_manager::AgentManager;
-use crate::config::AgentKind;
+use crate::config::{AgentKind, AgentPolicy, AgentPolicyCapability};
 use anyhow::Result;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use grep::regex::RegexMatcher;
@@ -63,6 +63,7 @@ pub struct Tools {
     agent_id: Option<String>,
     agent_kind: AgentKind,
     run_id: Option<String>,
+    agent_policy: Option<AgentPolicy>,
 }
 
 impl Tools {
@@ -73,6 +74,7 @@ impl Tools {
             agent_id: None,
             agent_kind: AgentKind::Main,
             run_id: None,
+            agent_policy: None,
         })
     }
 
@@ -85,6 +87,10 @@ impl Tools {
         self.manager = Some(manager);
         self.agent_id = Some(agent_id);
         self.agent_kind = agent_kind;
+    }
+
+    pub fn set_policy(&mut self, policy: Option<AgentPolicy>) {
+        self.agent_policy = policy;
     }
 
     pub fn set_run_id(&mut self, run_id: Option<String>) {
@@ -108,35 +114,30 @@ impl Tools {
                 self.root.display(),
                 std::env::consts::OS
             ))),
-            "list_files" | "Glob" => {
+            "Glob" => {
                 let args: ListFilesArgs = serde_json::from_value(normalized_args)
-                    .map_err(|e| anyhow::anyhow!("invalid args for list_files: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("invalid args for Glob: {}", e))?;
                 self.list_files(args)
             }
-            "read_file" | "Read" => {
+            "Read" => {
                 let args: ReadFileArgs = serde_json::from_value(normalized_args).map_err(|e| {
                     anyhow::anyhow!(
-                        "invalid args for read_file: {}. Expected keys: path|max_bytes|line_range",
+                        "invalid args for Read: {}. Expected keys: path|max_bytes|line_range",
                         e
                     )
                 })?;
                 self.read_file(args)
             }
-            "search_rg" | "Grep" => {
+            "Grep" => {
                 let args: SearchArgs = serde_json::from_value(normalized_args)
-                    .map_err(|e| anyhow::anyhow!("invalid args for search_rg: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("invalid args for Grep: {}", e))?;
                 self.search_rg(args)
             }
-            "smart_search" | "find_file" => {
-                let args: SmartSearchArgs = serde_json::from_value(normalized_args)
-                    .map_err(|e| anyhow::anyhow!("invalid args for smart_search: {}", e))?;
-                self.smart_search(args)
-            }
-            "run_command" | "Bash" => {
+            "Bash" => {
                 let args: RunCommandArgs =
                     serde_json::from_value(normalized_args).map_err(|e| {
                         anyhow::anyhow!(
-                            "invalid args for run_command: {}. Expected keys: cmd|timeout_ms",
+                            "invalid args for Bash: {}. Expected keys: cmd|timeout_ms",
                             e
                         )
                     })?;
@@ -147,12 +148,9 @@ impl Tools {
                     .map_err(|e| anyhow::anyhow!("invalid args for capture_screenshot: {}", e))?;
                 self.capture_screenshot(args)
             }
-            "write_file" | "Write" => {
+            "Write" => {
                 let args: WriteFileArgs = serde_json::from_value(normalized_args).map_err(|e| {
-                    anyhow::anyhow!(
-                        "invalid args for write_file: {}. Expected keys: path|content",
-                        e
-                    )
+                    anyhow::anyhow!("invalid args for Write: {}. Expected keys: path|content", e)
                 })?;
                 self.write_file(args)
             }
@@ -216,10 +214,10 @@ impl Tools {
             .and_then(|n| n.to_str())
             .unwrap_or(&rel);
         let path = self.root.join(&rel);
-        
+
         if path.exists() && path.is_dir() {
             anyhow::bail!(
-                "path '{}' is a directory. Use list_files to enumerate files, then read_file with an exact file path.",
+                "path '{}' is a directory. Use Glob to enumerate files, then Read with an exact file path.",
                 rel
             );
         }
@@ -258,22 +256,9 @@ impl Tools {
 
         // 3. Last resort: tell the model we searched everywhere
         Ok(ToolResult::Success(format!(
-            "file_not_found: {} - I searched the whole repository for '{}' (including case-insensitive and partial matches) but found nothing. Please verify the filename or use 'list_files' to explore the directory structure.",
+            "file_not_found: {} - I searched the whole repository for '{}' (including case-insensitive and partial matches) but found nothing. Please verify the filename or use 'Glob' to explore the directory structure.",
             rel, filename
         )))
-    }
-
-    fn smart_search(&self, args: SmartSearchArgs) -> Result<ToolResult> {
-        let query = sanitize_rel_path(&self.root, &args.query).unwrap_or(args.query.clone());
-        let max_results = args.max_results.unwrap_or(20);
-        let matches = self.smart_search_candidates(&query, max_results)?;
-        if matches.is_empty() {
-            return Ok(ToolResult::Success(format!(
-                "smart_search: no file candidates found for '{}'",
-                query
-            )));
-        }
-        Ok(ToolResult::FileList(matches))
     }
 
     fn smart_search_candidates(&self, query: &str, max_results: usize) -> Result<Vec<String>> {
@@ -422,13 +407,15 @@ impl Tools {
         note: &str,
     ) -> Result<ToolResult> {
         match self.do_read_file(rel, path, max_bytes, line_range)? {
-            ToolResult::FileContent { path, content, truncated } => {
-                Ok(ToolResult::FileContent {
-                    path: format!("{} ({})", path, note),
-                    content: format!("/* {} */\n\n{}", note, content),
-                    truncated,
-                })
-            }
+            ToolResult::FileContent {
+                path,
+                content,
+                truncated,
+            } => Ok(ToolResult::FileContent {
+                path: format!("{} ({})", path, note),
+                content: format!("/* {} */\n\n{}", note, content),
+                truncated,
+            }),
             other => Ok(other),
         }
     }
@@ -495,7 +482,7 @@ impl Tools {
     fn run_command(&self, args: RunCommandArgs) -> Result<ToolResult> {
         if self.agent_kind == AgentKind::Main && is_repo_discovery_command(&args.cmd) {
             anyhow::bail!(
-                "Policy: main agents must delegate repository discovery to subagent 'search' via delegate_to_agent"
+                "Policy: main agents must delegate repository discovery to a subagent via delegate_to_agent"
             );
         }
 
@@ -721,11 +708,34 @@ impl Tools {
                 caller_id
             );
         }
+        let policy = self
+            .agent_policy
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Delegation denied: missing agent policy"))?;
+        if !policy.allows(AgentPolicyCapability::Delegate) {
+            anyhow::bail!(
+                "Delegation denied: agent '{}' policy does not allow Delegate",
+                caller_id
+            );
+        }
+        if !policy.allows_delegate_target(&target_agent_id) {
+            let allowed = if policy.delegate_targets.is_empty() {
+                "(none)".to_string()
+            } else {
+                policy.delegate_targets.join(", ")
+            };
+            anyhow::bail!(
+                "Delegation denied: target '{}' is not allowed by policy for '{}'. Allowed: {}",
+                target_agent_id,
+                caller_id,
+                allowed
+            );
+        }
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let target_kind = manager
-                    .resolve_agent_kind(&target_agent_id)
+                    .resolve_agent_kind(&self.root, &target_agent_id)
                     .await
                     .unwrap_or(AgentKind::Main);
                 let parent_run_id = if target_kind == AgentKind::Subagent {
@@ -846,13 +856,6 @@ struct SearchArgs {
 }
 
 #[derive(Debug, Deserialize)]
-struct SmartSearchArgs {
-    #[serde(alias = "path", alias = "file", alias = "filepath")]
-    query: String,
-    max_results: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
 struct RunCommandArgs {
     cmd: String,
     timeout_ms: Option<u64>,
@@ -928,7 +931,7 @@ fn summarize_tool_args(tool: &str, args: &Value) -> String {
     let mut safe_args = args.clone();
     if let Some(obj) = safe_args.as_object_mut() {
         match tool {
-            "write_file" | "Write" => {
+            "Write" => {
                 if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
                     let byte_len = content.len();
                     let line_count = content.lines().count();
@@ -941,7 +944,7 @@ fn summarize_tool_args(tool: &str, args: &Value) -> String {
                     );
                 }
             }
-            "run_command" | "Bash" => {
+            "Bash" => {
                 if let Some(cmd) = obj.get("cmd").and_then(|v| v.as_str()) {
                     let preview = if cmd.len() > 160 {
                         format!("{}... (truncated, {} chars)", &cmd[..160], cmd.len())
@@ -960,9 +963,7 @@ fn summarize_tool_args(tool: &str, args: &Value) -> String {
 fn normalize_tool_args(tool: &str, args: &Value) -> Value {
     let mut normalized = args.clone();
     if let Some(obj) = normalized.as_object_mut() {
-        if matches!(tool, "read_file" | "Read" | "write_file" | "Write")
-            && !obj.contains_key("path")
-        {
+        if matches!(tool, "Read" | "Write") && !obj.contains_key("path") {
             if let Some(fp) = obj.get("filepath").cloned() {
                 obj.insert("path".to_string(), fp);
             } else if let Some(file) = obj.get("file").cloned() {
@@ -970,7 +971,7 @@ fn normalize_tool_args(tool: &str, args: &Value) -> Value {
             }
         }
 
-        if matches!(tool, "smart_search" | "find_file") && !obj.contains_key("query") {
+        if matches!(tool, "Grep") && !obj.contains_key("query") {
             if let Some(path) = obj.get("path").cloned() {
                 obj.insert("query".to_string(), path);
             } else if let Some(fp) = obj.get("filepath").cloned() {
@@ -980,11 +981,8 @@ fn normalize_tool_args(tool: &str, args: &Value) -> Value {
             }
         }
 
-        if matches!(tool, "search_rg" | "Grep" | "list_files" | "Glob")
-            && obj
-                .get("globs")
-                .map(|v| v.is_string())
-                .unwrap_or(false)
+        if matches!(tool, "Grep" | "Glob")
+            && obj.get("globs").map(|v| v.is_string()).unwrap_or(false)
         {
             if let Some(glob) = obj.get("globs").and_then(|v| v.as_str()) {
                 obj.insert("globs".to_string(), serde_json::json!([glob]));
@@ -1066,14 +1064,13 @@ fn first_segment_token(segment: &str) -> Option<&str> {
 pub fn canonical_tool_name(tool: &str) -> Option<&'static str> {
     Some(match tool {
         "get_repo_info" => "get_repo_info",
-        "list_files" | "Glob" => "list_files",
-        "read_file" | "Read" => "read_file",
-        "smart_search" | "find_file" => "smart_search",
-        "search_rg" | "Grep" => "search_rg",
-        "write_file" | "Write" => "write_file",
-        "run_command" | "Bash" => "run_command",
+        "Glob" => "Glob",
+        "Read" => "Read",
+        "Grep" => "Grep",
+        "Write" => "Write",
+        "Bash" => "Bash",
         "capture_screenshot" => "capture_screenshot",
-        "lock_paths" | "acquire_locks" => "lock_paths",
+        "lock_paths" => "lock_paths",
         "unlock_paths" => "unlock_paths",
         "delegate_to_agent" => "delegate_to_agent",
         _ => return None,
@@ -1088,38 +1085,33 @@ fn full_tool_schema_entries() -> Vec<Value> {
             "returns": "string"
         }),
         serde_json::json!({
-            "name": "list_files",
+            "name": "Glob",
             "args": {"globs": "string[]?", "max_results": "number?"},
             "returns": "string[]"
         }),
         serde_json::json!({
-            "name": "read_file",
+            "name": "Read",
             "args": {"path": "string", "max_bytes": "number?", "line_range": "[number,number]?"},
             "returns": "{path,content,truncated}",
             "notes": "Path aliases accepted: path, file, filepath."
         }),
         serde_json::json!({
-            "name": "smart_search",
-            "args": {"query": "string", "max_results": "number?"},
-            "returns": "string[]",
-            "notes": "Find likely file paths by filename/path similarity. Aliases accepted for query: query, path, file, filepath."
-        }),
-        serde_json::json!({
-            "name": "search_rg",
+            "name": "Grep",
             "args": {"query": "string", "globs": "string[]?", "max_results": "number?"},
-            "returns": "{matches:[{path,line,snippet}]}"
+            "returns": "{matches:[{path,line,snippet}]}",
+            "notes": "Query aliases accepted: query, path, file, filepath."
         }),
         serde_json::json!({
-            "name": "write_file",
+            "name": "Write",
             "args": {"path": "string", "content": "string"},
             "returns": "success",
             "notes": "Path aliases accepted: path, file, filepath."
         }),
         serde_json::json!({
-            "name": "run_command",
+            "name": "Bash",
             "args": {"cmd": "string", "timeout_ms": "number?"},
             "returns": "{exit_code,stdout,stderr}",
-            "notes": "Alias: Bash. Supports common dev/search/build CLI commands with per-segment allowlist checks."
+            "notes": "Runs allowlisted dev/search/build shell commands with per-segment validation."
         }),
         serde_json::json!({
             "name": "capture_screenshot",

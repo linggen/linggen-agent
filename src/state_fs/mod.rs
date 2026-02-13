@@ -40,7 +40,7 @@ pub struct StateFs {
 
 impl StateFs {
     pub fn new(ws_root: PathBuf) -> Self {
-        let root = ws_root.join(".linggen-agent/lead");
+        let root = ws_root.join(".linggen-agent/workspace");
         Self { root }
     }
 
@@ -126,5 +126,4 @@ impl StateFs {
         let body = parts[2].trim().to_string();
         Ok((state, body))
     }
-
 }

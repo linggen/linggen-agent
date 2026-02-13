@@ -1,5 +1,5 @@
 export interface ChatMessage {
-  role: 'user' | 'agent' | 'lead' | 'coder';
+  role: 'user' | 'agent';
   from?: string;
   to?: string;
   text: string;
@@ -26,8 +26,8 @@ export interface FileEntry {
   path: string;
 }
 
-export interface LeadState {
-  active_lead_task: [any, string] | null;
+export interface WorkspaceState {
+  active_task: [any, string] | null;
   user_stories: [any, string] | null;
   tasks: [any, string][];
   messages: [any, string][];
@@ -76,6 +76,14 @@ export interface AgentInfo {
   name: string;
   description: string;
   kind?: 'main' | 'subagent';
+}
+
+export interface AgentFileInfo {
+  agent_id: string;
+  name: string;
+  description: string;
+  kind: 'main' | 'subagent' | string;
+  path: string;
 }
 
 export interface ModelInfo {

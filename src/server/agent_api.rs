@@ -1,15 +1,37 @@
+use crate::config::{AgentKind, AgentPolicyCapability};
 use crate::server::{ServerEvent, ServerState};
 use crate::state_fs::StateFile;
-use crate::config::AgentKind;
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+async fn agent_allows_policy(
+    state: &Arc<ServerState>,
+    root: &PathBuf,
+    agent_id: &str,
+    capability: AgentPolicyCapability,
+) -> bool {
+    match state.manager.list_agent_specs(root).await {
+        Ok(entries) => entries
+            .into_iter()
+            .find(|entry| entry.agent_id.eq_ignore_ascii_case(agent_id))
+            .map(|entry| entry.spec.allows_policy(capability))
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+async fn first_patch_main_agent(state: &Arc<ServerState>, root: &PathBuf) -> Option<String> {
+    let entries = state.manager.list_agent_specs(root).await.ok()?;
+    entries
+        .into_iter()
+        .find(|entry| {
+            entry.spec.kind == AgentKind::Main
+                && entry.spec.allows_policy(AgentPolicyCapability::Patch)
+        })
+        .map(|entry| entry.agent_id)
+}
 
 #[derive(Deserialize)]
 pub(crate) struct TaskRequest {
@@ -25,7 +47,7 @@ pub(crate) async fn set_task(
     let root = PathBuf::from(&req.project_root);
     let kind = state
         .manager
-        .resolve_agent_kind(&req.agent_id)
+        .resolve_agent_kind(&root, &req.agent_id)
         .await
         .unwrap_or(AgentKind::Main);
 
@@ -48,12 +70,19 @@ pub(crate) async fn set_task(
             let mut engine = agent.lock().await;
             engine.set_task(req.task.clone());
 
-            // Persist Lead task if it's Lead
-            if req.agent_id == "lead" {
+            // Persist planning task when this main agent is allowed to finalize.
+            if agent_allows_policy(
+                &state,
+                &root,
+                &req.agent_id,
+                AgentPolicyCapability::Finalize,
+            )
+            .await
+            {
                 if let Ok(ctx) = state.manager.get_or_create_project(root).await {
-                    let lead_task = StateFile::PmTask {
+                    let planning_task = StateFile::PmTask {
                         id: format!(
-                            "lead-{}",
+                            "plan-{}",
                             std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap()
@@ -62,7 +91,9 @@ pub(crate) async fn set_task(
                         status: "active".to_string(),
                         assigned_tasks: Vec::new(),
                     };
-                    let _ = ctx.state_fs.write_file("active.md", &lead_task, &req.task);
+                    let _ = ctx
+                        .state_fs
+                        .write_file("active.md", &planning_task, &req.task);
                     let _ = state.events_tx.send(ServerEvent::StateUpdated);
                 }
             }
@@ -103,7 +134,7 @@ pub(crate) async fn run_agent(
 
     let kind = state
         .manager
-        .resolve_agent_kind(&req.agent_id)
+        .resolve_agent_kind(&root, &req.agent_id)
         .await
         .unwrap_or(AgentKind::Main);
 
@@ -161,17 +192,25 @@ pub(crate) async fn run_agent(
                         } else {
                             "failed"
                         };
-                        let _ = manager
-                            .finish_agent_run(&run_id, status, Some(msg))
-                            .await;
+                        let _ = manager.finish_agent_run(&run_id, status, Some(msg)).await;
                         crate::engine::AgentOutcome::None
                     }
                 };
 
-                // If Lead finalized a task, save it
-                if agent_id == "lead" {
+                // If a Finalize-capable agent finalized a task, persist and queue for Patch-capable main agent.
+                let is_finalize_agent = agent_allows_policy(
+                    &state_clone,
+                    &root,
+                    &agent_id,
+                    AgentPolicyCapability::Finalize,
+                )
+                .await;
+                if is_finalize_agent {
                     if let crate::engine::AgentOutcome::Task(packet) = &outcome {
                         if let Ok(ctx) = manager.get_or_create_project(root.clone()).await {
+                            let assignee = first_patch_main_agent(&state_clone, &root)
+                                .await
+                                .unwrap_or_else(|| "unassigned".to_string());
                             let task_id = format!(
                                 "task-{}",
                                 std::time::SystemTime::now()
@@ -183,7 +222,7 @@ pub(crate) async fn run_agent(
                                 id: task_id.clone(),
                                 status: "queued".to_string(),
                                 story_id: None,
-                                assigned_to: "coder".to_string(),
+                                assigned_to: assignee,
                             };
                             let body = format!(
                                 "## {}\n\n### User Stories\n{}\n\n### Acceptance Criteria\n{}",

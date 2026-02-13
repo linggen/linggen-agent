@@ -17,7 +17,7 @@ keep_alive = "20m"
 port = 6666
 
 [agent]
-max_iters = 10
+max_iters = 100
 prompt_loop_breaker = "You are repeatedly calling '{}' with the same arguments and not making progress. Use a different tool/arguments and continue automatically."
 
 [logging]

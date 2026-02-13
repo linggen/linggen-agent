@@ -9,7 +9,8 @@ const PROJECTS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("projec
 const FILE_ACTIVITY_TABLE: TableDefinition<&str, &str> = TableDefinition::new("file_activity");
 const SESSIONS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sessions");
 const CHAT_HISTORY_TABLE: TableDefinition<&str, &str> = TableDefinition::new("chat_history");
-const PROJECT_SETTINGS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("project_settings");
+const PROJECT_SETTINGS_TABLE: TableDefinition<&str, &str> =
+    TableDefinition::new("project_settings");
 const AGENT_RUNS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("agent_runs");
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -358,9 +359,7 @@ impl Db {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(AGENT_RUNS_TABLE)?;
-            let existing = table
-                .get(run_id)?
-                .map(|val| val.value().to_string());
+            let existing = table.get(run_id)?.map(|val| val.value().to_string());
             if let Some(json) = existing {
                 let mut run: AgentRunRecord = serde_json::from_str(&json)?;
                 run.status = status.to_string();

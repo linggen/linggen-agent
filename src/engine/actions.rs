@@ -68,6 +68,9 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
         .unwrap_or_else(|| serde_json::json!({}));
 
     if let Some(tool) = obj.get("tool").and_then(|v| v.as_str()) {
+        if !is_supported_model_tool(tool) {
+            return None;
+        }
         return Some(ModelAction::Tool {
             tool: tool.to_string(),
             args,
@@ -75,18 +78,8 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
     }
 
     let tool_name = match action_type {
-        "read_file"
-        | "smart_search"
-        | "find_file"
-        | "write_file"
-        | "list_files"
-        | "search_rg"
-        | "run_command"
-        | "capture_screenshot"
-        | "acquire_locks"
-        | "unlock_paths"
-        | "delegate_to_agent"
-        | "get_repo_info" => action_type,
+        "Read" | "Grep" | "Write" | "Glob" | "Bash" | "capture_screenshot" | "lock_paths"
+        | "unlock_paths" | "delegate_to_agent" | "get_repo_info" => action_type,
         _ => return None,
     };
 
@@ -94,6 +87,22 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
         tool: tool_name.to_string(),
         args,
     })
+}
+
+fn is_supported_model_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "Read"
+            | "Grep"
+            | "Write"
+            | "Glob"
+            | "Bash"
+            | "capture_screenshot"
+            | "lock_paths"
+            | "unlock_paths"
+            | "delegate_to_agent"
+            | "get_repo_info"
+    )
 }
 
 fn strip_angle_tags(input: &str) -> String {

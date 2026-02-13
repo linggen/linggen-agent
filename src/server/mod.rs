@@ -31,12 +31,12 @@ use tracing::info;
 use agent_api::{cancel_agent_run, run_agent, set_task};
 use chat_api::{chat_handler, clear_chat_history_api, get_settings_api, update_settings_api};
 use projects_api::{
-    add_project, create_session, get_agent_context_api, list_agent_children_api,
-    list_agent_runs_api, list_agents_api, list_models_api, list_projects, list_sessions,
-    list_skills, remove_project,
-    remove_session_api,
+    add_project, create_session, delete_agent_file_api, get_agent_context_api, get_agent_file_api,
+    list_agent_children_api, list_agent_files_api, list_agent_runs_api, list_agents_api,
+    list_models_api, list_projects, list_sessions, list_skills, remove_project, remove_session_api,
+    upsert_agent_file_api,
 };
-use workspace_api::{get_agent_tree, get_lead_state, list_files, read_file_api};
+use workspace_api::{get_agent_tree, get_workspace_state, list_files, read_file_api};
 
 #[derive(RustEmbed)]
 #[folder = "ui/dist/"]
@@ -130,7 +130,12 @@ pub enum ServerEvent {
 }
 
 impl ServerState {
-    pub async fn send_agent_status(&self, agent_id: String, status: String, detail: Option<String>) {
+    pub async fn send_agent_status(
+        &self,
+        agent_id: String,
+        status: String,
+        detail: Option<String>,
+    ) {
         let mut done_event: Option<ServerEvent> = None;
         let mut status_id: Option<String> = None;
         let mut lifecycle: Option<String> = None;
@@ -173,7 +178,8 @@ impl ServerState {
                 }
 
                 if status_id.is_none() {
-                    let next_id = format!("status-{}", self.status_seq.fetch_add(1, Ordering::Relaxed));
+                    let next_id =
+                        format!("status-{}", self.status_seq.fetch_add(1, Ordering::Relaxed));
                     status_id = Some(next_id.clone());
                     lifecycle = Some("doing".to_string());
                     active.insert(
@@ -236,16 +242,19 @@ pub async fn start_server(
                         let _ = state_clone.events_tx.send(ServerEvent::StateUpdated);
                     }
                     crate::agent_manager::AgentEvent::Message { from, to, content } => {
-                        let _ = state_clone
-                            .events_tx
-                            .send(ServerEvent::Message { from, to, content });
+                        let _ =
+                            state_clone
+                                .events_tx
+                                .send(ServerEvent::Message { from, to, content });
                     }
                     crate::agent_manager::AgentEvent::AgentStatus {
                         agent_id,
                         status,
                         detail,
                     } => {
-                        state_clone.send_agent_status(agent_id, status, detail).await;
+                        state_clone
+                            .send_agent_status(agent_id, status, detail)
+                            .await;
                     }
                     crate::agent_manager::AgentEvent::SubagentSpawned {
                         parent_id,
@@ -309,6 +318,10 @@ pub async fn start_server(
         .route("/api/projects", post(add_project))
         .route("/api/projects", delete(remove_project))
         .route("/api/agents", get(list_agents_api))
+        .route("/api/agent-files", get(list_agent_files_api))
+        .route("/api/agent-file", get(get_agent_file_api))
+        .route("/api/agent-file", post(upsert_agent_file_api))
+        .route("/api/agent-file", delete(delete_agent_file_api))
         .route("/api/agent-runs", get(list_agent_runs_api))
         .route("/api/agent-children", get(list_agent_children_api))
         .route("/api/agent-context", get(get_agent_context_api))
@@ -327,7 +340,7 @@ pub async fn start_server(
         .route("/api/workspace/tree", get(get_agent_tree))
         .route("/api/files", get(list_files))
         .route("/api/file", get(read_file_api))
-        .route("/api/lead/state", get(get_lead_state))
+        .route("/api/workspace/state", get(get_workspace_state))
         .route("/api/events", get(events_handler))
         .route("/api/utils/pick-folder", get(pick_folder))
         .route("/api/utils/ollama-status", get(get_ollama_status))
@@ -392,9 +405,7 @@ async fn events_handler(
                 session_id,
                 ..
             } => (Some(project_root.clone()), Some(session_id.clone())),
-            ServerEvent::SettingsUpdated { project_root, .. } => {
-                (Some(project_root.clone()), None)
-            }
+            ServerEvent::SettingsUpdated { project_root, .. } => (Some(project_root.clone()), None),
             _ => (None, None),
         }
     }
@@ -436,9 +447,15 @@ async fn get_ollama_status(State(state): State<Arc<ServerState>>) -> impl IntoRe
         let client = crate::ollama::OllamaClient::new(m.url.clone(), m.api_key.clone());
         match client.get_ps().await {
             Ok(status) => axum::Json(status).into_response(),
-            Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Err(e) => {
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
         }
     } else {
-        (axum::http::StatusCode::NOT_FOUND, "No Ollama models configured").into_response()
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            "No Ollama models configured",
+        )
+            .into_response()
     }
 }

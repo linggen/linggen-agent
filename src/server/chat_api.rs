@@ -1,5 +1,5 @@
+use crate::config::{AgentKind, AgentPolicyCapability};
 use crate::engine::PromptMode;
-use crate::config::AgentKind;
 use crate::server::chat_helpers::{
     emit_outcome_event, emit_queue_updated, extract_tool_path_arg, queue_key, queue_preview,
     sanitize_tool_args_for_display,
@@ -13,8 +13,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tokio_stream::StreamExt;
 
 #[derive(Deserialize)]
@@ -82,8 +82,9 @@ fn looks_like_file_or_path_request(message: &str) -> bool {
     ];
 
     for raw in msg.split_whitespace() {
-        let w = raw
-            .trim_matches(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')));
+        let w = raw.trim_matches(|c: char| {
+            !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+        });
         if w.contains('/') {
             return true;
         }
@@ -152,7 +153,7 @@ fn extract_shell_command_candidate(text: &str) -> Option<String> {
 
 fn extract_read_file_candidate(text: &str) -> Option<String> {
     // Heuristic: if the model says it's going to "read/open/check/look at" a file,
-    // extract a likely file path token and auto-run read_file.
+    // extract a likely file path token and auto-run Read.
     let lower = text.to_ascii_lowercase();
     let intent = ["read", "open", "check", "look at", "inspect", "view"]
         .iter()
@@ -170,8 +171,7 @@ fn extract_read_file_candidate(text: &str) -> Option<String> {
     let mut best: Option<String> = None;
     for raw in text.split_whitespace() {
         let w = raw.trim_matches(|c: char| {
-            !(c.is_ascii_alphanumeric()
-                || matches!(c, '.' | '_' | '-' | '/' | '\\'))
+            !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '\\'))
         });
         if w.is_empty() {
             continue;
@@ -182,12 +182,23 @@ fn extract_read_file_candidate(text: &str) -> Option<String> {
             continue;
         }
         // Prefer paths with separators, then shorter tokens.
-        let score = (if w.contains('/') || w.contains('\\') { 0 } else { 1 }, w.len());
+        let score = (
+            if w.contains('/') || w.contains('\\') {
+                0
+            } else {
+                1
+            },
+            w.len(),
+        );
         match &best {
             None => best = Some(w.to_string()),
             Some(existing) => {
                 let existing_score = (
-                    if existing.contains('/') || existing.contains('\\') { 0 } else { 1 },
+                    if existing.contains('/') || existing.contains('\\') {
+                        0
+                    } else {
+                        1
+                    },
                     existing.len(),
                 );
                 if score < existing_score {
@@ -199,6 +210,103 @@ fn extract_read_file_candidate(text: &str) -> Option<String> {
     best
 }
 
+fn parse_explicit_target_prefix(message: &str) -> Option<(&str, &str)> {
+    let rest = message.strip_prefix('@')?;
+    let space_idx = rest.find(' ')?;
+    let candidate = rest[..space_idx].trim();
+    let body = rest[space_idx + 1..].trim_start();
+    if candidate.is_empty() {
+        return None;
+    }
+    if !candidate
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    Some((candidate, body))
+}
+
+fn extract_chat_tool_call(text: &str) -> Option<(String, serde_json::Value)> {
+    if let Ok(action) = crate::engine::parse_first_action(text) {
+        if let crate::engine::ModelAction::Tool { tool, args } = action {
+            return Some((tool, args));
+        }
+    }
+
+    if let Some(cmd) = extract_shell_command_candidate(text) {
+        return Some((
+            "Bash".to_string(),
+            serde_json::json!({ "cmd": cmd, "timeout_ms": 30000 }),
+        ));
+    }
+
+    if let Some(path) = extract_read_file_candidate(text) {
+        return Some((
+            "Read".to_string(),
+            serde_json::json!({ "path": path, "max_bytes": 8000 }),
+        ));
+    }
+
+    None
+}
+
+fn chat_mode_structured_output_error(
+    text: &str,
+    allow_patch: bool,
+    allow_finalize: bool,
+) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(action) = crate::engine::parse_first_action(trimmed) {
+        return match action {
+            crate::engine::ModelAction::Tool { .. } => None,
+            crate::engine::ModelAction::Patch { .. } => {
+                if !allow_patch {
+                    Some(
+                        "I couldn't continue because this agent's policy does not allow `patch`. Update frontmatter `policy` to include `Patch` if needed."
+                            .to_string(),
+                    )
+                } else {
+                    Some(
+                        "I couldn't continue because chat mode expects plain text or a single tool call. Please try again."
+                            .to_string(),
+                    )
+                }
+            }
+            crate::engine::ModelAction::FinalizeTask { .. } => {
+                if !allow_finalize {
+                    Some(
+                        "I couldn't continue because this agent's policy does not allow `finalize_task`. Update frontmatter `policy` to include `Finalize` if needed."
+                            .to_string(),
+                    )
+                } else {
+                    Some(
+                        "I couldn't continue because chat mode expects plain text or a single tool call. Please try again."
+                            .to_string(),
+                    )
+                }
+            }
+        };
+    }
+
+    if trimmed.starts_with('{') {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if value.get("type").and_then(|v| v.as_str()).is_some() {
+                return Some(
+                    "I couldn't continue because chat mode expects plain text or a single tool call."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    None
+}
+
 async fn run_loop_with_tracking(
     manager: &Arc<crate::agent_manager::AgentManager>,
     root: &PathBuf,
@@ -208,13 +316,7 @@ async fn run_loop_with_tracking(
     detail: &str,
 ) -> Result<crate::engine::AgentOutcome, anyhow::Error> {
     let run_id = manager
-        .begin_agent_run(
-            root,
-            session_id,
-            agent_id,
-            None,
-            Some(detail.to_string()),
-        )
+        .begin_agent_run(root, session_id, agent_id, None, Some(detail.to_string()))
         .await
         .ok();
 
@@ -234,9 +336,7 @@ async fn run_loop_with_tracking(
                 } else {
                     "failed"
                 };
-                let _ = manager
-                    .finish_agent_run(&run_id, status, Some(msg))
-                    .await;
+                let _ = manager.finish_agent_run(&run_id, status, Some(msg)).await;
             }
         }
     }
@@ -256,7 +356,10 @@ pub(crate) async fn get_settings_api(
         .db
         .get_project_settings(&root.to_string_lossy())
     {
-        Ok(settings) => Json(SettingsResponse { mode: settings.mode }).into_response(),
+        Ok(settings) => Json(SettingsResponse {
+            mode: settings.mode,
+        })
+        .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -293,7 +396,10 @@ pub(crate) async fn clear_chat_history_api(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ClearChatRequest>,
 ) -> impl IntoResponse {
-    let session_id = req.session_id.clone().unwrap_or_else(|| "default".to_string());
+    let session_id = req
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
     match state
         .manager
         .db
@@ -329,22 +435,29 @@ pub(crate) async fn chat_handler(
     let effective_session_id = session_id.clone().unwrap_or_else(|| "default".to_string());
     let events_tx = state.events_tx.clone();
 
-    // Check for @Lead or @Coder prefix
-    let (target_id, clean_msg) = if req.message.starts_with("@Lead ") {
-        ("lead", req.message.strip_prefix("@Lead ").unwrap())
-    } else if req.message.starts_with("@Coder ") {
-        ("coder", req.message.strip_prefix("@Coder ").unwrap())
-    } else {
-        (req.agent_id.as_str(), req.message.as_str())
-    };
-
-    let target_id = target_id.to_string();
-    let clean_msg = clean_msg.to_string();
+    // Optional explicit target prefix: "@agent_id <message>".
+    // Only reroute when the candidate agent exists in this project.
+    let (target_id, clean_msg) =
+        if let Some((candidate, body)) = parse_explicit_target_prefix(&req.message) {
+            let candidate_id = candidate.to_string();
+            if state
+                .manager
+                .resolve_agent_kind(&root, &candidate_id)
+                .await
+                .is_some()
+            {
+                (candidate_id, body.to_string())
+            } else {
+                (req.agent_id.clone(), req.message.clone())
+            }
+        } else {
+            (req.agent_id.clone(), req.message.clone())
+        };
     let trimmed_msg = clean_msg.trim();
 
     let kind = state
         .manager
-        .resolve_agent_kind(&target_id)
+        .resolve_agent_kind(&root, &target_id)
         .await
         .unwrap_or(AgentKind::Main);
     if kind == AgentKind::Subagent {
@@ -417,19 +530,22 @@ pub(crate) async fn chat_handler(
                         None,
                         session_id.as_deref(),
                     );
-                    let _ = state.manager.db.add_chat_message(crate::db::ChatMessageRecord {
-                        repo_path: root.to_string_lossy().to_string(),
-                        session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
-                        agent_id: target_id.clone(),
-                        from_id: "user".to_string(),
-                        to_id: target_id.clone(),
-                        content: clean_msg.clone(),
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                        is_observation: false,
-                    });
+                    let _ = state
+                        .manager
+                        .db
+                        .add_chat_message(crate::db::ChatMessageRecord {
+                            repo_path: root.to_string_lossy().to_string(),
+                            session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
+                            agent_id: target_id.clone(),
+                            from_id: "user".to_string(),
+                            to_id: target_id.clone(),
+                            content: clean_msg.clone(),
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs(),
+                            is_observation: false,
+                        });
                 }
 
                 let mode_value = mode_value.trim().to_lowercase();
@@ -462,7 +578,7 @@ pub(crate) async fn chat_handler(
                     content: clean_msg.clone(),
                 });
 
-                // Persist user message in DB immediately so fetchLeadState sees it.
+                // Persist user message in DB immediately so fetchWorkspaceState sees it.
                 if let Ok(ctx) = state.manager.get_or_create_project(root.clone()).await {
                     let _ = ctx.state_fs.append_message(
                         "user",
@@ -472,19 +588,22 @@ pub(crate) async fn chat_handler(
                         session_id.as_deref(),
                     );
 
-                    let _ = state.manager.db.add_chat_message(crate::db::ChatMessageRecord {
-                        repo_path: root.to_string_lossy().to_string(),
-                        session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
-                        agent_id: target_id.clone(),
-                        from_id: "user".to_string(),
-                        to_id: target_id.clone(),
-                        content: clean_msg.clone(),
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                        is_observation: false,
-                    });
+                    let _ = state
+                        .manager
+                        .db
+                        .add_chat_message(crate::db::ChatMessageRecord {
+                            repo_path: root.to_string_lossy().to_string(),
+                            session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
+                            agent_id: target_id.clone(),
+                            from_id: "user".to_string(),
+                            to_id: target_id.clone(),
+                            content: clean_msg.clone(),
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs(),
+                            is_observation: false,
+                        });
                 }
             }
 
@@ -492,8 +611,11 @@ pub(crate) async fn chat_handler(
                 let mut engine = agent.lock().await;
                 if let Some(queued_id) = queued_item_id.as_deref() {
                     // This message just left the queue and is now active.
-                    let key =
-                        queue_key(&project_root_for_queue, &session_id_for_queue, &target_id_clone);
+                    let key = queue_key(
+                        &project_root_for_queue,
+                        &session_id_for_queue,
+                        &target_id_clone,
+                    );
                     {
                         let mut guard = state_clone.queued_chats.lock().await;
                         if let Some(items) = guard.get_mut(&key) {
@@ -563,7 +685,9 @@ pub(crate) async fn chat_handler(
                         .get(1)
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "Initialize this workspace and summarize status.".to_string());
+                        .unwrap_or_else(|| {
+                            "Initialize this workspace and summarize status.".to_string()
+                        });
 
                     if let Some(manager) = engine.tools.get_manager() {
                         if let Some(skill) = manager.skill_manager.get_skill(cmd).await {
@@ -630,7 +754,9 @@ pub(crate) async fn chat_handler(
                             );
                             let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
                                 repo_path: root_clone.to_string_lossy().to_string(),
-                                session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
+                                session_id: session_id
+                                    .clone()
+                                    .unwrap_or_else(|| "default".to_string()),
                                 agent_id: target_id_clone.clone(),
                                 from_id: target_id_clone.clone(),
                                 to_id: "user".to_string(),
@@ -705,9 +831,8 @@ pub(crate) async fn chat_handler(
                     return;
                 }
 
-                // In chat mode, avoid jumping into the structured multi-step loop for file/path
-                // requests. We prefer one-tool execution + plain-text follow-up to prevent
-                // exhausting max tool iterations on simple read/search requests.
+                // In chat mode, run a bounded agentic loop:
+                // model -> tool -> observation -> model (repeat) until plain-text answer.
 
                 match engine
                     .chat_stream(&clean_msg_clone, session_id.as_deref(), prompt_mode)
@@ -744,366 +869,292 @@ pub(crate) async fn chat_handler(
                             json_rendered
                         );
 
-                        // If the model asked for a tool, don't dump the raw model output (often multi-JSON)
-                        // into the chat UI. Instead send a clean single tool JSON message and proceed.
-                        let mut handled_tool = false;
-                        let mut forced_tool_from_command: Option<(String, serde_json::Value)> = None;
-                        if let Ok(action) = crate::engine::parse_first_action(&full_response) {
-                            if let crate::engine::ModelAction::Tool { tool, args } = action {
-                                handled_tool = true;
-                                forced_tool_from_command = Some((tool, args));
-                            }
-                        }
-                        if !handled_tool {
-                            if let Some(cmd) = extract_shell_command_candidate(&full_response) {
-                                // Model suggested a raw shell command in chat mode. Convert it into a tool call.
-                                handled_tool = true;
-                                forced_tool_from_command = Some((
-                                    "run_command".to_string(),
-                                    serde_json::json!({ "cmd": cmd, "timeout_ms": 30000 }),
+                        // Chat-mode tool loop budget is fully config-driven.
+                        let chat_tool_max_iters = engine.cfg.max_iters;
+                        let allow_patch = engine
+                            .spec
+                            .as_ref()
+                            .map(|s| s.allows_policy(AgentPolicyCapability::Patch))
+                            .unwrap_or(false);
+                        let allow_finalize = engine
+                            .spec
+                            .as_ref()
+                            .map(|s| s.allows_policy(AgentPolicyCapability::Finalize))
+                            .unwrap_or(false);
+                        let mut pending_tool = extract_chat_tool_call(&full_response);
+                        let mut final_response = if pending_tool.is_some() {
+                            None
+                        } else if let Some(err_msg) = chat_mode_structured_output_error(
+                            &full_response,
+                            allow_patch,
+                            allow_finalize,
+                        ) {
+                            Some(err_msg)
+                        } else {
+                            Some(full_response.clone())
+                        };
+                        let mut tool_steps = 0usize;
+
+                        while final_response.is_none() {
+                            if tool_steps >= chat_tool_max_iters {
+                                final_response = Some(format!(
+                                    "I stopped after {} tool steps to respect max_iters.",
+                                    chat_tool_max_iters
                                 ));
+                                break;
                             }
-                        }
-                        if !handled_tool {
-                            if let Some(path) = extract_read_file_candidate(&full_response) {
-                                handled_tool = true;
-                                forced_tool_from_command = Some((
-                                    "read_file".to_string(),
-                                    serde_json::json!({ "path": path, "max_bytes": 8000 }),
-                                ));
-                            }
-                        }
+                            let Some((tool, args)) = pending_tool.take() else {
+                                break;
+                            };
+                            tool_steps += 1;
 
-                        if let Some((tool, args)) = forced_tool_from_command {
-                            {
-                                state_clone
-                                    .send_agent_status(
-                                        target_id_clone.clone(),
-                                        "calling_tool".to_string(),
-                                        Some(format!("Calling {}", tool)),
-                                    )
-                                    .await;
-                                let safe_args = sanitize_tool_args_for_display(&tool, &args);
-                                let _ = events_tx_clone.send(ServerEvent::Message {
-                                    from: target_id_clone.clone(),
-                                    to: "user".to_string(),
-                                    content: serde_json::json!({
-                                        "type": "tool",
-                                        "tool": tool.clone(),
-                                        "args": safe_args.clone()
-                                    })
-                                    .to_string(),
-                                });
-                                if let Ok(ctx) = manager.get_or_create_project(root_clone.clone()).await {
-                                    let tool_msg = serde_json::json!({
-                                        "type": "tool",
-                                        "tool": tool.clone(),
-                                        "args": safe_args
-                                    })
-                                    .to_string();
-                                    let _ = ctx.state_fs.append_message(
-                                        &target_id_clone,
-                                        "user",
-                                        &tool_msg,
-                                        None,
-                                        session_id.as_deref(),
-                                    );
-                                    let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
-                                        repo_path: root_clone.to_string_lossy().to_string(),
-                                        session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
-                                        agent_id: target_id_clone.clone(),
-                                        from_id: target_id_clone.clone(),
-                                        to_id: "user".to_string(),
-                                        content: tool_msg,
-                                        timestamp: std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_secs(),
-                                        is_observation: false,
-                                    });
-                                }
-
-                                // 1. Execute the tool that was just requested in chat
-                                let write_path = if matches!(tool.as_str(), "write_file" | "Write") {
-                                    extract_tool_path_arg(&args)
-                                } else {
-                                    None
-                                };
-                                let call = crate::engine::tools::ToolCall { tool: tool.clone(), args };
-                                match engine.tools.execute(call) {
-                                    Ok(result) => {
-                                        let rendered_model = crate::engine::render_tool_result(&result);
-                                        let rendered_public =
-                                            crate::engine::render_tool_result_public(&result);
-                                        engine.upsert_observation("tool", &tool, rendered_model.clone());
-
-                                        // Record observation in DB
-                                        let _ = engine
-                                            .manager_db_add_observation(
-                                                &tool,
-                                                &rendered_public,
-                                                session_id.as_deref(),
-                                            )
-                                            .await;
-
-                                        let _ = events_tx_clone.send(ServerEvent::StateUpdated);
-                                        state_clone
-                                            .send_agent_status(
-                                                target_id_clone.clone(),
-                                                "thinking".to_string(),
-                                                Some("Thinking".to_string()),
-                                            )
-                                            .await;
-
-                                        if prompt_mode == crate::engine::PromptMode::Chat {
-                                            // Chat mode: always summarize tool observation directly in plain text.
-                                            // This avoids re-entering structured loops for simple read/search/list
-                                            // requests, which can hit max_iters without producing user-facing output.
-                                            if matches!(tool.as_str(), "write_file" | "Write") {
-                                                let mut observation_for_summary = rendered_public.clone();
-                                                if let Some(path) = write_path {
-                                                    let readback = engine.tools.execute(crate::engine::tools::ToolCall {
-                                                        tool: "read_file".to_string(),
-                                                        args: serde_json::json!({
-                                                            "path": path,
-                                                            "max_bytes": 8000
-                                                        }),
-                                                    });
-                                                    if let Ok(read_result) = readback {
-                                                        let read_public =
-                                                            crate::engine::render_tool_result_public(&read_result);
-                                                        let _ = engine
-                                                            .manager_db_add_observation(
-                                                                "read_file",
-                                                                &read_public,
-                                                                session_id.as_deref(),
-                                                            )
-                                                            .await;
-                                                        let _ = events_tx_clone.send(ServerEvent::StateUpdated);
-                                                        state_clone
-                                                            .send_agent_status(
-                                                                target_id_clone.clone(),
-                                                                "thinking".to_string(),
-                                                                Some("Thinking".to_string()),
-                                                            )
-                                                            .await;
-                                                        observation_for_summary = format!(
-                                                            "{}\n\nPost-write readback:\n{}",
-                                                            observation_for_summary, read_public
-                                                        );
-                                                    }
-                                                }
-                                                let followup_prompt = format!(
-                                                    "Use the observation below to answer the user's request in plain text.\n\nUser request: {}\n\nObservation:\n{}\n\nRequirements:\n- Be concise but concrete.\n- If you ran a command, summarize key results.\n- If you read or wrote files, summarize what you found/changed.",
-                                                    clean_msg_clone,
-                                                    observation_for_summary
-                                                );
-
-                                                let mut followup_response = String::new();
-                                                if let Ok(mut followup_stream) =
-                                                    engine
-                                                        .chat_stream(
-                                                            &followup_prompt,
-                                                            session_id.as_deref(),
-                                                            crate::engine::PromptMode::Chat,
-                                                        )
-                                                        .await
-                                                {
-                                                    while let Some(token_result) = followup_stream.next().await {
-                                                        if let Ok(token) = token_result {
-                                                            followup_response.push_str(&token);
-                                                            let _ = events_tx_clone.send(ServerEvent::Token {
-                                                                agent_id: target_id_clone.clone(),
-                                                                token,
-                                                            });
-                                                        }
-                                                    }
-
-                                                    let _ = engine
-                                                        .finalize_chat(
-                                                            &followup_prompt,
-                                                            &followup_response,
-                                                            session_id.as_deref(),
-                                                            crate::engine::PromptMode::Chat,
-                                                        )
-                                                        .await;
-                                                    let _ = events_tx_clone.send(ServerEvent::Message {
-                                                        from: target_id_clone.clone(),
-                                                        to: "user".to_string(),
-                                                        content: followup_response.clone(),
-                                                    });
-                                                }
-                                                let _ = events_tx_clone.send(ServerEvent::StateUpdated);
-                                            } else {
-                                                let followup_prompt = format!(
-                                                    "Use the observation below to answer the user's request in plain text.\n\nUser request: {}\n\nObservation:\n{}\n\nRequirements:\n- Be concise but concrete.\n- If you ran a command, summarize key results.\n- If you read files, mention the file path(s) and key findings.",
-                                                    clean_msg_clone,
-                                                    rendered_public
-                                                );
-
-                                                let mut followup_response = String::new();
-                                                if let Ok(mut followup_stream) =
-                                                    engine
-                                                        .chat_stream(
-                                                            &followup_prompt,
-                                                            session_id.as_deref(),
-                                                            crate::engine::PromptMode::Chat,
-                                                        )
-                                                        .await
-                                                {
-                                                    while let Some(token_result) = followup_stream.next().await {
-                                                        if let Ok(token) = token_result {
-                                                            followup_response.push_str(&token);
-                                                            let _ = events_tx_clone.send(ServerEvent::Token {
-                                                                agent_id: target_id_clone.clone(),
-                                                                token,
-                                                            });
-                                                        }
-                                                    }
-
-                                                    let _ = engine
-                                                        .finalize_chat(
-                                                            &followup_prompt,
-                                                            &followup_response,
-                                                            session_id.as_deref(),
-                                                            crate::engine::PromptMode::Chat,
-                                                        )
-                                                        .await;
-                                                    let _ = events_tx_clone.send(ServerEvent::Message {
-                                                        from: target_id_clone.clone(),
-                                                        to: "user".to_string(),
-                                                        content: followup_response.clone(),
-                                                    });
-                                                }
-                                                let _ = events_tx_clone.send(ServerEvent::StateUpdated);
-                                            }
-                                        } else {
-                                            let followup_prompt = format!(
-                                                "Use the observation below to answer the user's request in plain text.\n\nUser request: {}\n\nObservation:\n{}",
-                                                clean_msg_clone,
-                                                rendered_public
-                                            );
-
-                                            let mut followup_response = String::new();
-                                            if let Ok(mut followup_stream) =
-                                                engine
-                                                    .chat_stream(
-                                                        &followup_prompt,
-                                                        session_id.as_deref(),
-                                                        crate::engine::PromptMode::Chat,
-                                                    )
-                                                    .await
-                                            {
-                                                while let Some(token_result) = followup_stream.next().await {
-                                                    if let Ok(token) = token_result {
-                                                        followup_response.push_str(&token);
-                                                        let _ = events_tx_clone.send(ServerEvent::Token {
-                                                            agent_id: target_id_clone.clone(),
-                                                            token,
-                                                        });
-                                                    }
-                                                }
-
-                                                let _ = engine
-                                                    .finalize_chat(
-                                                        &followup_prompt,
-                                                        &followup_response,
-                                                        session_id.as_deref(),
-                                                        crate::engine::PromptMode::Chat,
-                                                    )
-                                                    .await;
-                                                let _ = events_tx_clone.send(ServerEvent::Message {
-                                                    from: target_id_clone.clone(),
-                                                    to: "user".to_string(),
-                                                    content: followup_response.clone(),
-                                                });
-                                                let _ = events_tx_clone.send(ServerEvent::StateUpdated);
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("Tool execution failed ({}): {}", tool, e);
-                                        // Record the tool error as an observation so the loop can self-correct.
-                                        let rendered = format!("tool_error: tool={} error={}", tool, e);
-                                        engine.upsert_observation("error", &tool, rendered.clone());
-                                        let _ = engine
-                                            .manager_db_add_observation(&tool, &rendered, session_id.as_deref())
-                                            .await;
-                                        let _ = events_tx_clone.send(ServerEvent::StateUpdated);
-                                        let task_for_loop =
-                                            clean_msg_clone.trim().to_string();
-                                        engine.task = Some(task_for_loop);
-                                        // Ask the model again with the error + schema.
-                                        let outcome = run_loop_with_tracking(
-                                            &manager,
-                                            &root_clone,
-                                            &mut engine,
-                                            &target_id_clone,
-                                            session_id.as_deref(),
-                                            "chat:error-retry",
-                                        )
-                                        .await;
-                                        if let Ok(outcome) = &outcome {
-                                            emit_outcome_event(outcome, &events_tx_clone, &target_id_clone);
-                                        } else {
-                                            let _ = events_tx_clone.send(ServerEvent::Message {
-                                                from: target_id_clone.clone(),
-                                                to: "user".to_string(),
-                                                content: format!("Tool execution failed ({}): {}", tool, e),
-                                            });
-                                            if let Ok(ctx) = manager.get_or_create_project(root_clone.clone()).await {
-                                                let err_msg = format!("Tool execution failed ({}): {}", tool, e);
-                                                let _ = ctx.state_fs.append_message(
-                                                    &target_id_clone,
-                                                    "user",
-                                                    &err_msg,
-                                                    None,
-                                                    session_id.as_deref(),
-                                                );
-                                                let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
-                                                    repo_path: root_clone.to_string_lossy().to_string(),
-                                                    session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
-                                                    agent_id: target_id_clone.clone(),
-                                                    from_id: target_id_clone.clone(),
-                                                    to_id: "user".to_string(),
-                                                    content: err_msg,
-                                                    timestamp: std::time::SystemTime::now()
-                                                        .duration_since(std::time::UNIX_EPOCH)
-                                                        .unwrap()
-                                                        .as_secs(),
-                                                    is_observation: false,
-                                                });
-                                            }
-                                        }
-                                        let _ = events_tx_clone.send(ServerEvent::StateUpdated);
-                                    }
-                                };
-                            }
-                        }
-
-                        if !handled_tool {
-                            // Finalize chat in engine (updates history and DB) only when we're showing
-                            // the model's response directly to the user.
-                            let _ = engine
-                                .finalize_chat(
-                                    &clean_msg_clone,
-                                    &full_response,
-                                    session_id.as_deref(),
-                                    prompt_mode,
+                            state_clone
+                                .send_agent_status(
+                                    target_id_clone.clone(),
+                                    "calling_tool".to_string(),
+                                    Some(format!("Calling {}", tool)),
                                 )
                                 .await;
-                            // Normal assistant message (finalize/other text)
+                            let safe_args = sanitize_tool_args_for_display(&tool, &args);
                             let _ = events_tx_clone.send(ServerEvent::Message {
                                 from: target_id_clone.clone(),
                                 to: "user".to_string(),
-                                content: full_response.clone(),
+                                content: serde_json::json!({
+                                    "type": "tool",
+                                    "tool": tool.clone(),
+                                    "args": safe_args.clone()
+                                })
+                                .to_string(),
                             });
-                            // Force UI refresh after sending final message
+                            if let Ok(ctx) = manager.get_or_create_project(root_clone.clone()).await
+                            {
+                                let tool_msg = serde_json::json!({
+                                    "type": "tool",
+                                    "tool": tool.clone(),
+                                    "args": safe_args
+                                })
+                                .to_string();
+                                let _ = ctx.state_fs.append_message(
+                                    &target_id_clone,
+                                    "user",
+                                    &tool_msg,
+                                    None,
+                                    session_id.as_deref(),
+                                );
+                                let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
+                                    repo_path: root_clone.to_string_lossy().to_string(),
+                                    session_id: session_id
+                                        .clone()
+                                        .unwrap_or_else(|| "default".to_string()),
+                                    agent_id: target_id_clone.clone(),
+                                    from_id: target_id_clone.clone(),
+                                    to_id: "user".to_string(),
+                                    content: tool_msg,
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs(),
+                                    is_observation: false,
+                                });
+                            }
+
+                            let write_path = if matches!(tool.as_str(), "Write") {
+                                extract_tool_path_arg(&args)
+                            } else {
+                                None
+                            };
+                            let call = crate::engine::tools::ToolCall {
+                                tool: tool.clone(),
+                                args,
+                            };
+
+                            let result = match engine.tools.execute(call) {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    tracing::warn!("Tool execution failed ({}): {}", tool, e);
+                                    let rendered = format!("tool_error: tool={} error={}", tool, e);
+                                    engine.upsert_observation("error", &tool, rendered.clone());
+                                    let _ = engine
+                                        .manager_db_add_observation(
+                                            &tool,
+                                            &rendered,
+                                            session_id.as_deref(),
+                                        )
+                                        .await;
+                                    let _ = events_tx_clone.send(ServerEvent::StateUpdated);
+                                    final_response =
+                                        Some(format!("Tool execution failed ({}): {}", tool, e));
+                                    break;
+                                }
+                            };
+
+                            let rendered_model = crate::engine::render_tool_result(&result);
+                            let rendered_public = crate::engine::render_tool_result_public(&result);
+                            engine.upsert_observation("tool", &tool, rendered_model.clone());
+                            let _ = engine
+                                .manager_db_add_observation(
+                                    &tool,
+                                    &rendered_public,
+                                    session_id.as_deref(),
+                                )
+                                .await;
                             let _ = events_tx_clone.send(ServerEvent::StateUpdated);
-                        } else {
-                            // Tool path: ensure UI refresh even though we didn't store the raw assistant text.
-                            let _ = events_tx_clone.send(ServerEvent::StateUpdated);
+                            state_clone
+                                .send_agent_status(
+                                    target_id_clone.clone(),
+                                    "thinking".to_string(),
+                                    Some("Thinking".to_string()),
+                                )
+                                .await;
+
+                            // Deterministic chaining for common file workflows.
+                            let mut observation_for_prompt = rendered_model.clone();
+                            let mut observation_for_display = rendered_public.clone();
+
+                            if matches!(tool.as_str(), "Write") {
+                                if let Some(path) = write_path {
+                                    let readback = engine.tools.execute(crate::engine::tools::ToolCall {
+                                        tool: "Read".to_string(),
+                                        args: serde_json::json!({ "path": path, "max_bytes": 8000 }),
+                                    });
+                                    if let Ok(read_result) = readback {
+                                        let read_model =
+                                            crate::engine::render_tool_result(&read_result);
+                                        let read_public =
+                                            crate::engine::render_tool_result_public(&read_result);
+                                        engine.upsert_observation(
+                                            "tool",
+                                            "Read",
+                                            read_model.clone(),
+                                        );
+                                        let _ = engine
+                                            .manager_db_add_observation(
+                                                "Read",
+                                                &read_public,
+                                                session_id.as_deref(),
+                                            )
+                                            .await;
+                                        observation_for_prompt = format!(
+                                            "{}\n\nPost-write readback:\n{}",
+                                            observation_for_prompt, read_model
+                                        );
+                                        observation_for_display = format!(
+                                            "{}\n\nPost-write readback:\n{}",
+                                            observation_for_display, read_public
+                                        );
+                                        let _ = events_tx_clone.send(ServerEvent::StateUpdated);
+                                    }
+                                }
+                            }
+
+                            let followup_prompt = format!(
+                                "Continue helping with the same user request.\n\nOriginal user request:\n{}\n\nLatest observation:\n{}\n\nIf another tool is needed, respond with exactly one JSON tool call.\nOtherwise, answer the user directly in plain text.",
+                                clean_msg_clone, observation_for_prompt
+                            );
+                            let mut followup_response = String::new();
+                            match engine
+                                .chat_stream(
+                                    &followup_prompt,
+                                    session_id.as_deref(),
+                                    crate::engine::PromptMode::Chat,
+                                )
+                                .await
+                            {
+                                Ok(mut followup_stream) => {
+                                    while let Some(token_result) = followup_stream.next().await {
+                                        match token_result {
+                                            Ok(token) => {
+                                                followup_response.push_str(&token);
+                                                let _ = events_tx_clone.send(ServerEvent::Token {
+                                                    agent_id: target_id_clone.clone(),
+                                                    token,
+                                                });
+                                            }
+                                            Err(err) => {
+                                                tracing::warn!(
+                                                    "Follow-up stream token error (step {}): {}",
+                                                    tool_steps,
+                                                    err
+                                                );
+                                                final_response = Some(format!(
+                                                    "I hit a model stream error while continuing the task: {}",
+                                                    err
+                                                ));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "Follow-up model stream failed after tool '{}' (step {}): {}",
+                                        tool,
+                                        tool_steps,
+                                        err
+                                    );
+                                    final_response = Some(format!(
+                                        "I couldn't continue after tool '{}' due to model error: {}",
+                                        tool, err
+                                    ));
+                                }
+                            }
+                            if final_response.is_some() {
+                                break;
+                            }
+
+                            let (followup_text_part, followup_json_part) =
+                                crate::engine::model_message_log_parts(
+                                    &followup_response,
+                                    100,
+                                    100,
+                                );
+                            let followup_json_rendered = followup_json_part
+                                .as_ref()
+                                .and_then(|v| serde_json::to_string(v).ok())
+                                .unwrap_or_else(|| "null".to_string());
+                            tracing::info!(
+                                "Chat follow-up output split: text='{}' json={}",
+                                followup_text_part.replace('\n', "\\n"),
+                                followup_json_rendered
+                            );
+
+                            pending_tool = extract_chat_tool_call(&followup_response);
+                            if pending_tool.is_none() {
+                                if let Some(err_msg) = chat_mode_structured_output_error(
+                                    &followup_response,
+                                    allow_patch,
+                                    allow_finalize,
+                                ) {
+                                    final_response = Some(err_msg);
+                                } else {
+                                    final_response = Some(followup_response);
+                                }
+                                break;
+                            }
                         }
+
+                        let mut reply = final_response.unwrap_or_else(|| {
+                            "I couldn't produce a final answer from the tool loop.".to_string()
+                        });
+                        if reply.trim().is_empty() {
+                            reply = "I couldn't produce a non-empty response. Please try again."
+                                .to_string();
+                        }
+
+                        let _ = engine
+                            .finalize_chat(
+                                &clean_msg_clone,
+                                &reply,
+                                session_id.as_deref(),
+                                prompt_mode,
+                            )
+                            .await;
+                        let _ = events_tx_clone.send(ServerEvent::Message {
+                            from: target_id_clone.clone(),
+                            to: "user".to_string(),
+                            content: reply,
+                        });
+                        let _ = events_tx_clone.send(ServerEvent::StateUpdated);
                     }
                     Err(e) => {
                         let error_msg = format!("Error: {}", e);
@@ -1122,7 +1173,9 @@ pub(crate) async fn chat_handler(
                             );
                             let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
                                 repo_path: root_clone.to_string_lossy().to_string(),
-                                session_id: session_id.clone().unwrap_or_else(|| "default".to_string()),
+                                session_id: session_id
+                                    .clone()
+                                    .unwrap_or_else(|| "default".to_string()),
                                 agent_id: target_id_clone.clone(),
                                 from_id: target_id_clone.clone(),
                                 to_id: "user".to_string(),
@@ -1149,5 +1202,76 @@ pub(crate) async fn chat_handler(
             Json(serde_json::json!({ "status": status })).into_response()
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        chat_mode_structured_output_error, extract_chat_tool_call, parse_explicit_target_prefix,
+    };
+
+    #[test]
+    fn extract_chat_tool_call_parses_supported_tool_json() {
+        let input =
+            r#"{"type":"tool","tool":"Grep","args":{"query":"logging.rs","globs":["src/**"]}}"#;
+        let parsed = extract_chat_tool_call(input);
+        assert!(parsed.is_some());
+        let (tool, args) = parsed.unwrap();
+        assert_eq!(tool, "Grep");
+        assert_eq!(args["query"], "logging.rs");
+        assert_eq!(args["globs"][0], "src/**");
+    }
+
+    #[test]
+    fn chat_mode_structured_output_error_blocks_finalize_task() {
+        let input = r#"{"type":"finalize_task","packet":{"title":"x","user_stories":[],"acceptance_criteria":[],"mermaid_wireframe":null}}"#;
+        let err = chat_mode_structured_output_error(input, false, false);
+        assert!(err.is_some());
+    }
+
+    #[test]
+    fn chat_mode_structured_output_error_blocks_unknown_structured_json() {
+        let input = r#"{"type":"unsupported_action","foo":"bar"}"#;
+        let err = chat_mode_structured_output_error(input, false, false);
+        assert!(err.is_some());
+    }
+
+    #[test]
+    fn chat_mode_structured_output_error_allows_plain_text() {
+        let err = chat_mode_structured_output_error(
+            "I reviewed logging.rs and found two issues.",
+            false,
+            false,
+        );
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn chat_mode_structured_output_error_finalize_allowed_still_requires_chat_shape() {
+        let input = r#"{"type":"finalize_task","packet":{"title":"x","user_stories":[],"acceptance_criteria":[],"mermaid_wireframe":null}}"#;
+        let err = chat_mode_structured_output_error(input, false, true);
+        assert!(err.is_some());
+        assert!(err
+            .unwrap()
+            .contains("chat mode expects plain text or a single tool call"));
+    }
+
+    #[test]
+    fn parse_explicit_target_prefix_accepts_valid_mention() {
+        let parsed = parse_explicit_target_prefix("@coder please review src/main.rs");
+        assert_eq!(parsed, Some(("coder", "please review src/main.rs")));
+    }
+
+    #[test]
+    fn parse_explicit_target_prefix_rejects_missing_body() {
+        let parsed = parse_explicit_target_prefix("@coder");
+        assert_eq!(parsed, None);
+    }
+
+    #[test]
+    fn parse_explicit_target_prefix_rejects_invalid_agent_token() {
+        let parsed = parse_explicit_target_prefix("@coder! please review");
+        assert_eq!(parsed, None);
     }
 }
