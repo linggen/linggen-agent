@@ -2,7 +2,7 @@ use crate::config::{AgentKind, AgentPolicyCapability};
 use crate::engine::PromptMode;
 use crate::server::chat_helpers::{
     emit_outcome_event, emit_queue_updated, extract_tool_path_arg, queue_key, queue_preview,
-    sanitize_tool_args_for_display,
+    sanitize_tool_args_for_display, tool_status_line, ToolStatusPhase,
 };
 use crate::server::{QueuedChatItem, ServerEvent, ServerState};
 use axum::{
@@ -12,6 +12,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -98,118 +99,6 @@ fn looks_like_file_or_path_request(message: &str) -> bool {
     false
 }
 
-fn extract_shell_command_candidate(text: &str) -> Option<String> {
-    // Prefer commands inside fenced code blocks, otherwise fall back to any
-    // line that looks like a standalone shell command.
-    let mut in_code = false;
-    let mut code_lines: Vec<String> = Vec::new();
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.starts_with("```") {
-            in_code = !in_code;
-            continue;
-        }
-        if in_code && !line.is_empty() {
-            code_lines.push(line.to_string());
-        }
-    }
-
-    let mut candidates: Vec<String> = Vec::new();
-    candidates.extend(code_lines);
-    candidates.extend(
-        text.lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .map(|l| l.to_string()),
-    );
-
-    // Keep this list aligned with `validate_shell_command` allowlist in `src/engine/tools.rs`.
-    // (We only extract; the actual tool execution still validates.)
-    const TOKENS: &[&str] = &[
-        "find", "fd", "rg", "grep", "git", "ls", "pwd", "head", "tail", "cat", "wc", "sort",
-        "uniq", "tr", "sed", "awk", "cargo", "rustc", "npm", "pnpm", "yarn", "node", "python3",
-        "pytest", "go", "make", "just",
-    ];
-
-    for line in candidates {
-        let t = line.trim_start();
-        let token = t
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_start_matches('(');
-        if TOKENS.iter().any(|v| v.eq_ignore_ascii_case(token)) {
-            // Ignore obvious prose like "run: find ..." but accept raw commands.
-            if t.to_ascii_lowercase().starts_with("run: ")
-                || t.to_ascii_lowercase().starts_with("command: ")
-            {
-                continue;
-            }
-            return Some(t.to_string());
-        }
-    }
-    None
-}
-
-fn extract_read_file_candidate(text: &str) -> Option<String> {
-    // Heuristic: if the model says it's going to "read/open/check/look at" a file,
-    // extract a likely file path token and auto-run Read.
-    let lower = text.to_ascii_lowercase();
-    let intent = ["read", "open", "check", "look at", "inspect", "view"]
-        .iter()
-        .any(|k| lower.contains(k));
-    if !intent {
-        return None;
-    }
-
-    // Allowed extensions (keep aligned with looks_like_file_or_path_request)
-    const EXTS: &[&str] = &[
-        "rs", "toml", "md", "txt", "json", "yaml", "yml", "ts", "tsx", "js", "jsx", "py", "sql",
-        "go", "java", "kt", "c", "h", "cpp", "hpp",
-    ];
-
-    let mut best: Option<String> = None;
-    for raw in text.split_whitespace() {
-        let w = raw.trim_matches(|c: char| {
-            !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '\\'))
-        });
-        if w.is_empty() {
-            continue;
-        }
-        let Some(dot) = w.rfind('.') else { continue };
-        let ext = w[dot + 1..].to_ascii_lowercase();
-        if !EXTS.iter().any(|e| *e == ext) {
-            continue;
-        }
-        // Prefer paths with separators, then shorter tokens.
-        let score = (
-            if w.contains('/') || w.contains('\\') {
-                0
-            } else {
-                1
-            },
-            w.len(),
-        );
-        match &best {
-            None => best = Some(w.to_string()),
-            Some(existing) => {
-                let existing_score = (
-                    if existing.contains('/') || existing.contains('\\') {
-                        0
-                    } else {
-                        1
-                    },
-                    existing.len(),
-                );
-                if score < existing_score {
-                    best = Some(w.to_string());
-                }
-            }
-        }
-    }
-    best
-}
-
 fn parse_explicit_target_prefix(message: &str) -> Option<(&str, &str)> {
     let rest = message.strip_prefix('@')?;
     let space_idx = rest.find(' ')?;
@@ -227,25 +116,81 @@ fn parse_explicit_target_prefix(message: &str) -> Option<(&str, &str)> {
     Some((candidate, body))
 }
 
+const CHAT_DUP_TOOL_STREAK_LIMIT: usize = 3;
+const CHAT_NO_NEW_READ_STEP_LIMIT: usize = 12;
+
+async fn force_plaintext_summary(
+    engine: &mut crate::engine::AgentEngine,
+    events_tx: &tokio::sync::broadcast::Sender<ServerEvent>,
+    agent_id: &str,
+    session_id: Option<&str>,
+    original_user_request: &str,
+    read_paths: &[String],
+    reason: &str,
+) -> String {
+    let read_files = if read_paths.is_empty() {
+        "(none)".to_string()
+    } else {
+        read_paths.join(", ")
+    };
+    let prompt = format!(
+        "Stop using tools now.\n\
+Reason: {reason}\n\
+Original user request: {original_user_request}\n\
+Files already read: {read_files}\n\n\
+Provide a concise final plain-text response to the user based on gathered information. \
+Do not output JSON and do not request more tool calls."
+    );
+
+    let mut summary = String::new();
+    match engine
+        .chat_stream(
+            &prompt,
+            session_id,
+            crate::engine::PromptMode::Chat,
+        )
+        .await
+    {
+        Ok(mut stream) => {
+            while let Some(token_result) = stream.next().await {
+                if let Ok(token) = token_result {
+                    summary.push_str(&token);
+                    let _ = events_tx.send(ServerEvent::Token {
+                        agent_id: agent_id.to_string(),
+                        token,
+                    });
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!("Forced summary stream failed: {}", err);
+        }
+    }
+
+    let trimmed = summary.trim().to_string();
+    if trimmed.is_empty() || extract_chat_tool_call(&trimmed).is_some() {
+        if read_paths.is_empty() {
+            format!(
+                "I stopped because the tool loop was repeating without progress ({reason}). \
+Please narrow scope (for example, exact file names) and I can continue."
+            )
+        } else {
+            format!(
+                "I stopped because the tool loop was repeating without progress ({reason}). \
+I already read: {}. Please tell me which file(s) to focus on next, or ask for a summary of specific files.",
+                read_paths.join(", ")
+            )
+        }
+    } else {
+        trimmed
+    }
+}
+
 fn extract_chat_tool_call(text: &str) -> Option<(String, serde_json::Value)> {
     if let Ok(action) = crate::engine::parse_first_action(text) {
         if let crate::engine::ModelAction::Tool { tool, args } = action {
             return Some((tool, args));
         }
-    }
-
-    if let Some(cmd) = extract_shell_command_candidate(text) {
-        return Some((
-            "Bash".to_string(),
-            serde_json::json!({ "cmd": cmd, "timeout_ms": 30000 }),
-        ));
-    }
-
-    if let Some(path) = extract_read_file_candidate(text) {
-        return Some((
-            "Read".to_string(),
-            serde_json::json!({ "path": path, "max_bytes": 8000 }),
-        ));
     }
 
     None
@@ -894,6 +839,11 @@ pub(crate) async fn chat_handler(
                             Some(full_response.clone())
                         };
                         let mut tool_steps = 0usize;
+                        let mut last_tool_sig = String::new();
+                        let mut duplicate_tool_streak = 0usize;
+                        let mut read_paths_seen: HashSet<String> = HashSet::new();
+                        let mut read_paths_order: Vec<String> = Vec::new();
+                        let mut steps_since_new_read = 0usize;
 
                         while final_response.is_none() {
                             if tool_steps >= chat_tool_max_iters {
@@ -907,12 +857,47 @@ pub(crate) async fn chat_handler(
                                 break;
                             };
                             tool_steps += 1;
+                            steps_since_new_read = steps_since_new_read.saturating_add(1);
+
+                            let call_sig = crate::engine::tool_call_signature(&tool, &args);
+                            if call_sig == last_tool_sig {
+                                duplicate_tool_streak = duplicate_tool_streak.saturating_add(1);
+                            } else {
+                                duplicate_tool_streak = 0;
+                                last_tool_sig = call_sig;
+                            }
+                            if duplicate_tool_streak >= CHAT_DUP_TOOL_STREAK_LIMIT {
+                                tracing::warn!(
+                                    "Chat tool loop breaker: duplicate call streak={} tool={}",
+                                    duplicate_tool_streak + 1,
+                                    tool
+                                );
+                                let reply = force_plaintext_summary(
+                                    &mut engine,
+                                    &events_tx_clone,
+                                    &target_id_clone,
+                                    session_id.as_deref(),
+                                    &clean_msg_clone,
+                                    &read_paths_order,
+                                    "same tool call repeated",
+                                )
+                                .await;
+                                final_response = Some(reply);
+                                break;
+                            }
+
+                            let tool_start_status =
+                                tool_status_line(&tool, Some(&args), ToolStatusPhase::Start);
+                            let tool_done_status =
+                                tool_status_line(&tool, Some(&args), ToolStatusPhase::Done);
+                            let tool_failed_status =
+                                tool_status_line(&tool, Some(&args), ToolStatusPhase::Failed);
 
                             state_clone
                                 .send_agent_status(
                                     target_id_clone.clone(),
                                     "calling_tool".to_string(),
-                                    Some(format!("Calling {}", tool)),
+                                    Some(tool_start_status),
                                 )
                                 .await;
                             let safe_args = sanitize_tool_args_for_display(&tool, &args);
@@ -958,7 +943,12 @@ pub(crate) async fn chat_handler(
                                 });
                             }
 
-                            let write_path = if matches!(tool.as_str(), "Write") {
+                            let mutate_path = if matches!(tool.as_str(), "Write" | "Edit") {
+                                extract_tool_path_arg(&args)
+                            } else {
+                                None
+                            };
+                            let read_path = if matches!(tool.as_str(), "Read") {
                                 extract_tool_path_arg(&args)
                             } else {
                                 None
@@ -972,6 +962,13 @@ pub(crate) async fn chat_handler(
                                 Ok(result) => result,
                                 Err(e) => {
                                     tracing::warn!("Tool execution failed ({}): {}", tool, e);
+                                    state_clone
+                                        .send_agent_status(
+                                            target_id_clone.clone(),
+                                            "calling_tool".to_string(),
+                                            Some(tool_failed_status.clone()),
+                                        )
+                                        .await;
                                     let rendered = format!("tool_error: tool={} error={}", tool, e);
                                     engine.upsert_observation("error", &tool, rendered.clone());
                                     let _ = engine
@@ -1002,6 +999,13 @@ pub(crate) async fn chat_handler(
                             state_clone
                                 .send_agent_status(
                                     target_id_clone.clone(),
+                                    "calling_tool".to_string(),
+                                    Some(tool_done_status),
+                                )
+                                .await;
+                            state_clone
+                                .send_agent_status(
+                                    target_id_clone.clone(),
                                     "thinking".to_string(),
                                     Some("Thinking".to_string()),
                                 )
@@ -1011,8 +1015,40 @@ pub(crate) async fn chat_handler(
                             let mut observation_for_prompt = rendered_model.clone();
                             let mut observation_for_display = rendered_public.clone();
 
-                            if matches!(tool.as_str(), "Write") {
-                                if let Some(path) = write_path {
+                            if matches!(tool.as_str(), "Read") {
+                                if let Some(path) = read_path {
+                                    let norm = path.trim().replace('\\', "/");
+                                    if !norm.is_empty() {
+                                        if read_paths_seen.insert(norm.clone()) {
+                                            read_paths_order.push(norm);
+                                            steps_since_new_read = 0;
+                                        }
+                                    }
+                                }
+                                if !read_paths_order.is_empty()
+                                    && steps_since_new_read >= CHAT_NO_NEW_READ_STEP_LIMIT
+                                {
+                                    tracing::warn!(
+                                        "Chat tool loop breaker: no new read files for {} steps",
+                                        steps_since_new_read
+                                    );
+                                    let reply = force_plaintext_summary(
+                                        &mut engine,
+                                        &events_tx_clone,
+                                        &target_id_clone,
+                                        session_id.as_deref(),
+                                        &clean_msg_clone,
+                                        &read_paths_order,
+                                        "no new files were read",
+                                    )
+                                    .await;
+                                    final_response = Some(reply);
+                                    break;
+                                }
+                            }
+
+                            if matches!(tool.as_str(), "Write" | "Edit") {
+                                if let Some(path) = mutate_path {
                                     let readback = engine.tools.execute(crate::engine::tools::ToolCall {
                                         tool: "Read".to_string(),
                                         args: serde_json::json!({ "path": path, "max_bytes": 8000 }),
@@ -1224,6 +1260,19 @@ mod tests {
     }
 
     #[test]
+    fn extract_chat_tool_call_parses_edit_tool_json() {
+        let input = r#"{"type":"tool","tool":"Edit","args":{"path":"src/logging.rs","old_string":"a","new_string":"b","replace_all":false}}"#;
+        let parsed = extract_chat_tool_call(input);
+        assert!(parsed.is_some());
+        let (tool, args) = parsed.unwrap();
+        assert_eq!(tool, "Edit");
+        assert_eq!(args["path"], "src/logging.rs");
+        assert_eq!(args["old_string"], "a");
+        assert_eq!(args["new_string"], "b");
+        assert_eq!(args["replace_all"], false);
+    }
+
+    #[test]
     fn chat_mode_structured_output_error_blocks_finalize_task() {
         let input = r#"{"type":"finalize_task","packet":{"title":"x","user_stories":[],"acceptance_criteria":[],"mermaid_wireframe":null}}"#;
         let err = chat_mode_structured_output_error(input, false, false);
@@ -1273,5 +1322,17 @@ mod tests {
     fn parse_explicit_target_prefix_rejects_invalid_agent_token() {
         let parsed = parse_explicit_target_prefix("@coder! please review");
         assert_eq!(parsed, None);
+    }
+
+    #[test]
+    fn extract_chat_tool_call_does_not_infer_read_from_plain_text_with_filename() {
+        let input = "All fixes have been applied to src/logging.rs and cargo check passed.";
+        assert_eq!(extract_chat_tool_call(input), None);
+    }
+
+    #[test]
+    fn extract_chat_tool_call_does_not_infer_bash_from_plain_text_command() {
+        let input = "I'll run cargo check and report back.";
+        assert_eq!(extract_chat_tool_call(input), None);
     }
 }

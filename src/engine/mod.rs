@@ -848,47 +848,48 @@ impl AgentEngine {
                         }
                     }
 
-                    if canonical_tool == "Write" {
+                    if matches!(canonical_tool.as_str(), "Write" | "Edit") {
                         if let Some(path) = normalize_tool_path_arg(&self.cfg.ws_root, &args) {
                             let existing = self.cfg.ws_root.join(&path).exists();
                             if existing && !read_paths.contains(&path) {
+                                let action = if canonical_tool == "Edit" {
+                                    "Edit"
+                                } else {
+                                    "Write"
+                                };
                                 match self.cfg.write_safety_mode {
                                     crate::config::WriteSafetyMode::Strict => {
                                         let rendered = format!(
-                                            "tool_error: tool=Write error=precondition_failed: must call Read on '{}' before Write for existing files",
-                                            path
+                                            "tool_error: tool={} error=precondition_failed: must call Read on '{}' before {} for existing files",
+                                            action, path, action
                                         );
-                                        self.upsert_observation("error", "Write", rendered.clone());
+                                        self.upsert_observation("error", action, rendered.clone());
                                         let _ = self
                                             .manager_db_add_observation(
-                                                "Write", &rendered, session_id,
+                                                action, &rendered, session_id,
                                             )
                                             .await;
                                         messages.push(ChatMessage {
                                             role: "user".to_string(),
                                             content: format!(
-                                                "Tool execution blocked for safety: {}. Read the existing file first, then write a minimal update.",
-                                                rendered
+                                                "Tool execution blocked for safety: {}. Read the existing file first, then apply a minimal update.",
+                                                rendered,
                                             ),
                                         });
                                         continue;
                                     }
                                     crate::config::WriteSafetyMode::Warn => {
                                         let rendered = format!(
-                                            "tool_warning: tool=Write warning=writing_existing_file_without_prior_read path='{}'",
-                                            path
+                                            "tool_warning: tool={} warning=writing_existing_file_without_prior_read path='{}'",
+                                            action, path
                                         );
-                                        self.upsert_observation(
-                                            "warning",
-                                            "Write",
-                                            rendered.clone(),
-                                        );
+                                        self.upsert_observation("warning", action, rendered.clone());
                                         let _ = self
                                             .manager_db_add_observation(
-                                                "Write", &rendered, session_id,
+                                                action, &rendered, session_id,
                                             )
                                             .await;
-                                        // Allow the write to proceed.
+                                        // Allow the edit/write to proceed.
                                     }
                                     crate::config::WriteSafetyMode::Off => {
                                         // Allow writes without read.
@@ -949,6 +950,22 @@ impl AgentEngine {
                         continue;
                     }
 
+                    let tool_start_status = crate::server::chat_helpers::tool_status_line(
+                        &canonical_tool,
+                        Some(&args),
+                        crate::server::chat_helpers::ToolStatusPhase::Start,
+                    );
+                    let tool_done_status = crate::server::chat_helpers::tool_status_line(
+                        &canonical_tool,
+                        Some(&args),
+                        crate::server::chat_helpers::ToolStatusPhase::Done,
+                    );
+                    let tool_failed_status = crate::server::chat_helpers::tool_status_line(
+                        &canonical_tool,
+                        Some(&args),
+                        crate::server::chat_helpers::ToolStatusPhase::Failed,
+                    );
+
                     // Tell the UI what tool we're about to use (progress visibility).
                     if let Some(manager) = self.tools.get_manager() {
                         let from = self
@@ -960,7 +977,7 @@ impl AgentEngine {
                             .send_event(crate::agent_manager::AgentEvent::AgentStatus {
                                 agent_id: from.clone(),
                                 status: "calling_tool".to_string(),
-                                detail: Some(format!("Calling {}", canonical_tool)),
+                                detail: Some(tool_start_status.clone()),
                             })
                             .await;
                         let _ = manager
@@ -1026,16 +1043,24 @@ impl AgentEngine {
                                 )
                                 .await;
                             if let Some(manager) = self.tools.get_manager() {
+                                let agent_id = self
+                                    .agent_id
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                manager
+                                    .send_event(crate::agent_manager::AgentEvent::AgentStatus {
+                                        agent_id: agent_id.clone(),
+                                        status: "calling_tool".to_string(),
+                                        detail: Some(tool_done_status.clone()),
+                                    })
+                                    .await;
+
                                 // Trigger a UI refresh via the server's SSE bridge.
                                 manager
                                     .send_event(crate::agent_manager::AgentEvent::StateUpdated)
                                     .await;
 
                                 // After tool completes, we're back to thinking.
-                                let agent_id = self
-                                    .agent_id
-                                    .clone()
-                                    .unwrap_or_else(|| "unknown".to_string());
                                 manager
                                     .send_event(crate::agent_manager::AgentEvent::AgentStatus {
                                         agent_id,
@@ -1045,17 +1070,18 @@ impl AgentEngine {
                                     .await;
                             }
 
-                            // For writes, emit a brief user-visible summary line immediately.
-                            if canonical_tool == "Write"
+                            // For file mutations, emit a brief user-visible summary line immediately.
+                            if matches!(canonical_tool.as_str(), "Write" | "Edit")
                                 && (rendered_public.starts_with("File written:")
+                                    || rendered_public.starts_with("Edited file:")
                                     || rendered_public.starts_with("File unchanged"))
                             {
                                 let msg = if rendered_public.starts_with("File unchanged") {
                                     if let Some(idx) = rendered_public.rfind(':') {
                                         let path = rendered_public[idx + 1..].trim();
-                                        format!("No changes to `{}` (content identical).", path)
+                                        format!("No changes to `{}`.", path)
                                     } else {
-                                        "No file changes (content identical).".to_string()
+                                        "No file changes.".to_string()
                                     }
                                 } else if let Some(idx) = rendered_public.rfind(':') {
                                     let rest = rendered_public[idx + 1..].trim();
@@ -1121,6 +1147,13 @@ impl AgentEngine {
                                     .agent_id
                                     .clone()
                                     .unwrap_or_else(|| "unknown".to_string());
+                                manager
+                                    .send_event(crate::agent_manager::AgentEvent::AgentStatus {
+                                        agent_id: agent_id.clone(),
+                                        status: "calling_tool".to_string(),
+                                        detail: Some(tool_failed_status.clone()),
+                                    })
+                                    .await;
                                 manager
                                     .send_event(crate::agent_manager::AgentEvent::AgentStatus {
                                         agent_id,

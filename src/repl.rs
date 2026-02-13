@@ -271,7 +271,6 @@ fn setup_tracing() {
     let _ = logging::setup_tracing_with_settings(logging::LoggingSettings {
         level: None,
         directory: None,
-        rotation: None,
         retention_days: None,
     });
 }

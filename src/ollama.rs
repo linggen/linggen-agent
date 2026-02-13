@@ -228,8 +228,9 @@ impl OllamaClient {
     /// Best-effort: fetch model context window (num_ctx) from Ollama.
     ///
     /// Ollama exposes model metadata at /api/show. We parse either:
-    /// - parameters.num_ctx (if present), or
-    /// - "PARAMETER num_ctx <N>" inside the modelfile string.
+    /// - parameters.num_ctx (if present in object form),
+    /// - num_ctx/context_length lines from parameters/modelfile text, or
+    /// - model_info.*.context_length keys.
     pub async fn get_model_context_window(&self, model: &str) -> Result<Option<usize>> {
         let url = format!("{}/api/show", self.base_url);
         let req = serde_json::json!({ "name": model });
@@ -246,33 +247,53 @@ impl OllamaClient {
 
         let payload: OllamaShowResponse = resp.json().await?;
 
-        // 1) parameters.num_ctx
+        // 1) parameters object or text
         if let Some(params) = payload.parameters.as_ref() {
-            if let Some(v) = params.get("num_ctx") {
-                if let Some(n) = v.as_u64() {
-                    return Ok(Some(n as usize));
+            match params {
+                OllamaShowParameters::Map(map) => {
+                    if let Some(v) = map.get("num_ctx").and_then(parse_usize_value) {
+                        return Ok(Some(v));
+                    }
+                    if let Some(v) = map.get("context_length").and_then(parse_usize_value) {
+                        return Ok(Some(v));
+                    }
                 }
-                if let Some(s) = v.as_str() {
-                    if let Ok(n) = s.trim().parse::<usize>() {
-                        return Ok(Some(n));
+                OllamaShowParameters::Text(text) => {
+                    if let Some(v) = parse_num_ctx_from_text(text) {
+                        return Ok(Some(v));
                     }
                 }
             }
         }
 
-        // 2) parse from modelfile text
-        if let Some(modelfile) = payload.modelfile.as_deref() {
-            for line in modelfile.lines() {
-                let line = line.trim();
-                // e.g. "PARAMETER num_ctx 8192"
-                if let Some(rest) = line.strip_prefix("PARAMETER") {
-                    let parts: Vec<&str> = rest.split_whitespace().collect();
-                    if parts.len() >= 2 && parts[0].eq_ignore_ascii_case("num_ctx") {
-                        if let Ok(n) = parts[1].parse::<usize>() {
-                            return Ok(Some(n));
-                        }
+        // 2) parse from model_info keys like "<arch>.context_length"
+        if let Some(model_info) = payload.model_info.as_ref() {
+            for (key, value) in model_info {
+                let key_lc = key.to_ascii_lowercase();
+                if key_lc == "context_length"
+                    || key_lc.ends_with(".context_length")
+                    || key_lc.ends_with("_context_length")
+                {
+                    if let Some(v) = parse_usize_value(value) {
+                        return Ok(Some(v));
                     }
                 }
+            }
+        }
+
+        // 3) parse from details object when available
+        if let Some(details) = payload.details.as_ref() {
+            for k in ["context_length", "num_ctx"] {
+                if let Some(v) = details.get(k).and_then(parse_usize_value) {
+                    return Ok(Some(v));
+                }
+            }
+        }
+
+        // 4) parse from modelfile text
+        if let Some(modelfile) = payload.modelfile.as_deref() {
+            if let Some(v) = parse_num_ctx_from_text(modelfile) {
+                return Ok(Some(v));
             }
         }
 
@@ -280,12 +301,91 @@ impl OllamaClient {
     }
 }
 
+fn parse_usize_value(value: &serde_json::Value) -> Option<usize> {
+    if let Some(v) = value.as_u64() {
+        return usize::try_from(v).ok();
+    }
+    if let Some(s) = value.as_str() {
+        return parse_usize_token(s);
+    }
+    None
+}
+
+fn parse_usize_token(raw: &str) -> Option<usize> {
+    let cleaned = raw.trim().trim_matches('"').trim_matches('\'');
+    if let Ok(v) = cleaned.parse::<usize>() {
+        return Some(v);
+    }
+    for token in cleaned.split(|c: char| c.is_whitespace() || c == '=' || c == ':') {
+        let t = token.trim().trim_matches(',').trim_matches(';');
+        if t.is_empty() {
+            continue;
+        }
+        if let Ok(v) = t.parse::<usize>() {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn parse_num_ctx_from_line(line: &str) -> Option<usize> {
+    let mut s = line.trim();
+    if let Some(rest) = s.strip_prefix("PARAMETER") {
+        s = rest.trim();
+    }
+    if s.is_empty() {
+        return None;
+    }
+
+    if let Some((k, v)) = s.split_once('=') {
+        let key = k.trim().to_ascii_lowercase();
+        if key == "num_ctx" || key == "context_length" {
+            return parse_usize_token(v);
+        }
+    }
+    if let Some((k, v)) = s.split_once(':') {
+        let key = k.trim().to_ascii_lowercase();
+        if key == "num_ctx" || key == "context_length" {
+            return parse_usize_token(v);
+        }
+    }
+
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() >= 2 {
+        let key = parts[0].trim().to_ascii_lowercase();
+        if key == "num_ctx" || key == "context_length" {
+            return parse_usize_token(parts[1]);
+        }
+    }
+    None
+}
+
+fn parse_num_ctx_from_text(text: &str) -> Option<usize> {
+    for line in text.lines() {
+        if let Some(v) = parse_num_ctx_from_line(line) {
+            return Some(v);
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OllamaShowResponse {
     #[serde(default)]
-    parameters: Option<HashMap<String, serde_json::Value>>,
+    parameters: Option<OllamaShowParameters>,
     #[serde(default)]
     modelfile: Option<String>,
+    #[serde(default)]
+    model_info: Option<HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    details: Option<HashMap<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum OllamaShowParameters {
+    Map(HashMap<String, serde_json::Value>),
+    Text(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

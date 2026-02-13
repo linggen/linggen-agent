@@ -138,14 +138,8 @@ impl ModelManager {
         let client = instance.client.clone();
         let value = instance
             .context_window
-            .get_or_init(|| async move {
-                client
-                    .get_model_context_window(&model_name)
-                    .await
-                    .ok()
-                    .flatten()
-            })
+            .get_or_try_init(|| async move { client.get_model_context_window(&model_name).await })
             .await;
-        Ok(*value)
+        Ok(*value?)
     }
 }

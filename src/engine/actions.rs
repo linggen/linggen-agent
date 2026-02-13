@@ -30,16 +30,10 @@ pub fn parse_first_action(raw: &str) -> Result<ModelAction> {
 
     // Fallback: models sometimes emit prose + one or more JSON objects.
     // Scan for JSON object starts and return the first valid ModelAction.
-    // We strip XML-style tags like <search_indexing> before parsing.
-    let mut cleaned = trimmed.to_string();
-    while let Some(start) = cleaned.find('<') {
-        if let Some(end) = cleaned[start..].find('>') {
-            cleaned.replace_range(start..start + end + 1, "");
-        } else {
-            break;
-        }
-    }
-    let cleaned_trimmed = cleaned.trim();
+    // IMPORTANT: do not strip angle-bracket content here.
+    // Rust/TS code in tool args can contain generics like `Option<u64>` and
+    // removing `<...>` would corrupt write payloads.
+    let cleaned_trimmed = trimmed;
 
     for (idx, _) in cleaned_trimmed.match_indices('{') {
         let candidate = &cleaned_trimmed[idx..];
@@ -78,8 +72,8 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
     }
 
     let tool_name = match action_type {
-        "Read" | "Grep" | "Write" | "Glob" | "Bash" | "capture_screenshot" | "lock_paths"
-        | "unlock_paths" | "delegate_to_agent" | "get_repo_info" => action_type,
+        "Read" | "Grep" | "Write" | "Edit" | "Glob" | "Bash" | "capture_screenshot"
+        | "lock_paths" | "unlock_paths" | "delegate_to_agent" | "get_repo_info" => action_type,
         _ => return None,
     };
 
@@ -95,6 +89,7 @@ fn is_supported_model_tool(tool: &str) -> bool {
         "Read"
             | "Grep"
             | "Write"
+            | "Edit"
             | "Glob"
             | "Bash"
             | "capture_screenshot"
@@ -103,19 +98,6 @@ fn is_supported_model_tool(tool: &str) -> bool {
             | "delegate_to_agent"
             | "get_repo_info"
     )
-}
-
-fn strip_angle_tags(input: &str) -> String {
-    // Keep behavior aligned with parse_first_action's tag stripping.
-    let mut cleaned = input.to_string();
-    while let Some(start) = cleaned.find('<') {
-        if let Some(end) = cleaned[start..].find('>') {
-            cleaned.replace_range(start..start + end + 1, "");
-        } else {
-            break;
-        }
-    }
-    cleaned
 }
 
 fn extract_first_json_object_span(s: &str) -> Option<(usize, usize)> {
@@ -206,8 +188,7 @@ pub fn model_message_log_parts(
         return ("".to_string(), None);
     }
 
-    let cleaned = strip_angle_tags(trimmed);
-    let cleaned_trimmed = cleaned.trim();
+    let cleaned_trimmed = trimmed;
     let Some((start, end)) = extract_first_json_object_span(cleaned_trimmed) else {
         return (truncate_text_chars(cleaned_trimmed, max_text_chars), None);
     };
@@ -225,4 +206,56 @@ pub fn model_message_log_parts(
         .ok()
         .map(|v| truncate_json_values(v, max_json_value_chars));
     (truncate_text_chars(&text, max_text_chars), json_value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_first_action, ModelAction};
+
+    #[test]
+    fn parse_first_action_preserves_generic_types_in_write_content() {
+        let raw = r#"I'll apply the fix.
+{"type":"tool","tool":"Write","args":{"path":"src/logging.rs","content":"static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();\npub struct LoggingSettings<'a> { pub level: Option<&'a str>, pub retention_days: Option<u64>, }\n"}} "#;
+
+        let action = parse_first_action(raw).expect("expected tool action");
+        match action {
+            ModelAction::Tool { tool, args } => {
+                assert_eq!(tool, "Write");
+                let content = args["content"].as_str().expect("content should be a string");
+                assert!(content.contains("OnceLock<WorkerGuard>"));
+                assert!(content.contains("Option<&'a str>"));
+                assert!(content.contains("Option<u64>"));
+            }
+            _ => panic!("expected tool action"),
+        }
+    }
+
+    #[test]
+    fn parse_first_action_handles_wrapped_json_without_stripping() {
+        let raw =
+            "<search_indexing>\n{\"type\":\"tool\",\"tool\":\"Read\",\"args\":{\"path\":\"src/logging.rs\"}}\n</search_indexing>";
+        let action = parse_first_action(raw).expect("expected wrapped tool action");
+        match action {
+            ModelAction::Tool { tool, args } => {
+                assert_eq!(tool, "Read");
+                assert_eq!(args["path"], "src/logging.rs");
+            }
+            _ => panic!("expected tool action"),
+        }
+    }
+
+    #[test]
+    fn parse_first_action_accepts_edit_tool() {
+        let raw = r#"{"type":"tool","tool":"Edit","args":{"path":"src/logging.rs","old_string":"foo","new_string":"bar","replace_all":false}}"#;
+        let action = parse_first_action(raw).expect("expected Edit tool action");
+        match action {
+            ModelAction::Tool { tool, args } => {
+                assert_eq!(tool, "Edit");
+                assert_eq!(args["path"], "src/logging.rs");
+                assert_eq!(args["old_string"], "foo");
+                assert_eq!(args["new_string"], "bar");
+            }
+            _ => panic!("expected tool action"),
+        }
+    }
 }

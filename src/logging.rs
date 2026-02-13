@@ -3,43 +3,36 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{fmt::time::ChronoUtc, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-static LOG_GUARD: OnceLock = OnceLock::new();
+static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
-const RETENTION_DAYS: u64 = 30;
+const DEFAULT_RETENTION_DAYS: u64 = 7;
 const LOG_FILE_PREFIX: &str = "linggen-agent";
-const ROTATION_DAILY: &str = "daily";
 
-pub struct LoggingSettings {
-    pub level: Option,
-    pub directory: Option,
-    pub rotation: Option,
-    pub retention_days: Option,
+pub struct LoggingSettings<'a> {
+    pub level: Option<&'a str>,
+    pub directory: Option<&'a str>,
+    pub retention_days: Option<u64>,
 }
 
-pub fn setup_tracing_with_settings(settings: LoggingSettings) -> Result {
+pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Result<PathBuf> {
     let log_dir = resolve_log_dir(settings.directory)?;
-    let retention_days = settings.retention_days.unwrap_or(RETENTION_DAYS);
+    let retention_days = settings.retention_days.unwrap_or(DEFAULT_RETENTION_DAYS).max(1);
     if let Err(e) = cleanup_old_logs(&log_dir, retention_days) {
         eprintln!("Failed to cleanup old logs: {e}");
     }
 
-    let rotation = settings.rotation.unwrap_or(ROTATION_DAILY);
-    if rotation != ROTATION_DAILY {
-        eprintln!(
-            "Unsupported log rotation '{}' (only '{}' is supported). Falling back to daily.",
-            rotation, ROTATION_DAILY
-        );
-    }
-    
-    // Guard is intentionally stored in OnceLock to prevent it from being dropped
-    // If the guard is already set, return an error to prevent silent failures
     let file_appender = tracing_appender::rolling::daily(&log_dir, LOG_FILE_PREFIX);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-    if LOG_GUARD.set(guard).is_err() {
-        return Err(anyhow!("Logging already initialized. Cannot setup logging multiple times."));
-    }
+    LOG_GUARD
+        .set(guard)
+        .map_err(|_| anyhow!(
+            "Logging already initialized. Cannot setup logging multiple times."
+        ))?;
+
+    // Second-level timestamp precision to keep logs readable.
+    let time_format = ChronoUtc::new("%Y-%m-%dT%H:%M:%S".to_string());
 
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
@@ -48,7 +41,8 @@ pub fn setup_tracing_with_settings(settings: LoggingSettings) -> Result {
         .with_file(true)
         .with_line_number(true)
         .with_level(true)
-        .compact();
+        .compact()
+        .with_timer(time_format.clone());
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
@@ -58,10 +52,11 @@ pub fn setup_tracing_with_settings(settings: LoggingSettings) -> Result {
         .with_file(true)
         .with_line_number(true)
         .with_level(true)
-        .compact();
+        .compact()
+        .with_timer(time_format);
 
     let default_filter = || {
-        let base = settings.level.unwrap_or("info".to_string());
+        let base = settings.level.unwrap_or("info");
         EnvFilter::new(format!(
             "linggen_agent={level},linggen-agent={level},linggen={level},\
              axum=warn,tower_http=warn,hyper=warn,hyper_util=warn,reqwest=warn,\
@@ -70,9 +65,16 @@ pub fn setup_tracing_with_settings(settings: LoggingSettings) -> Result {
         ))
     };
 
-    let filter = if settings.level.is_some() {
-        default_filter()
+    // When level is explicitly set, override RUST_LOG; otherwise, use RUST_LOG first, then default
+    let filter = if let Some(level) = settings.level {
+        EnvFilter::try_new(format!(
+            "linggen_agent={level},linggen-agent={level},linggen={level},\
+             axum=warn,tower_http=warn,hyper=warn,hyper_util=warn,reqwest=warn,\
+             mio=warn,reqwest_retry=warn"
+        ))
+        .unwrap_or_else(|_| default_filter())
     } else {
+        // When no explicit level, try RUST_LOG env var first, then default
         match EnvFilter::try_from_default_env() {
             Ok(env_filter) => env_filter,
             Err(_) => default_filter(),
@@ -88,7 +90,7 @@ pub fn setup_tracing_with_settings(settings: LoggingSettings) -> Result {
     Ok(log_dir)
 }
 
-fn resolve_log_dir(configured: Option) -> Result {
+fn resolve_log_dir(configured: Option<&str>) -> Result<PathBuf> {
     let base = dirs::data_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
         .ok_or_else(|| anyhow!("Could not find data directory"))?;
@@ -110,7 +112,7 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn cleanup_old_logs(log_dir: &PathBuf, retention_days: u64) -> Result {
+fn cleanup_old_logs(log_dir: &PathBuf, retention_days: u64) -> Result<()> {
     let now = SystemTime::now();
     let max_age = Duration::from_secs(60 * 60 * 24 * retention_days);
     for entry in std::fs::read_dir(log_dir)? {
@@ -129,7 +131,6 @@ fn cleanup_old_logs(log_dir: &PathBuf, retention_days: u64) -> Result {
             Some(v) => v,
             None => continue,
         };
-        // Match log files by prefix, handling both compressed and uncompressed files
         if !file_name.starts_with(LOG_FILE_PREFIX) {
             continue;
         }
@@ -147,7 +148,8 @@ fn cleanup_old_logs(log_dir: &PathBuf, retention_days: u64) -> Result {
                 continue;
             }
         };
-        if age > max_age {
+        // Use >= to remove files exactly at retention age
+        if age >= max_age {
             if let Err(e) = std::fs::remove_file(&path) {
                 eprintln!("Failed to remove old log file {:?}: {e}", path);
             }

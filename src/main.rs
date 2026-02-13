@@ -76,12 +76,17 @@ enum Command {
 async fn main() -> Result<()> {
     let (config, config_path) =
         Config::load_with_path().unwrap_or_else(|_| (Config::default(), None));
-    let log_dir = logging::setup_tracing_with_settings(logging::LoggingSettings {
+    let log_dir = match logging::setup_tracing_with_settings(logging::LoggingSettings {
         level: config.logging.level.as_deref(),
         directory: config.logging.directory.as_deref(),
-        rotation: config.logging.rotation.as_deref(),
         retention_days: config.logging.retention_days,
-    });
+    }) {
+        Ok(path) => Some(path),
+        Err(err) => {
+            eprintln!("Failed to initialize logging: {err}");
+            None
+        }
+    };
     let cli = Cli::parse();
 
     match cli.cmd {

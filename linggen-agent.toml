@@ -22,8 +22,7 @@ prompt_loop_breaker = "You are repeatedly calling '{}' with the same arguments a
 
 [logging]
 level = "debug"
-rotation = "daily"
-retention_days = 30
+retention_days = 7
 
 [[agents]]
 id = "lead"

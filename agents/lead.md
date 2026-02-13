@@ -56,6 +56,12 @@ PromptMode: chat (tool call)
 
 {"type":"tool","tool":"delegate_to_agent","args":{"target_agent_id":"search","task":"Find where keep_alive is configured/used and report file+line references."}}
 
+PromptMode: chat (tool calls by tool)
+
+{"type":"tool","tool":"get_repo_info","args":{}}
+{"type":"tool","tool":"Read","args":{"path":"README.md","max_bytes":4000}}
+{"type":"tool","tool":"delegate_to_agent","args":{"target_agent_id":"plan","task":"Create a 4-step implementation plan with risks and validation checks for the current task."}}
+
 PromptMode: structured
 
 {"type":"finalize_task","packet":{"title":"TASK_TITLE","user_stories":["STORY_1"],"acceptance_criteria":["CRITERIA_1"],"mermaid_wireframe":"GRAPH_OR_NULL"}}

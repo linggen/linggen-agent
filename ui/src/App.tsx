@@ -26,6 +26,8 @@ import type {
 
 const SELECTED_AGENT_STORAGE_KEY = 'linggen-agent:selected-agent';
 const LIVE_MESSAGE_GRACE_MS = 10_000;
+const TOKEN_RATE_WINDOW_MS = 8_000;
+const TOKEN_RATE_IDLE_RESET_MS = 10_000;
 
 type ToolCallMeta = {
   tool: string;
@@ -91,16 +93,69 @@ const parseToolCallFromText = (text: string): ToolCallMeta | null => {
 const TOOL_JSON_EMBEDDED_RE = /\{"type":"tool","tool":"([^"]+)","args":\{[\s\S]*?\}\}/g;
 const TOOL_RESULT_LINE_RE = /^(Tool\s+[A-Za-z0-9_.:-]+\s*:|tool_error:|tool_not_allowed:)/i;
 
-const statusLineForTool = (toolName?: string) => {
-  const name = (toolName || '').trim().toLowerCase();
-  if (name === 'read') return 'Reading file...';
-  if (name === 'write') return 'Writing file...';
-  if (name === 'bash') return 'Running command...';
-  if (name === 'grep') return 'Searching...';
-  if (name === 'glob') return 'Listing files...';
-  if (name === 'delegate_to_agent') return 'Delegating...';
+const activityKind = (line?: string): string => {
+  const t = String(line || '').trim().toLowerCase();
+  if (!t) return '';
+  if (t === 'reading file...' || t.startsWith('reading file:') || t.startsWith('read ')) return 'read';
+  if (t === 'writing file...' || t.startsWith('writing file:') || t.startsWith('wrote ')) return 'write';
+  if (t === 'running command...' || t.startsWith('running command:') || t.startsWith('ran command')) return 'bash';
+  if (t === 'searching...' || t.startsWith('searching:') || t.startsWith('searched for ')) return 'grep';
+  if (t === 'listing files...' || t.startsWith('listing files:') || t.startsWith('listed files')) return 'glob';
+  if (t === 'delegating...' || t.startsWith('delegating to subagent:') || t.startsWith('delegated to ')) return 'delegate_to_agent';
+  if (t === 'calling tool...' || t.startsWith('calling tool:')) return 'calling_tool';
+  return '';
+};
+
+const isGenericActivityLine = (line?: string): boolean => {
+  const t = String(line || '').trim().toLowerCase();
+  return (
+    t === 'reading file...' ||
+    t === 'writing file...' ||
+    t === 'running command...' ||
+    t === 'searching...' ||
+    t === 'listing files...' ||
+    t === 'delegating...' ||
+    t === 'calling tool...'
+  );
+};
+
+const statusLineForToolCall = (toolCall?: ToolCallMeta | null) => {
+  const name = (toolCall?.tool || '').trim().toLowerCase();
+  const args = toolCall?.args;
+  if (name === 'read') {
+    const path = firstStringArg(args, ['path', 'file', 'filepath']);
+    return path ? `Reading file: ${previewText(path.split(/[/\\]/).pop() || path, 140)}` : 'Reading file...';
+  }
+  if (name === 'write') {
+    const path = firstStringArg(args, ['path', 'file', 'filepath']);
+    return path ? `Writing file: ${previewText(path.split(/[/\\]/).pop() || path, 140)}` : 'Writing file...';
+  }
+  if (name === 'bash') {
+    const cmd = firstStringArg(args, ['cmd', 'command']);
+    return cmd ? `Running command: ${previewText(cmd, 140)}` : 'Running command...';
+  }
+  if (name === 'grep') {
+    const query = firstStringArg(args, ['query', 'pattern', 'q']);
+    return query ? `Searching: ${previewText(query, 140)}` : 'Searching...';
+  }
+  if (name === 'glob') {
+    const globs = Array.isArray(args?.globs)
+      ? args.globs
+          .filter((v: unknown) => typeof v === 'string')
+          .map((v: string) => v.trim())
+          .filter(Boolean)
+      : [];
+    return globs.length > 0 ? `Listing files: ${previewText(globs.join(', '), 140)}` : 'Listing files...';
+  }
+  if (name === 'delegate_to_agent') {
+    const target = firstStringArg(args, ['target_agent_id']);
+    return target ? `Delegating to subagent: ${target}` : 'Delegating...';
+  }
   return name ? `Calling tool: ${name}` : 'Calling tool...';
 };
+
+const statusLineForTool = (toolName?: string) =>
+  statusLineForToolCall(toolName ? { tool: toolName } : null);
 
 const extractToolNamesFromText = (text: string): string[] => {
   const names: string[] = [];
@@ -161,11 +216,15 @@ const isStatusLineText = (text: string) =>
   text === 'Thinking...' ||
   text === 'Model loading...' ||
   text === 'Reading file...' ||
+  text.startsWith('Reading file:') ||
   text === 'Writing file...' ||
+  text.startsWith('Writing file:') ||
   text === 'Running command...' ||
   text.startsWith('Running command:') ||
   text === 'Searching...' ||
+  text.startsWith('Searching:') ||
   text === 'Listing files...' ||
+  text.startsWith('Listing files:') ||
   text === 'Delegating...' ||
   text.startsWith('Delegating to subagent:') ||
   text === 'Calling tool...' ||
@@ -176,6 +235,12 @@ const roleFromAgentId = (agentId: string): ChatMessage['role'] =>
 
 const previewText = (value: string, maxChars = 120) =>
   value.length <= maxChars ? value : `${value.slice(0, maxChars)}...`;
+
+const estimateTokensForChunk = (text?: string) => {
+  const chars = String(text || '').length;
+  if (chars <= 0) return 0;
+  return Math.max(1, Math.floor((chars + 3) / 4));
+};
 
 const normalizeMessageTextForDedup = (text: string) =>
   (text || '').replace(/\s+/g, ' ').trim();
@@ -195,11 +260,13 @@ const formatCompletedToolLine = (call?: ToolCallMeta): string | null => {
   const args = call.args;
   if (tool === 'read') {
     const path = firstStringArg(args, ['path', 'file', 'filepath']);
-    return path ? `Read ${path}` : 'Read file';
+    const file = path ? path.split(/[/\\]/).pop() || path : '';
+    return file ? `Read file: ${file}` : 'Read file';
   }
   if (tool === 'write') {
     const path = firstStringArg(args, ['path', 'file', 'filepath']);
-    return path ? `Wrote ${path}` : 'Wrote file';
+    const file = path ? path.split(/[/\\]/).pop() || path : '';
+    return file ? `Wrote file: ${file}` : 'Wrote file';
   }
   if (tool === 'grep') {
     const query = firstStringArg(args, ['query', 'pattern', 'q']);
@@ -209,7 +276,7 @@ const formatCompletedToolLine = (call?: ToolCallMeta): string | null => {
     const globs = Array.isArray(args?.globs)
       ? args.globs.filter((v: unknown) => typeof v === 'string').map((v: string) => v.trim()).filter(Boolean)
       : [];
-    if (globs.length > 0) return `Listed files in ${previewText(globs.join(', '), 110)}`;
+    if (globs.length > 0) return `Listed files: ${previewText(globs.join(', '), 110)}`;
     return 'Listed files in .';
   }
   if (tool === 'bash') {
@@ -260,8 +327,31 @@ const addActivityEntry = (msg: ChatMessage, entry: string): ChatMessage => {
   const clean = entry.trim();
   if (!clean) return msg;
   const entries = msg.activityEntries ? [...msg.activityEntries] : [];
-  if (entries.length === 0 || entries[entries.length - 1] !== clean) {
+  if (entries.length === 0) {
     entries.push(clean);
+  } else {
+    const last = entries[entries.length - 1];
+    if (last !== clean) {
+      const lastKind = activityKind(last);
+      const nextKind = activityKind(clean);
+      if (
+        lastKind &&
+        lastKind === nextKind &&
+        isGenericActivityLine(last) &&
+        !isGenericActivityLine(clean)
+      ) {
+        entries[entries.length - 1] = clean;
+      } else if (
+        lastKind &&
+        lastKind === nextKind &&
+        !isGenericActivityLine(last) &&
+        isGenericActivityLine(clean)
+      ) {
+        // Keep richer detail, drop regressive generic line.
+      } else {
+        entries.push(clean);
+      }
+    }
   }
   return {
     ...msg,
@@ -508,6 +598,12 @@ const App: React.FC = () => {
   const lastSseSeqRef = useRef(0);
   const lastAgentStatusRef = useRef<Record<string, string>>({});
   const pendingToolByAgentRef = useRef<Record<string, ToolCallMeta>>({});
+  const tokenRateSamplesRef = useRef<Array<{ ts: number; tokens: number }>>([]);
+  const lastTokenAtRef = useRef<number>(0);
+  const lastAgentCharsRef = useRef<number>(0);
+  const lastAgentCharsTsRef = useRef<number>(0);
+  const hadGeneratingRef = useRef<boolean>(false);
+  const [tokensPerSec, setTokensPerSec] = useState<number>(0);
   const mainAgents = useMemo(() => {
     const mains = agents.filter((agent) => (agent.kind || 'main') !== 'subagent');
     return mains.length > 0 ? mains : agents;
@@ -616,6 +712,31 @@ const App: React.FC = () => {
     setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
   }, []);
 
+  const recomputeTokenRate = useCallback((nowMs?: number) => {
+    const now = nowMs ?? Date.now();
+    const cutoff = now - TOKEN_RATE_WINDOW_MS;
+    const pruned = tokenRateSamplesRef.current.filter((sample) => sample.ts >= cutoff);
+    tokenRateSamplesRef.current = pruned;
+    if (pruned.length === 0) {
+      setTokensPerSec(0);
+      return;
+    }
+    const totalTokens = pruned.reduce((sum, sample) => sum + sample.tokens, 0);
+    const oldestTs = pruned[0]?.ts ?? now;
+    const elapsedSec = Math.max((now - oldestTs) / 1000, 0.25);
+    const rate = totalTokens / elapsedSec;
+    setTokensPerSec(Number.isFinite(rate) ? rate : 0);
+  }, []);
+
+  const recordTokenSample = useCallback((chunk: string) => {
+    const tokens = estimateTokensForChunk(chunk);
+    if (tokens <= 0) return;
+    const now = Date.now();
+    tokenRateSamplesRef.current.push({ ts: now, tokens });
+    lastTokenAtRef.current = now;
+    recomputeTokenRate(now);
+  }, [recomputeTokenRate]);
+
   const [agentContext, setAgentContext] = useState<Record<string, { tokens: number; messages: number; tokenLimit?: number }>>({});
 
   const shouldHideInternalChatMessage = useCallback((from?: string, text?: string) => {
@@ -719,6 +840,53 @@ const App: React.FC = () => {
     }
     lastChatCountRef.current = chatMessages.length;
   }, [chatMessages.length]);
+
+  useEffect(() => {
+    const now = Date.now();
+    const agentChars = chatMessages.reduce((sum, msg) => {
+      const from = msg.from || msg.role;
+      if (from === 'user') return sum;
+      return sum + String(msg.text || '').length;
+    }, 0);
+    const hasGeneratingAgent = chatMessages.some((msg) => {
+      const from = msg.from || msg.role;
+      return from !== 'user' && !!msg.isGenerating;
+    });
+
+    if (lastAgentCharsTsRef.current > 0) {
+      const deltaChars = agentChars - lastAgentCharsRef.current;
+      const elapsedMs = now - lastAgentCharsTsRef.current;
+      const noRecentTokenEvents = now - lastTokenAtRef.current > 1_200;
+      if (
+        noRecentTokenEvents &&
+        deltaChars > 0 &&
+        elapsedMs > 0 &&
+        (hasGeneratingAgent || hadGeneratingRef.current)
+      ) {
+        const tokens = Math.max(1, Math.floor((deltaChars + 3) / 4));
+        tokenRateSamplesRef.current.push({ ts: now, tokens });
+        lastTokenAtRef.current = now;
+        recomputeTokenRate(now);
+      }
+    }
+
+    lastAgentCharsRef.current = agentChars;
+    lastAgentCharsTsRef.current = now;
+    hadGeneratingRef.current = hasGeneratingAgent;
+  }, [chatMessages, recomputeTokenRate]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      if (lastTokenAtRef.current === 0 || now - lastTokenAtRef.current > TOKEN_RATE_IDLE_RESET_MS) {
+        tokenRateSamplesRef.current = [];
+        setTokensPerSec(0);
+        return;
+      }
+      recomputeTokenRate(now);
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [recomputeTokenRate]);
 
   const fetchProjects = useCallback(async () => {
     try {
@@ -1115,6 +1283,7 @@ const App: React.FC = () => {
           fetchAgentRuns();
         } else if (event.type === 'AgentStatus') {
           const lifecycle = typeof event.lifecycle === 'string' ? event.lifecycle.trim().toLowerCase() : '';
+          const statusDetail = typeof event.detail === 'string' ? event.detail.trim() : '';
           const nextStatus: 'idle' | 'model_loading' | 'thinking' | 'calling_tool' | 'working' =
             event.status === 'calling_tool'
               ? 'calling_tool'
@@ -1128,7 +1297,7 @@ const App: React.FC = () => {
           const prevStatus = lastAgentStatusRef.current[event.agent_id] || 'idle';
           if (lifecycle === 'done') {
             if (nextStatus === 'calling_tool') {
-              const completed = formatCompletedToolLine(pendingToolByAgentRef.current[event.agent_id]);
+              const completed = statusDetail || formatCompletedToolLine(pendingToolByAgentRef.current[event.agent_id]);
               if (completed) {
                 setChatMessages((prev) => appendGeneratingActivity(prev, event.agent_id, completed));
               }
@@ -1138,6 +1307,9 @@ const App: React.FC = () => {
           }
 
           if (nextStatus === 'calling_tool') {
+            if (statusDetail) {
+              setChatMessages((prev) => appendGeneratingActivity(prev, event.agent_id, statusDetail));
+            }
             const tool = normalizeToolStatusDetail(event.detail);
             if (tool) {
               pendingToolByAgentRef.current[event.agent_id] = pendingToolByAgentRef.current[event.agent_id] || { tool };
@@ -1156,8 +1328,8 @@ const App: React.FC = () => {
           setAgentStatusText((prev) => ({
             ...prev,
             [event.agent_id]:
-              typeof event.detail === 'string' && event.detail.trim().length > 0
-                ? event.detail
+              statusDetail.length > 0
+                ? statusDetail
                 : nextStatus === 'calling_tool'
                   ? 'Calling Tool'
                   : nextStatus === 'model_loading'
@@ -1168,16 +1340,10 @@ const App: React.FC = () => {
                       ? 'Working'
                       : 'Idle',
           }));
-          if (nextStatus === 'model_loading' || nextStatus === 'thinking' || nextStatus === 'calling_tool') {
-            const toolName = normalizeToolStatusDetail(event.detail);
-            const placeholder =
-              nextStatus === 'calling_tool'
-                ? statusLineForTool(toolName || '')
-                : nextStatus === 'model_loading'
-                  ? 'Model loading...'
-                  : 'Thinking...';
+          if (nextStatus === 'model_loading' || nextStatus === 'thinking') {
+            const placeholder = nextStatus === 'model_loading' ? 'Model loading...' : 'Thinking...';
             setChatMessages((prev) =>
-              upsertGeneratingAgentMessage(prev, event.agent_id, placeholder, placeholder)
+              upsertGeneratingAgentMessage(prev, event.agent_id, placeholder)
             );
           } else if (nextStatus === 'idle') {
             setChatMessages((prev) => {
@@ -1218,6 +1384,7 @@ const App: React.FC = () => {
             setQueuedMessages(event.items || []);
           }
         } else if (event.type === 'Token') {
+          recordTokenSample(String(event.token || ''));
           setChatMessages(prev => {
             const idx = findLastGeneratingMessageIndex(prev, event.agent_id);
             const now = new Date();
@@ -1236,9 +1403,6 @@ const App: React.FC = () => {
                 timestampMs: now.getTime(),
                 isGenerating: true,
               };
-              if (rawToolName) {
-                nextMsg = addActivityEntry(nextMsg, `Calling tool: ${rawToolName}`);
-              }
               next[idx] = {
                 ...nextMsg,
               };
@@ -1249,18 +1413,15 @@ const App: React.FC = () => {
             const clean = rawToolName ? stripToolPayloadLines(event.token) : event.token;
             return [
               ...prev,
-              addActivityEntry(
-                {
-                  role: roleFromAgentId(event.agent_id),
-                  from: event.agent_id,
-                  to: 'user',
-                  text: clean || 'Thinking...',
-                  timestamp: now.toLocaleTimeString(),
-                  timestampMs: now.getTime(),
-                  isGenerating: true,
-                },
-                rawToolName ? `Calling tool: ${rawToolName}` : 'Thinking...'
-              ),
+              {
+                role: roleFromAgentId(event.agent_id),
+                from: event.agent_id,
+                to: 'user',
+                text: clean || 'Thinking...',
+                timestamp: now.toLocaleTimeString(),
+                timestampMs: now.getTime(),
+                isGenerating: true,
+              },
             ];
           });
         } else if (event.type === 'Message') {
@@ -1271,13 +1432,6 @@ const App: React.FC = () => {
             if (toolCall) {
               pendingToolByAgentRef.current[event.from] = toolCall;
             }
-            setChatMessages((prev) => {
-              let next = prev;
-              for (const name of toolNames) {
-                next = appendGeneratingActivity(next, event.from, statusLineForTool(name));
-              }
-              return next;
-            });
             if (!stripToolPayloadLines(content)) {
               return;
             }
@@ -1290,6 +1444,10 @@ const App: React.FC = () => {
               ? content
               : stripToolPayloadLines(content);
           if (event.from !== 'user' && !cleanedContent) {
+            return;
+          }
+          if (event.from !== 'user' && isStatusLineText(cleanedContent)) {
+            setChatMessages((prev) => appendGeneratingActivity(prev, event.from, cleanedContent));
             return;
           }
           setChatMessages(prev => {
@@ -1353,7 +1511,7 @@ const App: React.FC = () => {
     };
 
     return () => events.close();
-  }, [currentPath, selectedProjectRoot, activeSessionId, fetchWorkspaceState, fetchFiles, fetchAllAgentTrees, fetchAgentRuns, shouldHideInternalChatMessage]);
+  }, [currentPath, selectedProjectRoot, activeSessionId, fetchWorkspaceState, fetchFiles, fetchAllAgentTrees, fetchAgentRuns, shouldHideInternalChatMessage, recordTokenSample]);
 
   const sendChatMessage = async (userMessage: string, targetAgent?: string) => {
     if (!userMessage.trim() || !selectedProjectRoot) return;
@@ -1602,7 +1760,12 @@ const App: React.FC = () => {
             agentRunSummary={agentRunSummary}
             agentContext={agentContext}
           />
-          <ModelsCard models={models} ollamaStatus={ollamaStatus} chatMessages={chatMessages} />
+          <ModelsCard
+            models={models}
+            ollamaStatus={ollamaStatus}
+            chatMessages={chatMessages}
+            tokensPerSec={tokensPerSec}
+          />
         </aside>
       </div>
 

@@ -32,6 +32,17 @@ pub(crate) fn sanitize_tool_args_for_display(
                     serde_json::json!(format!("<omitted:{} bytes, {} lines>", bytes, lines)),
                 );
             }
+        } else if matches!(tool, "Edit") {
+            for key in ["old_string", "new_string", "old", "new", "old_text", "new_text", "oldText", "newText", "search", "replace", "from", "to"] {
+                if let Some(content) = obj.get(key).and_then(|v| v.as_str()) {
+                    let bytes = content.len();
+                    let lines = content.lines().count();
+                    obj.insert(
+                        key.to_string(),
+                        serde_json::json!(format!("<omitted:{} bytes, {} lines>", bytes, lines)),
+                    );
+                }
+            }
         }
     }
     safe
@@ -80,6 +91,22 @@ fn parse_tool_call_from_json_line(line: &str) -> Option<ToolCallForUi> {
     None
 }
 
+fn parse_tool_name_from_result_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("tool ") {
+        return None;
+    }
+    let rest = trimmed.get(5..)?.trim();
+    let (name, _) = rest.split_once(':')?;
+    let clean = name.trim();
+    if clean.is_empty() {
+        None
+    } else {
+        Some(clean.to_string())
+    }
+}
+
 fn preview_value(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         value.to_string()
@@ -89,62 +116,162 @@ fn preview_value(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn basename(value: &str) -> String {
+    let normalized = value.trim().replace('\\', "/");
+    normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .last()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| normalized.to_string())
+}
+
+fn first_string_arg(args: Option<&serde_json::Value>, keys: &[&str]) -> Option<String> {
+    let obj = args.and_then(|v| v.as_object())?;
+    for key in keys {
+        if let Some(value) = obj.get(*key).and_then(|v| v.as_str()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolStatusPhase {
+    Start,
+    Done,
+    Failed,
+}
+
+pub(crate) fn tool_status_line(
+    tool: &str,
+    args: Option<&serde_json::Value>,
+    phase: ToolStatusPhase,
+) -> String {
+    let name = tool.trim().to_lowercase();
+    let read_path = first_string_arg(args, &["path", "file", "filepath"])
+        .map(|path| preview_value(&basename(&path), 140));
+    let bash_cmd = first_string_arg(args, &["cmd", "command"]).map(|cmd| preview_value(&cmd, 140));
+    let grep_query =
+        first_string_arg(args, &["query", "pattern", "q"]).map(|query| preview_value(&query, 140));
+    let delegate_target = first_string_arg(args, &["target_agent_id"]);
+    let glob_preview = args
+        .and_then(|v| v.get("globs"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_str())
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .map(|values| preview_value(&values.join(", "), 140));
+
+    match name.as_str() {
+        "read" => match phase {
+            ToolStatusPhase::Start => read_path
+                .map(|path| format!("Reading file: {path}"))
+                .unwrap_or_else(|| "Reading file...".to_string()),
+            ToolStatusPhase::Done => read_path
+                .map(|path| format!("Read file: {path}"))
+                .unwrap_or_else(|| "Read file".to_string()),
+            ToolStatusPhase::Failed => read_path
+                .map(|path| format!("Read failed: {path}"))
+                .unwrap_or_else(|| "Read failed".to_string()),
+        },
+        "write" => match phase {
+            ToolStatusPhase::Start => read_path
+                .map(|path| format!("Writing file: {path}"))
+                .unwrap_or_else(|| "Writing file...".to_string()),
+            ToolStatusPhase::Done => read_path
+                .map(|path| format!("Wrote file: {path}"))
+                .unwrap_or_else(|| "Wrote file".to_string()),
+            ToolStatusPhase::Failed => read_path
+                .map(|path| format!("Write failed: {path}"))
+                .unwrap_or_else(|| "Write failed".to_string()),
+        },
+        "edit" => match phase {
+            ToolStatusPhase::Start => read_path
+                .map(|path| format!("Editing file: {path}"))
+                .unwrap_or_else(|| "Editing file...".to_string()),
+            ToolStatusPhase::Done => read_path
+                .map(|path| format!("Edited file: {path}"))
+                .unwrap_or_else(|| "Edited file".to_string()),
+            ToolStatusPhase::Failed => read_path
+                .map(|path| format!("Edit failed: {path}"))
+                .unwrap_or_else(|| "Edit failed".to_string()),
+        },
+        "bash" => match phase {
+            ToolStatusPhase::Start => bash_cmd
+                .map(|cmd| format!("Running command: {cmd}"))
+                .unwrap_or_else(|| "Running command...".to_string()),
+            ToolStatusPhase::Done => bash_cmd
+                .map(|cmd| format!("Ran command: {cmd}"))
+                .unwrap_or_else(|| "Ran command".to_string()),
+            ToolStatusPhase::Failed => bash_cmd
+                .map(|cmd| format!("Command failed: {cmd}"))
+                .unwrap_or_else(|| "Command failed".to_string()),
+        },
+        "grep" => match phase {
+            ToolStatusPhase::Start => grep_query
+                .map(|query| format!("Searching: {query}"))
+                .unwrap_or_else(|| "Searching...".to_string()),
+            ToolStatusPhase::Done => grep_query
+                .map(|query| format!("Searched: {query}"))
+                .unwrap_or_else(|| "Searched".to_string()),
+            ToolStatusPhase::Failed => grep_query
+                .map(|query| format!("Search failed: {query}"))
+                .unwrap_or_else(|| "Search failed".to_string()),
+        },
+        "glob" => match phase {
+            ToolStatusPhase::Start => glob_preview
+                .map(|globs| format!("Listing files: {globs}"))
+                .unwrap_or_else(|| "Listing files...".to_string()),
+            ToolStatusPhase::Done => glob_preview
+                .map(|globs| format!("Listed files: {globs}"))
+                .unwrap_or_else(|| "Listed files".to_string()),
+            ToolStatusPhase::Failed => glob_preview
+                .map(|globs| format!("List files failed: {globs}"))
+                .unwrap_or_else(|| "List files failed".to_string()),
+        },
+        "delegate_to_agent" => match phase {
+            ToolStatusPhase::Start => delegate_target
+                .map(|target| format!("Delegating to subagent: {target}"))
+                .unwrap_or_else(|| "Delegating...".to_string()),
+            ToolStatusPhase::Done => delegate_target
+                .map(|target| format!("Delegated to subagent: {target}"))
+                .unwrap_or_else(|| "Delegated to subagent".to_string()),
+            ToolStatusPhase::Failed => delegate_target
+                .map(|target| format!("Delegation failed: {target}"))
+                .unwrap_or_else(|| "Delegation failed".to_string()),
+        },
+        "" => match phase {
+            ToolStatusPhase::Start => "Calling tool...".to_string(),
+            ToolStatusPhase::Done => "Used tool".to_string(),
+            ToolStatusPhase::Failed => "Tool failed".to_string(),
+        },
+        _ => match phase {
+            ToolStatusPhase::Start => format!("Calling tool: {}", tool.trim()),
+            ToolStatusPhase::Done => format!("Used tool: {}", tool.trim()),
+            ToolStatusPhase::Failed => format!("Tool failed: {}", tool.trim()),
+        },
+    }
+}
+
 fn status_line_for_tool_call(tool_call: Option<&ToolCallForUi>) -> String {
     let Some(tool_call) = tool_call else {
         return "Calling tool...".to_string();
     };
 
-    let name = tool_call.name.trim().to_lowercase();
-    let args = tool_call.args.as_ref();
-    match name.as_str() {
-        "read" => "Reading file...".to_string(),
-        "write" => "Writing file...".to_string(),
-        "bash" => {
-            let cmd = args
-                .and_then(|v| v.get("cmd"))
-                .and_then(|v| v.as_str())
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty());
-            if let Some(cmd) = cmd {
-                format!("Running command: {}", preview_value(cmd, 120))
-            } else {
-                "Running command...".to_string()
-            }
-        }
-        "grep" => "Searching...".to_string(),
-        "glob" => "Listing files...".to_string(),
-        "delegate_to_agent" => {
-            let target = args
-                .and_then(|v| v.get("target_agent_id"))
-                .and_then(|v| v.as_str())
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty());
-            if let Some(target) = target {
-                format!("Delegating to subagent: {target}")
-            } else {
-                "Delegating...".to_string()
-            }
-        }
-        "" => "Calling tool...".to_string(),
-        _ => format!("Calling tool: {}", tool_call.name.trim()),
-    }
-}
-
-fn looks_like_code_line(line: &str) -> bool {
-    let t = line.trim_start();
-    t.starts_with("//")
-        || t.starts_with("use ")
-        || t.starts_with("import ")
-        || t.starts_with("fn ")
-        || t.starts_with("pub ")
-        || t.starts_with("let ")
-        || t.starts_with("const ")
-        || t.starts_with("struct ")
-        || t.starts_with("impl ")
-        || t.starts_with("#include")
-        || t.starts_with('{')
-        || t.starts_with('}')
-        || t.contains("::")
+    tool_status_line(
+        &tool_call.name,
+        tool_call.args.as_ref(),
+        ToolStatusPhase::Start,
+    )
 }
 
 pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<String> {
@@ -156,6 +283,8 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
     let mut saw_tool = false;
     let mut last_tool: Option<ToolCallForUi> = None;
     let mut saw_read_result = false;
+    let mut saw_tool_result_block = false;
+    let mut drop_remainder_as_tool_result = false;
 
     for raw_line in content.lines() {
         let line = raw_line.trim();
@@ -163,6 +292,9 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
             if cleaned_lines.last().map(|v| !v.is_empty()).unwrap_or(false) {
                 cleaned_lines.push(String::new());
             }
+            continue;
+        }
+        if drop_remainder_as_tool_result {
             continue;
         }
 
@@ -180,12 +312,22 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
             || lower.starts_with("tool_not_allowed:")
         {
             saw_tool = true;
-            if lower.starts_with("tool read:") {
-                saw_read_result = true;
+            saw_tool_result_block = true;
+            drop_remainder_as_tool_result = true;
+            if let Some(name) = parse_tool_name_from_result_line(line) {
                 last_tool = Some(ToolCallForUi {
-                    name: "Read".to_string(),
+                    name,
                     args: None,
                 });
+            }
+            if lower.starts_with("tool read:") {
+                saw_read_result = true;
+                if last_tool.is_none() {
+                    last_tool = Some(ToolCallForUi {
+                        name: "Read".to_string(),
+                        args: None,
+                    });
+                }
             }
             continue;
         }
@@ -210,6 +352,11 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
         .replace("\n\n\n", "\n\n")
         .trim()
         .to_string();
+    if saw_tool_result_block {
+        // Tool call status lines are emitted from the call event itself; suppress
+        // tool-result duplicates in chat UI.
+        return None;
+    }
     if cleaned.is_empty() {
         if saw_tool {
             return Some(status_line_for_tool_call(last_tool.as_ref()));

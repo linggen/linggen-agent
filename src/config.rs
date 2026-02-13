@@ -199,7 +199,6 @@ impl Default for WriteSafetyMode {
 pub struct LoggingConfig {
     pub level: Option<String>,
     pub directory: Option<String>,
-    pub rotation: Option<String>,
     pub retention_days: Option<u64>,
 }
 
@@ -253,7 +252,6 @@ impl Default for Config {
             logging: LoggingConfig {
                 level: None,
                 directory: None,
-                rotation: None,
                 retention_days: None,
             },
             agents: Vec::new(),
