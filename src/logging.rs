@@ -5,21 +5,21 @@ use std::time::{Duration, SystemTime};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+static LOG_GUARD: OnceLock = OnceLock::new();
 
 const RETENTION_DAYS: u64 = 30;
 const LOG_FILE_PREFIX: &str = "linggen-agent";
 const ROTATION_DAILY: &str = "daily";
 
-pub struct LoggingSettings<'a> {
-    pub level: Option<&'a str>,
-    pub directory: Option<&'a str>,
-    pub rotation: Option<&'a str>,
-    pub retention_days: Option<u64>,
+pub struct LoggingSettings {
+    pub level: Option,
+    pub directory: Option,
+    pub rotation: Option,
+    pub retention_days: Option,
 }
 
-pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Option<PathBuf> {
-    let log_dir = resolve_log_dir(settings.directory).ok()?;
+pub fn setup_tracing_with_settings(settings: LoggingSettings) -> Result {
+    let log_dir = resolve_log_dir(settings.directory)?;
     let retention_days = settings.retention_days.unwrap_or(RETENTION_DAYS);
     if let Err(e) = cleanup_old_logs(&log_dir, retention_days) {
         eprintln!("Failed to cleanup old logs: {e}");
@@ -32,11 +32,14 @@ pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Option<Path
             rotation, ROTATION_DAILY
         );
     }
-    // Ensure guard is kept alive by not using `let _ =`
+    
+    // Guard is intentionally stored in OnceLock to prevent it from being dropped
+    // If the guard is already set, return an error to prevent silent failures
     let file_appender = tracing_appender::rolling::daily(&log_dir, LOG_FILE_PREFIX);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-    // Guard is intentionally stored in OnceLock to prevent it from being dropped
-    let _ = LOG_GUARD.set(guard);
+    if LOG_GUARD.set(guard).is_err() {
+        return Err(anyhow!("Logging already initialized. Cannot setup logging multiple times."));
+    }
 
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
@@ -58,7 +61,7 @@ pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Option<Path
         .compact();
 
     let default_filter = || {
-        let base = settings.level.unwrap_or("info");
+        let base = settings.level.unwrap_or("info".to_string());
         EnvFilter::new(format!(
             "linggen_agent={level},linggen-agent={level},linggen={level},\
              axum=warn,tower_http=warn,hyper=warn,hyper_util=warn,reqwest=warn,\
@@ -82,10 +85,10 @@ pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Option<Path
         .with(file_layer)
         .try_init();
 
-    Some(log_dir)
+    Ok(log_dir)
 }
 
-fn resolve_log_dir(configured: Option<&str>) -> Result<PathBuf> {
+fn resolve_log_dir(configured: Option) -> Result {
     let base = dirs::data_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
         .ok_or_else(|| anyhow!("Could not find data directory"))?;
@@ -107,7 +110,7 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn cleanup_old_logs(log_dir: &PathBuf, retention_days: u64) -> Result<()> {
+fn cleanup_old_logs(log_dir: &PathBuf, retention_days: u64) -> Result {
     let now = SystemTime::now();
     let max_age = Duration::from_secs(60 * 60 * 24 * retention_days);
     for entry in std::fs::read_dir(log_dir)? {
@@ -126,6 +129,7 @@ fn cleanup_old_logs(log_dir: &PathBuf, retention_days: u64) -> Result<()> {
             Some(v) => v,
             None => continue,
         };
+        // Match log files by prefix, handling both compressed and uncompressed files
         if !file_name.starts_with(LOG_FILE_PREFIX) {
             continue;
         }

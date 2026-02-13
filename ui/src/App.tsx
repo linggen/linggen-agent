@@ -1,11 +1,12 @@
 import React, { useCallback, useMemo, useState, useEffect, useRef } from 'react';
-import { Activity, Folder, RefreshCw, Trash2 } from 'lucide-react';
+import { Activity, FilePenLine, Folder, RefreshCw, Trash2 } from 'lucide-react';
 import { AgentTree } from './components/AgentTree';
 import { AgentsCard } from './components/AgentsCard';
 import { ModelsCard } from './components/ModelsCard';
 import { FilePreview } from './components/FilePreview';
 import { ChatPanel } from './components/ChatPanel';
 import { HeaderBar } from './components/HeaderBar';
+import { AgentSpecEditorModal } from './components/AgentSpecEditorModal';
 import type {
   AgentInfo,
   AgentTreeItem,
@@ -13,7 +14,7 @@ import type {
   AgentRunSummary,
   AgentWorkInfo,
   ChatMessage,
-  LeadState,
+  WorkspaceState,
   ModelInfo,
   OllamaPsResponse,
   ProjectInfo,
@@ -92,12 +93,11 @@ const TOOL_RESULT_LINE_RE = /^(Tool\s+[A-Za-z0-9_.:-]+\s*:|tool_error:|tool_not_
 
 const statusLineForTool = (toolName?: string) => {
   const name = (toolName || '').trim().toLowerCase();
-  if (name === 'read_file' || name === 'read') return 'Reading file...';
-  if (name === 'write_file' || name === 'write') return 'Writing file...';
-  if (name === 'run_command' || name === 'bash') return 'Running command...';
-  if (name === 'search_rg' || name === 'grep' || name === 'smart_search' || name === 'find_file')
-    return 'Searching...';
-  if (name === 'list_files' || name === 'glob') return 'Listing files...';
+  if (name === 'read') return 'Reading file...';
+  if (name === 'write') return 'Writing file...';
+  if (name === 'bash') return 'Running command...';
+  if (name === 'grep') return 'Searching...';
+  if (name === 'glob') return 'Listing files...';
   if (name === 'delegate_to_agent') return 'Delegating...';
   return name ? `Calling tool: ${name}` : 'Calling tool...';
 };
@@ -172,10 +172,13 @@ const isStatusLineText = (text: string) =>
   text.startsWith('Calling tool:');
 
 const roleFromAgentId = (agentId: string): ChatMessage['role'] =>
-  agentId === 'lead' ? 'lead' : agentId === 'coder' ? 'coder' : 'agent';
+  agentId === 'user' ? 'user' : 'agent';
 
 const previewText = (value: string, maxChars = 120) =>
   value.length <= maxChars ? value : `${value.slice(0, maxChars)}...`;
+
+const normalizeMessageTextForDedup = (text: string) =>
+  (text || '').replace(/\s+/g, ' ').trim();
 
 const firstStringArg = (args: any, keys: string[]) => {
   if (!args || typeof args !== 'object') return '';
@@ -190,26 +193,26 @@ const formatCompletedToolLine = (call?: ToolCallMeta): string | null => {
   if (!call || !call.tool) return null;
   const tool = call.tool.trim().toLowerCase();
   const args = call.args;
-  if (tool === 'read_file' || tool === 'read') {
+  if (tool === 'read') {
     const path = firstStringArg(args, ['path', 'file', 'filepath']);
     return path ? `Read ${path}` : 'Read file';
   }
-  if (tool === 'write_file' || tool === 'write') {
+  if (tool === 'write') {
     const path = firstStringArg(args, ['path', 'file', 'filepath']);
     return path ? `Wrote ${path}` : 'Wrote file';
   }
-  if (tool === 'search_rg' || tool === 'grep' || tool === 'smart_search' || tool === 'find_file') {
+  if (tool === 'grep') {
     const query = firstStringArg(args, ['query', 'pattern', 'q']);
     return query ? `Searched for ${previewText(query, 110)}` : 'Searched';
   }
-  if (tool === 'list_files' || tool === 'glob') {
+  if (tool === 'glob') {
     const globs = Array.isArray(args?.globs)
       ? args.globs.filter((v: unknown) => typeof v === 'string').map((v: string) => v.trim()).filter(Boolean)
       : [];
     if (globs.length > 0) return `Listed files in ${previewText(globs.join(', '), 110)}`;
     return 'Listed files in .';
   }
-  if (tool === 'run_command' || tool === 'bash') {
+  if (tool === 'bash') {
     const cmd = firstStringArg(args, ['cmd', 'command']);
     return cmd ? `Ran command: ${previewText(cmd, 110)}` : 'Ran command';
   }
@@ -229,9 +232,9 @@ const summarizeActivityEntries = (entries: string[], inProgress = false): string
   const uniqueTools = Array.from(new Set(tools));
   const phases = entries.filter((line) => !/^Calling tool:/i.test(line));
   const normalized = entries.map((line) => line.toLowerCase());
-  const readCount = normalized.filter((v) => v.startsWith('read ') || v.includes('reading file') || v.includes('read_file')).length;
-  const searchCount = normalized.filter((v) => v.startsWith('searched for ') || v.includes('searching') || v.includes('search_rg') || v.includes('grep') || v.includes('smart_search') || v.includes('find_file')).length;
-  const listCount = normalized.filter((v) => v.startsWith('listed files') || v.includes('listing files') || v.includes('list_files') || v.includes('glob')).length;
+  const readCount = normalized.filter((v) => v.startsWith('read ') || v.includes('reading file')).length;
+  const searchCount = normalized.filter((v) => v.startsWith('searched for ') || v.includes('searching') || v.includes('grep')).length;
+  const listCount = normalized.filter((v) => v.startsWith('listed files') || v.includes('listing files') || v.includes('glob')).length;
   if (readCount > 0 || searchCount > 0 || listCount > 0) {
     const parts: string[] = [];
     if (readCount > 0) parts.push(`${readCount} file${readCount > 1 ? 's' : ''}`);
@@ -479,9 +482,9 @@ const App: React.FC = () => {
   const [, setLogs] = useState<string[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [selectedAgent, setSelectedAgent] = useState<string>(() => {
-    if (typeof window === 'undefined') return 'lead';
+    if (typeof window === 'undefined') return '';
     const stored = window.localStorage.getItem(SELECTED_AGENT_STORAGE_KEY);
-    return stored || 'lead';
+    return stored || '';
   });
   const [currentMode, setCurrentMode] = useState<'chat' | 'auto'>('auto');
   const [isRunning, _setIsRunning] = useState(false);
@@ -496,8 +499,9 @@ const App: React.FC = () => {
   const [currentPath, setCurrentPath] = useState('');
   const [selectedFileContent, setSelectedFileContent] = useState<string | null>(null);
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
+  const [showAgentSpecEditor, setShowAgentSpecEditor] = useState(false);
   
-  const [leadState, setLeadState] = useState<LeadState | null>(null);
+  const [workspaceState, setWorkspaceState] = useState<WorkspaceState | null>(null);
   
   const chatEndRef = useRef<HTMLDivElement>(null);
   const lastChatCountRef = useRef(0);
@@ -510,7 +514,7 @@ const App: React.FC = () => {
   }, [agents]);
   const mainAgentIds = useMemo(() => {
     const ids = mainAgents.map((agent) => agent.name.toLowerCase());
-    return ids.length > 0 ? ids : ['lead', 'coder'];
+    return ids;
   }, [mainAgents]);
   const agentWork = useMemo(() => buildAgentWorkInfo(agentTree), [agentTree]);
   const subagents = useMemo(
@@ -623,8 +627,8 @@ const App: React.FC = () => {
     // Hide tool results and tool payloads that have no other text
     if ((isToolResult || hasToolPayload) && !stripped) return true;
     
-    // Explicitly hide any message that looks like a raw read_file output if it's from 'system'
-    if (from === 'system' && text.includes('read_file:')) return true;
+    // Explicitly hide any message that looks like a raw Read output if it's from 'system'
+    if (from === 'system' && text.includes('Read:')) return true;
 
     if (from !== 'system') return false;
     return text.startsWith('Starting autonomous loop for task:');
@@ -642,7 +646,11 @@ const App: React.FC = () => {
     const fromB = b.from || b.role;
     const toA = a.to || '';
     const toB = b.to || '';
-    return fromA === fromB && toA === toB && a.text === b.text;
+    return (
+      fromA === fromB &&
+      toA === toB &&
+      normalizeMessageTextForDedup(a.text) === normalizeMessageTextForDedup(b.text)
+    );
   }, []);
 
   const isStructuredAgentMessage = useCallback((msg: ChatMessage) => {
@@ -838,16 +846,16 @@ const App: React.FC = () => {
     setSelectedFileContent(null);
   };
 
-  const fetchLeadState = useCallback(async () => {
+  const fetchWorkspaceState = useCallback(async () => {
     if (!selectedProjectRoot) return;
     try {
-      const url = new URL('/api/lead/state', window.location.origin);
+      const url = new URL('/api/workspace/state', window.location.origin);
       url.searchParams.append('project_root', selectedProjectRoot);
       if (activeSessionId) url.searchParams.append('session_id', activeSessionId);
       
       const resp = await fetch(url.toString());
       const data = await resp.json();
-      setLeadState(data);
+      setWorkspaceState(data);
       
       // Update chat messages from state if needed
       if (data.messages) {
@@ -861,11 +869,7 @@ const App: React.FC = () => {
               role:
                 meta.from === 'user'
                   ? 'user'
-                  : meta.from === 'lead'
-                    ? 'lead'
-                    : meta.from === 'coder'
-                      ? 'coder'
-                      : 'agent',
+                  : 'agent',
               from: meta.from,
               to: meta.to,
               text: cleaned,
@@ -876,7 +880,7 @@ const App: React.FC = () => {
         setChatMessages(prev => mergeChatMessages(msgs, prev));
       }
     } catch (e) {
-      addLog(`Error fetching Lead state: ${e}`);
+      addLog(`Error fetching workspace state: ${e}`);
     }
   }, [selectedProjectRoot, activeSessionId, shouldHideInternalChatMessage, mergeChatMessages, addLog]);
 
@@ -935,15 +939,20 @@ const App: React.FC = () => {
     }
   }, []);
 
-  const fetchAgents = useCallback(async () => {
+  const fetchAgents = useCallback(async (projectRootOverride?: string) => {
+    const root = projectRootOverride || selectedProjectRoot;
+    if (!root) {
+      setAgents([]);
+      return;
+    }
     try {
-      const resp = await fetch('/api/agents');
+      const resp = await fetch(`/api/agents?project_root=${encodeURIComponent(root)}`);
       const data = await resp.json();
       setAgents(data);
     } catch (e) {
       console.error('Failed to fetch agents:', e);
     }
-  }, []);
+  }, [selectedProjectRoot]);
 
   const fetchModels = useCallback(async () => {
     try {
@@ -1003,7 +1012,7 @@ const App: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ run_id: runId }),
       });
-      await Promise.all([fetchAgentRuns(), fetchLeadState(), fetchAllAgentTrees()]);
+      await Promise.all([fetchAgentRuns(), fetchWorkspaceState(), fetchAllAgentTrees()]);
     } catch (e) {
       addLog(`Error cancelling run ${runId}: ${e}`);
     } finally {
@@ -1045,16 +1054,17 @@ const App: React.FC = () => {
   useEffect(() => {
     if (selectedProjectRoot) {
       fetchFiles();
-      fetchLeadState();
+      fetchWorkspaceState();
       fetchAgentTree(selectedProjectRoot);
       fetchAgentRuns();
       fetchSessions();
       fetchSettings();
+      fetchAgents(selectedProjectRoot);
       setAgentStatus({});
       setAgentStatusText({});
       setQueuedMessages([]);
     }
-  }, [selectedProjectRoot, fetchFiles, fetchLeadState, fetchAgentTree, fetchAgentRuns, fetchSessions, fetchSettings]);
+  }, [selectedProjectRoot, fetchFiles, fetchWorkspaceState, fetchAgentTree, fetchAgentRuns, fetchSessions, fetchSettings, fetchAgents]);
 
   useEffect(() => {
     if (projects.length === 0) return;
@@ -1063,20 +1073,20 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (selectedProjectRoot) {
-      fetchLeadState();
+      fetchWorkspaceState();
       fetchAgentRuns();
       setQueuedMessages([]);
     }
-  }, [activeSessionId, selectedProjectRoot, fetchLeadState, fetchAgentRuns]);
+  }, [activeSessionId, selectedProjectRoot, fetchWorkspaceState, fetchAgentRuns]);
 
   useEffect(() => {
     if (!selectedProjectRoot) return;
     const interval = window.setInterval(() => {
-      fetchLeadState();
+      fetchWorkspaceState();
       fetchAgentRuns();
     }, 2000);
     return () => window.clearInterval(interval);
-  }, [selectedProjectRoot, activeSessionId, fetchLeadState, fetchAgentRuns]);
+  }, [selectedProjectRoot, activeSessionId, fetchWorkspaceState, fetchAgentRuns]);
 
   useEffect(() => {
     window.localStorage.setItem(SELECTED_AGENT_STORAGE_KEY, selectedAgent);
@@ -1099,7 +1109,7 @@ const App: React.FC = () => {
           lastSseSeqRef.current = event.seq;
         }
         if (event.type === 'StateUpdated') {
-          fetchLeadState();
+          fetchWorkspaceState();
           fetchFiles(currentPath);
           fetchAllAgentTrees();
           fetchAgentRuns();
@@ -1185,12 +1195,17 @@ const App: React.FC = () => {
           }
           lastAgentStatusRef.current[event.agent_id] = nextStatus;
         } else if (event.type === 'ContextUsage') {
+          const agentIdKey =
+            typeof event.agent_id === 'string' ? event.agent_id.toLowerCase() : event.agent_id;
           setAgentContext((prev) => ({
             ...prev,
-            [event.agent_id]: {
+            [agentIdKey]: {
               tokens: Number(event.estimated_tokens || 0),
               messages: Number(event.message_count || 0),
-              tokenLimit: typeof event.token_limit === 'number' ? Number(event.token_limit) : prev[event.agent_id]?.tokenLimit,
+              tokenLimit:
+                typeof event.token_limit === 'number'
+                  ? Number(event.token_limit)
+                  : prev[agentIdKey]?.tokenLimit,
             },
           }));
         } else if (event.type === 'SettingsUpdated') {
@@ -1298,11 +1313,7 @@ const App: React.FC = () => {
             const role: ChatMessage['role'] =
               event.from === 'user'
                 ? 'user'
-                : event.from === 'lead'
-                  ? 'lead'
-                  : event.from === 'coder'
-                    ? 'coder'
-                    : 'agent';
+                : 'agent';
 
             if (
               prev.some(
@@ -1310,7 +1321,8 @@ const App: React.FC = () => {
                   !msg.isGenerating &&
                   (msg.from || msg.role) === event.from &&
                   (msg.to || '') === (event.to || '') &&
-                  msg.text === cleanedContent
+                  normalizeMessageTextForDedup(msg.text) ===
+                    normalizeMessageTextForDedup(cleanedContent)
               )
             ) {
               return prev;
@@ -1326,26 +1338,27 @@ const App: React.FC = () => {
               isGenerating: false
             }];
           });
-          fetchLeadState();
+          fetchWorkspaceState();
         } else if (event.type === 'Outcome') {
-          fetchLeadState();
+          fetchWorkspaceState();
           fetchAgentRuns();
         }
       } catch (err) {
         // If we ever receive a malformed SSE payload (e.g. due to lag/drop),
         // fall back to a state refresh so tool actions still show up.
         console.error("SSE parse error", err);
-        fetchLeadState();
+        fetchWorkspaceState();
         fetchAgentRuns();
       }
     };
 
     return () => events.close();
-  }, [currentPath, selectedProjectRoot, activeSessionId, fetchLeadState, fetchFiles, fetchAllAgentTrees, fetchAgentRuns, shouldHideInternalChatMessage]);
+  }, [currentPath, selectedProjectRoot, activeSessionId, fetchWorkspaceState, fetchFiles, fetchAllAgentTrees, fetchAgentRuns, shouldHideInternalChatMessage]);
 
   const sendChatMessage = async (userMessage: string, targetAgent?: string) => {
     if (!userMessage.trim() || !selectedProjectRoot) return;
     const agentToUse = targetAgent || selectedAgent;
+    if (!agentToUse) return;
     const now = new Date();
 
     setChatMessages(prev => [
@@ -1375,7 +1388,7 @@ const App: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           project_root: selectedProjectRoot, 
-          agent_id: 'lead', 
+          agent_id: agentToUse, 
           task: story 
         }),
       });
@@ -1420,7 +1433,7 @@ const App: React.FC = () => {
       });
       setChatMessages([]);
       setQueuedMessages([]);
-      fetchLeadState();
+      fetchWorkspaceState();
     } catch (e) {
       addLog(`Error clearing chat: ${e}`);
     }
@@ -1460,11 +1473,12 @@ const App: React.FC = () => {
 
   const refreshPageState = async () => {
     if (!selectedProjectRoot) return;
-    fetchLeadState();
+    fetchWorkspaceState();
     fetchFiles(currentPath);
     fetchAllAgentTrees();
     fetchSessions();
     fetchSettings();
+    fetchAgents(selectedProjectRoot);
   };
 
   return (
@@ -1567,9 +1581,19 @@ const App: React.FC = () => {
 
         {/* Right: Status */}
         <aside className="w-80 border-l border-slate-200 dark:border-white/5 flex flex-col bg-slate-100/40 dark:bg-[#0a0a0a] p-4 gap-4 overflow-y-auto">
+          <div className="bg-white dark:bg-[#141414] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm p-3">
+            <button
+              onClick={() => setShowAgentSpecEditor(true)}
+              disabled={!selectedProjectRoot}
+              className="w-full inline-flex items-center justify-center gap-2 px-3 py-2 text-xs font-semibold rounded-lg border border-slate-200 dark:border-white/10 hover:bg-slate-50 dark:hover:bg-white/5 disabled:opacity-50"
+            >
+              <FilePenLine size={14} />
+              Edit Agent Markdown
+            </button>
+          </div>
           <AgentsCard
             agents={mainAgents}
-            leadState={leadState}
+            workspaceState={workspaceState}
             isRunning={isRunning}
             selectedAgent={selectedAgent}
             agentStatus={agentStatus}
@@ -1583,6 +1607,16 @@ const App: React.FC = () => {
       </div>
 
       <FilePreview selectedFilePath={selectedFilePath} selectedFileContent={selectedFileContent} onClose={closeFilePreview} />
+      <AgentSpecEditorModal
+        open={showAgentSpecEditor}
+        projectRoot={selectedProjectRoot}
+        onClose={() => setShowAgentSpecEditor(false)}
+        onChanged={() => {
+          fetchAgents(selectedProjectRoot);
+          fetchWorkspaceState();
+          fetchAllAgentTrees();
+        }}
+      />
 
       <style>{`
         .custom-scrollbar { scrollbar-gutter: stable; }

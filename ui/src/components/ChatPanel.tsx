@@ -124,6 +124,19 @@ function normalizeMarkdownish(text: string): string {
 }
 
 const normalizeAgentKey = (value?: string) => (value || '').trim().toLowerCase();
+const normalizeMessageTextForDedup = (text?: string) =>
+  (text || '').replace(/\s+/g, ' ').trim();
+
+const hasStrongContentOverlap = (aText: string, bText: string) => {
+  if (!aText || !bText) return false;
+  if (aText === bText) return true;
+  const [shorter, longer] =
+    aText.length <= bText.length ? [aText, bText] : [bText, aText];
+  // Avoid over-merging short generic messages like "yes", "ok", etc.
+  if (shorter.length < 80) return false;
+  if (!longer.includes(shorter)) return false;
+  return shorter.length / longer.length >= 0.45;
+};
 
 const statusBadgeClass = (status?: string) => {
   if (status === 'working') return 'bg-green-500/15 text-green-600 dark:text-green-300';
@@ -136,8 +149,6 @@ const statusBadgeClass = (status?: string) => {
 const roleFromSender = (sender: string): ChatMessage['role'] => {
   const key = normalizeAgentKey(sender);
   if (key === 'user') return 'user';
-  if (key === 'lead') return 'lead';
-  if (key === 'coder') return 'coder';
   return 'agent';
 };
 
@@ -174,11 +185,11 @@ const looksLikeCodeLine = (line: string) =>
 const sanitizeAgentMessageText = (text: string) => {
   if (!text) return '';
   // Optimization: if it's a raw tool result from system, we often want to hide it entirely
-  if (text.startsWith('read_file:') || text.startsWith('Tool read_file:')) return '';
+  if (text.startsWith('Read:') || text.startsWith('Tool Read:')) return '';
   
   const withoutEmbedded = text.replace(TOOL_JSON_EMBEDDED_RE, '').trim();
   const lines = withoutEmbedded.split('\n');
-  const readFileRelated = /read_file|content omitted in chat/i.test(withoutEmbedded);
+  const readFileRelated = /read:|content omitted in chat/i.test(withoutEmbedded);
   const kept: string[] = [];
   for (const line of lines) {
     const trimmed = line.trim();
@@ -216,7 +227,9 @@ const sameMessageIdentity = (a: ChatMessage, b: ChatMessage) => {
   const aTo = normalizeAgentKey(a.to || '');
   const bTo = normalizeAgentKey(b.to || '');
   if (aFrom !== bFrom || aTo !== bTo) return false;
-  if (a.text.trim() !== b.text.trim()) return false;
+  const aText = normalizeMessageTextForDedup(a.text);
+  const bText = normalizeMessageTextForDedup(b.text);
+  if (!hasStrongContentOverlap(aText, bText)) return false;
   const ta = a.timestampMs ?? 0;
   const tb = b.timestampMs ?? 0;
   if (ta <= 0 || tb <= 0) return true;
@@ -274,12 +287,12 @@ const isProgressLineText = (text?: string) => {
 
 const summarizeCollapsedActivity = (entries: string[], inProgress = false) => {
   const normalized = entries.map((entry) => entry.toLowerCase());
-  const readCount = normalized.filter((v) => v.startsWith('read ') || v.includes('reading file') || v.includes('read_file')).length;
-  const searchCount = normalized.filter((v) => v.startsWith('searched for ') || v.includes('searching') || v.includes('search_rg') || v.includes('grep') || v.includes('smart_search') || v.includes('find_file')).length;
+  const readCount = normalized.filter((v) => v.startsWith('read ') || v.includes('reading file')).length;
+  const searchCount = normalized.filter((v) => v.startsWith('searched for ') || v.includes('searching') || v.includes('grep')).length;
   const runCount = normalized.filter((v) => v.startsWith('ran command') || v.includes('running command')).length;
   const delegateCount = normalized.filter((v) => v.startsWith('delegated to ') || v.includes('delegating')).length;
-  const writeCount = normalized.filter((v) => v.startsWith('wrote ') || v.includes('writing file') || v.includes('write_file')).length;
-  const listCount = normalized.filter((v) => v.startsWith('listed files') || v.includes('listing files') || v.includes('list_files') || v.includes('glob')).length;
+  const writeCount = normalized.filter((v) => v.startsWith('wrote ') || v.includes('writing file')).length;
+  const listCount = normalized.filter((v) => v.startsWith('listed files') || v.includes('listing files') || v.includes('glob')).length;
 
   if (readCount > 0 || searchCount > 0 || listCount > 0) {
     const parts: string[] = [];
@@ -458,7 +471,7 @@ const parseToolIntent = (content: string): ToolIntent | null => {
   }
   if (/^Running command:/i.test(trimmed)) {
     const cmd = trimmed.replace(/^Running command:\s*/i, '').trim();
-    return { name: 'run_command', detail: cmd || undefined };
+    return { name: 'Bash', detail: cmd || undefined };
   }
   if (/^Delegating to subagent:/i.test(trimmed)) {
     const target = trimmed.replace(/^Delegating to subagent:\s*/i, '').trim();
@@ -471,7 +484,7 @@ const parseToolIntent = (content: string): ToolIntent | null => {
     const type = typeof parsed.type === 'string' ? parsed.type : '';
     if (type === 'tool') {
       const tool = typeof parsed.tool === 'string' ? parsed.tool : 'tool';
-      if (tool === 'run_command' || tool === 'bash') {
+      if (tool === 'Bash' || tool === 'bash') {
         const cmd = typeof parsed.args?.cmd === 'string' ? parsed.args.cmd.trim() : '';
         return { name: tool, detail: cmd ? previewValue(cmd) : undefined };
       }
@@ -509,7 +522,7 @@ const parseTaskEvent = (content: string): string | null => {
 
 const hasReadFileActivity = (entries?: string[]) =>
   Array.isArray(entries) &&
-  entries.some((entry) => /^Calling tool:\s*read_file\b/i.test(String(entry || '').trim()));
+  entries.some((entry) => /^Calling tool:\s*read\b/i.test(String(entry || '').trim()));
 
 const looksLikeFileDump = (text: string) => {
   const lines = text.split('\n');
@@ -1227,11 +1240,9 @@ export const ChatPanel: React.FC<{
           );
           const messageClass = isUser
             ? 'bg-slate-100 dark:bg-white/10 text-slate-900 dark:text-slate-100 rounded-md px-2.5 py-1.5'
-            : msg.from === 'lead' && msg.to === 'coder'
-              ? 'bg-amber-500/10 text-amber-900 dark:text-amber-200 rounded-md px-2.5 py-1.5'
-              : isStatusLine && !hasActivity
-                ? 'text-blue-700 dark:text-blue-300 italic'
-                : 'text-slate-800 dark:text-slate-200';
+            : isStatusLine && !hasActivity
+              ? 'text-blue-700 dark:text-blue-300 italic'
+              : 'text-slate-800 dark:text-slate-200';
           return (
           <div
             key={key}

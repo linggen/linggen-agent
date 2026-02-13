@@ -1,7 +1,7 @@
 import React from 'react';
-import { User, Bot } from 'lucide-react';
+import { Bot } from 'lucide-react';
 import { cn } from '../lib/cn';
-import type { AgentInfo, AgentRunSummary, AgentWorkInfo, LeadState } from '../types';
+import type { AgentInfo, AgentRunSummary, AgentWorkInfo, WorkspaceState } from '../types';
 
 const formatTime = (ts?: number | null) => {
   if (!ts || ts <= 0) return '-';
@@ -10,7 +10,8 @@ const formatTime = (ts?: number | null) => {
 
 const contextPercent = (tokens: number, tokenLimit?: number) => {
   const limit = tokenLimit && tokenLimit > 0 ? tokenLimit : undefined;
-  if (!limit || !tokens || tokens <= 0) return null;
+  if (!limit) return null;
+  if (!tokens || tokens <= 0) return 0;
   return Math.round((tokens / limit) * 100);
 };
 
@@ -24,7 +25,7 @@ const formatCompactInt = (n: number) => {
 
 export const AgentsCard: React.FC<{
   agents: AgentInfo[];
-  leadState: LeadState | null;
+  workspaceState: WorkspaceState | null;
   isRunning: boolean;
   selectedAgent: string;
   agentStatus?: Record<string, 'idle' | 'model_loading' | 'thinking' | 'calling_tool' | 'working'>;
@@ -32,12 +33,12 @@ export const AgentsCard: React.FC<{
   agentWork?: Record<string, AgentWorkInfo>;
   agentRunSummary?: Record<string, AgentRunSummary>;
   agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
-}> = ({ agents, leadState, isRunning, selectedAgent, agentStatus, agentStatusText, agentWork, agentRunSummary, agentContext }) => {
+}> = ({ agents, workspaceState, isRunning, selectedAgent, agentStatus, agentStatusText, agentWork, agentRunSummary, agentContext }) => {
   return (
     <section className="bg-white dark:bg-[#141414] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm flex flex-col overflow-hidden">
       <div className="px-4 py-2 border-b border-slate-200 dark:border-white/5 bg-slate-50 dark:bg-white/[0.02] flex items-center justify-between">
         <h3 className="text-[10px] font-bold uppercase tracking-widest text-blue-500 flex items-center gap-2">
-          <User size={12} /> Agents Status
+          <Bot size={12} /> Agents Status
         </h3>
         <span className="text-[10px] text-slate-400">Swarm</span>
       </div>
@@ -47,6 +48,12 @@ export const AgentsCard: React.FC<{
           const work = agentWork?.[agent.name];
           const run = agentRunSummary?.[agent.name.toLowerCase()];
           const context = agentContext?.[agent.name.toLowerCase()];
+          const contextTokens = Number(context?.tokens || 0);
+          const contextLimit =
+            context && typeof context.tokenLimit === 'number' && context.tokenLimit > 0
+              ? Number(context.tokenLimit)
+              : null;
+          const contextPct = contextPercent(contextTokens, contextLimit ?? undefined);
           const statusText =
             agentStatusText?.[agent.name] ||
             (status === 'calling_tool'
@@ -65,7 +72,7 @@ export const AgentsCard: React.FC<{
           >
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
-                {agent.name === 'lead' ? <User size={14} className="text-blue-500" /> : <Bot size={14} className="text-purple-500" />}
+                <Bot size={14} className="text-purple-500" />
                 <span className="font-bold uppercase tracking-tight">{agent.name}</span>
               </div>
               <div className="flex items-center gap-2">
@@ -97,23 +104,25 @@ export const AgentsCard: React.FC<{
                 {work?.file || '-'}
                 {work && work.activeCount > 1 ? ` (+${work.activeCount - 1})` : ''}
               </div>
-              {context && (
-                (() => {
-                  const pct = contextPercent(context.tokens, context.tokenLimit);
-                  if (pct === null) return null;
-                  const limit = Number(context.tokenLimit);
-                  return (
-                    <div
-                      className="mt-1 flex items-center gap-2 text-blue-500/80 font-medium"
-                      title={`${context.tokens.toLocaleString()} tokens • ${context.messages} msgs (model max ctx ~${limit.toLocaleString()} tokens)`}
-                    >
-                      <span className="flex items-center gap-1">
-                        <span className="font-semibold">Context:</span> {pct}% ({formatCompactInt(context.tokens)} / {formatCompactInt(limit)})
-                      </span>
-                    </div>
-                  );
-                })()
-              )}
+              <div
+                className="mt-1 flex items-center gap-2 text-blue-500/80 font-medium"
+                title={
+                  context
+                    ? `${contextTokens.toLocaleString()} tokens • ${context.messages} msgs${
+                        contextLimit ? ` (model max ctx ~${contextLimit.toLocaleString()} tokens)` : ''
+                      }`
+                    : 'Context telemetry not available yet'
+                }
+              >
+                <span className="flex items-center gap-1">
+                  <span className="font-semibold">Context:</span>
+                  {context
+                    ? `${formatCompactInt(contextTokens)} / ${
+                        contextLimit ? formatCompactInt(contextLimit) : 'n/a'
+                      } (${contextPct !== null ? `${contextPct}%` : 'n/a'})`
+                    : 'n/a'}
+                </span>
+              </div>
               {run && (
                 <div className="mt-2 flex flex-wrap items-center gap-1.5">
                   <span
@@ -146,9 +155,9 @@ export const AgentsCard: React.FC<{
         )})}
 
         <div className="pt-2 border-t border-slate-200 dark:border-white/5">
-          <div className="text-[10px] text-slate-500 mb-1 font-bold uppercase tracking-widest">Active Lead Task</div>
+          <div className="text-[10px] text-slate-500 mb-1 font-bold uppercase tracking-widest">Active Task</div>
           <div className="bg-slate-50 dark:bg-black/20 p-2.5 rounded-lg border border-slate-200 dark:border-white/5 italic text-[11px] text-slate-500 dark:text-slate-400 truncate">
-            {leadState?.active_lead_task ? `${leadState.active_lead_task[1].substring(0, 100)}...` : 'No active task'}
+            {workspaceState?.active_task ? `${workspaceState.active_task[1].substring(0, 100)}...` : 'No active task'}
           </div>
         </div>
       </div>

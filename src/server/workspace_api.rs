@@ -1,5 +1,5 @@
-use crate::server::ServerState;
 use crate::server::chat_helpers::sanitize_message_for_ui;
+use crate::server::ServerState;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -62,8 +62,8 @@ pub(crate) async fn read_file_api(
 }
 
 #[derive(Serialize)]
-struct LeadStateResponse {
-    active_lead_task: Option<(crate::state_fs::StateFile, String)>,
+struct WorkspaceStateResponse {
+    active_task: Option<(crate::state_fs::StateFile, String)>,
     user_stories: Option<(crate::state_fs::StateFile, String)>,
     tasks: Vec<(crate::state_fs::StateFile, String)>,
     messages: Vec<(crate::state_fs::StateFile, String)>,
@@ -75,13 +75,13 @@ pub(crate) struct ProjectQuery {
     session_id: Option<String>,
 }
 
-pub(crate) async fn get_lead_state(
+pub(crate) async fn get_workspace_state(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<ProjectQuery>,
 ) -> impl IntoResponse {
     let root = PathBuf::from(&query.project_root);
     if let Ok(ctx) = state.manager.get_or_create_project(root).await {
-        let active_lead_task = ctx.state_fs.read_file("active.md").ok();
+        let active_task = ctx.state_fs.read_file("active.md").ok();
         let user_stories = ctx.state_fs.read_file("user-stories.md").ok();
         let tasks = ctx.state_fs.list_tasks().unwrap_or_default();
 
@@ -114,8 +114,8 @@ pub(crate) async fn get_lead_state(
             })
             .collect();
 
-        Json(LeadStateResponse {
-            active_lead_task,
+        Json(WorkspaceStateResponse {
+            active_task,
             user_stories,
             tasks,
             messages: mapped_messages,

@@ -93,5 +93,3 @@ Mixed behavior:
 - Linggen scripts use network calls; ensure network permission when required by the environment.
 - Omit `source_id` to search across indexed projects.
 - Keep single-repo work local by default; use Linggen when cross-project or indexed context is needed.
-
-## Run cargo check when changed rust

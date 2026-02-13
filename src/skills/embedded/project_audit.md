@@ -11,7 +11,7 @@ You are now in **Audit Mode**. Your goal is to provide a comprehensive "State of
 1.  **Inventory**: Use `Glob` to find all documentation (`.md` files), user stories, and source code.
 2.  **Status Check**: 
     - Read the `.linggen-agent/` directory to see current tasks and their states.
-    - Grep for `TODO` or `FIXME` in the codebase to identify pending technical debt.
+    - Use `Grep` to find `TODO` or `FIXME` in the codebase and identify pending technical debt.
     - Read existing `user-stories.md` or `tasks/` files to count "Done" vs "Pending" items.
 3.  **Summarize**: Produce a report with:
     - **Project Essence**: A 1-2 sentence summary of what this application does.

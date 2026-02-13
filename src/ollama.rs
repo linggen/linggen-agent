@@ -121,7 +121,8 @@ impl OllamaClient {
         model: &str,
         messages: &[ChatMessage],
     ) -> Result<impl Stream<Item = Result<String>> + Send> {
-        self.chat_text_stream_with_keep_alive(model, messages, None).await
+        self.chat_text_stream_with_keep_alive(model, messages, None)
+            .await
     }
 
     pub async fn chat_text_stream_with_keep_alive(
@@ -185,7 +186,11 @@ impl OllamaClient {
 
     /// Preload a model into memory and keep it there.
     pub async fn preload_model(&self, model: &str, keep_alive: &str) -> Result<()> {
-        tracing::info!("Preloading Ollama model: {} (keep_alive={})", model, keep_alive);
+        tracing::info!(
+            "Preloading Ollama model: {} (keep_alive={})",
+            model,
+            keep_alive
+        );
         let url = format!("{}/api/chat", self.base_url);
         let req = ChatRequest {
             model: model.to_string(),

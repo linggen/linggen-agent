@@ -23,7 +23,7 @@ pub(crate) fn sanitize_tool_args_for_display(
 ) -> serde_json::Value {
     let mut safe = args.clone();
     if let Some(obj) = safe.as_object_mut() {
-        if matches!(tool, "write_file" | "Write") {
+        if matches!(tool, "Write") {
             if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
                 let bytes = content.len();
                 let lines = content.lines().count();
@@ -97,9 +97,9 @@ fn status_line_for_tool_call(tool_call: Option<&ToolCallForUi>) -> String {
     let name = tool_call.name.trim().to_lowercase();
     let args = tool_call.args.as_ref();
     match name.as_str() {
-        "read_file" | "read" => "Reading file...".to_string(),
-        "write_file" | "write" => "Writing file...".to_string(),
-        "run_command" | "bash" => {
+        "read" => "Reading file...".to_string(),
+        "write" => "Writing file...".to_string(),
+        "bash" => {
             let cmd = args
                 .and_then(|v| v.get("cmd"))
                 .and_then(|v| v.as_str())
@@ -111,8 +111,8 @@ fn status_line_for_tool_call(tool_call: Option<&ToolCallForUi>) -> String {
                 "Running command...".to_string()
             }
         }
-        "search_rg" | "grep" | "smart_search" | "find_file" => "Searching...".to_string(),
-        "list_files" | "glob" => "Listing files...".to_string(),
+        "grep" => "Searching...".to_string(),
+        "glob" => "Listing files...".to_string(),
         "delegate_to_agent" => {
             let target = args
                 .and_then(|v| v.get("target_agent_id"))
@@ -155,7 +155,7 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
     let mut cleaned_lines: Vec<String> = Vec::new();
     let mut saw_tool = false;
     let mut last_tool: Option<ToolCallForUi> = None;
-    let mut saw_read_file_result = false;
+    let mut saw_read_result = false;
 
     for raw_line in content.lines() {
         let line = raw_line.trim();
@@ -180,10 +180,10 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
             || lower.starts_with("tool_not_allowed:")
         {
             saw_tool = true;
-            if lower.starts_with("tool read_file:") {
-                saw_read_file_result = true;
+            if lower.starts_with("tool read:") {
+                saw_read_result = true;
                 last_tool = Some(ToolCallForUi {
-                    name: "read_file".to_string(),
+                    name: "Read".to_string(),
                     args: None,
                 });
             }
@@ -195,11 +195,11 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
         if lower == "(content omitted in chat; open the file viewer for full text)" {
             continue;
         }
-        // Never show read_file output content in chat UI. After a read_file tool result,
+        // Never show Read output content in chat UI. After a Read tool result,
         // many lines are TOML/JSON/etc and don't trip `looks_like_code_line`, which causes
         // full file dumps to appear in chat. Instead, collapse the entire tool result into
         // a single progress/status line ("Reading file...").
-        if saw_read_file_result {
+        if saw_read_result {
             continue;
         }
         cleaned_lines.push(raw_line.to_string());

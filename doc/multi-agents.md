@@ -9,13 +9,25 @@ Current runtime contract for main agents, subagents, and UI-facing events/APIs.
 
 ## Agent types
 
+- Agent definitions are discovered dynamically from `agents/*.md` markdown files.
+- No hardcoded agent roster should be required in code or static config.
+- Adding a new markdown file under `agents/` creates a new available agent (after reload/startup).
+- Gate policy is defined in frontmatter `policy`.
+  - Supported shorthand: `policy: [Patch, Finalize, Delegate]`.
+  - Optional delegate target constraints: `policy.delegate_targets`.
 - Main agents:
   - Long-lived, can receive user tasks, can message other main agents.
-  - Current examples: `lead`, `coder`.
-  - Planned: `operator`.
+  - Determined by markdown metadata (`kind: main`).
 - Subagents:
   - Ephemeral child workers owned by one main agent.
-  - Typical IDs: `search`, `plan`, `review`.
+  - Determined by markdown metadata (`kind: subagent`).
+
+## Mode loop semantics
+
+- `chat` mode: human-in-the-loop interaction, basically Claude Code mode.
+  - Runtime uses a bounded chat tool loop: model can request one tool per turn, and the host chains turns until plain-text completion or `agent.max_iters`.
+- `auto` mode: human-not-in-the-loop execution; agents are in the loop.
+  - Runtime uses the structured agent loop and is also bounded by `agent.max_iters`.
 
 ## Hard invariants
 
@@ -27,6 +39,9 @@ Current runtime contract for main agents, subagents, and UI-facing events/APIs.
 6. Delegation depth is fixed at 1.
 7. Parent cancellation cascades to active children.
 8. Tool usage is enforced per-agent by `spec.tools` (hard gate, not prompt-only).
+   - `tools: ["*"]` in frontmatter means unrestricted tool access.
+   - Canonical tool names are Claude Code-style (`Read`, `Write`, `Bash`, `Glob`, `Grep`).
+9. Action capabilities are enforced per-agent by frontmatter policy (`Patch`, `Finalize`, `Delegate`).
 
 ## Run model
 
@@ -52,7 +67,7 @@ The UI consumes `AgentStatus` events with these commonly used states:
 - `working`
 - `idle`
 
-`detail` is free text (for example: "Model loading", "Calling read_file").
+`detail` is free text (for example: "Model loading", "Calling Read").
 
 ## SSE event contract (current)
 

@@ -126,8 +126,7 @@ async fn main() -> Result<()> {
 
             let db = Arc::new(db::Db::new()?);
             let skill_manager = Arc::new(skills::SkillManager::new());
-            let (manager, rx) =
-                agent_manager::AgentManager::new(config, db, skill_manager.clone());
+            let (manager, rx) = agent_manager::AgentManager::new(config, db, skill_manager.clone());
 
             // Load skills for initial project
             let _ = skill_manager.load_all(Some(&ws_root)).await;
@@ -147,17 +146,23 @@ async fn main() -> Result<()> {
             if let Some(dir) = log_dir.as_ref() {
                 tracing::info!("Log Directory: {}", dir.display());
             }
-            
+
             let config = manager.get_config();
             tracing::info!("Max Tool Iterations: {}", config.agent.max_iters);
-            
+
             let models = manager.models.list_models();
             tracing::info!("Configured Models ({}):", models.len());
             for m in models {
-                tracing::info!("  - ID: {}, Provider: {}, Model: {}, URL: {}", m.id, m.provider, m.model, m.url);
+                tracing::info!(
+                    "  - ID: {}, Provider: {}, Model: {}, URL: {}",
+                    m.id,
+                    m.provider,
+                    m.model,
+                    m.url
+                );
             }
 
-            let agents = manager.list_agents().await?;
+            let agents = manager.list_agents(&ws_root).await?;
             tracing::info!("Active Agents ({}):", agents.len());
             for a in agents {
                 tracing::info!("  - Name: {}, Tools: {:?}", a.name, a.tools);

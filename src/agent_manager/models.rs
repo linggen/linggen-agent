@@ -26,20 +26,26 @@ impl ModelManager {
             // Default to 1 concurrent request per model if not specified
             // (We could add max_concurrent to ModelConfig later)
             let semaphore = Arc::new(Semaphore::new(1));
-            models.insert(cfg.id.clone(), ModelInstance {
-                config: cfg,
-                client,
-                semaphore,
-                context_window: OnceCell::new(),
-            });
+            models.insert(
+                cfg.id.clone(),
+                ModelInstance {
+                    config: cfg,
+                    client,
+                    semaphore,
+                    context_window: OnceCell::new(),
+                },
+            );
         }
         Self { models }
     }
 
     pub async fn chat_json(&self, model_id: &str, messages: &[ChatMessage]) -> Result<String> {
-        let instance = self.models.get(model_id)
+        let instance = self
+            .models
+            .get(model_id)
             .ok_or_else(|| anyhow::anyhow!("Model {} not found", model_id))?;
-        self.chat_json_with_keep_alive(model_id, messages, instance.config.keep_alive.clone()).await
+        self.chat_json_with_keep_alive(model_id, messages, instance.config.keep_alive.clone())
+            .await
     }
 
     pub async fn chat_json_with_keep_alive(
@@ -48,11 +54,16 @@ impl ModelManager {
         messages: &[ChatMessage],
         keep_alive: Option<String>,
     ) -> Result<String> {
-        let instance = self.models.get(model_id)
+        let instance = self
+            .models
+            .get(model_id)
             .ok_or_else(|| anyhow::anyhow!("Model {} not found", model_id))?;
-        
+
         let _permit = instance.semaphore.acquire().await?;
-        instance.client.chat_json_with_keep_alive(&instance.config.model, messages, keep_alive).await
+        instance
+            .client
+            .chat_json_with_keep_alive(&instance.config.model, messages, keep_alive)
+            .await
     }
 
     pub async fn chat_text_stream(
@@ -60,9 +71,16 @@ impl ModelManager {
         model_id: &str,
         messages: &[ChatMessage],
     ) -> Result<impl Stream<Item = Result<String>> + Send + Unpin> {
-        let instance = self.models.get(model_id)
+        let instance = self
+            .models
+            .get(model_id)
             .ok_or_else(|| anyhow::anyhow!("Model {} not found", model_id))?;
-        self.chat_text_stream_with_keep_alive(model_id, messages, instance.config.keep_alive.clone()).await
+        self.chat_text_stream_with_keep_alive(
+            model_id,
+            messages,
+            instance.config.keep_alive.clone(),
+        )
+        .await
     }
 
     pub async fn chat_text_stream_with_keep_alive(
@@ -96,9 +114,14 @@ impl ModelManager {
     }
 
     pub async fn preload_model(&self, model_id: &str, keep_alive: &str) -> Result<()> {
-        let instance = self.models.get(model_id)
+        let instance = self
+            .models
+            .get(model_id)
             .ok_or_else(|| anyhow::anyhow!("Model {} not found", model_id))?;
-        instance.client.preload_model(&instance.config.model, keep_alive).await
+        instance
+            .client
+            .preload_model(&instance.config.model, keep_alive)
+            .await
     }
 
     pub fn list_models(&self) -> Vec<&ModelConfig> {
@@ -115,7 +138,13 @@ impl ModelManager {
         let client = instance.client.clone();
         let value = instance
             .context_window
-            .get_or_init(|| async move { client.get_model_context_window(&model_name).await.ok().flatten() })
+            .get_or_init(|| async move {
+                client
+                    .get_model_context_window(&model_name)
+                    .await
+                    .ok()
+                    .flatten()
+            })
             .await;
         Ok(*value)
     }

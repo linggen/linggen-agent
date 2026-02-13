@@ -17,14 +17,11 @@ pub fn render_tool_result(r: &ToolResult) -> String {
             content,
             truncated,
         } => {
-            format!(
-                "read_file: {} (truncated: {})\n{}",
-                path, truncated, content
-            )
+            format!("Read: {} (truncated: {})\n{}", path, truncated, content)
         }
         ToolResult::SearchMatches(v) => {
             let mut out = String::new();
-            out.push_str("search_matches:\n");
+            out.push_str("Grep matches:\n");
             if v.is_empty() {
                 out.push_str("(no matches)\n");
             } else {
@@ -40,7 +37,7 @@ pub fn render_tool_result(r: &ToolResult) -> String {
             stderr,
         } => {
             format!(
-                "command_output (exit_code: {:?}):\nSTDOUT:\n{}\nSTDERR:\n{}",
+                "Bash output (exit_code: {:?}):\nSTDOUT:\n{}\nSTDERR:\n{}",
                 exit_code, stdout, stderr
             )
         }
@@ -98,7 +95,7 @@ pub fn render_tool_result_public(r: &ToolResult) -> String {
             let (preview, preview_truncated) = preview_text(content, 20, 1200);
             let shown_note = if preview_truncated { " (preview)" } else { "" };
             format!(
-                "read_file: {} (truncated: {}){}\n{}\n\n(content omitted in chat; open the file viewer for full text)",
+                "Read: {} (truncated: {}){}\n{}\n\n(content omitted in chat; open the file viewer for full text)",
                 path, truncated, shown_note, preview
             )
         }
@@ -132,7 +129,7 @@ pub fn normalize_tool_path_arg(ws_root: &Path, args: &serde_json::Value) -> Opti
 pub fn sanitize_tool_args_for_display(tool: &str, args: &serde_json::Value) -> serde_json::Value {
     let mut safe = args.clone();
     if let Some(obj) = safe.as_object_mut() {
-        if matches!(tool, "write_file" | "Write") {
+        if matches!(tool, "Write") {
             if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
                 let bytes = content.len();
                 let lines = content.lines().count();
@@ -147,7 +144,7 @@ pub fn sanitize_tool_args_for_display(tool: &str, args: &serde_json::Value) -> s
 }
 
 pub fn tool_call_signature(tool: &str, args: &serde_json::Value) -> String {
-    if matches!(tool, "write_file" | "Write") {
+    if matches!(tool, "Write") {
         let path = args
             .get("path")
             .or_else(|| args.get("file"))
