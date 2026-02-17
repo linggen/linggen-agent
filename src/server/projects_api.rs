@@ -359,7 +359,9 @@ pub(crate) async fn get_agent_context_api(
 }
 
 pub(crate) async fn list_models_api(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    let models = state.manager.models.list_models();
+    let models_guard = state.manager.models.read().await;
+    let models: Vec<_> = models_guard.list_models().into_iter().cloned().collect();
+    drop(models_guard);
     Json(models).into_response()
 }
 
@@ -388,21 +390,12 @@ pub(crate) async fn create_session(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
-    let id = format!(
-        "sess-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-    );
+    let id = format!("sess-{}", crate::util::now_ts_secs());
     let session = crate::db::SessionInfo {
         id: id.clone(),
         repo_path: req.project_root,
         title: req.title,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+        created_at: crate::util::now_ts_secs(),
     };
 
     match state.manager.db.add_session(session) {

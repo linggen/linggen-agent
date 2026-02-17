@@ -6,10 +6,25 @@ export interface ChatMessage {
   timestamp: string;
   timestampMs?: number;
   isGenerating?: boolean;
+  isThinking?: boolean;
   activitySummary?: string;
   activityEntries?: string[];
   contextTokens?: number;
   messageCount?: number;
+}
+
+export interface UiSseMessage {
+  id: string;
+  seq: number;
+  rev: number;
+  ts_ms: number;
+  kind: 'message' | 'activity' | 'queue' | 'run' | 'token';
+  phase?: string;
+  text?: string;
+  agent_id?: string;
+  session_id?: string;
+  project_root?: string;
+  data?: any;
 }
 
 export interface QueuedChatItem {
@@ -106,6 +121,23 @@ export interface OllamaPsModel {
 
 export interface OllamaPsResponse {
   models: OllamaPsModel[];
+}
+
+export interface AppConfig {
+  models: ModelConfigUI[];
+  server: { port: number };
+  agent: { max_iters: number; write_safety_mode: string; prompt_loop_breaker?: string | null };
+  logging: { level?: string | null; directory?: string | null; retention_days?: number | null };
+  agents: { id: string; spec_path: string; model?: string | null }[];
+}
+
+export interface ModelConfigUI {
+  id: string;
+  provider: string;
+  url: string;
+  model: string;
+  api_key?: string | null;
+  keep_alive?: string | null;
 }
 
 export interface SessionInfo {

@@ -1,5 +1,5 @@
 use crate::config::{AgentKind, AgentPolicyCapability};
-use crate::server::{ServerEvent, ServerState};
+use crate::server::{AgentStatusKind, ServerEvent, ServerState};
 use crate::state_fs::StateFile;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
@@ -81,13 +81,7 @@ pub(crate) async fn set_task(
             {
                 if let Ok(ctx) = state.manager.get_or_create_project(root).await {
                     let planning_task = StateFile::PmTask {
-                        id: format!(
-                            "plan-{}",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs()
-                        ),
+                        id: format!("plan-{}", crate::util::now_ts_secs()),
                         status: "active".to_string(),
                         assigned_tasks: Vec::new(),
                     };
@@ -171,7 +165,7 @@ pub(crate) async fn run_agent(
                 state_clone
                     .send_agent_status(
                         agent_id.clone(),
-                        "working".to_string(),
+                        AgentStatusKind::Working,
                         Some("Running".to_string()),
                     )
                     .await;
@@ -182,15 +176,21 @@ pub(crate) async fn run_agent(
                 engine.set_run_id(None);
                 let outcome = match run_result {
                     Ok(outcome) => {
-                        let _ = manager.finish_agent_run(&run_id, "completed", None).await;
+                        let _ = manager
+                            .finish_agent_run(
+                                &run_id,
+                                crate::db::AgentRunStatus::Completed,
+                                None,
+                            )
+                            .await;
                         outcome
                     }
                     Err(err) => {
                         let msg = err.to_string();
                         let status = if msg.to_lowercase().contains("cancel") {
-                            "cancelled"
+                            crate::db::AgentRunStatus::Cancelled
                         } else {
-                            "failed"
+                            crate::db::AgentRunStatus::Failed
                         };
                         let _ = manager.finish_agent_run(&run_id, status, Some(msg)).await;
                         crate::engine::AgentOutcome::None
@@ -211,13 +211,7 @@ pub(crate) async fn run_agent(
                             let assignee = first_patch_main_agent(&state_clone, &root)
                                 .await
                                 .unwrap_or_else(|| "unassigned".to_string());
-                            let task_id = format!(
-                                "task-{}",
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs()
-                            );
+                            let task_id = format!("task-{}", crate::util::now_ts_secs());
                             let coder_task = StateFile::CoderTask {
                                 id: task_id.clone(),
                                 status: "queued".to_string(),
@@ -247,7 +241,7 @@ pub(crate) async fn run_agent(
                 state_clone
                     .send_agent_status(
                         agent_id.clone(),
-                        "idle".to_string(),
+                        AgentStatusKind::Idle,
                         Some("Idle".to_string()),
                     )
                     .await;
@@ -269,7 +263,7 @@ pub(crate) async fn cancel_agent_run(
                 state
                     .send_agent_status(
                         run.agent_id.clone(),
-                        "idle".to_string(),
+                        AgentStatusKind::Idle,
                         Some("Cancelled".to_string()),
                     )
                     .await;

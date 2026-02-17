@@ -6,6 +6,7 @@ import { ModelsCard } from './components/ModelsCard';
 import { FilePreview } from './components/FilePreview';
 import { ChatPanel } from './components/ChatPanel';
 import { HeaderBar } from './components/HeaderBar';
+import { SettingsPage } from './components/SettingsPage';
 import { AgentSpecEditorModal } from './components/AgentSpecEditorModal';
 import type {
   AgentInfo,
@@ -22,6 +23,7 @@ import type {
   SessionInfo,
   SkillInfo,
   SubagentInfo,
+  UiSseMessage,
 } from './types';
 
 const SELECTED_AGENT_STORAGE_KEY = 'linggen-agent:selected-agent';
@@ -29,18 +31,10 @@ const LIVE_MESSAGE_GRACE_MS = 10_000;
 const TOKEN_RATE_WINDOW_MS = 8_000;
 const TOKEN_RATE_IDLE_RESET_MS = 10_000;
 
-type ToolCallMeta = {
-  tool: string;
-  args?: any;
-};
-
-const parseToolCallFromParsedPayload = (parsed: any): ToolCallMeta | null => {
+const parseToolNameFromParsedPayload = (parsed: any): string | null => {
   if (!parsed || typeof parsed !== 'object') return null;
   if (parsed?.type === 'tool' && typeof parsed?.tool === 'string') {
-    return {
-      tool: parsed.tool,
-      args: parsed.args && typeof parsed.args === 'object' ? parsed.args : undefined,
-    };
+    return parsed.tool;
   }
   if (
     typeof parsed?.type === 'string' &&
@@ -48,13 +42,10 @@ const parseToolCallFromParsedPayload = (parsed: any): ToolCallMeta | null => {
     parsed.args &&
     typeof parsed.args === 'object'
   ) {
-    return { tool: parsed.type, args: parsed.args };
+    return parsed.type;
   }
   return null;
 };
-
-const parseToolNameFromParsedPayload = (parsed: any): string | null =>
-  parseToolCallFromParsedPayload(parsed)?.tool || null;
 
 const parseToolNameFromMessage = (text: string): string | null => {
   try {
@@ -62,30 +53,6 @@ const parseToolNameFromMessage = (text: string): string | null => {
     return parseToolNameFromParsedPayload(parsed);
   } catch (_e) {
     // Non-JSON messages are ignored.
-  }
-  return null;
-};
-
-const parseToolCallFromMessage = (text: string): ToolCallMeta | null => {
-  try {
-    const parsed = JSON.parse(text);
-    return parseToolCallFromParsedPayload(parsed);
-  } catch (_e) {
-    // Non-JSON messages are ignored.
-  }
-  return null;
-};
-
-const parseToolCallFromText = (text: string): ToolCallMeta | null => {
-  const direct = parseToolCallFromMessage(text.trim());
-  if (direct) return direct;
-  const lines = text
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const parsed = parseToolCallFromMessage(lines[i]);
-    if (parsed) return parsed;
   }
   return null;
 };
@@ -119,44 +86,6 @@ const isGenericActivityLine = (line?: string): boolean => {
   );
 };
 
-const statusLineForToolCall = (toolCall?: ToolCallMeta | null) => {
-  const name = (toolCall?.tool || '').trim().toLowerCase();
-  const args = toolCall?.args;
-  if (name === 'read') {
-    const path = firstStringArg(args, ['path', 'file', 'filepath']);
-    return path ? `Reading file: ${previewText(path.split(/[/\\]/).pop() || path, 140)}` : 'Reading file...';
-  }
-  if (name === 'write') {
-    const path = firstStringArg(args, ['path', 'file', 'filepath']);
-    return path ? `Writing file: ${previewText(path.split(/[/\\]/).pop() || path, 140)}` : 'Writing file...';
-  }
-  if (name === 'bash') {
-    const cmd = firstStringArg(args, ['cmd', 'command']);
-    return cmd ? `Running command: ${previewText(cmd, 140)}` : 'Running command...';
-  }
-  if (name === 'grep') {
-    const query = firstStringArg(args, ['query', 'pattern', 'q']);
-    return query ? `Searching: ${previewText(query, 140)}` : 'Searching...';
-  }
-  if (name === 'glob') {
-    const globs = Array.isArray(args?.globs)
-      ? args.globs
-          .filter((v: unknown) => typeof v === 'string')
-          .map((v: string) => v.trim())
-          .filter(Boolean)
-      : [];
-    return globs.length > 0 ? `Listing files: ${previewText(globs.join(', '), 140)}` : 'Listing files...';
-  }
-  if (name === 'delegate_to_agent') {
-    const target = firstStringArg(args, ['target_agent_id']);
-    return target ? `Delegating to subagent: ${target}` : 'Delegating...';
-  }
-  return name ? `Calling tool: ${name}` : 'Calling tool...';
-};
-
-const statusLineForTool = (toolName?: string) =>
-  statusLineForToolCall(toolName ? { tool: toolName } : null);
-
 const extractToolNamesFromText = (text: string): string[] => {
   const names: string[] = [];
   const direct = parseToolNameFromMessage(text.trim());
@@ -175,17 +104,6 @@ const extractToolNamesFromText = (text: string): string[] => {
     if (m[1]) names.push(m[1]);
   }
   return Array.from(new Set(names));
-};
-
-const extractToolNameFromRawText = (text: string): string | null => {
-  const trimmed = text.trim();
-  if (!trimmed) return null;
-  const lines = trimmed.split('\n').map((line) => line.trim()).filter(Boolean);
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const toolName = parseToolNameFromMessage(lines[i]);
-    if (toolName) return toolName;
-  }
-  return parseToolNameFromMessage(trimmed);
 };
 
 const stripToolPayloadLines = (text: string): string => {
@@ -233,62 +151,16 @@ const isStatusLineText = (text: string) =>
 const roleFromAgentId = (agentId: string): ChatMessage['role'] =>
   agentId === 'user' ? 'user' : 'agent';
 
-const previewText = (value: string, maxChars = 120) =>
-  value.length <= maxChars ? value : `${value.slice(0, maxChars)}...`;
+const MODEL_LOADING_ENTRY = 'Model loading...';
 
-const estimateTokensForChunk = (text?: string) => {
-  const chars = String(text || '').length;
-  if (chars <= 0) return 0;
-  return Math.max(1, Math.floor((chars + 3) / 4));
+const orderActivityEntries = (entries: string[]) => {
+  if (!entries.includes(MODEL_LOADING_ENTRY)) return entries;
+  const rest = entries.filter((entry) => entry !== MODEL_LOADING_ENTRY);
+  return [MODEL_LOADING_ENTRY, ...rest];
 };
 
 const normalizeMessageTextForDedup = (text: string) =>
   (text || '').replace(/\s+/g, ' ').trim();
-
-const firstStringArg = (args: any, keys: string[]) => {
-  if (!args || typeof args !== 'object') return '';
-  for (const key of keys) {
-    const value = args[key];
-    if (typeof value === 'string' && value.trim()) return value.trim();
-  }
-  return '';
-};
-
-const formatCompletedToolLine = (call?: ToolCallMeta): string | null => {
-  if (!call || !call.tool) return null;
-  const tool = call.tool.trim().toLowerCase();
-  const args = call.args;
-  if (tool === 'read') {
-    const path = firstStringArg(args, ['path', 'file', 'filepath']);
-    const file = path ? path.split(/[/\\]/).pop() || path : '';
-    return file ? `Read file: ${file}` : 'Read file';
-  }
-  if (tool === 'write') {
-    const path = firstStringArg(args, ['path', 'file', 'filepath']);
-    const file = path ? path.split(/[/\\]/).pop() || path : '';
-    return file ? `Wrote file: ${file}` : 'Wrote file';
-  }
-  if (tool === 'grep') {
-    const query = firstStringArg(args, ['query', 'pattern', 'q']);
-    return query ? `Searched for ${previewText(query, 110)}` : 'Searched';
-  }
-  if (tool === 'glob') {
-    const globs = Array.isArray(args?.globs)
-      ? args.globs.filter((v: unknown) => typeof v === 'string').map((v: string) => v.trim()).filter(Boolean)
-      : [];
-    if (globs.length > 0) return `Listed files: ${previewText(globs.join(', '), 110)}`;
-    return 'Listed files in .';
-  }
-  if (tool === 'bash') {
-    const cmd = firstStringArg(args, ['cmd', 'command']);
-    return cmd ? `Ran command: ${previewText(cmd, 110)}` : 'Ran command';
-  }
-  if (tool === 'delegate_to_agent') {
-    const target = firstStringArg(args, ['target_agent_id']);
-    return target ? `Delegated to ${target}` : 'Delegated to subagent';
-  }
-  return `Used ${tool}`;
-};
 
 const summarizeActivityEntries = (entries: string[], inProgress = false): string | undefined => {
   if (entries.length === 0) return undefined;
@@ -327,6 +199,9 @@ const addActivityEntry = (msg: ChatMessage, entry: string): ChatMessage => {
   const clean = entry.trim();
   if (!clean) return msg;
   const entries = msg.activityEntries ? [...msg.activityEntries] : [];
+  if (clean === MODEL_LOADING_ENTRY && entries.some((item) => item !== MODEL_LOADING_ENTRY)) {
+    return msg;
+  }
   if (entries.length === 0) {
     entries.push(clean);
   } else {
@@ -353,10 +228,11 @@ const addActivityEntry = (msg: ChatMessage, entry: string): ChatMessage => {
       }
     }
   }
+  const ordered = orderActivityEntries(entries);
   return {
     ...msg,
-    activityEntries: entries,
-    activitySummary: summarizeActivityEntries(entries, Boolean(msg.isGenerating)),
+    activityEntries: ordered,
+    activitySummary: summarizeActivityEntries(ordered, Boolean(msg.isGenerating)),
   };
 };
 
@@ -430,13 +306,6 @@ const appendGeneratingActivity = (messages: ChatMessage[], agentId: string, acti
   return upsertGeneratingAgentMessage(messages, agentId, activityLine, activityLine);
 };
 
-const normalizeToolStatusDetail = (detail?: string) =>
-  (detail || '')
-    .trim()
-    .replace(/^calling tool:\s*/i, '')
-    .replace(/^calling\s+/i, '')
-    .trim();
-
 type ActivityEntry = {
   path: string;
   agent: string;
@@ -505,6 +374,16 @@ const buildAgentWorkInfo = (tree: Record<string, AgentTreeItem>): Record<string,
   return out;
 };
 
+const normalizeAgentStatus = (
+  status?: string
+): 'idle' | 'model_loading' | 'thinking' | 'calling_tool' | 'working' => {
+  if (status === 'calling_tool') return 'calling_tool';
+  if (status === 'model_loading') return 'model_loading';
+  if (status === 'thinking') return 'thinking';
+  if (status === 'working') return 'working';
+  return 'idle';
+};
+
 const buildSubagentInfos = (
   tree: Record<string, AgentTreeItem>,
   mainAgentIds: string[],
@@ -553,7 +432,10 @@ const buildSubagentInfos = (
   return out;
 };
 
+type Page = 'main' | 'settings';
+
 const App: React.FC = () => {
+  const [currentPage, setCurrentPage] = useState<Page>('main');
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [selectedProjectRoot, setSelectedProjectRoot] = useState<string>('');
   const [agentTree, setAgentTree] = useState<Record<string, AgentTreeItem>>({});
@@ -577,15 +459,15 @@ const App: React.FC = () => {
     return stored || '';
   });
   const [currentMode, setCurrentMode] = useState<'chat' | 'auto'>('auto');
-  const [isRunning, _setIsRunning] = useState(false);
   const [agentStatus, setAgentStatus] = useState<Record<string, 'idle' | 'model_loading' | 'thinking' | 'calling_tool' | 'working'>>({});
+  // Derived: true when any agent is actively working
+  const isRunning = Object.values(agentStatus).some((s) => s !== 'idle');
   const [agentStatusText, setAgentStatusText] = useState<Record<string, string>>({});
   const [queuedMessages, setQueuedMessages] = useState<QueuedChatItem[]>([]);
   const [agentRuns, setAgentRuns] = useState<AgentRunInfo[]>([]);
   const [cancellingRunIds, setCancellingRunIds] = useState<Record<string, boolean>>({});
   // Refresh icon should only refresh UI state, not run an audit skill.
   
-  const [, setFiles] = useState<unknown[]>([]);
   const [currentPath, setCurrentPath] = useState('');
   const [selectedFileContent, setSelectedFileContent] = useState<string | null>(null);
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
@@ -596,8 +478,6 @@ const App: React.FC = () => {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const lastChatCountRef = useRef(0);
   const lastSseSeqRef = useRef(0);
-  const lastAgentStatusRef = useRef<Record<string, string>>({});
-  const pendingToolByAgentRef = useRef<Record<string, ToolCallMeta>>({});
   const tokenRateSamplesRef = useRef<Array<{ ts: number; tokens: number }>>([]);
   const lastTokenAtRef = useRef<number>(0);
   const lastAgentCharsRef = useRef<number>(0);
@@ -727,15 +607,6 @@ const App: React.FC = () => {
     const rate = totalTokens / elapsedSec;
     setTokensPerSec(Number.isFinite(rate) ? rate : 0);
   }, []);
-
-  const recordTokenSample = useCallback((chunk: string) => {
-    const tokens = estimateTokensForChunk(chunk);
-    if (tokens <= 0) return;
-    const now = Date.now();
-    tokenRateSamplesRef.current.push({ ts: now, tokens });
-    lastTokenAtRef.current = now;
-    recomputeTokenRate(now);
-  }, [recomputeTokenRate]);
 
   const [agentContext, setAgentContext] = useState<Record<string, { tokens: number; messages: number; tokenLimit?: number }>>({});
 
@@ -981,8 +852,7 @@ const App: React.FC = () => {
     if (!selectedProjectRoot) return;
     try {
       const resp = await fetch(`/api/files?project_root=${encodeURIComponent(selectedProjectRoot)}&path=${encodeURIComponent(path)}`);
-      const data = await resp.json();
-      setFiles(data);
+      await resp.json();
       setCurrentPath(path);
     } catch (e) {
       addLog(`Error fetching files: ${e}`);
@@ -1271,84 +1141,100 @@ const App: React.FC = () => {
     const events = new EventSource('/api/events');
     events.onmessage = (e) => {
       try {
-        const event = JSON.parse(e.data);
-        if (typeof event.seq === 'number') {
-          if (event.seq <= lastSseSeqRef.current) return;
-          lastSseSeqRef.current = event.seq;
+        const item = JSON.parse(e.data) as UiSseMessage;
+        if (typeof item.seq === 'number') {
+          if (item.seq <= lastSseSeqRef.current) return;
+          lastSseSeqRef.current = item.seq;
         }
-        if (event.type === 'StateUpdated') {
-          fetchWorkspaceState();
-          fetchFiles(currentPath);
-          fetchAllAgentTrees();
-          fetchAgentRuns();
-        } else if (event.type === 'AgentStatus') {
-          const lifecycle = typeof event.lifecycle === 'string' ? event.lifecycle.trim().toLowerCase() : '';
-          const statusDetail = typeof event.detail === 'string' ? event.detail.trim() : '';
-          const nextStatus: 'idle' | 'model_loading' | 'thinking' | 'calling_tool' | 'working' =
-            event.status === 'calling_tool'
-              ? 'calling_tool'
-              : event.status === 'model_loading'
-                ? 'model_loading'
-              : event.status === 'thinking'
-                ? 'thinking'
-                : event.status === 'working'
-                  ? 'working'
-                  : 'idle';
-          const prevStatus = lastAgentStatusRef.current[event.agent_id] || 'idle';
-          if (lifecycle === 'done') {
-            if (nextStatus === 'calling_tool') {
-              const completed = statusDetail || formatCompletedToolLine(pendingToolByAgentRef.current[event.agent_id]);
-              if (completed) {
-                setChatMessages((prev) => appendGeneratingActivity(prev, event.agent_id, completed));
-              }
-              delete pendingToolByAgentRef.current[event.agent_id];
+        if (item.kind === 'run') {
+          if (item.phase === 'sync' || item.phase === 'outcome') {
+            fetchWorkspaceState();
+            fetchFiles(currentPath);
+            fetchAllAgentTrees();
+            fetchAgentRuns();
+          } else if (item.phase === 'context_usage' && item.data) {
+            const agentIdKey =
+              typeof item.data.agent_id === 'string'
+                ? item.data.agent_id.toLowerCase()
+                : (item.agent_id || '').toLowerCase();
+            if (agentIdKey) {
+              setAgentContext((prev) => ({
+                ...prev,
+                [agentIdKey]: {
+                  tokens: Number(item.data.estimated_tokens || 0),
+                  messages: Number(item.data.message_count || 0),
+                  tokenLimit:
+                    typeof item.data.token_limit === 'number'
+                      ? Number(item.data.token_limit)
+                      : prev[agentIdKey]?.tokenLimit,
+                },
+              }));
             }
-            return;
+          } else if (item.phase === 'settings_updated') {
+            if (item.project_root === selectedProjectRoot) {
+              const mode = String(item.data?.mode || '').toLowerCase();
+              setCurrentMode(mode === 'chat' ? 'chat' : 'auto');
+            }
+          } else if (item.phase === 'change_report' && item.data) {
+            fetchWorkspaceState();
+            fetchFiles(currentPath);
+          }
+          return;
+        }
+
+        if (item.kind === 'queue') {
+          const session = activeSessionId || 'default';
+          if (item.project_root === selectedProjectRoot && item.session_id === session) {
+            const items = Array.isArray(item.data?.items) ? item.data.items : [];
+            setQueuedMessages(items);
+          }
+          return;
+        }
+
+        if (item.kind === 'activity') {
+          const agentId = String(item.agent_id || '');
+          if (!agentId) return;
+          const statusRaw = String(item.data?.status || '').trim();
+          const nextStatus = normalizeAgentStatus(statusRaw);
+          const statusText = String(item.text || '').trim();
+
+          if (statusRaw) {
+            setAgentStatus((prev) => ({
+              ...prev,
+              [agentId]: nextStatus,
+            }));
+            setAgentStatusText((prev) => ({
+              ...prev,
+              [agentId]:
+                statusText.length > 0
+                  ? statusText
+                  : nextStatus === 'calling_tool'
+                    ? 'Calling Tool'
+                    : nextStatus === 'model_loading'
+                      ? 'Model Loading'
+                      : nextStatus === 'thinking'
+                        ? 'Thinking'
+                        : nextStatus === 'working'
+                          ? 'Working'
+                          : 'Idle',
+            }));
           }
 
-          if (nextStatus === 'calling_tool') {
-            if (statusDetail) {
-              setChatMessages((prev) => appendGeneratingActivity(prev, event.agent_id, statusDetail));
-            }
-            const tool = normalizeToolStatusDetail(event.detail);
-            if (tool) {
-              pendingToolByAgentRef.current[event.agent_id] = pendingToolByAgentRef.current[event.agent_id] || { tool };
-            }
-          } else if (!lifecycle && (nextStatus === 'thinking' || nextStatus === 'idle') && prevStatus === 'calling_tool') {
-            const completed = formatCompletedToolLine(pendingToolByAgentRef.current[event.agent_id]);
-            if (completed) {
-              setChatMessages((prev) => appendGeneratingActivity(prev, event.agent_id, completed));
-            }
-            delete pendingToolByAgentRef.current[event.agent_id];
-          }
-          setAgentStatus((prev) => ({
-            ...prev,
-            [event.agent_id]: nextStatus,
-          }));
-          setAgentStatusText((prev) => ({
-            ...prev,
-            [event.agent_id]:
-              statusDetail.length > 0
-                ? statusDetail
-                : nextStatus === 'calling_tool'
-                  ? 'Calling Tool'
-                  : nextStatus === 'model_loading'
-                    ? 'Model Loading'
-                  : nextStatus === 'thinking'
-                    ? 'Thinking'
-                    : nextStatus === 'working'
-                      ? 'Working'
-                      : 'Idle',
-          }));
-          if (nextStatus === 'model_loading' || nextStatus === 'thinking') {
+          if (statusText.length > 0) {
+            setChatMessages((prev) => appendGeneratingActivity(prev, agentId, statusText));
+          } else if (nextStatus === 'model_loading' || nextStatus === 'thinking') {
             const placeholder = nextStatus === 'model_loading' ? 'Model loading...' : 'Thinking...';
-            setChatMessages((prev) =>
-              upsertGeneratingAgentMessage(prev, event.agent_id, placeholder)
-            );
-          } else if (nextStatus === 'idle') {
+            setChatMessages((prev) => upsertGeneratingAgentMessage(prev, agentId, placeholder));
+          }
+
+          if (nextStatus === 'idle' || item.phase === 'done' || item.phase === 'failed') {
             setChatMessages((prev) => {
-              const idx = findLastGeneratingMessageIndex(prev, event.agent_id);
-              if (idx < 0 || !isStatusLineText(prev[idx].text)) return prev;
+              const idx = findLastGeneratingMessageIndex(prev, agentId);
+              if (idx < 0) return prev;
+              // Only finalize status-only messages here; real token content
+              // gets finalized by the 'message' handler to avoid premature cutoff.
+              const msgText = prev[idx].text || '';
+              if (msgText && !isStatusLineText(msgText)) return prev;
               const next = [...prev];
               const entries = Array.isArray(next[idx].activityEntries) ? next[idx].activityEntries : [];
               next[idx] = {
@@ -1359,99 +1245,65 @@ const App: React.FC = () => {
               return next;
             });
           }
-          lastAgentStatusRef.current[event.agent_id] = nextStatus;
-        } else if (event.type === 'ContextUsage') {
-          const agentIdKey =
-            typeof event.agent_id === 'string' ? event.agent_id.toLowerCase() : event.agent_id;
-          setAgentContext((prev) => ({
-            ...prev,
-            [agentIdKey]: {
-              tokens: Number(event.estimated_tokens || 0),
-              messages: Number(event.message_count || 0),
-              tokenLimit:
-                typeof event.token_limit === 'number'
-                  ? Number(event.token_limit)
-                  : prev[agentIdKey]?.tokenLimit,
-            },
-          }));
-        } else if (event.type === 'SettingsUpdated') {
-          if (event.project_root === selectedProjectRoot) {
-            setCurrentMode(event.mode === 'chat' ? 'chat' : 'auto');
+          return;
+        }
+
+        if (item.kind === 'token') {
+          const agentId = String(item.agent_id || '');
+          const isThinking = item.data?.thinking === true;
+          if (!agentId) return;
+
+          if (item.phase === 'done') {
+            if (isThinking) {
+              // Mark the current generating message as thinking (not final answer).
+              setChatMessages((prev) => {
+                const idx = findLastGeneratingMessageIndex(prev, agentId);
+                if (idx >= 0) {
+                  const next = [...prev];
+                  next[idx] = { ...next[idx], isThinking: true };
+                  return next;
+                }
+                return prev;
+              });
+            }
+            return;
           }
-        } else if (event.type === 'QueueUpdated') {
-          const session = activeSessionId || 'default';
-          if (event.project_root === selectedProjectRoot && event.session_id === session) {
-            setQueuedMessages(event.items || []);
-          }
-        } else if (event.type === 'Token') {
-          recordTokenSample(String(event.token || ''));
-          setChatMessages(prev => {
-            const idx = findLastGeneratingMessageIndex(prev, event.agent_id);
-            const now = new Date();
+
+          const tokenText = String(item.text || '');
+          setChatMessages((prev) => {
+            const idx = findLastGeneratingMessageIndex(prev, agentId);
             if (idx >= 0) {
               const next = [...prev];
-              const currentText = next[idx].text;
-              const streamed = isStatusLineText(currentText)
-                ? event.token
-                : `${currentText}${event.token}`;
-              const rawToolName = extractToolNameFromRawText(streamed);
-              const cleaned = stripToolPayloadLines(streamed);
-              let nextMsg: ChatMessage = {
-                ...next[idx],
-                text: rawToolName ? (cleaned || currentText) : streamed,
-                timestamp: now.toLocaleTimeString(),
-                timestampMs: now.getTime(),
-                isGenerating: true,
-              };
+              const isPlaceholder = isStatusLineText(next[idx].text || '');
               next[idx] = {
-                ...nextMsg,
+                ...next[idx],
+                text: isPlaceholder ? tokenText : (next[idx].text || '') + tokenText,
+                isGenerating: true,
+                isThinking: isThinking || next[idx].isThinking,
+                timestampMs: Date.now(),
               };
               return next;
             }
-
-            const rawToolName = extractToolNameFromRawText(event.token);
-            const clean = rawToolName ? stripToolPayloadLines(event.token) : event.token;
-            return [
-              ...prev,
-              {
-                role: roleFromAgentId(event.agent_id),
-                from: event.agent_id,
-                to: 'user',
-                text: clean || 'Thinking...',
-                timestamp: now.toLocaleTimeString(),
-                timestampMs: now.getTime(),
-                isGenerating: true,
-              },
-            ];
+            return upsertGeneratingAgentMessage(prev, agentId, tokenText);
           });
-        } else if (event.type === 'Message') {
-          const content = event.content || '';
-          const toolNames = extractToolNamesFromText(content);
-          if (toolNames.length > 0) {
-            const toolCall = parseToolCallFromText(content);
-            if (toolCall) {
-              pendingToolByAgentRef.current[event.from] = toolCall;
-            }
-            if (!stripToolPayloadLines(content)) {
-              return;
-            }
-          }
-          if (shouldHideInternalChatMessage(event.from, content)) {
+          return;
+        }
+
+        if (item.kind === 'message') {
+          const from = String(item.data?.from || item.agent_id || 'assistant');
+          const to = String(item.data?.to || '');
+          const content = String(item.text || '');
+          if (!content) return;
+          if (shouldHideInternalChatMessage(from, content)) return;
+
+          if (from !== 'user' && isStatusLineText(content)) {
+            setChatMessages((prev) => appendGeneratingActivity(prev, from, content));
             return;
           }
-          const cleanedContent =
-            event.from === 'user'
-              ? content
-              : stripToolPayloadLines(content);
-          if (event.from !== 'user' && !cleanedContent) {
-            return;
-          }
-          if (event.from !== 'user' && isStatusLineText(cleanedContent)) {
-            setChatMessages((prev) => appendGeneratingActivity(prev, event.from, cleanedContent));
-            return;
-          }
-          setChatMessages(prev => {
-            const generatingIdx = findLastGeneratingMessageIndex(prev, event.from);
+
+          const tsMs = Number(item.ts_ms || Date.now());
+          setChatMessages((prev) => {
+            const generatingIdx = findLastGeneratingMessageIndex(prev, from);
             if (generatingIdx >= 0) {
               const next = [...prev];
               const existingEntries = Array.isArray(next[generatingIdx].activityEntries)
@@ -1459,51 +1311,46 @@ const App: React.FC = () => {
                 : [];
               next[generatingIdx] = {
                 ...next[generatingIdx],
-                text: cleanedContent,
-                to: event.to || next[generatingIdx].to || 'user',
+                text: content,
+                to: to || next[generatingIdx].to || 'user',
                 isGenerating: false,
+                timestamp: new Date(tsMs).toLocaleTimeString(),
+                timestampMs: tsMs,
                 activitySummary:
                   summarizeActivityEntries(existingEntries, false) || next[generatingIdx].activitySummary,
               };
               return next;
             }
-            // If there's no streaming message to finalize, append as a new message.
-            const role: ChatMessage['role'] =
-              event.from === 'user'
-                ? 'user'
-                : 'agent';
 
             if (
               prev.some(
                 (msg) =>
                   !msg.isGenerating &&
-                  (msg.from || msg.role) === event.from &&
-                  (msg.to || '') === (event.to || '') &&
+                  (msg.from || msg.role) === from &&
+                  (msg.to || '') === to &&
                   normalizeMessageTextForDedup(msg.text) ===
-                    normalizeMessageTextForDedup(cleanedContent)
+                    normalizeMessageTextForDedup(content)
               )
             ) {
               return prev;
             }
 
-            return [...prev, {
-              role,
-              from: event.from,
-              to: event.to,
-              text: cleanedContent,
-              timestamp: new Date().toLocaleTimeString(),
-              timestampMs: Date.now(),
-              isGenerating: false
-            }];
+            return [
+              ...prev,
+              {
+                role: from === 'user' ? 'user' : 'agent',
+                from,
+                to,
+                text: content,
+                timestamp: new Date(tsMs).toLocaleTimeString(),
+                timestampMs: tsMs,
+                isGenerating: false,
+              },
+            ];
           });
           fetchWorkspaceState();
-        } else if (event.type === 'Outcome') {
-          fetchWorkspaceState();
-          fetchAgentRuns();
         }
       } catch (err) {
-        // If we ever receive a malformed SSE payload (e.g. due to lag/drop),
-        // fall back to a state refresh so tool actions still show up.
         console.error("SSE parse error", err);
         fetchWorkspaceState();
         fetchAgentRuns();
@@ -1511,7 +1358,7 @@ const App: React.FC = () => {
     };
 
     return () => events.close();
-  }, [currentPath, selectedProjectRoot, activeSessionId, fetchWorkspaceState, fetchFiles, fetchAllAgentTrees, fetchAgentRuns, shouldHideInternalChatMessage, recordTokenSample]);
+  }, [currentPath, selectedProjectRoot, activeSessionId, fetchWorkspaceState, fetchFiles, fetchAllAgentTrees, fetchAgentRuns, shouldHideInternalChatMessage]);
 
   const sendChatMessage = async (userMessage: string, targetAgent?: string) => {
     if (!userMessage.trim() || !selectedProjectRoot) return;
@@ -1637,10 +1484,22 @@ const App: React.FC = () => {
     fetchSessions();
     fetchSettings();
     fetchAgents(selectedProjectRoot);
+    fetchModels();
+    fetchOllamaStatus();
   };
 
   return (
-    <div className="flex flex-col h-screen bg-slate-100/70 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200 font-sans overflow-hidden">
+    <>
+    {currentPage === 'settings' && (
+      <SettingsPage
+        onBack={() => {
+          setCurrentPage('main');
+          fetchModels();
+          fetchOllamaStatus();
+        }}
+      />
+    )}
+    <div className={`flex flex-col h-screen bg-slate-100/70 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200 font-sans overflow-hidden${currentPage === 'settings' ? ' hidden' : ''}`}>
       {/* Header */}
       <HeaderBar
         showAddProject={showAddProject}
@@ -1664,6 +1523,7 @@ const App: React.FC = () => {
         currentMode={currentMode}
         onModeChange={updateMode}
         agentContext={agentContext}
+        onOpenSettings={() => setCurrentPage('settings')}
       />
 
       {/* Main Layout */}
@@ -1789,6 +1649,7 @@ const App: React.FC = () => {
         .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(59, 130, 246, 0.7); }
       `}</style>
     </div>
+    </>
   );
 };
 

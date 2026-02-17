@@ -40,19 +40,51 @@ pub struct ChatMessageRecord {
     pub is_observation: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileActivityStatus {
+    Working,
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentRunStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectMode {
+    Chat,
+    Auto,
+}
+
+impl std::fmt::Display for ProjectMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Chat => write!(f, "chat"),
+            Self::Auto => write!(f, "auto"),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileActivity {
     pub repo_path: String,
     pub file_path: String,
     pub agent_id: String,
-    pub status: String, // "working" or "done"
+    pub status: FileActivityStatus,
     pub last_modified: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProjectSettings {
     pub repo_path: String,
-    pub mode: String, // "chat" | "auto"
+    pub mode: ProjectMode,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -61,9 +93,9 @@ pub struct AgentRunRecord {
     pub repo_path: String,
     pub session_id: String,
     pub agent_id: String,
-    pub agent_kind: String, // "main" | "subagent"
+    pub agent_kind: crate::config::AgentKind,
     pub parent_run_id: Option<String>,
-    pub status: String, // "running" | "completed" | "failed" | "cancelled"
+    pub status: AgentRunStatus,
     pub detail: Option<String>,
     pub started_at: u64,
     pub ended_at: Option<u64>,
@@ -104,7 +136,7 @@ impl Db {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(PROJECTS_TABLE)?;
-            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            let now = crate::util::now_ts_secs();
             let info = ProjectInfo {
                 path: path.clone(),
                 name,
@@ -117,7 +149,7 @@ impl Db {
             if settings_table.get(path.as_str())?.is_none() {
                 let settings = ProjectSettings {
                     repo_path: path.clone(),
-                    mode: "auto".to_string(),
+                    mode: ProjectMode::Auto,
                 };
                 let settings_val = serde_json::to_string(&settings)?;
                 settings_table.insert(path.as_str(), settings_val.as_str())?;
@@ -174,18 +206,18 @@ impl Db {
         } else {
             Ok(ProjectSettings {
                 repo_path: repo_path.to_string(),
-                mode: "auto".to_string(),
+                mode: ProjectMode::Auto,
             })
         }
     }
 
-    pub fn set_project_mode(&self, repo_path: &str, mode: &str) -> Result<()> {
+    pub fn set_project_mode(&self, repo_path: &str, mode: ProjectMode) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(PROJECT_SETTINGS_TABLE)?;
             let settings = ProjectSettings {
                 repo_path: repo_path.to_string(),
-                mode: mode.to_string(),
+                mode,
             };
             let val = serde_json::to_string(&settings)?;
             table.insert(repo_path, val.as_str())?;
@@ -352,7 +384,7 @@ impl Db {
     pub fn update_agent_run(
         &self,
         run_id: &str,
-        status: &str,
+        status: AgentRunStatus,
         detail: Option<String>,
         ended_at: Option<u64>,
     ) -> Result<()> {
@@ -362,7 +394,7 @@ impl Db {
             let existing = table.get(run_id)?.map(|val| val.value().to_string());
             if let Some(json) = existing {
                 let mut run: AgentRunRecord = serde_json::from_str(&json)?;
-                run.status = status.to_string();
+                run.status = status;
                 if detail.is_some() {
                     run.detail = detail;
                 }

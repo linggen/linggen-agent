@@ -1,5 +1,5 @@
 import React from 'react';
-import { Copy, Eraser, Plus, Sparkles } from 'lucide-react';
+import { Copy, Eraser, Plus, Settings, Sparkles } from 'lucide-react';
 import { cn } from '../lib/cn';
 import type { AgentInfo, SessionInfo } from '../types';
 
@@ -39,6 +39,7 @@ export const HeaderBar: React.FC<{
   currentMode: 'chat' | 'auto';
   onModeChange: (mode: 'chat' | 'auto') => void;
   agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
+  onOpenSettings?: () => void;
 }> = ({
   showAddProject,
   newProjectPath,
@@ -61,6 +62,7 @@ export const HeaderBar: React.FC<{
   currentMode,
   onModeChange,
   agentContext,
+  onOpenSettings,
 }) => {
   return (
     <header className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.6fr)_minmax(0,1fr)] items-center gap-3 px-6 py-3 border-b border-slate-200 dark:border-white/5 bg-white/90 dark:bg-[#0f0f0f]/90 backdrop-blur-md z-50">
@@ -226,6 +228,18 @@ export const HeaderBar: React.FC<{
           <option value="auto">Mode: Auto</option>
           <option value="chat">Mode: Chat</option>
         </select>
+        {onOpenSettings && (
+          <>
+            <div className="w-px h-3 bg-slate-300 dark:bg-white/10" />
+            <button
+              onClick={onOpenSettings}
+              className="p-1 hover:text-blue-500 text-slate-500 transition-colors"
+              title="Settings"
+            >
+              <Settings size={14} />
+            </button>
+          </>
+        )}
       </div>
     </header>
   );

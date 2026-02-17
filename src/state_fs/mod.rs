@@ -2,7 +2,6 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -74,7 +73,7 @@ impl StateFs {
         } else {
             self.root.join("messages.md")
         };
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let ts = crate::util::now_ts_secs();
         let id = format!("msg-{}", ts);
 
         let msg = StateFile::Message {

@@ -127,6 +127,20 @@ const normalizeAgentKey = (value?: string) => (value || '').trim().toLowerCase()
 const normalizeMessageTextForDedup = (text?: string) =>
   (text || '').replace(/\s+/g, ' ').trim();
 
+const sortMessagesByTime = (messages: ChatMessage[]) =>
+  messages
+    .map((msg, index) => ({ msg, index }))
+    .sort((a, b) => {
+      const ta = a.msg.timestampMs ?? 0;
+      const tb = b.msg.timestampMs ?? 0;
+      if (ta <= 0 && tb <= 0) return a.index - b.index;
+      if (ta <= 0) return 1;
+      if (tb <= 0) return -1;
+      if (ta !== tb) return ta - tb;
+      return a.index - b.index;
+    })
+    .map((entry) => entry.msg);
+
 const hasStrongContentOverlap = (aText: string, bText: string) => {
   if (!aText || !bText) return false;
   if (aText === bText) return true;
@@ -424,7 +438,9 @@ const dedupeActivityEntries = (entries: string[]) => {
     seen.add(clean);
     out.push(clean);
   }
-  return out;
+  if (!out.includes('Model loading...')) return out;
+  const rest = out.filter((entry) => entry !== 'Model loading...');
+  return ['Model loading...', ...rest];
 };
 
 const isProgressLineText = (text?: string) => {
@@ -855,7 +871,7 @@ export const ChatPanel: React.FC<{
 
   const visibleMessages = useMemo(() => {
     const selected = normalizeAgentKey(selectedAgent);
-    return chatMessages.filter((msg) => {
+    const filtered = chatMessages.filter((msg) => {
       const from = normalizeAgentKey(msg.from || msg.role);
       const to = normalizeAgentKey(msg.to || '');
       if (msg.role === 'user') {
@@ -865,6 +881,7 @@ export const ChatPanel: React.FC<{
       if (from === 'user') return to === selected;
       return false;
     });
+    return sortMessagesByTime(filtered);
   }, [chatMessages, selectedAgent]);
 
   const visibleQueued = useMemo(
@@ -948,11 +965,12 @@ export const ChatPanel: React.FC<{
   const subagentMessages = useMemo(() => {
     if (!selectedSubagent) return [];
     const id = normalizeAgentKey(selectedSubagent.id);
-    return chatMessages.filter((msg) => {
+    const filtered = chatMessages.filter((msg) => {
       const from = normalizeAgentKey(msg.from || msg.role);
       const to = normalizeAgentKey(msg.to || '');
       return from === id || to === id;
     });
+    return sortMessagesByTime(filtered);
   }, [chatMessages, selectedSubagent]);
   const mainContextMessages = useMemo(
     () => (selectedMainContext?.messages || []).map(contextMessageToChatMessage),
@@ -1408,9 +1426,11 @@ export const ChatPanel: React.FC<{
           );
           const messageClass = isUser
             ? 'bg-slate-100 dark:bg-white/10 text-slate-900 dark:text-slate-100 rounded-md px-2.5 py-1.5'
-            : isStatusLine && !hasActivity
-              ? 'text-blue-700 dark:text-blue-300 italic'
-              : 'text-slate-800 dark:text-slate-200';
+            : msg.isThinking
+              ? 'text-slate-500 dark:text-slate-400 italic opacity-60'
+              : isStatusLine && !hasActivity
+                ? 'text-blue-700 dark:text-blue-300 italic'
+                : 'text-slate-800 dark:text-slate-200';
           return (
           <div
             key={key}
@@ -1481,6 +1501,41 @@ export const ChatPanel: React.FC<{
                                 - {crit}
                               </div>
                             ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  }
+                  if (parsed.type === 'change_report' && Array.isArray(parsed.files)) {
+                    const files = parsed.files
+                      .map((item: any) => ({
+                        path: typeof item?.path === 'string' ? item.path : '',
+                        summary: typeof item?.summary === 'string' ? item.summary : '',
+                      }))
+                      .filter((item: any) => item.path);
+                    const truncatedCount = Number(parsed.truncated_count || 0);
+                    const reviewHint =
+                      typeof parsed.review_hint === 'string' ? parsed.review_hint : '';
+                    return (
+                      <div className="space-y-2">
+                        <div className="font-bold text-blue-500">
+                          Changed files ({files.length}
+                          {truncatedCount > 0 ? ` +${truncatedCount} more` : ''})
+                        </div>
+                        {files.map((file: any, idx: number) => (
+                          <div
+                            key={`${file.path}-${idx}`}
+                            className="flex flex-wrap items-center gap-2 rounded-md border border-slate-200 dark:border-white/10 bg-slate-50/80 dark:bg-white/[0.03] px-2 py-1.5 text-[11px]"
+                          >
+                            <span className="text-slate-500 dark:text-slate-300">
+                              {file.summary || 'Updated'}
+                            </span>
+                            <span className="font-mono text-[11px]">{file.path}</span>
+                          </div>
+                        ))}
+                        {reviewHint && (
+                          <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                            {reviewHint}
                           </div>
                         )}
                       </div>

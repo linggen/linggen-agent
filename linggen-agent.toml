@@ -1,8 +1,9 @@
 [[models]]
-id = "local_ollama"
+id = "ollama1"
 provider = "ollama"
 url = "http://127.0.0.1:11434"
-model = "qwen3-coder-next"
+#model = "qwen3-coder-next"
+model = "qwen3.5:cloud"
 keep_alive = "20m"
 
 
@@ -27,19 +28,19 @@ retention_days = 7
 [[agents]]
 id = "lead"
 spec_path = "agents/lead.md"
-model = "local_ollama"
+model = "ollama1"
 
 [[agents]]
 id = "coder"
 spec_path = "agents/coder.md"
-model = "local_ollama"
+model = "ollama1"
 
 [[agents]]
 id = "search"
 spec_path = "agents/search.md"
-model = "local_ollama"
+model = "ollama1"
 
 [[agents]]
 id = "plan"
 spec_path = "agents/plan.md"
-model = "local_ollama"
+model = "ollama1"

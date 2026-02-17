@@ -21,8 +21,20 @@ pub(crate) async fn list_files(
     State(_state): State<Arc<ServerState>>,
     Query(query): Query<FileQuery>,
 ) -> impl IntoResponse {
+    let project_root = PathBuf::from(&query.project_root);
+    let canonical_root = match project_root.canonicalize() {
+        Ok(r) => r,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
     let rel_path = query.path.unwrap_or_default();
-    let full_path = PathBuf::from(&query.project_root).join(&rel_path);
+    if rel_path.contains("..") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let full_path = canonical_root.join(&rel_path);
+    let full_path = full_path.canonicalize().unwrap_or(full_path);
+    if !full_path.starts_with(&canonical_root) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
 
     if !full_path.exists() {
         return StatusCode::NOT_FOUND.into_response();
@@ -53,7 +65,19 @@ pub(crate) async fn read_file_api(
         Some(p) => p,
         None => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let full_path = PathBuf::from(&query.project_root).join(&rel_path);
+    if rel_path.contains("..") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let project_root = PathBuf::from(&query.project_root);
+    let canonical_root = match project_root.canonicalize() {
+        Ok(r) => r,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let full_path = canonical_root.join(&rel_path);
+    let full_path = full_path.canonicalize().unwrap_or(full_path);
+    if !full_path.starts_with(&canonical_root) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
 
     match std::fs::read_to_string(full_path) {
         Ok(content) => Json(serde_json::json!({ "content": content })).into_response(),
@@ -141,7 +165,7 @@ pub(crate) async fn get_agent_tree(
         .await
         .map(|runs| {
             runs.into_iter()
-                .filter(|run| run.status == "running")
+                .filter(|run| run.status == crate::db::AgentRunStatus::Running)
                 .map(|run| run.agent_id)
                 .collect()
         })

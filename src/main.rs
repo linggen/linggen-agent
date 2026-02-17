@@ -3,12 +3,14 @@ mod check;
 mod config;
 mod db;
 mod engine;
+mod eval;
 mod logging;
 mod ollama;
 mod repl;
 mod server;
 mod skills;
 mod state_fs;
+mod util;
 mod workspace;
 
 use crate::config::{Config, ModelConfig};
@@ -47,6 +49,32 @@ enum Command {
         /// Disable streaming model output (uses non-streaming requests)
         #[arg(long, default_value_t = false)]
         no_stream: bool,
+    },
+    /// Run eval tasks against the agent
+    Eval {
+        /// Workspace root. If omitted, detects by walking up for .git.
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+
+        /// Filter tasks by name (substring match)
+        #[arg(long)]
+        filter: Option<String>,
+
+        /// Override max iterations per task
+        #[arg(long)]
+        max_iters: Option<usize>,
+
+        /// Per-task timeout in seconds (default 300)
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+
+        /// Override agent_id for all tasks
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Print agent messages during execution
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
     },
     /// Start the agent server with Web UI (Service mode)
     Serve {
@@ -131,7 +159,8 @@ async fn main() -> Result<()> {
 
             let db = Arc::new(db::Db::new()?);
             let skill_manager = Arc::new(skills::SkillManager::new());
-            let (manager, rx) = agent_manager::AgentManager::new(config, db, skill_manager.clone());
+            let config_dir = config_path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+            let (manager, rx) = agent_manager::AgentManager::new(config, config_dir, db, skill_manager.clone());
 
             // Load skills for initial project
             let _ = skill_manager.load_all(Some(&ws_root)).await;
@@ -152,19 +181,22 @@ async fn main() -> Result<()> {
                 tracing::info!("Log Directory: {}", dir.display());
             }
 
-            let config = manager.get_config();
-            tracing::info!("Max Tool Iterations: {}", config.agent.max_iters);
+            let config_snap = manager.get_config_snapshot().await;
+            tracing::info!("Max Tool Iterations: {}", config_snap.agent.max_iters);
 
-            let models = manager.models.list_models();
-            tracing::info!("Configured Models ({}):", models.len());
-            for m in models {
-                tracing::info!(
-                    "  - ID: {}, Provider: {}, Model: {}, URL: {}",
-                    m.id,
-                    m.provider,
-                    m.model,
-                    m.url
-                );
+            {
+                let models_guard = manager.models.read().await;
+                let models = models_guard.list_models();
+                tracing::info!("Configured Models ({}):", models.len());
+                for m in models {
+                    tracing::info!(
+                        "  - ID: {}, Provider: {}, Model: {}, URL: {}",
+                        m.id,
+                        m.provider,
+                        m.model,
+                        m.url
+                    );
+                }
             }
 
             let agents = manager.list_agents(&ws_root).await?;
@@ -175,6 +207,27 @@ async fn main() -> Result<()> {
             tracing::info!("------------------------------");
 
             server::start_server(manager, skill_manager, port, dev, rx).await?;
+        }
+        Command::Eval {
+            root,
+            filter,
+            max_iters,
+            timeout,
+            agent,
+            verbose: _,
+        } => {
+            let ws_root = workspace::resolve_workspace_root(root)?;
+            let eval_cfg = eval::EvalConfig {
+                ws_root,
+                filter,
+                max_iters,
+                timeout,
+                agent_override: agent,
+            };
+            let summary = eval::run_eval(eval_cfg).await?;
+            if summary.failed > 0 {
+                std::process::exit(1);
+            }
         }
     }
 

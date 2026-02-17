@@ -210,14 +210,20 @@ impl Config {
             candidates.push(PathBuf::from(explicit));
         }
 
+        // Check runtime.toml alongside the base config in each search location
+        candidates.push(PathBuf::from("linggen-agent.runtime.toml"));
         candidates.push(PathBuf::from("linggen-agent.toml"));
 
         if let Some(dir) = dirs::config_dir() {
-            candidates.push(dir.join("linggen-agent").join("linggen-agent.toml"));
+            let cfg_dir = dir.join("linggen-agent");
+            candidates.push(cfg_dir.join("linggen-agent.runtime.toml"));
+            candidates.push(cfg_dir.join("linggen-agent.toml"));
         }
 
         if let Some(dir) = dirs::data_dir() {
-            candidates.push(dir.join("linggen-agent").join("linggen-agent.toml"));
+            let data_dir = dir.join("linggen-agent");
+            candidates.push(data_dir.join("linggen-agent.runtime.toml"));
+            candidates.push(data_dir.join("linggen-agent.toml"));
         }
 
         for path in candidates {
@@ -229,6 +235,62 @@ impl Config {
         }
 
         Ok((Config::default(), None))
+    }
+
+    pub fn runtime_config_path(config_dir: Option<&Path>) -> PathBuf {
+        if let Some(dir) = config_dir {
+            return dir.join("linggen-agent.runtime.toml");
+        }
+        if let Some(dir) = dirs::data_dir() {
+            return dir
+                .join("linggen-agent")
+                .join("linggen-agent.runtime.toml");
+        }
+        PathBuf::from("linggen-agent.runtime.toml")
+    }
+
+    pub fn save_runtime(&self, config_dir: Option<&Path>) -> Result<PathBuf> {
+        let path = Self::runtime_config_path(config_dir);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = toml::to_string_pretty(self)?;
+        fs::write(&path, content)?;
+        Ok(path)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.models.is_empty() {
+            anyhow::bail!("At least one model must be configured");
+        }
+        let mut seen_ids = std::collections::HashSet::new();
+        for model in &self.models {
+            if model.id.trim().is_empty() {
+                anyhow::bail!("Model ID cannot be empty");
+            }
+            if !seen_ids.insert(&model.id) {
+                anyhow::bail!("Duplicate model ID: {}", model.id);
+            }
+            // Validate model URL scheme to prevent SSRF.
+            let url_lower = model.url.trim().to_lowercase();
+            if !url_lower.starts_with("http://") && !url_lower.starts_with("https://") {
+                anyhow::bail!(
+                    "Model '{}' URL must start with http:// or https://, got: {}",
+                    model.id,
+                    model.url
+                );
+            }
+        }
+        if self.server.port == 0 {
+            anyhow::bail!("Server port must be greater than 0");
+        }
+        if self.agent.max_iters == 0 {
+            anyhow::bail!("Agent max_iters must be greater than 0");
+        }
+        if self.agent.max_iters > 1000 {
+            anyhow::bail!("Agent max_iters must not exceed 1000");
+        }
+        Ok(())
     }
 }
 

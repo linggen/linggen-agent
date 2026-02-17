@@ -17,9 +17,23 @@ use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio_stream::StreamExt as TokioStreamExt;
 use tracing::{info, warn};
 
-pub use actions::{model_message_log_parts, parse_first_action, ModelAction};
+pub use actions::{model_message_log_parts, parse_all_actions, parse_first_action, ModelAction};
+
+#[derive(Debug, Clone)]
+pub enum ThinkingEvent {
+    Token(String),
+    Done,
+}
+
+#[derive(Debug, Clone)]
+pub enum ReplEvent {
+    Status { status: String, detail: Option<String> },
+    Iteration { current: usize, max: usize },
+}
 pub use render::{
     normalize_tool_path_arg, render_tool_result, render_tool_result_public,
     sanitize_tool_args_for_display, tool_call_signature,
@@ -127,6 +141,8 @@ pub struct AgentEngine {
     pub prompt_mode: PromptMode,
     pub parent_agent_id: Option<String>,
     pub run_id: Option<String>,
+    pub thinking_tx: Option<mpsc::UnboundedSender<ThinkingEvent>>,
+    pub repl_events_tx: Option<mpsc::UnboundedSender<ReplEvent>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +160,19 @@ pub enum AgentOutcome {
     Patch(String),
     #[serde(rename = "none")]
     None,
+}
+
+/// Control flow returned by extracted loop helpers.
+enum LoopControl {
+    /// Continue to the next iteration of the agent loop.
+    Continue,
+    /// Exit the loop and return this outcome.
+    Return(AgentOutcome),
+}
+
+#[derive(Clone)]
+struct CachedToolObs {
+    model: String,
 }
 
 impl AgentEngine {
@@ -172,6 +201,8 @@ impl AgentEngine {
             prompt_mode: PromptMode::Structured,
             parent_agent_id: None,
             run_id: None,
+            thinking_tx: None,
+            repl_events_tx: None,
         })
     }
 
@@ -387,6 +418,9 @@ impl AgentEngine {
                     ModelAction::Patch { .. } => {
                         "I've proposed a code patch. I will apply it now.".to_string()
                     }
+                    ModelAction::Done { message } => {
+                        message.unwrap_or_else(|| "Task completed.".to_string())
+                    }
                 }
             } else {
                 // If JSON parsing fails, it might be because of leaked tags.
@@ -412,10 +446,7 @@ impl AgentEngine {
                     .unwrap_or_else(|| "unknown".to_string()),
                 to_id: target,
                 content: final_content.clone(),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
+                timestamp: crate::util::now_ts_secs(),
                 is_observation: false,
             });
         }
@@ -456,10 +487,7 @@ impl AgentEngine {
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
                 content: format!("Tool {}: {}", tool, rendered),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
+                timestamp: crate::util::now_ts_secs(),
                 is_observation: true,
             });
         }
@@ -493,10 +521,7 @@ impl AgentEngine {
                 from_id: agent_id.clone(),
                 to_id: target,
                 content: content.to_string(),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
+                timestamp: crate::util::now_ts_secs(),
                 is_observation: false,
             });
 
@@ -506,6 +531,697 @@ impl AgentEngine {
                 .await;
         }
         Ok(())
+    }
+
+    /// Validate, dispatch, and record a single tool call from the model.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_tool_action(
+        &mut self,
+        tool: String,
+        args: JsonValue,
+        allowed_tools: &Option<HashSet<String>>,
+        messages: &mut Vec<ChatMessage>,
+        tool_cache: &mut HashMap<String, CachedToolObs>,
+        read_paths: &mut HashSet<String>,
+        last_tool_sig: &mut String,
+        redundant_tool_streak: &mut usize,
+        empty_search_streak: &mut usize,
+        session_id: Option<&str>,
+    ) -> LoopControl {
+        let canonical_tool = tools::canonical_tool_name(&tool)
+            .unwrap_or(tool.as_str())
+            .to_string();
+
+        // --- permission gate ---
+        if let Some(allowed) = allowed_tools {
+            if !self.is_tool_allowed(allowed, &tool) {
+                let mut allowed_list = allowed.iter().cloned().collect::<Vec<_>>();
+                allowed_list.sort();
+                let rendered = format!(
+                    "tool_not_allowed: tool={} canonical={} allowed={}",
+                    tool,
+                    canonical_tool,
+                    allowed_list.join(",")
+                );
+                self.upsert_observation("error", &canonical_tool, rendered.clone());
+                let _ = self
+                    .manager_db_add_observation(&canonical_tool, &rendered, session_id)
+                    .await;
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: format!(
+                        "Tool '{}' is not allowed for this agent. Use one of [{}].",
+                        tool,
+                        allowed_list.join(", ")
+                    ),
+                });
+                return LoopControl::Continue;
+            }
+        }
+
+        let safe_args = sanitize_tool_args_for_display(&canonical_tool, &args);
+        self.upsert_context_record_by_type_name(
+            ContextType::ToolCall,
+            &canonical_tool,
+            self.agent_id.clone(),
+            Some(self.outbound_target()),
+            serde_json::to_string(&safe_args).unwrap_or_else(|_| "{}".to_string()),
+            serde_json::json!({ "args": safe_args.clone() }),
+        );
+        info!(
+            "Agent requested tool: {} (requested: {}) with args: {}",
+            canonical_tool, tool, safe_args
+        );
+        if canonical_tool == "Read" {
+            if let Some(path) = normalize_tool_path_arg(&self.cfg.ws_root, &args) {
+                read_paths.insert(path);
+            }
+        }
+
+        // --- write-safety gate ---
+        if matches!(canonical_tool.as_str(), "Write" | "Edit") {
+            if let Some(path) = normalize_tool_path_arg(&self.cfg.ws_root, &args) {
+                let existing = self.cfg.ws_root.join(&path).exists();
+                if existing && !read_paths.contains(&path) {
+                    let action = if canonical_tool == "Edit" {
+                        "Edit"
+                    } else {
+                        "Write"
+                    };
+                    match self.cfg.write_safety_mode {
+                        crate::config::WriteSafetyMode::Strict => {
+                            let rendered = format!(
+                                "tool_error: tool={} error=precondition_failed: must call Read on '{}' before {} for existing files",
+                                action, path, action
+                            );
+                            self.upsert_observation("error", action, rendered.clone());
+                            let _ = self
+                                .manager_db_add_observation(action, &rendered, session_id)
+                                .await;
+                            messages.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: format!(
+                                    "Tool execution blocked for safety: {}. Read the existing file first, then apply a minimal update.",
+                                    rendered,
+                                ),
+                            });
+                            return LoopControl::Continue;
+                        }
+                        crate::config::WriteSafetyMode::Warn => {
+                            let rendered = format!(
+                                "tool_warning: tool={} warning=writing_existing_file_without_prior_read path='{}'",
+                                action, path
+                            );
+                            self.upsert_observation("warning", action, rendered.clone());
+                            let _ = self
+                                .manager_db_add_observation(action, &rendered, session_id)
+                                .await;
+                        }
+                        crate::config::WriteSafetyMode::Off => {}
+                    }
+                }
+            }
+        }
+
+        // --- redundancy / cache gates ---
+        let sig = tool_call_signature(&canonical_tool, &args);
+        if sig == *last_tool_sig {
+            *redundant_tool_streak += 1;
+        } else {
+            *redundant_tool_streak = 0;
+            *last_tool_sig = sig.clone();
+        }
+
+        if *redundant_tool_streak >= 3 {
+            let loop_breaker_prompt = self
+                .cfg
+                .prompt_loop_breaker
+                .as_deref()
+                .map(|template| Self::render_loop_breaker_prompt(template, &canonical_tool))
+                .unwrap_or_else(|| {
+                    format!(
+                        "You are repeatedly calling '{}' with the same arguments and not making progress. Use a different tool/arguments and continue automatically.",
+                        canonical_tool
+                    )
+                });
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: loop_breaker_prompt,
+            });
+            self.push_context_record(
+                ContextType::Error,
+                Some("redundant_tool_loop".to_string()),
+                self.agent_id.clone(),
+                None,
+                format!(
+                    "Repeated tool call loop detected for '{}'; nudging model to change approach.",
+                    canonical_tool
+                ),
+                serde_json::json!({ "tool": canonical_tool, "streak": *redundant_tool_streak + 1 }),
+            );
+            *redundant_tool_streak = 0;
+            return LoopControl::Continue;
+        }
+
+        if let Some(cached) = tool_cache.get(&sig) {
+            self.upsert_observation("tool", &canonical_tool, cached.model.clone());
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: Self::observation_text("tool", &canonical_tool, &cached.model),
+            });
+            return LoopControl::Continue;
+        }
+
+        // --- status lines ---
+        let tool_start_status = crate::server::chat_helpers::tool_status_line(
+            &canonical_tool,
+            Some(&args),
+            crate::server::chat_helpers::ToolStatusPhase::Start,
+        );
+        let tool_done_status = crate::server::chat_helpers::tool_status_line(
+            &canonical_tool,
+            Some(&args),
+            crate::server::chat_helpers::ToolStatusPhase::Done,
+        );
+        let tool_failed_status = crate::server::chat_helpers::tool_status_line(
+            &canonical_tool,
+            Some(&args),
+            crate::server::chat_helpers::ToolStatusPhase::Failed,
+        );
+
+        // Tell the UI what tool we're about to use.
+        if let Some(manager) = self.tools.get_manager() {
+            let from = self
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let target = self.outbound_target();
+            let _ = manager
+                .send_event(crate::agent_manager::AgentEvent::AgentStatus {
+                    agent_id: from.clone(),
+                    status: "calling_tool".to_string(),
+                    detail: Some(tool_start_status.clone()),
+                })
+                .await;
+            let _ = manager
+                .send_event(crate::agent_manager::AgentEvent::Message {
+                    from: from.clone(),
+                    to: target.clone(),
+                    content: serde_json::json!({
+                        "type": "tool",
+                        "tool": canonical_tool.clone(),
+                        "args": safe_args.clone()
+                    })
+                    .to_string(),
+                })
+                .await;
+            let tool_msg = serde_json::json!({
+                "type": "tool",
+                "tool": canonical_tool.clone(),
+                "args": safe_args
+            })
+            .to_string();
+            let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
+                repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
+                session_id: session_id.unwrap_or("default").to_string(),
+                agent_id: from.clone(),
+                from_id: from,
+                to_id: target,
+                content: tool_msg,
+                timestamp: crate::util::now_ts_secs(),
+                is_observation: false,
+            });
+        }
+
+        // --- execute ---
+        let call = ToolCall {
+            tool: canonical_tool.clone(),
+            args: args.clone(),
+        };
+        match self.tools.execute(call) {
+            Ok(result) => {
+                let rendered_model = render_tool_result(&result);
+                let rendered_public = render_tool_result_public(&result);
+
+                tool_cache.insert(
+                    sig,
+                    CachedToolObs {
+                        model: rendered_model.clone(),
+                    },
+                );
+
+                // Invalidate cached Read results for the same file after a successful mutation.
+                // The Read cache key format is: Read|{"path":"<path>"}  (default sig).
+                // We invalidate any Read cache entry whose key contains the file path.
+                if matches!(canonical_tool.as_str(), "Write" | "Edit") {
+                    if let Some(path) = normalize_tool_path_arg(&self.cfg.ws_root, &args) {
+                        tool_cache.retain(|key, _| {
+                            if !key.starts_with("Read|") {
+                                return true;
+                            }
+                            !key.contains(&format!("\"{}\"", path))
+                        });
+                    }
+                }
+
+                self.upsert_observation("tool", &canonical_tool, rendered_model.clone());
+
+                let _ = self
+                    .manager_db_add_observation(&canonical_tool, &rendered_public, session_id)
+                    .await;
+                if let Some(manager) = self.tools.get_manager() {
+                    let agent_id = self
+                        .agent_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    manager
+                        .send_event(crate::agent_manager::AgentEvent::AgentStatus {
+                            agent_id: agent_id.clone(),
+                            status: "calling_tool".to_string(),
+                            detail: Some(tool_done_status.clone()),
+                        })
+                        .await;
+                    manager
+                        .send_event(crate::agent_manager::AgentEvent::StateUpdated)
+                        .await;
+                    manager
+                        .send_event(crate::agent_manager::AgentEvent::AgentStatus {
+                            agent_id,
+                            status: "thinking".to_string(),
+                            detail: Some("Thinking".to_string()),
+                        })
+                        .await;
+                }
+
+                // For file mutations, emit a brief user-visible summary line.
+                if matches!(canonical_tool.as_str(), "Write" | "Edit")
+                    && (rendered_public.starts_with("File written:")
+                        || rendered_public.starts_with("Edited file:")
+                        || rendered_public.starts_with("File unchanged"))
+                {
+                    let msg = if rendered_public.starts_with("File unchanged") {
+                        if let Some(idx) = rendered_public.rfind(':') {
+                            let path = rendered_public[idx + 1..].trim();
+                            format!("No changes to `{}`.", path)
+                        } else {
+                            "No file changes.".to_string()
+                        }
+                    } else if let Some(idx) = rendered_public.rfind(':') {
+                        let rest = rendered_public[idx + 1..].trim();
+                        let path = rest.split_whitespace().next().unwrap_or(rest);
+                        format!("Updated `{}`.", path)
+                    } else {
+                        "File updated.".to_string()
+                    };
+                    let _ = self
+                        .manager_db_add_assistant_message(&msg, session_id)
+                        .await;
+                }
+
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Self::observation_text("tool", &canonical_tool, &rendered_model),
+                });
+
+                if canonical_tool == "Grep"
+                    && (rendered_model.contains("(no matches)")
+                        || rendered_model.contains("no file candidates found"))
+                {
+                    *empty_search_streak += 1;
+                } else {
+                    *empty_search_streak = 0;
+                }
+                if *empty_search_streak >= 4 {
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: "Grep returned no matches repeatedly. Change strategy and continue automatically (for example: broaden terms, use Glob to inspect files, then Read likely paths).".to_string(),
+                    });
+                    self.push_context_record(
+                        ContextType::Error,
+                        Some("empty_search_loop".to_string()),
+                        self.agent_id.clone(),
+                        None,
+                        "Repeated no-match search loop detected; nudging model to change strategy."
+                            .to_string(),
+                        serde_json::json!({ "streak": *empty_search_streak }),
+                    );
+                    *empty_search_streak = 0;
+                }
+            }
+            Err(e) => {
+                warn!("Tool execution failed ({}): {}", canonical_tool, e);
+                let rendered = format!("tool_error: tool={} error={}", canonical_tool, e);
+                tool_cache.insert(
+                    sig,
+                    CachedToolObs {
+                        model: rendered.clone(),
+                    },
+                );
+                self.upsert_observation("error", &canonical_tool, rendered.clone());
+                let _ = self
+                    .manager_db_add_observation(&canonical_tool, &rendered, session_id)
+                    .await;
+                if let Some(manager) = self.tools.get_manager() {
+                    let agent_id = self
+                        .agent_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    manager
+                        .send_event(crate::agent_manager::AgentEvent::AgentStatus {
+                            agent_id: agent_id.clone(),
+                            status: "calling_tool".to_string(),
+                            detail: Some(tool_failed_status.clone()),
+                        })
+                        .await;
+                    manager
+                        .send_event(crate::agent_manager::AgentEvent::AgentStatus {
+                            agent_id,
+                            status: "thinking".to_string(),
+                            detail: Some("Thinking".to_string()),
+                        })
+                        .await;
+                }
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: format!(
+                        "Tool execution failed for tool='{}'. Error: {}. Choose a valid tool+args from the tool schema and try again.",
+                        canonical_tool, e
+                    ),
+                });
+            }
+        }
+        LoopControl::Continue
+    }
+
+    /// Detect identical model responses and nudge or bail.
+    async fn handle_repetition_check(
+        &mut self,
+        raw: &str,
+        last_response: &mut String,
+        streak: &mut usize,
+        nudge_count: &mut usize,
+        messages: &mut Vec<ChatMessage>,
+        session_id: Option<&str>,
+    ) -> Option<LoopControl> {
+        if raw == last_response.as_str() {
+            *streak += 1;
+        } else {
+            *streak = 0;
+            *last_response = raw.to_string();
+        }
+
+        if *streak < 3 {
+            return None;
+        }
+
+        *nudge_count += 1;
+        if *nudge_count >= 2 {
+            let message = format!(
+                "I couldn't continue automatically because I got stuck in a repetition loop (same response {} times).",
+                *streak + 1
+            );
+            let _ = self
+                .manager_db_add_assistant_message(&message, session_id)
+                .await;
+            self.active_skill = None;
+            return Some(LoopControl::Return(AgentOutcome::None));
+        }
+
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: "It looks like you are trapped in a loop, sending the same response multiple times. Please try a different approach or tool to make progress.".to_string(),
+        });
+        self.push_context_record(
+            ContextType::Error,
+            Some("loop_detected".to_string()),
+            self.agent_id.clone(),
+            None,
+            "Model trapped in a loop. Nudging with a warning message.".to_string(),
+            serde_json::json!({ "streak": *streak + 1 }),
+        );
+        *streak = 0;
+        Some(LoopControl::Continue)
+    }
+
+    /// Build the initial message list and read-paths set for the structured agent loop.
+    fn prepare_loop_messages(
+        &mut self,
+        task: &str,
+    ) -> (Vec<ChatMessage>, Option<HashSet<String>>, HashSet<String>) {
+        let system = self.system_prompt();
+        let allowed_tools = self.allowed_tool_names();
+        let mut messages = vec![ChatMessage {
+            role: "system".to_string(),
+            content: system,
+        }];
+        self.push_context_record(
+            ContextType::System,
+            Some("structured_loop_prompt".to_string()),
+            None,
+            None,
+            messages[0].content.clone(),
+            serde_json::json!({ "mode": "structured" }),
+        );
+
+        // Include chat history so the model has context of the current conversation.
+        messages.extend(self.chat_history.clone());
+
+        for obs in &self.observations {
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: Self::observation_for_model(obs),
+            });
+        }
+
+        // Provide tool schema + workspace info (last user message).
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: format!(
+                "Autonomous agent loop started. Ignore any prior greetings or small talk.\n\nWorkspace root: {}\n\nCurrent Role: {:?}\n\nTask: {}\n\nTool schema (respond with one or more JSON tool call objects per turn):\n{}\n\nWhen the task is fully complete, respond with: {{\"type\":\"done\",\"message\":\"<brief summary>\"}}",
+                self.cfg.ws_root.display(),
+                self.role,
+                task,
+                tools::tool_schema_json(allowed_tools.as_ref())
+            ),
+        });
+        self.push_context_record(
+            ContextType::UserInput,
+            Some("structured_bootstrap".to_string()),
+            Some("system".to_string()),
+            self.agent_id.clone(),
+            messages
+                .last()
+                .map(|m| m.content.clone())
+                .unwrap_or_default(),
+            serde_json::json!({ "source": "run_agent_loop" }),
+        );
+
+        // Pre-populate read_paths from prior context.
+        let mut read_paths: HashSet<String> = HashSet::new();
+        let ws_root = self.cfg.ws_root.clone();
+        let mut ingest_read_file_text = |text: &str| {
+            if !text.contains("Read:") || text.contains("tool_error:") {
+                return;
+            }
+            if let Some(start) = text.find("Read: ") {
+                let path_part = &text[start + 6..];
+                let raw_path = path_part.split_whitespace().next().unwrap_or("");
+                if raw_path.is_empty() {
+                    return;
+                }
+                let clean_path = raw_path
+                    .trim_end_matches(')')
+                    .trim_end_matches(',')
+                    .trim_end_matches('.')
+                    .to_string();
+                if clean_path.is_empty() {
+                    return;
+                }
+                read_paths.insert(clean_path.clone());
+                if let Ok(abs) = ws_root.join(&clean_path).canonicalize() {
+                    if let Ok(rel) = abs.strip_prefix(&ws_root) {
+                        read_paths.insert(rel.to_string_lossy().to_string());
+                    }
+                }
+            }
+        };
+        for obs in &self.observations {
+            if obs.name == "Read" {
+                ingest_read_file_text(&obs.content);
+            }
+        }
+        for msg in &self.chat_history {
+            ingest_read_file_text(&msg.content);
+        }
+
+        (messages, allowed_tools, read_paths)
+    }
+
+    async fn handle_patch_action(
+        &mut self,
+        diff: String,
+        messages: &mut Vec<ChatMessage>,
+    ) -> LoopControl {
+        info!("Agent proposed a patch");
+        if !self.agent_allows_policy(AgentPolicyCapability::Patch) {
+            warn!("Agent tried to propose a patch without Patch policy");
+            self.push_context_record(
+                ContextType::Error,
+                Some("patch_not_allowed".to_string()),
+                self.agent_id.clone(),
+                None,
+                "Agent policy does not allow Patch.".to_string(),
+                serde_json::json!({
+                    "required_policy": "Patch",
+                    "agent": self.agent_id.clone(),
+                }),
+            );
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: "Error: This agent is not allowed to output 'patch'. Add `Patch` to the agent frontmatter `policy` to enable it.".to_string(),
+            });
+            return LoopControl::Continue;
+        }
+        let errs = validate_unified_diff(&diff);
+        if !errs.is_empty() {
+            warn!("Patch validation failed with {} errors", errs.len());
+            self.push_context_record(
+                ContextType::Error,
+                Some("patch_validation".to_string()),
+                self.agent_id.clone(),
+                None,
+                errs.join("\n"),
+                serde_json::json!({ "error_count": errs.len() }),
+            );
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: format!(
+                    "The patch failed validation. Fix and respond with a new patch JSON. Errors:\n{}",
+                    errs.join("\n")
+                ),
+            });
+            return LoopControl::Continue;
+        }
+
+        info!("Patch validated successfully");
+
+        // Record activity in DB for patched files
+        if let Some(manager) = self.tools.get_manager() {
+            if let Some(agent_id) = &self.agent_id {
+                for line in diff.lines() {
+                    if line.starts_with("--- ") || line.starts_with("+++ ") {
+                        let path = line[4..].split_whitespace().next().unwrap_or("");
+                        if path != "/dev/null" && !path.is_empty() {
+                            let _ = manager.db.record_activity(crate::db::FileActivity {
+                                repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
+                                file_path: path.to_string(),
+                                agent_id: agent_id.clone(),
+                                status: crate::db::FileActivityStatus::Done,
+                                last_modified: crate::util::now_ts_secs(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        self.active_skill = None;
+        LoopControl::Return(AgentOutcome::Patch(diff))
+    }
+
+    async fn handle_finalize_action(
+        &mut self,
+        packet: TaskPacket,
+        messages: &mut Vec<ChatMessage>,
+        session_id: Option<&str>,
+    ) -> LoopControl {
+        info!("Agent finalized task: {}", packet.title);
+        if !self.agent_allows_policy(AgentPolicyCapability::Finalize) {
+            warn!("Agent tried to finalize task without Finalize policy");
+            self.push_context_record(
+                ContextType::Error,
+                Some("finalize_not_allowed".to_string()),
+                self.agent_id.clone(),
+                None,
+                "Agent policy does not allow Finalize.".to_string(),
+                serde_json::json!({
+                    "required_policy": "Finalize",
+                    "agent": self.agent_id.clone(),
+                }),
+            );
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: "Error: This agent is not allowed to output 'finalize_task'. Add `Finalize` to the agent frontmatter `policy` to enable it.".to_string(),
+            });
+            return LoopControl::Continue;
+        }
+        // Persist the structured final answer for the UI (DB-backed chat).
+        let msg = serde_json::json!({ "type": "finalize_task", "packet": packet }).to_string();
+        let _ = self
+            .manager_db_add_assistant_message(&msg, session_id)
+            .await;
+        self.chat_history.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: msg.clone(),
+        });
+        self.push_context_record(
+            ContextType::AssistantReply,
+            Some("finalize_task".to_string()),
+            self.agent_id.clone(),
+            Some("user".to_string()),
+            msg,
+            serde_json::json!({ "kind": "finalize_task" }),
+        );
+        self.active_skill = None;
+        LoopControl::Return(AgentOutcome::Task(packet))
+    }
+
+    /// Stream model output with thinking-token forwarding.
+    ///
+    /// Uses `chat_text_stream` (no format constraint) instead of `chat_json`
+    /// so the model can emit prose "thinking" tokens before the JSON action.
+    /// Thinking tokens are forwarded via `self.thinking_tx` and the full
+    /// accumulated text is returned for action parsing.
+    async fn stream_with_thinking(&self, messages: &[ChatMessage]) -> Result<String> {
+        let mut stream = self
+            .model_manager
+            .chat_text_stream(&self.model_id, messages)
+            .await?;
+        let mut accumulated = String::new();
+        let mut thinking_ended = false;
+
+        while let Some(token_result) = TokioStreamExt::next(&mut stream).await {
+            let token = token_result?;
+            accumulated.push_str(&token);
+
+            if !thinking_ended {
+                if Self::looks_like_json_action_start(&accumulated) {
+                    thinking_ended = true;
+                    if let Some(tx) = &self.thinking_tx {
+                        let _ = tx.send(ThinkingEvent::Done);
+                    }
+                } else if let Some(tx) = &self.thinking_tx {
+                    let _ = tx.send(ThinkingEvent::Token(token));
+                }
+            }
+        }
+
+        // If thinking never ended (entire response was prose), signal done.
+        if !thinking_ended {
+            if let Some(tx) = &self.thinking_tx {
+                let _ = tx.send(ThinkingEvent::Done);
+            }
+        }
+
+        Ok(accumulated)
+    }
+
+    fn looks_like_json_action_start(text: &str) -> bool {
+        if let Some(brace_idx) = text.rfind('{') {
+            text[brace_idx..].contains("\"type\"")
+        } else {
+            false
+        }
     }
 
     pub async fn run_agent_loop(&mut self, session_id: Option<&str>) -> Result<AgentOutcome> {
@@ -564,114 +1280,15 @@ impl AgentEngine {
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
                 content: format!("Starting autonomous loop for task: {}", task),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
+                timestamp: crate::util::now_ts_secs(),
                 is_observation: true,
             });
         }
 
-        let system = self.system_prompt();
-        let allowed_tools = self.allowed_tool_names();
-        let mut messages = vec![ChatMessage {
-            role: "system".to_string(),
-            content: system,
-        }];
-        self.push_context_record(
-            ContextType::System,
-            Some("structured_loop_prompt".to_string()),
-            None,
-            None,
-            messages[0].content.clone(),
-            serde_json::json!({ "mode": "structured" }),
-        );
+        let (mut messages, allowed_tools, mut read_paths) =
+            self.prepare_loop_messages(&task);
 
-        // Include chat history so the model has context of the current conversation.
-        // IMPORTANT: We append the structured bootstrap *after* history+observations so the
-        // last message is always a fresh user instruction for the current task.
-        messages.extend(self.chat_history.clone());
-
-        for obs in &self.observations {
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: Self::observation_for_model(obs),
-            });
-        }
-
-        // Provide tool schema + workspace info (last user message, so the model starts the task
-        // instead of continuing a prior assistant greeting from chat_history).
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: format!(
-                "Autonomous agent loop started. Ignore any prior greetings or small talk.\n\nWorkspace root: {}\n\nCurrent Role: {:?}\n\nTask: {}\n\nTool schema (respond with a single JSON object per turn):\n{}",
-                self.cfg.ws_root.display(),
-                self.role,
-                task,
-                tools::tool_schema_json(allowed_tools.as_ref())
-            ),
-        });
-        self.push_context_record(
-            ContextType::UserInput,
-            Some("structured_bootstrap".to_string()),
-            Some("system".to_string()),
-            self.agent_id.clone(),
-            messages
-                .last()
-                .map(|m| m.content.clone())
-                .unwrap_or_default(),
-            serde_json::json!({ "source": "run_agent_loop" }),
-        );
-
-        #[derive(Clone)]
-        struct CachedToolObs {
-            model: String,
-        }
-
-        // Cache tool results by (tool,args) to prevent repetition loops.
         let mut tool_cache: HashMap<String, CachedToolObs> = HashMap::new();
-        // Guardrails: track files read in this loop so writes to existing files are never blind.
-        let mut read_paths: HashSet<String> = HashSet::new();
-
-        // Pre-populate read_paths from prior context if we've already read files in this session.
-        // IMPORTANT: Read results are stored as observations, not in chat_history.
-        let mut ingest_read_file_text = |text: &str| {
-            if !text.contains("Read:") || text.contains("tool_error:") {
-                return;
-            }
-            if let Some(start) = text.find("Read: ") {
-                let path_part = &text[start + 6..];
-                let raw_path = path_part.split_whitespace().next().unwrap_or("");
-                if raw_path.is_empty() {
-                    return;
-                }
-                let clean_path = raw_path
-                    .trim_end_matches(')')
-                    .trim_end_matches(',')
-                    .trim_end_matches('.')
-                    .to_string();
-                if clean_path.is_empty() {
-                    return;
-                }
-                read_paths.insert(clean_path.clone());
-
-                // Also insert normalized relative form if possible
-                if let Ok(abs) = self.cfg.ws_root.join(&clean_path).canonicalize() {
-                    if let Ok(rel) = abs.strip_prefix(&self.cfg.ws_root) {
-                        read_paths.insert(rel.to_string_lossy().to_string());
-                    }
-                }
-            }
-        };
-
-        for obs in &self.observations {
-            if obs.name == "Read" {
-                ingest_read_file_text(&obs.content);
-            }
-        }
-        for msg in &self.chat_history {
-            ingest_read_file_text(&msg.content);
-        }
 
         // Guardrail: repeated search with no matches means no progress.
         let mut empty_search_streak = 0usize;
@@ -685,7 +1302,14 @@ impl AgentEngine {
         let mut identical_response_streak = 0usize;
         let mut loop_nudge_count = 0usize;
 
-        for _ in 0..self.cfg.max_iters {
+        for iter_num in 0..self.cfg.max_iters {
+            if let Some(tx) = &self.repl_events_tx {
+                let _ = tx.send(ReplEvent::Iteration {
+                    current: iter_num + 1,
+                    max: self.cfg.max_iters,
+                });
+            }
+
             if self.is_cancelled().await {
                 anyhow::bail!("run cancelled");
             }
@@ -708,11 +1332,8 @@ impl AgentEngine {
             self.emit_context_usage_event("loop_iter", &messages, summary_count)
                 .await;
 
-            // Ask model for the next action as JSON.
-            let raw = self
-                .model_manager
-                .chat_json(&self.model_id, &messages)
-                .await?;
+            // Ask model for the next action, streaming thinking tokens.
+            let raw = self.stream_with_thinking(&messages).await?;
 
             // Debug log: split model output into text + json (truncated).
             let (text_part, json_part) = crate::engine::model_message_log_parts(&raw, 100, 100);
@@ -727,46 +1348,24 @@ impl AgentEngine {
             );
 
             // Repetition check
-            if raw == last_assistant_response {
-                identical_response_streak += 1;
-            } else {
-                identical_response_streak = 0;
-                last_assistant_response = raw.clone();
-            }
-
-            if identical_response_streak >= 3 {
-                loop_nudge_count += 1;
-                if loop_nudge_count >= 2 {
-                    let message = format!(
-                        "I couldn't continue automatically because I got stuck in a repetition loop (same response {} times).",
-                        identical_response_streak + 1
-                    );
-                    let _ = self
-                        .manager_db_add_assistant_message(&message, session_id)
-                        .await;
-                    self.active_skill = None;
-                    return Ok(AgentOutcome::None);
+            if let Some(ctrl) = self
+                .handle_repetition_check(
+                    &raw,
+                    &mut last_assistant_response,
+                    &mut identical_response_streak,
+                    &mut loop_nudge_count,
+                    &mut messages,
+                    session_id,
+                )
+                .await
+            {
+                match ctrl {
+                    LoopControl::Return(outcome) => return Ok(outcome),
+                    LoopControl::Continue => continue,
                 }
-
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: "It looks like you are trapped in a loop, sending the same response multiple times. Please try a different approach or tool to make progress.".to_string(),
-                });
-                self.push_context_record(
-                    ContextType::Error,
-                    Some("loop_detected".to_string()),
-                    self.agent_id.clone(),
-                    None,
-                    "Model trapped in a loop. Nudging with a warning message.".to_string(),
-                    serde_json::json!({ "streak": identical_response_streak + 1 }),
-                );
-                // Reset streak after nudging so we don't immediately trigger it again next turn
-                // but keep last_assistant_response to detect if it continues after the nudge.
-                identical_response_streak = 0;
-                continue;
             }
 
-            let action: ModelAction = match parse_first_action(&raw) {
+            let actions = match parse_all_actions(&raw) {
                 Ok(v) => v,
                 Err(e) => {
                     invalid_json_streak += 1;
@@ -781,7 +1380,7 @@ impl AgentEngine {
                     messages.push(ChatMessage {
                         role: "user".to_string(),
                         content: format!(
-                            "Your previous response was not valid JSON ({e}). Respond again with ONE JSON object matching the tool schema. Raw was:\n{raw}"
+                            "Your previous response was not valid JSON ({e}). Respond with one or more JSON objects matching the tool schema. Raw was:\n{raw}"
                         ),
                     });
                     self.push_context_record(
@@ -797,499 +1396,77 @@ impl AgentEngine {
             };
             invalid_json_streak = 0;
 
-            match action {
-                ModelAction::Tool { tool, args } => {
-                    let canonical_tool = tools::canonical_tool_name(&tool)
-                        .unwrap_or(tool.as_str())
-                        .to_string();
-
-                    if let Some(allowed) = &allowed_tools {
-                        if !self.is_tool_allowed(allowed, &tool) {
-                            let mut allowed_list = allowed.iter().cloned().collect::<Vec<_>>();
-                            allowed_list.sort();
-                            let rendered = format!(
-                                "tool_not_allowed: tool={} canonical={} allowed={}",
+            // Execute all actions sequentially within this turn.
+            let mut early_return: Option<AgentOutcome> = None;
+            for action in actions {
+                match action {
+                    ModelAction::Tool { tool, args } => {
+                        match self
+                            .handle_tool_action(
                                 tool,
-                                canonical_tool,
-                                allowed_list.join(",")
-                            );
-                            self.upsert_observation("error", &canonical_tool, rendered.clone());
-                            let _ = self
-                                .manager_db_add_observation(&canonical_tool, &rendered, session_id)
-                                .await;
-                            messages.push(ChatMessage {
-                                role: "user".to_string(),
-                                content: format!(
-                                    "Tool '{}' is not allowed for this agent. Use one of [{}].",
-                                    tool,
-                                    allowed_list.join(", ")
-                                ),
-                            });
-                            continue;
-                        }
-                    }
-
-                    let safe_args = sanitize_tool_args_for_display(&canonical_tool, &args);
-                    self.upsert_context_record_by_type_name(
-                        ContextType::ToolCall,
-                        &canonical_tool,
-                        self.agent_id.clone(),
-                        Some(self.outbound_target()),
-                        serde_json::to_string(&safe_args).unwrap_or_else(|_| "{}".to_string()),
-                        serde_json::json!({ "args": safe_args.clone() }),
-                    );
-                    info!(
-                        "Agent requested tool: {} (requested: {}) with args: {}",
-                        canonical_tool, tool, safe_args
-                    );
-                    if canonical_tool == "Read" {
-                        if let Some(path) = normalize_tool_path_arg(&self.cfg.ws_root, &args) {
-                            read_paths.insert(path);
-                        }
-                    }
-
-                    if matches!(canonical_tool.as_str(), "Write" | "Edit") {
-                        if let Some(path) = normalize_tool_path_arg(&self.cfg.ws_root, &args) {
-                            let existing = self.cfg.ws_root.join(&path).exists();
-                            if existing && !read_paths.contains(&path) {
-                                let action = if canonical_tool == "Edit" {
-                                    "Edit"
-                                } else {
-                                    "Write"
-                                };
-                                match self.cfg.write_safety_mode {
-                                    crate::config::WriteSafetyMode::Strict => {
-                                        let rendered = format!(
-                                            "tool_error: tool={} error=precondition_failed: must call Read on '{}' before {} for existing files",
-                                            action, path, action
-                                        );
-                                        self.upsert_observation("error", action, rendered.clone());
-                                        let _ = self
-                                            .manager_db_add_observation(
-                                                action, &rendered, session_id,
-                                            )
-                                            .await;
-                                        messages.push(ChatMessage {
-                                            role: "user".to_string(),
-                                            content: format!(
-                                                "Tool execution blocked for safety: {}. Read the existing file first, then apply a minimal update.",
-                                                rendered,
-                                            ),
-                                        });
-                                        continue;
-                                    }
-                                    crate::config::WriteSafetyMode::Warn => {
-                                        let rendered = format!(
-                                            "tool_warning: tool={} warning=writing_existing_file_without_prior_read path='{}'",
-                                            action, path
-                                        );
-                                        self.upsert_observation("warning", action, rendered.clone());
-                                        let _ = self
-                                            .manager_db_add_observation(
-                                                action, &rendered, session_id,
-                                            )
-                                            .await;
-                                        // Allow the edit/write to proceed.
-                                    }
-                                    crate::config::WriteSafetyMode::Off => {
-                                        // Allow writes without read.
-                                    }
-                                }
+                                args,
+                                &allowed_tools,
+                                &mut messages,
+                                &mut tool_cache,
+                                &mut read_paths,
+                                &mut last_tool_sig,
+                                &mut redundant_tool_streak,
+                                &mut empty_search_streak,
+                                session_id,
+                            )
+                            .await
+                        {
+                            LoopControl::Return(outcome) => {
+                                early_return = Some(outcome);
+                                break;
                             }
+                            LoopControl::Continue => {}
                         }
                     }
-
-                    let sig = tool_call_signature(&canonical_tool, &args);
-                    if sig == last_tool_sig {
-                        redundant_tool_streak += 1;
-                    } else {
-                        redundant_tool_streak = 0;
-                        last_tool_sig = sig.clone();
+                    ModelAction::Patch { diff } => {
+                        match self.handle_patch_action(diff, &mut messages).await {
+                            LoopControl::Return(outcome) => {
+                                early_return = Some(outcome);
+                                break;
+                            }
+                            LoopControl::Continue => {}
+                        }
                     }
-
-                    if redundant_tool_streak >= 3 {
-                        let loop_breaker_prompt = self
-                            .cfg
-                            .prompt_loop_breaker
-                            .as_deref()
-                            .map(|template| Self::render_loop_breaker_prompt(template, &canonical_tool))
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "You are repeatedly calling '{}' with the same arguments and not making progress. Use a different tool/arguments and continue automatically.",
-                                    canonical_tool
-                                )
-                            });
-                        messages.push(ChatMessage {
-                            role: "user".to_string(),
-                            content: loop_breaker_prompt,
-                        });
+                    ModelAction::FinalizeTask { packet } => {
+                        match self
+                            .handle_finalize_action(packet, &mut messages, session_id)
+                            .await
+                        {
+                            LoopControl::Return(outcome) => {
+                                early_return = Some(outcome);
+                                break;
+                            }
+                            LoopControl::Continue => {}
+                        }
+                    }
+                    ModelAction::Done { message } => {
+                        let msg = message
+                            .unwrap_or_else(|| "Task completed.".to_string());
+                        info!("Agent signalled done: {}", msg);
                         self.push_context_record(
-                            ContextType::Error,
-                            Some("redundant_tool_loop".to_string()),
+                            ContextType::Status,
+                            Some("done".to_string()),
                             self.agent_id.clone(),
-                            None,
-                            format!(
-                                "Repeated tool call loop detected for '{}'; nudging model to change approach.",
-                                canonical_tool
-                            ),
-                            serde_json::json!({ "tool": canonical_tool, "streak": redundant_tool_streak + 1 }),
+                            Some("user".to_string()),
+                            msg.clone(),
+                            serde_json::json!({ "kind": "done" }),
                         );
-                        redundant_tool_streak = 0;
-                        continue;
-                    }
-
-                    if let Some(cached) = tool_cache.get(&sig) {
-                        self.upsert_observation("tool", &canonical_tool, cached.model.clone());
-                        // Cached tool call: keep context for the model, but don't keep re-logging
-                        // identical observation rows to DB/UI.
-                        messages.push(ChatMessage {
-                            role: "user".to_string(),
-                            content: Self::observation_text("tool", &canonical_tool, &cached.model),
-                        });
-                        // Don't re-run identical tool calls.
-                        continue;
-                    }
-
-                    let tool_start_status = crate::server::chat_helpers::tool_status_line(
-                        &canonical_tool,
-                        Some(&args),
-                        crate::server::chat_helpers::ToolStatusPhase::Start,
-                    );
-                    let tool_done_status = crate::server::chat_helpers::tool_status_line(
-                        &canonical_tool,
-                        Some(&args),
-                        crate::server::chat_helpers::ToolStatusPhase::Done,
-                    );
-                    let tool_failed_status = crate::server::chat_helpers::tool_status_line(
-                        &canonical_tool,
-                        Some(&args),
-                        crate::server::chat_helpers::ToolStatusPhase::Failed,
-                    );
-
-                    // Tell the UI what tool we're about to use (progress visibility).
-                    if let Some(manager) = self.tools.get_manager() {
-                        let from = self
-                            .agent_id
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_string());
-                        let target = self.outbound_target();
-                        let _ = manager
-                            .send_event(crate::agent_manager::AgentEvent::AgentStatus {
-                                agent_id: from.clone(),
-                                status: "calling_tool".to_string(),
-                                detail: Some(tool_start_status.clone()),
-                            })
+                        let _ = self
+                            .manager_db_add_assistant_message(&msg, session_id)
                             .await;
-                        let _ = manager
-                            .send_event(crate::agent_manager::AgentEvent::Message {
-                                from: from.clone(),
-                                to: target.clone(),
-                                content: serde_json::json!({
-                                    "type": "tool",
-                                    "tool": canonical_tool.clone(),
-                                    "args": safe_args.clone()
-                                })
-                                .to_string(),
-                            })
-                            .await;
-                        let tool_msg = serde_json::json!({
-                            "type": "tool",
-                            "tool": canonical_tool.clone(),
-                            "args": safe_args
-                        })
-                        .to_string();
-                        let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
-                            repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
-                            session_id: session_id.unwrap_or("default").to_string(),
-                            agent_id: from.clone(),
-                            from_id: from,
-                            to_id: target,
-                            content: tool_msg,
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs(),
-                            is_observation: false,
-                        });
-                    }
-
-                    let call = ToolCall {
-                        tool: canonical_tool.clone(),
-                        args: args.clone(),
-                    };
-                    match self.tools.execute(call) {
-                        Ok(result) => {
-                            let rendered_model = render_tool_result(&result);
-                            let rendered_public = render_tool_result_public(&result);
-
-                            tool_cache.insert(
-                                sig,
-                                CachedToolObs {
-                                    model: rendered_model.clone(),
-                                },
-                            );
-                            self.upsert_observation(
-                                "tool",
-                                &canonical_tool,
-                                rendered_model.clone(),
-                            );
-
-                            // Record observation in DB
-                            let _ = self
-                                .manager_db_add_observation(
-                                    &canonical_tool,
-                                    &rendered_public,
-                                    session_id,
-                                )
-                                .await;
-                            if let Some(manager) = self.tools.get_manager() {
-                                let agent_id = self
-                                    .agent_id
-                                    .clone()
-                                    .unwrap_or_else(|| "unknown".to_string());
-                                manager
-                                    .send_event(crate::agent_manager::AgentEvent::AgentStatus {
-                                        agent_id: agent_id.clone(),
-                                        status: "calling_tool".to_string(),
-                                        detail: Some(tool_done_status.clone()),
-                                    })
-                                    .await;
-
-                                // Trigger a UI refresh via the server's SSE bridge.
-                                manager
-                                    .send_event(crate::agent_manager::AgentEvent::StateUpdated)
-                                    .await;
-
-                                // After tool completes, we're back to thinking.
-                                manager
-                                    .send_event(crate::agent_manager::AgentEvent::AgentStatus {
-                                        agent_id,
-                                        status: "thinking".to_string(),
-                                        detail: Some("Thinking".to_string()),
-                                    })
-                                    .await;
-                            }
-
-                            // For file mutations, emit a brief user-visible summary line immediately.
-                            if matches!(canonical_tool.as_str(), "Write" | "Edit")
-                                && (rendered_public.starts_with("File written:")
-                                    || rendered_public.starts_with("Edited file:")
-                                    || rendered_public.starts_with("File unchanged"))
-                            {
-                                let msg = if rendered_public.starts_with("File unchanged") {
-                                    if let Some(idx) = rendered_public.rfind(':') {
-                                        let path = rendered_public[idx + 1..].trim();
-                                        format!("No changes to `{}`.", path)
-                                    } else {
-                                        "No file changes.".to_string()
-                                    }
-                                } else if let Some(idx) = rendered_public.rfind(':') {
-                                    let rest = rendered_public[idx + 1..].trim();
-                                    let path = rest.split_whitespace().next().unwrap_or(rest);
-                                    format!("Updated `{}`.", path)
-                                } else {
-                                    "File updated.".to_string()
-                                };
-                                let _ = self
-                                    .manager_db_add_assistant_message(&msg, session_id)
-                                    .await;
-                            }
-
-                            messages.push(ChatMessage {
-                                role: "user".to_string(),
-                                content: Self::observation_text(
-                                    "tool",
-                                    &canonical_tool,
-                                    &rendered_model,
-                                ),
-                            });
-
-                            if canonical_tool == "Grep"
-                                && (rendered_model.contains("(no matches)")
-                                    || rendered_model.contains("no file candidates found"))
-                            {
-                                empty_search_streak += 1;
-                            } else {
-                                empty_search_streak = 0;
-                            }
-                            if empty_search_streak >= 4 {
-                                messages.push(ChatMessage {
-                                    role: "user".to_string(),
-                                    content: "Grep returned no matches repeatedly. Change strategy and continue automatically (for example: broaden terms, use Glob to inspect files, then Read likely paths).".to_string(),
-                                });
-                                self.push_context_record(
-                                    ContextType::Error,
-                                    Some("empty_search_loop".to_string()),
-                                    self.agent_id.clone(),
-                                    None,
-                                    "Repeated no-match search loop detected; nudging model to change strategy.".to_string(),
-                                    serde_json::json!({ "streak": empty_search_streak }),
-                                );
-                                empty_search_streak = 0;
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Tool execution failed ({}): {}", canonical_tool, e);
-                            let rendered =
-                                format!("tool_error: tool={} error={}", canonical_tool, e);
-                            tool_cache.insert(
-                                sig,
-                                CachedToolObs {
-                                    model: rendered.clone(),
-                                },
-                            );
-                            self.upsert_observation("error", &canonical_tool, rendered.clone());
-                            let _ = self
-                                .manager_db_add_observation(&canonical_tool, &rendered, session_id)
-                                .await;
-                            if let Some(manager) = self.tools.get_manager() {
-                                let agent_id = self
-                                    .agent_id
-                                    .clone()
-                                    .unwrap_or_else(|| "unknown".to_string());
-                                manager
-                                    .send_event(crate::agent_manager::AgentEvent::AgentStatus {
-                                        agent_id: agent_id.clone(),
-                                        status: "calling_tool".to_string(),
-                                        detail: Some(tool_failed_status.clone()),
-                                    })
-                                    .await;
-                                manager
-                                    .send_event(crate::agent_manager::AgentEvent::AgentStatus {
-                                        agent_id,
-                                        status: "thinking".to_string(),
-                                        detail: Some("Thinking".to_string()),
-                                    })
-                                    .await;
-                            }
-                            messages.push(ChatMessage {
-                                role: "user".to_string(),
-                                content: format!(
-                                    "Tool execution failed for tool='{}'. Error: {}. Choose a valid tool+args from the tool schema and try again.",
-                                    canonical_tool, e
-                                ),
-                            });
-                        }
+                        self.active_skill = None;
+                        early_return = Some(AgentOutcome::None);
+                        break;
                     }
                 }
-                ModelAction::Patch { diff } => {
-                    info!("Agent proposed a patch");
-                    if !self.agent_allows_policy(AgentPolicyCapability::Patch) {
-                        warn!("Agent tried to propose a patch without Patch policy");
-                        self.push_context_record(
-                            ContextType::Error,
-                            Some("patch_not_allowed".to_string()),
-                            self.agent_id.clone(),
-                            None,
-                            "Agent policy does not allow Patch.".to_string(),
-                            serde_json::json!({
-                                "required_policy": "Patch",
-                                "agent": self.agent_id.clone(),
-                            }),
-                        );
-                        messages.push(ChatMessage {
-                            role: "user".to_string(),
-                            content: "Error: This agent is not allowed to output 'patch'. Add `Patch` to the agent frontmatter `policy` to enable it.".to_string(),
-                        });
-                        continue;
-                    }
-                    let errs = validate_unified_diff(&diff);
-                    if !errs.is_empty() {
-                        warn!("Patch validation failed with {} errors", errs.len());
-                        self.push_context_record(
-                            ContextType::Error,
-                            Some("patch_validation".to_string()),
-                            self.agent_id.clone(),
-                            None,
-                            errs.join("\n"),
-                            serde_json::json!({ "error_count": errs.len() }),
-                        );
-                        messages.push(ChatMessage {
-                            role: "user".to_string(),
-                            content: format!(
-                                "The patch failed validation. Fix and respond with a new patch JSON. Errors:\n{}",
-                                errs.join("\n")
-                            ),
-                        });
-                        continue;
-                    }
-
-                    info!("Patch validated successfully");
-
-                    // Record activity in DB for patched files
-                    if let Some(manager) = self.tools.get_manager() {
-                        if let Some(agent_id) = &self.agent_id {
-                            // Simple parsing of diff to find files
-                            for line in diff.lines() {
-                                if line.starts_with("--- ") || line.starts_with("+++ ") {
-                                    let path = line[4..].split_whitespace().next().unwrap_or("");
-                                    if path != "/dev/null" && !path.is_empty() {
-                                        let _ =
-                                            manager.db.record_activity(crate::db::FileActivity {
-                                                repo_path: self
-                                                    .cfg
-                                                    .ws_root
-                                                    .to_string_lossy()
-                                                    .to_string(),
-                                                file_path: path.to_string(),
-                                                agent_id: agent_id.clone(),
-                                                status: "done".to_string(),
-                                                last_modified: std::time::SystemTime::now()
-                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                    .unwrap()
-                                                    .as_secs(),
-                                            });
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    self.active_skill = None;
-                    return Ok(AgentOutcome::Patch(diff));
-                }
-                ModelAction::FinalizeTask { packet } => {
-                    info!("Agent finalized task: {}", packet.title);
-                    if !self.agent_allows_policy(AgentPolicyCapability::Finalize) {
-                        warn!("Agent tried to finalize task without Finalize policy");
-                        self.push_context_record(
-                            ContextType::Error,
-                            Some("finalize_not_allowed".to_string()),
-                            self.agent_id.clone(),
-                            None,
-                            "Agent policy does not allow Finalize.".to_string(),
-                            serde_json::json!({
-                                "required_policy": "Finalize",
-                                "agent": self.agent_id.clone(),
-                            }),
-                        );
-                        messages.push(ChatMessage {
-                            role: "user".to_string(),
-                            content: "Error: This agent is not allowed to output 'finalize_task'. Add `Finalize` to the agent frontmatter `policy` to enable it.".to_string(),
-                        });
-                        continue;
-                    }
-                    // Persist the structured final answer for the UI (DB-backed chat).
-                    let msg = serde_json::json!({ "type": "finalize_task", "packet": packet })
-                        .to_string();
-                    let _ = self
-                        .manager_db_add_assistant_message(&msg, session_id)
-                        .await;
-                    self.chat_history.push(ChatMessage {
-                        role: "assistant".to_string(),
-                        content: msg.clone(),
-                    });
-                    self.push_context_record(
-                        ContextType::AssistantReply,
-                        Some("finalize_task".to_string()),
-                        self.agent_id.clone(),
-                        Some("user".to_string()),
-                        msg,
-                        serde_json::json!({ "kind": "finalize_task" }),
-                    );
-                    self.active_skill = None;
-                    return Ok(AgentOutcome::Task(packet));
-                }
+            }
+            if let Some(outcome) = early_return {
+                return Ok(outcome);
             }
         }
 
@@ -1335,13 +1512,6 @@ impl AgentEngine {
         }
 
         "user".to_string()
-    }
-
-    fn now_ts_secs() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
     }
 
     fn estimate_tokens_for_text(text: &str) -> usize {
@@ -1511,7 +1681,7 @@ impl AgentEngine {
     ) {
         let rec = ContextRecord {
             id: self.next_context_id,
-            ts: Self::now_ts_secs(),
+            ts: crate::util::now_ts_secs(),
             context_type,
             name,
             from,

@@ -1,7 +1,66 @@
+use crate::agent_manager::AgentManager;
 use crate::engine::AgentOutcome;
 use crate::server::{ServerEvent, ServerState};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+
+// ---------------------------------------------------------------------------
+// Message persistence
+// ---------------------------------------------------------------------------
+
+/// Emit a `ServerEvent::Message` **and** persist to state_fs + DB.
+pub(crate) async fn persist_and_emit_message(
+    manager: &Arc<AgentManager>,
+    events_tx: &broadcast::Sender<ServerEvent>,
+    root: &Path,
+    agent_id: &str,
+    from: &str,
+    to: &str,
+    content: &str,
+    session_id: Option<&str>,
+    is_observation: bool,
+) {
+    let _ = events_tx.send(ServerEvent::Message {
+        from: from.to_string(),
+        to: to.to_string(),
+        content: content.to_string(),
+    });
+    persist_message_only(manager, root, agent_id, from, to, content, session_id, is_observation)
+        .await;
+}
+
+/// Persist to state_fs + DB without emitting an SSE event.
+pub(crate) async fn persist_message_only(
+    manager: &Arc<AgentManager>,
+    root: &Path,
+    agent_id: &str,
+    from: &str,
+    to: &str,
+    content: &str,
+    session_id: Option<&str>,
+    is_observation: bool,
+) {
+    if let Ok(ctx) = manager.get_or_create_project(root.to_path_buf()).await {
+        let _ = ctx
+            .state_fs
+            .append_message(from, to, content, None, session_id);
+    }
+    let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
+        repo_path: root.to_string_lossy().to_string(),
+        session_id: session_id.unwrap_or("default").to_string(),
+        agent_id: agent_id.to_string(),
+        from_id: from.to_string(),
+        to_id: to.to_string(),
+        content: content.to_string(),
+        timestamp: crate::util::now_ts_secs(),
+        is_observation,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Queue management
+// ---------------------------------------------------------------------------
 
 pub(crate) fn queue_key(project_root: &str, session_id: &str, agent_id: &str) -> String {
     format!("{project_root}|{session_id}|{agent_id}")
@@ -17,36 +76,9 @@ pub(crate) fn queue_preview(message: &str) -> String {
     }
 }
 
-pub(crate) fn sanitize_tool_args_for_display(
-    tool: &str,
-    args: &serde_json::Value,
-) -> serde_json::Value {
-    let mut safe = args.clone();
-    if let Some(obj) = safe.as_object_mut() {
-        if matches!(tool, "Write") {
-            if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
-                let bytes = content.len();
-                let lines = content.lines().count();
-                obj.insert(
-                    "content".to_string(),
-                    serde_json::json!(format!("<omitted:{} bytes, {} lines>", bytes, lines)),
-                );
-            }
-        } else if matches!(tool, "Edit") {
-            for key in ["old_string", "new_string", "old", "new", "old_text", "new_text", "oldText", "newText", "search", "replace", "from", "to"] {
-                if let Some(content) = obj.get(key).and_then(|v| v.as_str()) {
-                    let bytes = content.len();
-                    let lines = content.lines().count();
-                    obj.insert(
-                        key.to_string(),
-                        serde_json::json!(format!("<omitted:{} bytes, {} lines>", bytes, lines)),
-                    );
-                }
-            }
-        }
-    }
-    safe
-}
+// ---------------------------------------------------------------------------
+// Tool status formatting
+// ---------------------------------------------------------------------------
 
 pub(crate) fn extract_tool_path_arg(args: &serde_json::Value) -> Option<String> {
     args.get("path")
@@ -274,6 +306,10 @@ fn status_line_for_tool_call(tool_call: Option<&ToolCallForUi>) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Message sanitization for UI
+// ---------------------------------------------------------------------------
+
 pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<String> {
     if from == "user" {
         return Some(content.to_string());
@@ -315,10 +351,7 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
             saw_tool_result_block = true;
             drop_remainder_as_tool_result = true;
             if let Some(name) = parse_tool_name_from_result_line(line) {
-                last_tool = Some(ToolCallForUi {
-                    name,
-                    args: None,
-                });
+                last_tool = Some(ToolCallForUi { name, args: None });
             }
             if lower.starts_with("tool read:") {
                 saw_read_result = true;
@@ -366,22 +399,34 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
     Some(cleaned)
 }
 
-pub(crate) fn sanitize_server_event_for_ui(event: ServerEvent) -> Option<ServerEvent> {
-    match event {
-        ServerEvent::Message { from, to, content } => {
-            let cleaned = sanitize_message_for_ui(&from, &content)?;
-            Some(ServerEvent::Message {
-                from,
-                to,
-                content: cleaned,
-            })
-        }
-        // Status + final Message are enough for chat UI; dropping token chunks prevents
-        // leaking raw tool payload fragments while keeping raw context in DB.
-        ServerEvent::Token { .. } => None,
-        other => Some(other),
+pub(crate) fn is_progress_text_for_ui(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
     }
+    matches!(
+        t,
+        "Thinking..."
+            | "Model loading..."
+            | "Reading file..."
+            | "Writing file..."
+            | "Running command..."
+            | "Searching..."
+            | "Listing files..."
+            | "Delegating..."
+            | "Calling tool..."
+    ) || t.starts_with("Reading file:")
+        || t.starts_with("Writing file:")
+        || t.starts_with("Running command:")
+        || t.starts_with("Searching:")
+        || t.starts_with("Listing files:")
+        || t.starts_with("Delegating to subagent:")
+        || t.starts_with("Calling tool:")
 }
+
+// ---------------------------------------------------------------------------
+// Queue event emission
+// ---------------------------------------------------------------------------
 
 pub(crate) async fn emit_queue_updated(
     state: &Arc<ServerState>,
@@ -401,6 +446,10 @@ pub(crate) async fn emit_queue_updated(
         items,
     });
 }
+
+// ---------------------------------------------------------------------------
+// Outcome events
+// ---------------------------------------------------------------------------
 
 pub(crate) fn emit_outcome_event(
     outcome: &AgentOutcome,

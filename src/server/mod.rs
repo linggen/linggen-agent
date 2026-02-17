@@ -1,6 +1,7 @@
 mod agent_api;
 mod chat_api;
 pub(crate) mod chat_helpers;
+mod config_api;
 mod projects_api;
 mod workspace_api;
 
@@ -17,6 +18,7 @@ use axum::{
 };
 use rust_embed::RustEmbed;
 use serde::Serialize;
+use serde_json::json;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +32,7 @@ use tracing::info;
 
 use agent_api::{cancel_agent_run, run_agent, set_task};
 use chat_api::{chat_handler, clear_chat_history_api, get_settings_api, update_settings_api};
+use config_api::{get_config_api, update_config_api};
 use projects_api::{
     add_project, create_session, delete_agent_file_api, get_agent_context_api, get_agent_file_api,
     list_agent_children_api, list_agent_files_api, list_agent_runs_api, list_agents_api,
@@ -54,10 +57,43 @@ pub struct ServerState {
     pub event_seq: AtomicU64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatusKind {
+    Idle,
+    ModelLoading,
+    Thinking,
+    CallingTool,
+    Working,
+}
+
+impl AgentStatusKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::ModelLoading => "model_loading",
+            Self::Thinking => "thinking",
+            Self::CallingTool => "calling_tool",
+            Self::Working => "working",
+        }
+    }
+
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "idle" => Self::Idle,
+            "model_loading" => Self::ModelLoading,
+            "thinking" => Self::Thinking,
+            "calling_tool" => Self::CallingTool,
+            "working" => Self::Working,
+            _ => Self::Working,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ActiveStatusRecord {
     status_id: String,
-    status: String,
+    status: AgentStatusKind,
     detail: Option<String>,
 }
 
@@ -108,10 +144,6 @@ pub enum ServerEvent {
         agent_id: String,
         items: Vec<QueuedChatItem>,
     },
-    Token {
-        agent_id: String,
-        token: String,
-    },
     ContextUsage {
         agent_id: String,
         stage: String,
@@ -127,13 +159,309 @@ pub enum ServerEvent {
         agent_id: String,
         outcome: crate::engine::AgentOutcome,
     },
+    Token {
+        agent_id: String,
+        token: String,
+        done: bool,
+        thinking: bool,
+    },
+    ChangeReport {
+        agent_id: String,
+        files: Vec<serde_json::Value>,
+        truncated_count: usize,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UiSseMessage {
+    pub id: String,
+    pub seq: u64,
+    pub rev: u64,
+    pub ts_ms: u64,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+// ---------------------------------------------------------------------------
+// UI SSE kind/phase constants
+// ---------------------------------------------------------------------------
+
+const UI_KIND_MESSAGE: &str = "message";
+const UI_KIND_ACTIVITY: &str = "activity";
+const UI_KIND_QUEUE: &str = "queue";
+const UI_KIND_RUN: &str = "run";
+const UI_KIND_TOKEN: &str = "token";
+
+const UI_PHASE_SYNC: &str = "sync";
+const UI_PHASE_OUTCOME: &str = "outcome";
+const UI_PHASE_SETTINGS_UPDATED: &str = "settings_updated";
+const UI_PHASE_CONTEXT_USAGE: &str = "context_usage";
+const UI_PHASE_SUBAGENT_SPAWNED: &str = "subagent_spawned";
+const UI_PHASE_SUBAGENT_RESULT: &str = "subagent_result";
+const UI_PHASE_CHANGE_REPORT: &str = "change_report";
+const UI_PHASE_DOING: &str = "doing";
+const UI_PHASE_DONE: &str = "done";
+
+fn default_status_text(status: AgentStatusKind) -> String {
+    match status {
+        AgentStatusKind::ModelLoading => "Model loading...".to_string(),
+        AgentStatusKind::Thinking => "Thinking...".to_string(),
+        AgentStatusKind::CallingTool => "Calling tool...".to_string(),
+        AgentStatusKind::Working => "Working...".to_string(),
+        AgentStatusKind::Idle => "Idle".to_string(),
+    }
+}
+
+fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseMessage> {
+    let ts_ms = crate::util::now_ts_ms();
+    match event {
+        ServerEvent::Message { from, to, content } => {
+            let cleaned = crate::server::chat_helpers::sanitize_message_for_ui(&from, &content)?;
+            if from != "user" && crate::server::chat_helpers::is_progress_text_for_ui(&cleaned) {
+                return None;
+            }
+            Some(UiSseMessage {
+                id: format!("msg-{seq}"),
+                seq,
+                rev: seq,
+                ts_ms,
+                kind: UI_KIND_MESSAGE.to_string(),
+                phase: None,
+                text: Some(cleaned),
+                agent_id: Some(from.clone()),
+                session_id: None,
+                project_root: None,
+                data: Some(json!({
+                    "from": from,
+                    "to": to,
+                    "role": if from == "user" { "user" } else { "assistant" },
+                })),
+            })
+        }
+        ServerEvent::AgentStatus {
+            agent_id,
+            status,
+            detail,
+            status_id,
+            lifecycle,
+        } => {
+            if status.eq_ignore_ascii_case("idle") && lifecycle.is_none() {
+                return None;
+            }
+            let phase = lifecycle.or_else(|| {
+                if status.eq_ignore_ascii_case("idle") {
+                    Some(UI_PHASE_DONE.to_string())
+                } else {
+                    Some(UI_PHASE_DOING.to_string())
+                }
+            });
+            let text = detail
+                .and_then(|v| {
+                    let t = v.trim().to_string();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        Some(t)
+                    }
+                })
+                .unwrap_or_else(|| default_status_text(AgentStatusKind::from_str_loose(&status)));
+            Some(UiSseMessage {
+                id: status_id.unwrap_or_else(|| format!("activity-{agent_id}-{status}-{seq}")),
+                seq,
+                rev: seq,
+                ts_ms,
+                kind: UI_KIND_ACTIVITY.to_string(),
+                phase,
+                text: Some(text),
+                agent_id: Some(agent_id),
+                session_id: None,
+                project_root: None,
+                data: Some(json!({ "status": status })),
+            })
+        }
+        ServerEvent::QueueUpdated {
+            project_root,
+            session_id,
+            agent_id,
+            items,
+        } => Some(UiSseMessage {
+            id: format!("queue-{project_root}|{session_id}|{agent_id}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: UI_KIND_QUEUE.to_string(),
+            phase: None,
+            text: Some(format!(
+                "Queued {} message{}",
+                items.len(),
+                if items.len() == 1 { "" } else { "s" }
+            )),
+            agent_id: Some(agent_id),
+            session_id: Some(session_id),
+            project_root: Some(project_root),
+            data: Some(json!({ "items": items })),
+        }),
+        ServerEvent::StateUpdated => Some(UiSseMessage {
+            id: format!("run-sync-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: UI_KIND_RUN.to_string(),
+            phase: Some(UI_PHASE_SYNC.to_string()),
+            text: Some("State updated".to_string()),
+            agent_id: None,
+            session_id: None,
+            project_root: None,
+            data: None,
+        }),
+        ServerEvent::Outcome { agent_id, outcome } => Some(UiSseMessage {
+            id: format!("run-outcome-{agent_id}-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: UI_KIND_RUN.to_string(),
+            phase: Some(UI_PHASE_OUTCOME.to_string()),
+            text: Some("Run outcome".to_string()),
+            agent_id: Some(agent_id),
+            session_id: None,
+            project_root: None,
+            data: Some(json!({ "outcome": outcome })),
+        }),
+        ServerEvent::SettingsUpdated { project_root, mode } => Some(UiSseMessage {
+            id: format!("run-settings-{project_root}-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: UI_KIND_RUN.to_string(),
+            phase: Some(UI_PHASE_SETTINGS_UPDATED.to_string()),
+            text: Some(format!("Mode set to {}", mode)),
+            agent_id: None,
+            session_id: None,
+            project_root: Some(project_root.clone()),
+            data: Some(json!({ "project_root": project_root, "mode": mode })),
+        }),
+        ServerEvent::ContextUsage {
+            agent_id,
+            stage,
+            message_count,
+            char_count,
+            estimated_tokens,
+            token_limit,
+            compressed,
+            summary_count,
+        } => Some(UiSseMessage {
+            id: format!("run-context-{agent_id}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: UI_KIND_RUN.to_string(),
+            phase: Some(UI_PHASE_CONTEXT_USAGE.to_string()),
+            text: None,
+            agent_id: Some(agent_id.clone()),
+            session_id: None,
+            project_root: None,
+            data: Some(json!({
+                "agent_id": agent_id,
+                "stage": stage,
+                "message_count": message_count,
+                "char_count": char_count,
+                "estimated_tokens": estimated_tokens,
+                "token_limit": token_limit,
+                "compressed": compressed,
+                "summary_count": summary_count,
+            })),
+        }),
+        ServerEvent::SubagentSpawned {
+            parent_id,
+            subagent_id,
+            task,
+        } => Some(UiSseMessage {
+            id: format!("run-subagent-spawned-{subagent_id}-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: UI_KIND_RUN.to_string(),
+            phase: Some(UI_PHASE_SUBAGENT_SPAWNED.to_string()),
+            text: Some(format!("Spawned subagent {}", subagent_id)),
+            agent_id: Some(parent_id),
+            session_id: None,
+            project_root: None,
+            data: Some(json!({ "subagent_id": subagent_id, "task": task })),
+        }),
+        ServerEvent::SubagentResult {
+            parent_id,
+            subagent_id,
+            outcome,
+        } => Some(UiSseMessage {
+            id: format!("run-subagent-result-{subagent_id}-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: UI_KIND_RUN.to_string(),
+            phase: Some(UI_PHASE_SUBAGENT_RESULT.to_string()),
+            text: Some(format!("Subagent {} returned", subagent_id)),
+            agent_id: Some(parent_id),
+            session_id: None,
+            project_root: None,
+            data: Some(json!({ "subagent_id": subagent_id, "outcome": outcome })),
+        }),
+        ServerEvent::Token {
+            agent_id,
+            token,
+            done,
+            thinking,
+        } => Some(UiSseMessage {
+            id: format!("token-{agent_id}-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: UI_KIND_TOKEN.to_string(),
+            phase: if done { Some(UI_PHASE_DONE.to_string()) } else { None },
+            text: Some(token),
+            agent_id: Some(agent_id),
+            session_id: None,
+            project_root: None,
+            data: if thinking { Some(json!({ "thinking": true })) } else { None },
+        }),
+        ServerEvent::ChangeReport {
+            agent_id,
+            files,
+            truncated_count,
+        } => Some(UiSseMessage {
+            id: format!("run-change-report-{agent_id}-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: UI_KIND_RUN.to_string(),
+            phase: Some(UI_PHASE_CHANGE_REPORT.to_string()),
+            text: Some("Change report".to_string()),
+            agent_id: Some(agent_id),
+            session_id: None,
+            project_root: None,
+            data: Some(json!({
+                "files": files,
+                "truncated_count": truncated_count,
+            })),
+        }),
+    }
 }
 
 impl ServerState {
     pub async fn send_agent_status(
         &self,
         agent_id: String,
-        status: String,
+        status: AgentStatusKind,
         detail: Option<String>,
     ) {
         let mut done_event: Option<ServerEvent> = None;
@@ -142,35 +470,35 @@ impl ServerState {
 
         {
             let mut active = self.active_statuses.lock().await;
-            if status.eq_ignore_ascii_case("idle") {
+            if status == AgentStatusKind::Idle {
                 if let Some(prev) = active.remove(&agent_id) {
                     done_event = Some(ServerEvent::AgentStatus {
                         agent_id: agent_id.clone(),
-                        status: prev.status,
+                        status: prev.status.as_str().to_string(),
                         detail: prev.detail,
                         status_id: Some(prev.status_id),
-                        lifecycle: Some("done".to_string()),
+                        lifecycle: Some(UI_PHASE_DONE.to_string()),
                     });
                 }
             } else {
                 if let Some(prev) = active.get(&agent_id).cloned() {
-                    if !prev.status.eq_ignore_ascii_case(&status) {
+                    if prev.status != status {
                         done_event = Some(ServerEvent::AgentStatus {
                             agent_id: agent_id.clone(),
-                            status: prev.status,
+                            status: prev.status.as_str().to_string(),
                             detail: prev.detail,
                             status_id: Some(prev.status_id),
-                            lifecycle: Some("done".to_string()),
+                            lifecycle: Some(UI_PHASE_DONE.to_string()),
                         });
                         active.remove(&agent_id);
                     } else {
                         status_id = Some(prev.status_id.clone());
-                        lifecycle = Some("doing".to_string());
+                        lifecycle = Some(UI_PHASE_DOING.to_string());
                         active.insert(
                             agent_id.clone(),
                             ActiveStatusRecord {
                                 status_id: prev.status_id,
-                                status: status.clone(),
+                                status,
                                 detail: detail.clone(),
                             },
                         );
@@ -181,12 +509,12 @@ impl ServerState {
                     let next_id =
                         format!("status-{}", self.status_seq.fetch_add(1, Ordering::Relaxed));
                     status_id = Some(next_id.clone());
-                    lifecycle = Some("doing".to_string());
+                    lifecycle = Some(UI_PHASE_DOING.to_string());
                     active.insert(
                         agent_id.clone(),
                         ActiveStatusRecord {
                             status_id: next_id,
-                            status: status.clone(),
+                            status,
                             detail: detail.clone(),
                         },
                     );
@@ -200,7 +528,7 @@ impl ServerState {
 
         let _ = self.events_tx.send(ServerEvent::AgentStatus {
             agent_id,
-            status,
+            status: status.as_str().to_string(),
             detail,
             status_id,
             lifecycle,
@@ -217,7 +545,7 @@ pub async fn start_server(
 ) -> anyhow::Result<()> {
     info!("linggen-agent server starting on port {}...", port);
 
-    // SSE can be bursty (tokens, tool steps). Use a larger buffer to reduce lag drops.
+    // SSE can be bursty (tool/status steps). Use a larger buffer to reduce lag drops.
     let (events_tx, _) = broadcast::channel(4096);
 
     let state = Arc::new(ServerState {
@@ -253,7 +581,7 @@ pub async fn start_server(
                         detail,
                     } => {
                         state_clone
-                            .send_agent_status(agent_id, status, detail)
+                            .send_agent_status(agent_id, AgentStatusKind::from_str_loose(&status), detail)
                             .await;
                     }
                     crate::agent_manager::AgentEvent::SubagentSpawned {
@@ -326,6 +654,7 @@ pub async fn start_server(
         .route("/api/agent-children", get(list_agent_children_api))
         .route("/api/agent-context", get(get_agent_context_api))
         .route("/api/models", get(list_models_api))
+        .route("/api/config", get(get_config_api).post(update_config_api))
         .route("/api/skills", get(list_skills))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions", post(create_session))
@@ -358,9 +687,15 @@ async fn static_handler(State(state): State<Arc<ServerState>>, uri: Uri) -> Resp
     let path = uri.path().trim_start_matches('/');
 
     if state.dev_mode {
-        // In dev mode, we could proxy to Vite, but for simplicity in this MVP
-        // we'll just try to serve from Assets or return 404.
-        // Real proxying would use tower-http's ReverseProxy.
+        // In dev mode, static assets are served by the Vite dev server.
+        // Return 404 so the user knows to use the Vite proxy.
+        return Response::builder()
+            .status(404)
+            .header("Content-Type", "text/plain")
+            .body(axum::body::Body::from(
+                "Dev mode: static assets are served by Vite. Use the Vite dev server URL instead.",
+            ))
+            .unwrap();
     }
 
     let path = if path.is_empty() { "index.html" } else { path };
@@ -375,11 +710,16 @@ async fn static_handler(State(state): State<Arc<ServerState>>, uri: Uri) -> Resp
         }
         None => {
             // Fallback to index.html for SPA routing
-            let index = Assets::get("index.html").unwrap();
-            Response::builder()
-                .header("Content-Type", "text/html")
-                .body(axum::body::Body::from(index.data))
-                .unwrap()
+            match Assets::get("index.html") {
+                Some(index) => Response::builder()
+                    .header("Content-Type", "text/html")
+                    .body(axum::body::Body::from(index.data))
+                    .unwrap(),
+                None => Response::builder()
+                    .status(404)
+                    .body(axum::body::Body::from("Not found"))
+                    .unwrap(),
+            }
         }
     }
 }
@@ -387,47 +727,15 @@ async fn static_handler(State(state): State<Arc<ServerState>>, uri: Uri) -> Resp
 async fn events_handler(
     State(state): State<Arc<ServerState>>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    #[derive(Serialize)]
-    struct SseEnvelope {
-        seq: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        project_root: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        session_id: Option<String>,
-        #[serde(flatten)]
-        event: ServerEvent,
-    }
-
-    fn infer_event_context(event: &ServerEvent) -> (Option<String>, Option<String>) {
-        match event {
-            ServerEvent::QueueUpdated {
-                project_root,
-                session_id,
-                ..
-            } => (Some(project_root.clone()), Some(session_id.clone())),
-            ServerEvent::SettingsUpdated { project_root, .. } => (Some(project_root.clone()), None),
-            _ => (None, None),
-        }
-    }
-
     let rx = state.events_tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(move |msg| {
         let event = match msg {
             Ok(event) => event,
-            // If the broadcast stream lags/drops messages, emit a parseable event that
-            // prompts the UI to refresh from DB instead of sending non-JSON "error".
             Err(_) => ServerEvent::StateUpdated,
         };
-        let filtered = crate::server::chat_helpers::sanitize_server_event_for_ui(event)?;
         let seq = state.event_seq.fetch_add(1, Ordering::Relaxed);
-        let (project_root, session_id) = infer_event_context(&filtered);
-        let envelope = SseEnvelope {
-            seq,
-            project_root,
-            session_id,
-            event: filtered,
-        };
-        let data = serde_json::to_string(&envelope).unwrap_or_default();
+        let ui_msg = map_server_event_to_ui_message(event, seq)?;
+        let data = serde_json::to_string(&ui_msg).unwrap_or_default();
         Some(Ok(Event::default().data(data)))
     });
 
@@ -435,12 +743,13 @@ async fn events_handler(
 }
 
 async fn pick_folder() -> impl IntoResponse {
-    // ... (existing code)
+    (axum::http::StatusCode::NOT_IMPLEMENTED, "Folder picker not implemented").into_response()
 }
 
 async fn get_ollama_status(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     // We'll just check the first ollama model we find
-    let models = state.manager.models.list_models();
+    let models_guard = state.manager.models.read().await;
+    let models = models_guard.list_models();
     let ollama_model = models.iter().find(|m| m.provider == "ollama");
 
     if let Some(m) = ollama_model {

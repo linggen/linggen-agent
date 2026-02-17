@@ -16,6 +16,11 @@ pub enum ModelAction {
     Patch { diff: String },
     #[serde(rename = "finalize_task")]
     FinalizeTask { packet: TaskPacket },
+    #[serde(rename = "done")]
+    Done {
+        #[serde(default)]
+        message: Option<String>,
+    },
 }
 
 pub fn parse_first_action(raw: &str) -> Result<ModelAction> {
@@ -46,6 +51,37 @@ pub fn parse_first_action(raw: &str) -> Result<ModelAction> {
     }
 
     anyhow::bail!("no valid model action found in response")
+}
+
+/// Parse ALL valid model actions from a response that may contain prose + multiple JSON objects.
+/// Actions are returned in the order they appear in the response.
+pub fn parse_all_actions(raw: &str) -> Result<Vec<ModelAction>> {
+    let trimmed = raw.trim();
+    let mut actions = Vec::new();
+    let mut pos = 0;
+
+    while pos < trimmed.len() {
+        let Some(brace_idx) = trimmed[pos..].find('{') else {
+            break;
+        };
+        let abs_idx = pos + brace_idx;
+        let candidate = &trimmed[abs_idx..];
+        let mut de = Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+        if let Some(Ok(value)) = de.next() {
+            let consumed = de.byte_offset();
+            if let Some(action) = value_to_action(value) {
+                actions.push(action);
+            }
+            pos = abs_idx + consumed;
+        } else {
+            pos = abs_idx + 1;
+        }
+    }
+
+    if actions.is_empty() {
+        anyhow::bail!("no valid model action found in response");
+    }
+    Ok(actions)
 }
 
 fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
@@ -210,7 +246,7 @@ pub fn model_message_log_parts(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_first_action, ModelAction};
+    use super::{parse_all_actions, parse_first_action, ModelAction};
 
     #[test]
     fn parse_first_action_preserves_generic_types_in_write_content() {
@@ -257,5 +293,67 @@ mod tests {
             }
             _ => panic!("expected tool action"),
         }
+    }
+
+    #[test]
+    fn parse_all_actions_single_tool() {
+        let raw = r#"{"type":"tool","tool":"Read","args":{"path":"src/main.rs"}}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ModelAction::Tool { tool, .. } => assert_eq!(tool, "Read"),
+            _ => panic!("expected tool action"),
+        }
+    }
+
+    #[test]
+    fn parse_all_actions_multiple_tools() {
+        let raw = r#"I'll read two files.
+{"type":"tool","tool":"Read","args":{"path":"src/main.rs"}}
+Now let me also search:
+{"type":"tool","tool":"Grep","args":{"query":"fn main","globs":["src/**"]}}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 2);
+        match &actions[0] {
+            ModelAction::Tool { tool, .. } => assert_eq!(tool, "Read"),
+            _ => panic!("expected Read tool"),
+        }
+        match &actions[1] {
+            ModelAction::Tool { tool, .. } => assert_eq!(tool, "Grep"),
+            _ => panic!("expected Grep tool"),
+        }
+    }
+
+    #[test]
+    fn parse_all_actions_tool_then_finalize() {
+        let raw = r#"{"type":"tool","tool":"Read","args":{"path":"src/main.rs"}}
+{"type":"finalize_task","packet":{"title":"test","user_stories":[],"acceptance_criteria":[],"mermaid_wireframe":null}}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 2);
+        match &actions[0] {
+            ModelAction::Tool { tool, .. } => assert_eq!(tool, "Read"),
+            _ => panic!("expected tool action"),
+        }
+        match &actions[1] {
+            ModelAction::FinalizeTask { packet } => assert_eq!(packet.title, "test"),
+            _ => panic!("expected finalize action"),
+        }
+    }
+
+    #[test]
+    fn parse_all_actions_preserves_order() {
+        let raw = r#"{"type":"tool","tool":"Glob","args":{"pattern":"*.rs"}}
+{"type":"tool","tool":"Read","args":{"path":"a.rs"}}
+{"type":"tool","tool":"Grep","args":{"query":"hello"}}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 3);
+        let tools: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ModelAction::Tool { tool, .. } => Some(tool.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools, vec!["Glob", "Read", "Grep"]);
     }
 }

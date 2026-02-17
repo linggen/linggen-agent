@@ -611,11 +611,8 @@ impl Tools {
                 repo_path: self.root.to_string_lossy().to_string(),
                 file_path: rel.to_string(),
                 agent_id: agent_id.clone(),
-                status: "working".to_string(),
-                last_modified: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
+                status: crate::db::FileActivityStatus::Working,
+                last_modified: crate::util::now_ts_secs(),
             });
 
             // Live working-place map for active-path UI (in-memory source of truth).
@@ -855,13 +852,13 @@ impl Tools {
                 engine.set_parent_agent(None);
 
                 let (outcome, status, detail) = match run_result {
-                    Ok(outcome) => (outcome, "completed", None),
+                    Ok(outcome) => (outcome, crate::db::AgentRunStatus::Completed, None),
                     Err(err) => {
                         let msg = err.to_string();
                         let status = if msg.to_lowercase().contains("cancel") {
-                            "cancelled"
+                            crate::db::AgentRunStatus::Cancelled
                         } else {
-                            "failed"
+                            crate::db::AgentRunStatus::Failed
                         };
                         let _ = manager.finish_agent_run(&run_id, status, Some(msg)).await;
                         return Err(err);
