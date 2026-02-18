@@ -14,6 +14,7 @@ pub async fn run_grader(
     grade_script: &Path,
     workspace_dir: &Path,
     task_name: &str,
+    timeout_secs: Option<u64>,
 ) -> Result<GradeResult> {
     if !grade_script.exists() {
         return Ok(GradeResult {
@@ -23,8 +24,9 @@ pub async fn run_grader(
         });
     }
 
+    let timeout = timeout_secs.unwrap_or(GRADER_TIMEOUT_SECS);
     let result = tokio::time::timeout(
-        Duration::from_secs(GRADER_TIMEOUT_SECS),
+        Duration::from_secs(timeout),
         tokio::process::Command::new("bash")
             .arg(grade_script)
             .current_dir(workspace_dir)
@@ -59,10 +61,7 @@ pub async fn run_grader(
         Err(_) => Ok(GradeResult {
             passed: false,
             exit_code: -1,
-            output: format!(
-                "Grader timed out after {}s",
-                GRADER_TIMEOUT_SECS
-            ),
+            output: format!("Grader timed out after {}s", timeout),
         }),
     }
 }

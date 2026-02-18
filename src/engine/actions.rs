@@ -110,6 +110,11 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
     let tool_name = match action_type {
         "Read" | "Grep" | "Write" | "Edit" | "Glob" | "Bash" | "capture_screenshot"
         | "lock_paths" | "unlock_paths" | "delegate_to_agent" | "get_repo_info" => action_type,
+        // Known non-tool action types that should not be treated as tool shorthands.
+        "" | "patch" | "finalize_task" | "done" => return None,
+        // Unknown type with args present: treat as a skill tool shorthand
+        // (e.g. {"type":"my_skill_tool","args":{...}}).
+        other if obj.contains_key("args") || obj.contains_key("tool_args") => other,
         _ => return None,
     };
 
@@ -119,21 +124,10 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
     })
 }
 
-fn is_supported_model_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        "Read"
-            | "Grep"
-            | "Write"
-            | "Edit"
-            | "Glob"
-            | "Bash"
-            | "capture_screenshot"
-            | "lock_paths"
-            | "unlock_paths"
-            | "delegate_to_agent"
-            | "get_repo_info"
-    )
+fn is_supported_model_tool(_tool: &str) -> bool {
+    // Always accept: the ToolRegistry rejects unknown tools at execution time
+    // with a proper error message, which is better than silently dropping the action.
+    true
 }
 
 fn extract_first_json_object_span(s: &str) -> Option<(usize, usize)> {

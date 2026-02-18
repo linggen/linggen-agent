@@ -15,8 +15,13 @@ pub struct OllamaClient {
 
 impl OllamaClient {
     pub fn new(base_url: String, api_key: Option<String>) -> Self {
+        let http = Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
-            http: Client::new(),
+            http,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
         }

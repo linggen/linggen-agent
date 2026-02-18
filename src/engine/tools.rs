@@ -1,5 +1,5 @@
 use crate::agent_manager::AgentManager;
-use crate::config::{AgentKind, AgentPolicy, AgentPolicyCapability};
+use crate::config::{AgentPolicy, AgentPolicyCapability};
 use anyhow::Result;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use grep::regex::RegexMatcher;
@@ -16,6 +16,18 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::info;
+
+/// Check if a hostname falls in the RFC 1918 172.16.0.0/12 range (172.16.x.x – 172.31.x.x).
+fn is_rfc1918_172(host: &str) -> bool {
+    if let Some(rest) = host.strip_prefix("172.") {
+        if let Some(second_octet) = rest.split('.').next() {
+            if let Ok(n) = second_octet.parse::<u8>() {
+                return (16..=31).contains(&n);
+            }
+        }
+    }
+    false
+}
 
 #[derive(Debug)]
 pub struct ToolCall {
@@ -61,7 +73,8 @@ pub struct Tools {
     root: PathBuf,
     manager: Option<Arc<AgentManager>>,
     agent_id: Option<String>,
-    agent_kind: AgentKind,
+    delegation_depth: usize,
+    max_delegation_depth: usize,
     run_id: Option<String>,
     agent_policy: Option<AgentPolicy>,
 }
@@ -72,7 +85,8 @@ impl Tools {
             root,
             manager: None,
             agent_id: None,
-            agent_kind: AgentKind::Main,
+            delegation_depth: 0,
+            max_delegation_depth: 2,
             run_id: None,
             agent_policy: None,
         })
@@ -82,11 +96,21 @@ impl Tools {
         &mut self,
         manager: Arc<AgentManager>,
         agent_id: String,
-        agent_kind: AgentKind,
     ) {
         self.manager = Some(manager);
         self.agent_id = Some(agent_id);
-        self.agent_kind = agent_kind;
+    }
+
+    pub fn set_delegation_depth(&mut self, depth: usize) {
+        self.delegation_depth = depth;
+    }
+
+    pub fn set_max_delegation_depth(&mut self, max_depth: usize) {
+        self.max_delegation_depth = max_depth;
+    }
+
+    pub fn delegation_depth(&self) -> usize {
+        self.delegation_depth
     }
 
     pub fn set_policy(&mut self, policy: Option<AgentPolicy>) {
@@ -99,6 +123,10 @@ impl Tools {
 
     pub fn get_manager(&self) -> Option<Arc<AgentManager>> {
         self.manager.clone()
+    }
+
+    pub(crate) fn workspace_root(&self) -> &Path {
+        &self.root
     }
 
     pub fn execute(&self, call: ToolCall) -> Result<ToolResult> {
@@ -489,12 +517,6 @@ impl Tools {
     }
 
     fn run_command(&self, args: RunCommandArgs) -> Result<ToolResult> {
-        if self.agent_kind == AgentKind::Main && is_repo_discovery_command(&args.cmd) {
-            anyhow::bail!(
-                "Policy: main agents must delegate repository discovery to a subagent via delegate_to_agent"
-            );
-        }
-
         // Hybrid shell mode: support common dev/inspection tools while enforcing
         // an allowlist on every shell segment.
         validate_shell_command(&args.cmd)?;
@@ -551,6 +573,32 @@ impl Tools {
     }
 
     fn capture_screenshot(&self, args: CaptureScreenshotArgs) -> Result<ToolResult> {
+        // Validate URL to prevent SSRF: only allow http/https and block private IPs.
+        let parsed_url: reqwest::Url = args
+            .url
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid URL: {}", e))?;
+        match parsed_url.scheme() {
+            "http" | "https" => {}
+            scheme => anyhow::bail!("Disallowed URL scheme: {}", scheme),
+        }
+        if let Some(host) = parsed_url.host_str() {
+            let is_private = host == "localhost"
+                || host == "127.0.0.1"
+                || host == "::1"
+                || host == "0.0.0.0"
+                || host.starts_with("10.")
+                || is_rfc1918_172(host)
+                || host.starts_with("192.168.")
+                || host.ends_with(".local");
+            if is_private {
+                anyhow::bail!(
+                    "Disallowed URL host (private/internal address): {}",
+                    host
+                );
+            }
+        }
+
         let browser = Browser::default()?;
         let tab = browser.new_tab()?;
 
@@ -767,10 +815,10 @@ impl Tools {
         let target_agent_id = args.target_agent_id;
         let task = args.task;
 
-        if self.agent_kind == AgentKind::Subagent {
+        if self.delegation_depth >= self.max_delegation_depth {
             anyhow::bail!(
-                "Delegation denied: subagent '{}' cannot spawn subagents (max delegation depth is 1)",
-                caller_id
+                "Delegation denied: max delegation depth ({}) reached",
+                self.max_delegation_depth
             );
         }
         let policy = self
@@ -797,23 +845,16 @@ impl Tools {
             );
         }
 
+        let delegation_depth = self.delegation_depth;
+        let max_delegation_depth = self.max_delegation_depth;
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let target_kind = manager
-                    .resolve_agent_kind(&self.root, &target_agent_id)
-                    .await
-                    .unwrap_or(AgentKind::Main);
-                let parent_run_id = if target_kind == AgentKind::Subagent {
-                    self.run_id.clone()
-                } else {
-                    None
-                };
                 let run_id = manager
                     .begin_agent_run(
                         &self.root,
                         None,
                         &target_agent_id,
-                        parent_run_id,
+                        self.run_id.clone(),
                         Some(format!("delegated by {}", caller_id)),
                     )
                     .await?;
@@ -826,30 +867,28 @@ impl Tools {
                     })
                     .await;
 
-                if target_kind == AgentKind::Subagent {
-                    manager
-                        .send_event(crate::agent_manager::AgentEvent::SubagentSpawned {
-                            parent_id: caller_id.clone(),
-                            subagent_id: target_agent_id.clone(),
-                            task: task.clone(),
-                        })
-                        .await;
-                }
+                manager
+                    .send_event(crate::agent_manager::AgentEvent::SubagentSpawned {
+                        parent_id: caller_id.clone(),
+                        subagent_id: target_agent_id.clone(),
+                        task: task.clone(),
+                    })
+                    .await;
 
                 let agent = manager
                     .get_or_create_agent(&self.root, &target_agent_id)
                     .await?;
                 let mut engine = agent.lock().await;
-                if target_kind == AgentKind::Subagent {
-                    engine.set_parent_agent(Some(caller_id.clone()));
-                } else {
-                    engine.set_parent_agent(None);
-                }
+                engine.set_parent_agent(Some(caller_id.clone()));
+                engine.set_delegation_depth(delegation_depth + 1, max_delegation_depth);
                 engine.set_run_id(Some(run_id.clone()));
                 engine.set_task(task);
                 let run_result = engine.run_agent_loop(None).await;
+
+                // Always clean up cached engine state, even on error
                 engine.set_run_id(None);
                 engine.set_parent_agent(None);
+                engine.set_delegation_depth(0, max_delegation_depth);
 
                 let (outcome, status, detail) = match run_result {
                     Ok(outcome) => (outcome, crate::db::AgentRunStatus::Completed, None),
@@ -860,21 +899,19 @@ impl Tools {
                         } else {
                             crate::db::AgentRunStatus::Failed
                         };
-                        let _ = manager.finish_agent_run(&run_id, status, Some(msg)).await;
+                        let _ = manager.finish_agent_run(&run_id, status, Some(msg.clone())).await;
                         return Err(err);
                     }
                 };
                 let _ = manager.finish_agent_run(&run_id, status, detail).await;
 
-                if target_kind == AgentKind::Subagent {
-                    manager
-                        .send_event(crate::agent_manager::AgentEvent::SubagentResult {
-                            parent_id: caller_id,
-                            subagent_id: target_agent_id,
-                            outcome: outcome.clone(),
-                        })
-                        .await;
-                }
+                manager
+                    .send_event(crate::agent_manager::AgentEvent::SubagentResult {
+                        parent_id: caller_id,
+                        subagent_id: target_agent_id,
+                        outcome: outcome.clone(),
+                    })
+                    .await;
                 Ok(ToolResult::AgentOutcome(outcome))
             })
         })
@@ -1016,7 +1053,7 @@ fn to_rel_string(root: &Path, path: &Path) -> Result<String> {
     Ok(rel.to_string_lossy().to_string())
 }
 
-fn summarize_tool_args(tool: &str, args: &Value) -> String {
+pub(crate) fn summarize_tool_args(tool: &str, args: &Value) -> String {
     let mut safe_args = args.clone();
     if let Some(obj) = safe_args.as_object_mut() {
         match tool {
@@ -1051,7 +1088,14 @@ fn summarize_tool_args(tool: &str, args: &Value) -> String {
             "Bash" => {
                 if let Some(cmd) = obj.get("cmd").and_then(|v| v.as_str()) {
                     let preview = if cmd.len() > 160 {
-                        format!("{}... (truncated, {} chars)", &cmd[..160], cmd.len())
+                        // Find a char boundary at or before 160 to avoid UTF-8 panic.
+                        let end = cmd
+                            .char_indices()
+                            .map(|(i, _)| i)
+                            .take_while(|&i| i <= 160)
+                            .last()
+                            .unwrap_or(0);
+                        format!("{}... (truncated, {} chars)", &cmd[..end], cmd.len())
                     } else {
                         cmd.to_string()
                     };
@@ -1064,7 +1108,7 @@ fn summarize_tool_args(tool: &str, args: &Value) -> String {
     safe_args.to_string()
 }
 
-fn normalize_tool_args(tool: &str, args: &Value) -> Value {
+pub(crate) fn normalize_tool_args(tool: &str, args: &Value) -> Value {
     let mut normalized = args.clone();
     if let Some(obj) = normalized.as_object_mut() {
         if matches!(tool, "Bash") && !obj.contains_key("cmd") {
@@ -1136,23 +1180,34 @@ fn normalize_tool_args(tool: &str, args: &Value) -> Value {
     normalized
 }
 
-fn validate_shell_command(cmd: &str) -> Result<()> {
+pub(crate) fn validate_shell_command(cmd: &str) -> Result<()> {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
         anyhow::bail!("empty command");
     }
 
     // Disallow common shell injection patterns.
-    for banned in ["$(", "`", "\n", "\r"] {
+    for banned in ["$(", "`", "\n", "\r", "<(", ">("] {
         if trimmed.contains(banned) {
             anyhow::bail!("command contains disallowed shell construct: {}", banned);
         }
+    }
+    // Block output redirection (but allow `>` inside grep patterns etc. via `--`).
+    // We only block bare `>` or `>>` that appear as shell operators.
+    for op in [" > ", " >> ", "\t>\t", "\t>>\t", " >|"] {
+        if trimmed.contains(op) {
+            anyhow::bail!("command contains disallowed shell redirection");
+        }
+    }
+    // Block input redirection `< file`.
+    if trimmed.contains(" < ") {
+        anyhow::bail!("command contains disallowed shell redirection");
     }
 
     let allowed: HashSet<&str> = [
         "ls", "pwd", "cat", "head", "tail", "wc", "cut", "sort", "uniq", "tr", "sed", "awk",
         "find", "fd", "rg", "grep", "git", "cargo", "rustc", "npm", "pnpm", "yarn", "node",
-        "python3", "pytest", "go", "make", "just",
+        "python", "python3", "pip", "pip3", "pytest", "go", "make", "just",
     ]
     .into_iter()
     .collect();
@@ -1169,24 +1224,6 @@ fn validate_shell_command(cmd: &str) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn is_repo_discovery_command(cmd: &str) -> bool {
-    split_shell_segments(cmd).iter().any(|segment| {
-        let Some(token) = first_segment_token(segment) else {
-            return false;
-        };
-
-        if matches!(token, "rg" | "grep" | "fd" | "find") {
-            return true;
-        }
-
-        if token == "git" {
-            return segment.split_whitespace().any(|part| part == "grep");
-        }
-
-        false
-    })
 }
 
 fn split_shell_segments(cmd: &str) -> Vec<&str> {
@@ -1222,7 +1259,7 @@ pub fn canonical_tool_name(tool: &str) -> Option<&'static str> {
     })
 }
 
-fn full_tool_schema_entries() -> Vec<Value> {
+pub(crate) fn full_tool_schema_entries() -> Vec<Value> {
     vec![
         serde_json::json!({
             "name": "get_repo_info",
@@ -1273,7 +1310,7 @@ fn full_tool_schema_entries() -> Vec<Value> {
             "name": "delegate_to_agent",
             "args": {"target_agent_id": "string", "task": "string"},
             "returns": "{agent_outcome}",
-            "notes": "Only main agents can delegate. Subagents cannot spawn subagents."
+            "notes": "Delegates a task to another agent. Subject to max delegation depth."
         }),
     ]
 }

@@ -1,5 +1,5 @@
 use crate::agent_manager::AgentManager;
-use crate::config::{AgentKind, AgentPolicyCapability};
+use crate::config::AgentPolicyCapability;
 use crate::engine::PromptMode;
 use crate::engine::sanitize_tool_args_for_display;
 use crate::server::chat_helpers::{
@@ -625,17 +625,46 @@ async fn run_skill_dispatch(
 ) {
     let parts: Vec<&str> = ctx.clean_msg.trim().splitn(2, ' ').collect();
     let cmd = parts[0].trim_start_matches('/');
-    let task_for_loop = parts
+    let user_args = parts
         .get(1)
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Initialize this workspace and summarize status.".to_string());
+        .filter(|s| !s.is_empty());
 
+    // Resolve the skill and build the task for the loop.
+    let mut skill_default_task: Option<String> = None;
     if let Some(manager) = engine.tools.get_manager() {
         if let Some(skill) = manager.skill_manager.get_skill(cmd).await {
+            if !skill.user_invocable {
+                let err_msg = format!(
+                    "Skill '{}' is not user-invocable and cannot be activated with /{cmd}.",
+                    skill.name
+                );
+                persist_and_emit_message(
+                    &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+                    &ctx.agent_id, "user", &err_msg, ctx.session_id.as_deref(), false,
+                )
+                .await;
+                return;
+            }
+            // Build a default task from the skill's metadata when no user args given.
+            if user_args.is_none() {
+                if let Some(hint) = &skill.argument_hint {
+                    skill_default_task = Some(format!(
+                        "The user invoked /{} without arguments. Usage: /{} {}. Show them the usage and ask what they want to do.",
+                        skill.name, skill.name, hint
+                    ));
+                } else {
+                    skill_default_task =
+                        Some(format!("Run the '{}' skill: {}", skill.name, skill.description));
+                }
+            }
             engine.active_skill = Some(skill);
         }
     }
+
+    let task_for_loop = user_args
+        .or(skill_default_task)
+        .unwrap_or_else(|| "Initialize this workspace and summarize status.".to_string());
 
     engine.observations.clear();
     engine.task = Some(task_for_loop);
@@ -655,6 +684,85 @@ async fn run_skill_dispatch(
 
     if let Err(e) = outcome {
         tracing::warn!("Skill loop failed: {}", e);
+        let err_msg = format!("Error: {}", e);
+        persist_and_emit_message(
+            &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+            &ctx.agent_id, "user", &err_msg, ctx.session_id.as_deref(), false,
+        )
+        .await;
+    } else {
+        if let Ok(outcome) = &outcome {
+            emit_outcome_event(outcome, &ctx.events_tx, &ctx.agent_id);
+        }
+        let no_explicit_mutations: HashMap<String, String> = HashMap::new();
+        emit_change_report_if_any(
+            &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+            ctx.session_id.as_deref(), ctx.git_baseline.as_ref(), &no_explicit_mutations,
+        )
+        .await;
+        let _ = ctx.events_tx.send(ServerEvent::StateUpdated);
+    }
+}
+
+/// Dispatch a user-defined trigger activation.
+/// Similar to `run_skill_dispatch` but takes a pre-resolved skill name and remaining input.
+async fn run_trigger_dispatch(
+    ctx: &ChatRunCtx,
+    engine: &mut crate::engine::AgentEngine,
+    skill_name: &str,
+    remaining: &str,
+) {
+    let user_args = if remaining.is_empty() {
+        None
+    } else {
+        Some(remaining.to_string())
+    };
+
+    let mut skill_default_task: Option<String> = None;
+    if let Some(manager) = engine.tools.get_manager() {
+        if let Some(skill) = manager.skill_manager.get_skill(skill_name).await {
+            if !skill.user_invocable {
+                let err_msg = format!(
+                    "Skill '{}' is not user-invocable and cannot be activated via trigger.",
+                    skill.name
+                );
+                persist_and_emit_message(
+                    &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+                    &ctx.agent_id, "user", &err_msg, ctx.session_id.as_deref(), false,
+                )
+                .await;
+                return;
+            }
+            if user_args.is_none() {
+                skill_default_task =
+                    Some(format!("Run the '{}' skill: {}", skill.name, skill.description));
+            }
+            engine.active_skill = Some(skill);
+        }
+    }
+
+    let task_for_loop = user_args
+        .or(skill_default_task)
+        .unwrap_or_else(|| "Initialize this workspace and summarize status.".to_string());
+
+    engine.observations.clear();
+    engine.task = Some(task_for_loop);
+
+    let skill_msg = format!("Running skill via trigger: {}", skill_name);
+    persist_and_emit_message(
+        &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+        &ctx.agent_id, "user", &skill_msg, ctx.session_id.as_deref(), false,
+    )
+    .await;
+
+    let outcome = run_loop_with_tracking(
+        &ctx.manager, &ctx.root, engine, &ctx.agent_id,
+        ctx.session_id.as_deref(), "chat:trigger",
+    )
+    .await;
+
+    if let Err(e) = outcome {
+        tracing::warn!("Trigger skill loop failed: {}", e);
         let err_msg = format!("Error: {}", e);
         persist_and_emit_message(
             &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
@@ -830,7 +938,7 @@ async fn run_chat_tool_loop(
                 }
                 // Take the current batch and execute sequentially.
                 let batch = std::mem::take(&mut pending_tools);
-                let mut last_observation_for_prompt = String::new();
+                let mut batch_observations: Vec<String> = Vec::new();
                 for (tool, args) in batch {
                     if tool_steps >= chat_tool_max_iters {
                         final_response = Some(format!(
@@ -1000,17 +1108,43 @@ async fn run_chat_tool_loop(
                     }
                 }
 
-                    last_observation_for_prompt = observation_for_prompt;
+                    // Truncate individual observations to 4KB to avoid blowing context.
+                    const OBS_MAX_CHARS: usize = 4096;
+                    let truncated_obs = if observation_for_prompt.len() > OBS_MAX_CHARS {
+                        format!("{}... (truncated)", &observation_for_prompt[..OBS_MAX_CHARS])
+                    } else {
+                        observation_for_prompt
+                    };
+                    batch_observations.push(format!("[{}] {}", tool, truncated_obs));
                 } // end for (tool, args) in batch
 
                 if final_response.is_some() {
                     continue;
                 }
 
-                // Send followup prompt with the last observation from the batch.
+                // Keep only the last 3 observations if the batch was larger.
+                let obs_for_prompt: Vec<&String> = if batch_observations.len() > 3 {
+                    batch_observations.iter().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect()
+                } else {
+                    batch_observations.iter().collect()
+                };
+                let observations_block = obs_for_prompt.iter()
+                    .enumerate()
+                    .map(|(i, obs)| format!("{}. {}", i + 1, obs))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+
+                // Persist batch observations into chat_history for context compression.
+                for obs in &batch_observations {
+                    engine.chat_history.push(crate::ollama::ChatMessage {
+                        role: "user".to_string(),
+                        content: obs.clone(),
+                    });
+                }
+
                 let followup_prompt = format!(
-                    "Continue helping with the same user request.\n\nOriginal user request:\n{}\n\nLatest observation:\n{}\n\nIf more tools are needed, respond with one or more JSON tool call objects.\nOtherwise, answer the user directly in plain text.",
-                    ctx.clean_msg, last_observation_for_prompt
+                    "Here are the results from your tool calls:\n\n{}\n\nOriginal user request:\n{}\n\nBased on these results, either continue with more tool calls or provide your final answer in plain text.",
+                    observations_block, ctx.clean_msg
                 );
                 let mut followup_response = String::new();
                 match engine
@@ -1137,9 +1271,8 @@ pub(crate) async fn chat_handler(
             let candidate_id = candidate.to_string();
             if state
                 .manager
-                .resolve_agent_kind(&root, &candidate_id)
+                .agent_exists(&root, &candidate_id)
                 .await
-                .is_some()
             {
                 (candidate_id, body.to_string())
             } else {
@@ -1149,21 +1282,6 @@ pub(crate) async fn chat_handler(
             (req.agent_id.clone(), req.message.clone())
         };
     let trimmed_msg = clean_msg.trim();
-
-    let kind = state
-        .manager
-        .resolve_agent_kind(&root, &target_id)
-        .await
-        .unwrap_or(AgentKind::Main);
-    if kind == AgentKind::Subagent {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "subagents cannot be chatted with directly; send requests to a main agent"
-            })),
-        )
-            .into_response();
-    }
 
     match state.manager.get_or_create_agent(&root, &target_id).await {
         Ok(agent) => {
@@ -1312,8 +1430,15 @@ pub(crate) async fn chat_handler(
                 };
 
                 if clean_msg_clone.trim_start().starts_with('/') {
+                    // 1. Slash-command skill dispatch
                     run_skill_dispatch(&ctx, &mut engine).await;
+                } else if let Some((skill_name, remaining)) =
+                    manager.skill_manager.match_trigger(&clean_msg_clone).await
+                {
+                    // 2. User-defined trigger prefix match
+                    run_trigger_dispatch(&ctx, &mut engine, &skill_name, &remaining).await;
                 } else {
+                    // 3. Normal chat / structured loop
                     let prompt_mode = engine.get_prompt_mode();
                     if prompt_mode == crate::engine::PromptMode::Structured {
                         run_structured_loop(&ctx, &mut engine).await;

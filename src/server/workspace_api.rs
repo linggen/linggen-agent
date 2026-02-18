@@ -203,13 +203,16 @@ pub(crate) async fn get_agent_tree(
                         "type": "dir",
                         "children": {}
                     }));
-                current = entry
-                    .as_object_mut()
-                    .unwrap()
-                    .get_mut("children")
-                    .unwrap()
-                    .as_object_mut()
-                    .unwrap();
+                let Some(obj) = entry.as_object_mut() else {
+                    break;
+                };
+                let Some(children) = obj.get_mut("children") else {
+                    break;
+                };
+                let Some(children_obj) = children.as_object_mut() else {
+                    break;
+                };
+                current = children_obj;
             }
         }
     }

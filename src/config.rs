@@ -13,6 +13,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub agents: Vec<AgentSpecRef>,
+    #[serde(default)]
+    pub routing: RoutingConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -23,6 +25,10 @@ pub struct ModelConfig {
     pub model: String,
     pub api_key: Option<String>,
     pub keep_alive: Option<String>,
+    /// Manual context window override (tokens). Used when the provider API
+    /// does not report context size (e.g. Ollama cloud/remote models).
+    #[serde(default)]
+    pub context_window: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -39,7 +45,7 @@ pub struct AgentSpec {
     pub tools: Vec<String>,
     pub model: Option<String>,
     #[serde(default)]
-    pub kind: AgentKind,
+    pub skills: Vec<String>,
     #[serde(default)]
     pub work_globs: Vec<String>,
     #[serde(default)]
@@ -128,19 +134,6 @@ impl AgentPolicy {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentKind {
-    Main,
-    Subagent,
-}
-
-impl Default for AgentKind {
-    fn default() -> Self {
-        Self::Main
-    }
-}
-
 impl AgentSpec {
     pub fn from_markdown_content(content: &str) -> Result<(Self, String)> {
         if !content.starts_with("---") {
@@ -178,6 +171,12 @@ pub struct AgentConfig {
     pub write_safety_mode: WriteSafetyMode,
     #[serde(default)]
     pub prompt_loop_breaker: Option<String>,
+    #[serde(default = "default_max_delegation_depth")]
+    pub max_delegation_depth: usize,
+}
+
+fn default_max_delegation_depth() -> usize {
+    2
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +199,40 @@ pub struct LoggingConfig {
     pub level: Option<String>,
     pub directory: Option<String>,
     pub retention_days: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct RoutingConfig {
+    #[serde(default)]
+    pub default_policy: Option<String>,
+    #[serde(default)]
+    pub policies: Vec<RoutingPolicy>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RoutingPolicy {
+    pub name: String,
+    #[serde(default)]
+    pub rules: Vec<RoutingRule>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RoutingRule {
+    pub model: String,
+    #[serde(default)]
+    pub priority: u32,
+    #[serde(default)]
+    pub min_complexity: Option<ComplexityLevel>,
+    #[serde(default)]
+    pub max_complexity: Option<ComplexityLevel>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplexityLevel {
+    Low,
+    Medium,
+    High,
 }
 
 impl Config {
@@ -271,6 +304,16 @@ impl Config {
             if !seen_ids.insert(&model.id) {
                 anyhow::bail!("Duplicate model ID: {}", model.id);
             }
+            // Validate provider is known.
+            let known_providers = ["ollama", "openai"];
+            if !known_providers.contains(&model.provider.as_str()) {
+                anyhow::bail!(
+                    "Model '{}' has unknown provider '{}'. Known providers: {}",
+                    model.id,
+                    model.provider,
+                    known_providers.join(", ")
+                );
+            }
             // Validate model URL scheme to prevent SSRF.
             let url_lower = model.url.trim().to_lowercase();
             if !url_lower.starts_with("http://") && !url_lower.starts_with("https://") {
@@ -304,12 +347,14 @@ impl Default for Config {
                 model: "qwen3-coder".to_string(),
                 api_key: None,
                 keep_alive: None,
+                context_window: None,
             }],
             server: ServerConfig { port: 8080 },
             agent: AgentConfig {
                 max_iters: 10,
                 write_safety_mode: WriteSafetyMode::default(),
                 prompt_loop_breaker: None,
+                max_delegation_depth: default_max_delegation_depth(),
             },
             logging: LoggingConfig {
                 level: None,
@@ -317,6 +362,7 @@ impl Default for Config {
                 retention_days: None,
             },
             agents: Vec::new(),
+            routing: RoutingConfig::default(),
         }
     }
 }

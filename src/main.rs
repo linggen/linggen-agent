@@ -1,11 +1,13 @@
 mod agent_manager;
 mod check;
+mod cli;
 mod config;
 mod db;
 mod engine;
 mod eval;
 mod logging;
 mod ollama;
+mod openai;
 mod repl;
 mod server;
 mod skills;
@@ -98,12 +100,142 @@ enum Command {
         #[arg(long, default_value_t = false)]
         dev: bool,
     },
+    /// Diagnose installation health
+    Doctor,
+    /// Start server as a background daemon
+    Start {
+        /// Port to listen on
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Workspace root
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
+    /// Stop the background daemon
+    Stop,
+    /// Show server status
+    Status,
+    /// Install all skills from linggen/skills repository
+    Init {
+        /// Install to global ~/.linggen/skills/ instead of project
+        #[arg(long, default_value_t = false)]
+        global: bool,
+
+        /// Workspace root (for project-scoped install)
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
+    /// Self-update the binary to the latest release
+    #[command(alias = "update")]
+    Install,
+    /// Manage skills
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillsAction {
+    /// Install a skill
+    Add {
+        /// Skill name
+        name: String,
+
+        /// GitHub repository URL
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// Git ref (branch/tag)
+        #[arg(long, alias = "ref")]
+        git_ref: Option<String>,
+
+        /// Install globally (~/.linggen/skills/)
+        #[arg(long, default_value_t = false)]
+        global: bool,
+
+        /// Overwrite existing installation
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// Remove an installed skill
+    Remove {
+        /// Skill name
+        name: String,
+
+        /// Remove from global scope
+        #[arg(long, default_value_t = false)]
+        global: bool,
+    },
+    /// List installed skills
+    List,
+    /// Search the marketplace
+    Search {
+        /// Search query
+        query: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (config, config_path) =
-        Config::load_with_path().unwrap_or_else(|_| (Config::default(), None));
+    let (config, config_path) = Config::load_with_path().unwrap_or_else(|e| {
+        eprintln!("Warning: failed to load config, using defaults: {e}");
+        (Config::default(), None)
+    });
+
+    let cli = Cli::parse();
+
+    // Lightweight subcommands — no tracing/AgentManager needed.
+    match &cli.cmd {
+        Command::Doctor => {
+            return cli::doctor::run(&config, config_path.as_deref()).await;
+        }
+        Command::Start { port, root } => {
+            return cli::daemon::start(&config, *port, root.clone()).await;
+        }
+        Command::Stop => {
+            return cli::daemon::stop().await;
+        }
+        Command::Status => {
+            return cli::daemon::status(&config, config_path.as_deref()).await;
+        }
+        Command::Init { global, root } => {
+            return cli::init::run(*global, root.clone()).await;
+        }
+        Command::Install => {
+            return cli::self_update::run().await;
+        }
+        Command::Skills { action } => {
+            let sa = match action {
+                SkillsAction::Add {
+                    name,
+                    repo,
+                    git_ref,
+                    global,
+                    force,
+                } => cli::skills_cmd::SkillsAction::Add {
+                    name: name.clone(),
+                    repo: repo.clone(),
+                    git_ref: git_ref.clone(),
+                    global: *global,
+                    force: *force,
+                },
+                SkillsAction::Remove { name, global } => cli::skills_cmd::SkillsAction::Remove {
+                    name: name.clone(),
+                    global: *global,
+                },
+                SkillsAction::List => cli::skills_cmd::SkillsAction::List,
+                SkillsAction::Search { query } => cli::skills_cmd::SkillsAction::Search {
+                    query: query.clone(),
+                },
+            };
+            return cli::skills_cmd::run(sa, &config).await;
+        }
+        _ => {}
+    }
+
+    // Full subcommands — need tracing.
     let log_dir = match logging::setup_tracing_with_settings(logging::LoggingSettings {
         level: config.logging.level.as_deref(),
         directory: config.logging.directory.as_deref(),
@@ -115,7 +247,6 @@ async fn main() -> Result<()> {
             None
         }
     };
-    let cli = Cli::parse();
 
     match cli.cmd {
         Command::Agent {
@@ -137,6 +268,7 @@ async fn main() -> Result<()> {
                     model: "qwen3-coder".to_string(),
                     api_key: None,
                     keep_alive: None,
+                    context_window: None,
                 });
             let cfg = repl::CoderConfig {
                 ws_root,
@@ -229,6 +361,14 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        // Lightweight commands already handled above.
+        Command::Doctor
+        | Command::Start { .. }
+        | Command::Stop
+        | Command::Status
+        | Command::Init { .. }
+        | Command::Install
+        | Command::Skills { .. } => unreachable!(),
     }
 
     Ok(())

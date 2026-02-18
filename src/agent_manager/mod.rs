@@ -1,6 +1,6 @@
 use crate::agent_manager::locks::LockManager;
 use crate::agent_manager::models::ModelManager;
-use crate::config::{AgentKind, AgentPolicyCapability, AgentSpec, Config};
+use crate::config::{AgentPolicyCapability, AgentSpec, Config};
 use crate::db::{AgentRunRecord, Db, ProjectMode, ProjectSettings};
 use crate::engine::{AgentEngine, AgentOutcome, AgentRole, EngineConfig, PromptMode};
 use crate::skills::SkillManager;
@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 pub mod locks;
 pub mod models;
+pub mod routing;
 
 pub struct ProjectContext {
     pub agents: Mutex<HashMap<String, Arc<Mutex<AgentEngine>>>>,
@@ -412,13 +413,20 @@ impl AgentManager {
         let model_id =
             Self::normalize_model_choice(Self::model_override_for_agent(&config, &normalized_id))
                 .or_else(|| Self::normalize_model_choice(agent_spec.spec.model.clone()))
-                .unwrap_or_else(|| {
-                    config
-                        .models
-                        .first()
-                        .map(|m| m.id.clone())
-                        .expect("No models configured")
-                });
+                .or_else(|| {
+                    routing::resolve_model(
+                        &config.routing,
+                        None,
+                        &routing::ComplexitySignal {
+                            estimated_tokens: None,
+                            tool_depth: None,
+                            skill_model_hint: None,
+                        },
+                        &config.models,
+                    )
+                })
+                .or_else(|| config.models.first().map(|m| m.id.clone()))
+                .ok_or_else(|| anyhow::anyhow!("No models configured"))?;
 
         let role = if agent_spec
             .spec
@@ -450,6 +458,8 @@ impl AgentManager {
             agent_spec.system_prompt,
         );
         engine.set_manager_context(self.clone());
+        engine.set_delegation_depth(0, config.agent.max_delegation_depth);
+        engine.load_skill_tools(&self.skill_manager).await;
         if let Ok(settings) = self
             .db
             .get_project_settings(&project_root.to_string_lossy())
@@ -508,16 +518,16 @@ impl AgentManager {
         Ok(out)
     }
 
-    pub async fn resolve_agent_kind(
+    pub async fn agent_exists(
         &self,
         project_root: &PathBuf,
         agent_id: &str,
-    ) -> Option<AgentKind> {
+    ) -> bool {
         let project_root = Self::canonical_project_root(project_root);
         let Ok(found) = self.find_agent_spec_for_project(&project_root, agent_id) else {
-            return None;
+            return false;
         };
-        found.map(|entry| entry.spec.kind)
+        found.is_some()
     }
 
     pub async fn invalidate_agent_cache(
@@ -609,10 +619,6 @@ impl AgentManager {
         let project_root = project_root
             .canonicalize()
             .unwrap_or_else(|_| project_root.clone());
-        let kind = self
-            .resolve_agent_kind(&project_root, agent_id)
-            .await
-            .unwrap_or(AgentKind::Main);
         let run_id = Self::make_run_id(agent_id);
         let started_at = crate::util::now_ts_secs();
         let repo_path = project_root.to_string_lossy().to_string();
@@ -622,7 +628,7 @@ impl AgentManager {
             repo_path: repo_path.clone(),
             session_id: session_id.unwrap_or("default").to_string(),
             agent_id: agent_id.to_string(),
-            agent_kind: kind,
+            agent_kind: None,
             parent_run_id,
             status: crate::db::AgentRunStatus::Running,
             detail,
@@ -773,8 +779,7 @@ impl AgentManager {
             .await?
             .into_iter()
             .find(|entry| {
-                entry.spec.kind == AgentKind::Main
-                    && entry.spec.allows_policy(AgentPolicyCapability::Patch)
+                entry.spec.allows_policy(AgentPolicyCapability::Patch)
             })
             .map(|entry| entry.agent_id);
 
@@ -856,7 +861,7 @@ mod tests {
 
     fn valid_agent_md(name: &str) -> String {
         format!(
-            "---\nname: {name}\ndescription: test agent\ntools: [Read]\nkind: main\npolicy: []\n---\n\nYou are {name}.\n"
+            "---\nname: {name}\ndescription: test agent\ntools: [Read]\npolicy: []\n---\n\nYou are {name}.\n"
         )
     }
 

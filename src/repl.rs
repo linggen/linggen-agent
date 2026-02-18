@@ -124,6 +124,7 @@ impl App {
             model: cfg.model,
             api_key: None,
             keep_alive: None,
+            context_window: None,
         }]));
         let ws_root = cfg.ws_root.clone();
         let engine = AgentEngine::new(

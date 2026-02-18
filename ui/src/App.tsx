@@ -63,13 +63,14 @@ const TOOL_RESULT_LINE_RE = /^(Tool\s+[A-Za-z0-9_.:-]+\s*:|tool_error:|tool_not_
 const activityKind = (line?: string): string => {
   const t = String(line || '').trim().toLowerCase();
   if (!t) return '';
-  if (t === 'reading file...' || t.startsWith('reading file:') || t.startsWith('read ')) return 'read';
+  if (t === 'reading file...' || t.startsWith('reading file:') || t.startsWith('read file')) return 'read';
   if (t === 'writing file...' || t.startsWith('writing file:') || t.startsWith('wrote ')) return 'write';
+  if (t === 'editing file...' || t.startsWith('editing file:') || t.startsWith('edited ')) return 'edit';
   if (t === 'running command...' || t.startsWith('running command:') || t.startsWith('ran command')) return 'bash';
-  if (t === 'searching...' || t.startsWith('searching:') || t.startsWith('searched for ')) return 'grep';
+  if (t === 'searching...' || t.startsWith('searching:') || t.startsWith('searched')) return 'grep';
   if (t === 'listing files...' || t.startsWith('listing files:') || t.startsWith('listed files')) return 'glob';
   if (t === 'delegating...' || t.startsWith('delegating to subagent:') || t.startsWith('delegated to ')) return 'delegate_to_agent';
-  if (t === 'calling tool...' || t.startsWith('calling tool:')) return 'calling_tool';
+  if (t === 'calling tool...' || t.startsWith('calling tool:') || t.startsWith('used tool')) return 'calling_tool';
   return '';
 };
 
@@ -78,11 +79,43 @@ const isGenericActivityLine = (line?: string): boolean => {
   return (
     t === 'reading file...' ||
     t === 'writing file...' ||
+    t === 'editing file...' ||
     t === 'running command...' ||
     t === 'searching...' ||
     t === 'listing files...' ||
     t === 'delegating...' ||
     t === 'calling tool...'
+  );
+};
+
+/** Detect "in-progress" activity lines (present continuous verb). */
+const isDoingActivityLine = (line?: string): boolean => {
+  const t = String(line || '').trim().toLowerCase();
+  return (
+    t.startsWith('reading file') ||
+    t.startsWith('writing file') ||
+    t.startsWith('editing file') ||
+    t.startsWith('running command') ||
+    t.startsWith('searching') ||
+    t.startsWith('listing files') ||
+    t.startsWith('delegating') ||
+    t.startsWith('calling tool')
+  );
+};
+
+/** Detect "completed" activity lines (past tense verb). */
+const isDoneActivityLine = (line?: string): boolean => {
+  const t = String(line || '').trim().toLowerCase();
+  return (
+    t.startsWith('read file') ||
+    t.startsWith('wrote ') ||
+    t.startsWith('edited ') ||
+    t.startsWith('ran command') ||
+    t.startsWith('searched:') ||
+    t.startsWith('searched for ') ||
+    t.startsWith('listed files') ||
+    t.startsWith('delegated to ') ||
+    t.startsWith('used tool')
   );
 };
 
@@ -132,7 +165,9 @@ const isToolResultMessage = (from?: string, text?: string) => {
 
 const isStatusLineText = (text: string) =>
   text === 'Thinking...' ||
+  text === 'Thinking' ||
   text === 'Model loading...' ||
+  text === 'Running' ||
   text === 'Reading file...' ||
   text.startsWith('Reading file:') ||
   text === 'Writing file...' ||
@@ -195,44 +230,75 @@ const summarizeActivityEntries = (entries: string[], inProgress = false): string
   return toolSummary || phaseSummary;
 };
 
+/** Transient status lines that should not appear as activity entries. */
+const isTransientStatus = (line: string): boolean => {
+  const t = line.trim().toLowerCase();
+  return t === 'thinking' || t === 'thinking...' || t === 'model loading' || t === 'model loading...' || t === 'running';
+};
+
+/** Extract the detail/target portion after the verb (e.g. "foo.rs" from "Reading file: foo.rs"). */
+const activityDetail = (line?: string): string => {
+  const idx = String(line || '').indexOf(': ');
+  return idx >= 0 ? String(line || '').slice(idx + 2).trim() : '';
+};
+
 const addActivityEntry = (msg: ChatMessage, entry: string): ChatMessage => {
   const clean = entry.trim();
   if (!clean) return msg;
+
+  // Skip transient status lines — they are not tool calls.
+  if (isTransientStatus(clean)) return msg;
+
   const entries = msg.activityEntries ? [...msg.activityEntries] : [];
-  if (clean === MODEL_LOADING_ENTRY && entries.some((item) => item !== MODEL_LOADING_ENTRY)) {
-    return msg;
-  }
+  const nextKind = activityKind(clean);
+
   if (entries.length === 0) {
     entries.push(clean);
   } else {
-    const last = entries[entries.length - 1];
-    if (last !== clean) {
-      const lastKind = activityKind(last);
-      const nextKind = activityKind(clean);
-      if (
-        lastKind &&
-        lastKind === nextKind &&
-        isGenericActivityLine(last) &&
-        !isGenericActivityLine(clean)
-      ) {
-        entries[entries.length - 1] = clean;
-      } else if (
-        lastKind &&
-        lastKind === nextKind &&
-        !isGenericActivityLine(last) &&
-        isGenericActivityLine(clean)
-      ) {
-        // Keep richer detail, drop regressive generic line.
-      } else {
+    // If this is a done-form line, scan backwards and replace its doing counterpart in-place.
+    if (nextKind && isDoneActivityLine(clean)) {
+      let replaced = false;
+      const nextDetail = activityDetail(clean);
+      for (let i = entries.length - 1; i >= 0; i--) {
+        if (activityKind(entries[i]) === nextKind && isDoingActivityLine(entries[i])) {
+          // Match on detail too: "Read file: foo.rs" must replace "Reading file: foo.rs",
+          // not "Reading file: bar.rs". If both have details, they must match.
+          const entryDetail = activityDetail(entries[i]);
+          if (!nextDetail || !entryDetail || nextDetail === entryDetail) {
+            entries[i] = clean;
+            replaced = true;
+            break;
+          }
+        }
+      }
+      if (!replaced) {
+        // No doing counterpart found — just append.
         entries.push(clean);
+      }
+    } else {
+      const last = entries[entries.length - 1];
+      if (last === clean) {
+        // Exact duplicate — skip.
+      } else {
+        const lastKind = activityKind(last);
+        if (lastKind && lastKind === nextKind && isGenericActivityLine(last) && !isGenericActivityLine(clean)) {
+          // Generic "Reading file..." → specific "Reading file: main.rs"
+          entries[entries.length - 1] = clean;
+        } else if (lastKind && lastKind === nextKind && !isGenericActivityLine(last) && isGenericActivityLine(clean)) {
+          // Keep richer detail, drop regressive generic line.
+        } else {
+          entries.push(clean);
+        }
       }
     }
   }
-  const ordered = orderActivityEntries(entries);
+
+  // Strip any transient entries that may have leaked in earlier.
+  const filtered = entries.filter((e) => !isTransientStatus(e));
   return {
     ...msg,
-    activityEntries: ordered,
-    activitySummary: summarizeActivityEntries(ordered, Boolean(msg.isGenerating)),
+    activityEntries: filtered,
+    activitySummary: summarizeActivityEntries(filtered, Boolean(msg.isGenerating)),
   };
 };
 
@@ -484,14 +550,10 @@ const App: React.FC = () => {
   const lastAgentCharsTsRef = useRef<number>(0);
   const hadGeneratingRef = useRef<boolean>(false);
   const [tokensPerSec, setTokensPerSec] = useState<number>(0);
-  const mainAgents = useMemo(() => {
-    const mains = agents.filter((agent) => (agent.kind || 'main') !== 'subagent');
-    return mains.length > 0 ? mains : agents;
-  }, [agents]);
+  const mainAgents = agents;
   const mainAgentIds = useMemo(() => {
-    const ids = mainAgents.map((agent) => agent.name.toLowerCase());
-    return ids;
-  }, [mainAgents]);
+    return agents.map((agent) => agent.name.toLowerCase());
+  }, [agents]);
   const agentWork = useMemo(() => buildAgentWorkInfo(agentTree), [agentTree]);
   const subagents = useMemo(
     () => buildSubagentInfos(agentTree, mainAgentIds, agentStatus),
@@ -507,7 +569,7 @@ const App: React.FC = () => {
     const out: Record<string, string> = {};
     for (const run of sortedAgentRuns) {
       const agentId = run.agent_id.toLowerCase();
-      if (run.agent_kind !== 'main') continue;
+      if (run.parent_run_id) continue;
       if (!out[agentId]) out[agentId] = run.run_id;
     }
     return out;
@@ -516,7 +578,7 @@ const App: React.FC = () => {
     const out: Record<string, string> = {};
     for (const run of sortedAgentRuns) {
       const agentId = run.agent_id.toLowerCase();
-      if (run.agent_kind !== 'subagent') continue;
+      if (!run.parent_run_id) continue;
       if (!out[agentId]) out[agentId] = run.run_id;
     }
     return out;
@@ -525,7 +587,7 @@ const App: React.FC = () => {
     const out: Record<string, string> = {};
     for (const run of sortedAgentRuns) {
       const agentId = run.agent_id.toLowerCase();
-      if (run.agent_kind !== 'main' || run.status !== 'running') continue;
+      if (run.parent_run_id || run.status !== 'running') continue;
       if (!out[agentId]) out[agentId] = run.run_id;
     }
     return out;
@@ -534,7 +596,7 @@ const App: React.FC = () => {
     const out: Record<string, string> = {};
     for (const run of sortedAgentRuns) {
       const agentId = run.agent_id.toLowerCase();
-      if (run.agent_kind !== 'subagent' || run.status !== 'running') continue;
+      if (!run.parent_run_id || run.status !== 'running') continue;
       if (!out[agentId]) out[agentId] = run.run_id;
     }
     return out;
@@ -543,7 +605,7 @@ const App: React.FC = () => {
     const out: Record<string, AgentRunInfo[]> = {};
     for (const run of sortedAgentRuns) {
       const agentId = run.agent_id.toLowerCase();
-      if (run.agent_kind !== 'main') continue;
+      if (run.parent_run_id) continue;
       if (!out[agentId]) out[agentId] = [];
       out[agentId].push(run);
     }
@@ -553,7 +615,7 @@ const App: React.FC = () => {
     const out: Record<string, AgentRunInfo[]> = {};
     for (const run of sortedAgentRuns) {
       const agentId = run.agent_id.toLowerCase();
-      if (run.agent_kind !== 'subagent') continue;
+      if (!run.parent_run_id) continue;
       if (!out[agentId]) out[agentId] = [];
       out[agentId].push(run);
     }
@@ -561,7 +623,7 @@ const App: React.FC = () => {
   }, [sortedAgentRuns]);
   const agentRunSummary = useMemo(() => {
     const out: Record<string, AgentRunSummary> = {};
-    for (const agent of mainAgents) {
+    for (const agent of agents) {
       const agentId = agent.name.toLowerCase();
       const latest = mainRunHistory[agentId]?.[0];
       if (!latest) continue;
@@ -586,7 +648,7 @@ const App: React.FC = () => {
       };
     }
     return out;
-  }, [mainAgents, mainRunHistory, sortedAgentRuns]);
+  }, [agents, mainRunHistory, sortedAgentRuns]);
 
   const addLog = useCallback((msg: string) => {
     setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
@@ -1133,7 +1195,9 @@ const App: React.FC = () => {
   useEffect(() => {
     if (mainAgentIds.length === 0) return;
     if (!mainAgentIds.includes(selectedAgent.toLowerCase())) {
-      setSelectedAgent(mainAgentIds[0]);
+      // Default to 'ling' if available, otherwise first agent
+      const preferred = mainAgentIds.includes('ling') ? 'ling' : mainAgentIds[0];
+      setSelectedAgent(preferred);
     }
   }, [mainAgentIds, selectedAgent]);
 
@@ -1199,30 +1263,38 @@ const App: React.FC = () => {
           const statusText = String(item.text || '').trim();
 
           if (statusRaw) {
-            setAgentStatus((prev) => ({
-              ...prev,
-              [agentId]: nextStatus,
-            }));
-            setAgentStatusText((prev) => ({
-              ...prev,
-              [agentId]:
-                statusText.length > 0
-                  ? statusText
-                  : nextStatus === 'calling_tool'
-                    ? 'Calling Tool'
-                    : nextStatus === 'model_loading'
-                      ? 'Model Loading'
-                      : nextStatus === 'thinking'
-                        ? 'Thinking'
-                        : nextStatus === 'working'
-                          ? 'Working'
-                          : 'Idle',
-            }));
+            // Don't update agent status badge on "done" lifecycle events — those describe
+            // the PREVIOUS status ending, not the current state. The next "doing" or "idle"
+            // event will set the correct status. Only update on "doing" or explicit "idle".
+            if (item.phase !== 'done' || nextStatus === 'idle') {
+              setAgentStatus((prev) => ({
+                ...prev,
+                [agentId]: nextStatus,
+              }));
+              setAgentStatusText((prev) => ({
+                ...prev,
+                [agentId]:
+                  nextStatus === 'idle'
+                    ? 'Idle'
+                    : statusText.length > 0
+                      ? statusText
+                      : nextStatus === 'calling_tool'
+                        ? 'Calling Tool'
+                        : nextStatus === 'model_loading'
+                          ? 'Model Loading'
+                          : nextStatus === 'thinking'
+                            ? 'Thinking'
+                            : nextStatus === 'working'
+                              ? 'Working'
+                              : 'Idle',
+              }));
+            }
           }
 
-          if (statusText.length > 0) {
+          // Only add tool call status lines as activity entries (not "Thinking"/"Model loading").
+          if (statusText.length > 0 && item.phase !== 'done') {
             setChatMessages((prev) => appendGeneratingActivity(prev, agentId, statusText));
-          } else if (nextStatus === 'model_loading' || nextStatus === 'thinking') {
+          } else if ((nextStatus === 'model_loading' || nextStatus === 'thinking') && item.phase !== 'done') {
             const placeholder = nextStatus === 'model_loading' ? 'Model loading...' : 'Thinking...';
             setChatMessages((prev) => upsertGeneratingAgentMessage(prev, agentId, placeholder));
           }
@@ -1279,7 +1351,7 @@ const App: React.FC = () => {
                 ...next[idx],
                 text: isPlaceholder ? tokenText : (next[idx].text || '') + tokenText,
                 isGenerating: true,
-                isThinking: isThinking || next[idx].isThinking,
+                isThinking,
                 timestampMs: Date.now(),
               };
               return next;
@@ -1314,6 +1386,7 @@ const App: React.FC = () => {
                 text: content,
                 to: to || next[generatingIdx].to || 'user',
                 isGenerating: false,
+                isThinking: false,
                 timestamp: new Date(tsMs).toLocaleTimeString(),
                 timestampMs: tsMs,
                 activitySummary:
@@ -1497,6 +1570,7 @@ const App: React.FC = () => {
           fetchModels();
           fetchOllamaStatus();
         }}
+        projectRoot={selectedProjectRoot}
       />
     )}
     <div className={`flex flex-col h-screen bg-slate-100/70 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200 font-sans overflow-hidden${currentPage === 'settings' ? ' hidden' : ''}`}>

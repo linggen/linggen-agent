@@ -69,8 +69,8 @@ Linggen Agent is a local-first, multi-agent coding assistant. Two entry points: 
 ### Rust Backend (`src/`)
 
 - **`main.rs`** — CLI entry point (clap). Parses subcommands `agent` and `serve`, loads config, sets up logging.
-- **`config.rs`** — Config loading from `linggen-agent.toml` (TOML). Defines `Config`, `ModelConfig`, `AgentSpec` (parsed from markdown frontmatter), `AgentPolicy`, `AgentKind`.
-- **`engine/`** — Core agent execution engine. Prompt loop, tool dispatch, structured/chat mode execution, action parsing, patch application, output rendering. `engine/tools.rs` implements all model-facing tools (`Read`, `Write`, `Bash`, `Glob`, `Grep`, `capture_screenshot`, `delegate_to_agent`, `get_repo_info`).
+- **`config.rs`** — Config loading from `linggen-agent.toml` (TOML). Defines `Config`, `ModelConfig`, `AgentSpec` (parsed from markdown frontmatter), `AgentPolicy`.
+- **`engine/`** — Core agent execution engine. Prompt loop, tool dispatch, structured/chat mode execution, action parsing, patch application, output rendering. `engine/tools.rs` implements all model-facing tools (`Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `capture_screenshot`, `lock_paths`, `unlock_paths`, `delegate_to_agent`, `get_repo_info`).
 - **`server/`** — Axum HTTP server. `mod.rs` sets up routes and static asset serving. `chat_api.rs` handles chat/run endpoints and SSE streaming. `chat_helpers.rs` has shared chat logic. `agent_api.rs` has run inspection APIs. `projects_api.rs` handles project/session CRUD. `workspace_api.rs` serves workspace file tree.
 - **`agent_manager/`** — Agent lifecycle management, run records, cancellation, model routing. `models.rs` handles multi-model provider dispatch (Ollama, OpenAI-compatible).
 - **`ollama.rs`** — Ollama API client (streaming and non-streaming chat completions).
@@ -98,9 +98,9 @@ React 19 + TypeScript + Tailwind CSS v4 + Vite. Key files:
 
 Agent specs are markdown files with YAML frontmatter. Discovered dynamically at startup — adding a new `.md` file registers a new agent without code changes.
 
-Frontmatter fields: `name`, `description`, `tools`, `model`, `kind` (`main`/`subagent`), `work_globs`, `policy`.
+Frontmatter fields: `name`, `description`, `tools`, `model`, `work_globs`, `policy`.
 
-Current agents: `lead` (orchestrator), `coder` (implementation), `search` (discovery), `plan` (planning).
+Current agents: `ling` (general-purpose assistant), `coder` (implementation).
 
 ### Configuration (`linggen-agent.toml`)
 
@@ -118,9 +118,9 @@ Follow `doc/code-style.md`:
 
 ## Key Design Patterns
 
-- **Tool names are Claude Code-style**: `Read`, `Write`, `Bash`, `Glob`, `Grep` (capitalized).
+- **Tool names are Claude Code-style**: `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep` (capitalized).
 - **Workspace-scoped file operations**: all paths are sandboxed to workspace root; parent traversal (`..`) is rejected.
 - **Bash command safety**: commands are validated against an allowlist; shell injection patterns are blocked.
 - **Agent policy enforcement**: tools and actions (Patch, Finalize, Delegate) are hard-gated per agent via frontmatter policy, not just prompt guidance.
 - **SSE events**: server publishes real-time events (`Token`, `Message`, `AgentStatus`, `SubagentSpawned`, etc.) consumed by the web UI.
-- **Delegation depth fixed at 1**: `main → subagent` only; subagents cannot spawn subagents.
+- **Delegation depth**: configurable via `max_delegation_depth` (default 2). All agents are equal — any agent can delegate to any other agent within the depth limit.

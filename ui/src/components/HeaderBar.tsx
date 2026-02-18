@@ -1,5 +1,5 @@
 import React from 'react';
-import { Copy, Eraser, Plus, Settings, Sparkles } from 'lucide-react';
+import { Copy, Eraser, Plus, Settings } from 'lucide-react';
 import { cn } from '../lib/cn';
 import type { AgentInfo, SessionInfo } from '../types';
 
@@ -68,9 +68,7 @@ export const HeaderBar: React.FC<{
     <header className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.6fr)_minmax(0,1fr)] items-center gap-3 px-6 py-3 border-b border-slate-200 dark:border-white/5 bg-white/90 dark:bg-[#0f0f0f]/90 backdrop-blur-md z-50">
       <div className="flex items-center gap-6 min-w-0">
         <div className="flex items-center gap-3">
-          <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shadow-lg shadow-blue-600/20">
-            <Sparkles size={18} className="text-white" />
-          </div>
+          <img src="/logo.svg" alt="Linggen" className="w-8 h-8" />
           <h1 className="text-lg font-bold tracking-tight text-slate-900 dark:text-white truncate">Linggen Agent</h1>
         </div>
       </div>

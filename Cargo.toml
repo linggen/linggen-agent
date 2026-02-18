@@ -36,3 +36,6 @@ grep = "0.3"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
+tempfile = "3"
+zip = "2"
+url = "2"

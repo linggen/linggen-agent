@@ -1,13 +1,16 @@
 pub mod actions;
 pub mod patch;
 pub mod render;
+pub mod skill_tool;
+pub mod tool_registry;
 pub mod tools;
 
 use crate::agent_manager::models::ModelManager;
 use crate::agent_manager::AgentManager;
-use crate::config::{AgentKind, AgentPolicyCapability, AgentSpec};
+use crate::config::{AgentPolicyCapability, AgentSpec};
 use crate::engine::patch::validate_unified_diff;
-use crate::engine::tools::{ToolCall, Tools};
+use crate::engine::tool_registry::ToolRegistry;
+use crate::engine::tools::ToolCall;
 use crate::ollama::ChatMessage;
 use crate::skills::Skill;
 use anyhow::Result;
@@ -123,7 +126,7 @@ pub struct AgentEngine {
     pub cfg: EngineConfig,
     pub model_manager: Arc<ModelManager>,
     pub model_id: String,
-    pub tools: Tools,
+    pub tools: ToolRegistry,
     pub role: AgentRole,
     pub task: Option<String>,
     // Agent spec and runtime context
@@ -182,7 +185,8 @@ impl AgentEngine {
         model_id: String,
         role: AgentRole,
     ) -> Result<Self> {
-        let tools = Tools::new(cfg.ws_root.clone())?;
+        let builtins = tools::Tools::new(cfg.ws_root.clone())?;
+        let tools = ToolRegistry::new(builtins);
         Ok(Self {
             cfg,
             model_manager,
@@ -216,12 +220,7 @@ impl AgentEngine {
 
     pub fn set_manager_context(&mut self, manager: Arc<AgentManager>) {
         if let Some(agent_id) = &self.agent_id {
-            let kind = self
-                .spec
-                .as_ref()
-                .map(|s| s.kind)
-                .unwrap_or(crate::config::AgentKind::Main);
-            self.tools.set_context(manager, agent_id.clone(), kind);
+            self.tools.set_context(manager, agent_id.clone());
         }
     }
 
@@ -245,6 +244,11 @@ impl AgentEngine {
         self.parent_agent_id = parent_agent_id;
     }
 
+    pub fn set_delegation_depth(&mut self, depth: usize, max_depth: usize) {
+        self.tools.builtins.set_delegation_depth(depth);
+        self.tools.builtins.set_max_delegation_depth(max_depth);
+    }
+
     pub fn set_run_id(&mut self, run_id: Option<String>) {
         self.run_id = run_id.clone();
         self.tools.set_run_id(run_id);
@@ -262,6 +266,24 @@ impl AgentEngine {
         self.prompt_mode
     }
 
+    /// Load skill-defined tools into the registry based on the agent spec's skills list.
+    /// Skills with `disable_model_invocation == true` are skipped (their tools are not
+    /// registered in the model-facing tool schema).
+    pub async fn load_skill_tools(&mut self, skill_manager: &crate::skills::SkillManager) {
+        let Some(spec) = &self.spec else { return };
+        let skill_names = spec.skills.clone();
+        for skill_name in &skill_names {
+            if let Some(skill) = skill_manager.get_skill(skill_name).await {
+                if skill.disable_model_invocation {
+                    continue;
+                }
+                for tool_def in skill.tool_defs {
+                    self.tools.register_skill_tool(tool_def);
+                }
+            }
+        }
+    }
+
     pub async fn chat_stream(
         &mut self,
         message: &str,
@@ -274,26 +296,19 @@ impl AgentEngine {
             self.role, message_preview
         );
 
-        let mut clean_message = message.to_string();
-        if message.starts_with('/') {
+        // Skill activation is handled by the caller (chat_api.rs run_skill_dispatch).
+        // Here we only strip the slash-command prefix if present, for backward compat
+        // with callers that pass through the raw user message.
+        let clean_message = if message.starts_with('/') {
             let parts: Vec<&str> = message.splitn(2, ' ').collect();
-            let cmd = parts[0].trim_start_matches('/');
-
-            if let Some(manager) = self.tools.get_manager() {
-                if let Some(skill) = manager.skill_manager.get_skill(cmd).await {
-                    info!("Activating skill: {}", skill.name);
-                    self.active_skill = Some(skill);
-                    if parts.len() > 1 {
-                        clean_message = parts[1].to_string();
-                    } else {
-                        clean_message = "I'm ready to use this skill. How can I help?".to_string();
-                    }
-                }
+            if parts.len() > 1 {
+                parts[1].to_string()
+            } else {
+                "I'm ready to use this skill. How can I help?".to_string()
             }
         } else {
-            // Prevent a previously activated skill from affecting normal chat.
-            self.active_skill = None;
-        }
+            message.to_string()
+        };
 
         let mut messages = vec![ChatMessage {
             role: "system".to_string(),
@@ -318,7 +333,7 @@ impl AgentEngine {
                     self.cfg.ws_root.display(),
                     self.role,
                     self.task.as_deref().unwrap_or("No task set yet."),
-                    tools::tool_schema_json(allowed_tools.as_ref())
+                    self.tools.tool_schema_json(allowed_tools.as_ref())
                 ),
             });
         }
@@ -389,15 +404,13 @@ impl AgentEngine {
         }
 
         let final_content = if mode == PromptMode::Chat {
-            // Strip XML-style tags like <search_indexing> from chat responses if they leak
-            let mut cleaned = assistant_response.to_string();
-            while let Some(start) = cleaned.find('<') {
-                if let Some(end) = cleaned[start..].find('>') {
-                    cleaned.replace_range(start..start + end + 1, "");
-                } else {
-                    break;
-                }
-            }
+            // Strip known internal XML-style tags from chat responses if they leak.
+            // Only strip specific tags to avoid destroying legitimate `<`/`>` content.
+            let cleaned = regex::Regex::new(
+                r"</?(?:search_indexing|internal_note|tool_call|agent_directive|system)[^>]*>"
+            )
+            .map(|re| re.replace_all(assistant_response, "").to_string())
+            .unwrap_or_else(|_| assistant_response.to_string());
             cleaned.trim().to_string()
         } else {
             // Try to parse the response as JSON to extract a user-facing summary.
@@ -548,7 +561,9 @@ impl AgentEngine {
         empty_search_streak: &mut usize,
         session_id: Option<&str>,
     ) -> LoopControl {
-        let canonical_tool = tools::canonical_tool_name(&tool)
+        let canonical_tool = self
+            .tools
+            .canonical_tool_name(&tool)
             .unwrap_or(tool.as_str())
             .to_string();
 
@@ -723,6 +738,12 @@ impl AgentEngine {
                     detail: Some(tool_start_status.clone()),
                 })
                 .await;
+            if let Some(tx) = &self.repl_events_tx {
+                let _ = tx.send(ReplEvent::Status {
+                    status: "calling_tool".to_string(),
+                    detail: Some(tool_start_status.clone()),
+                });
+            }
             let _ = manager
                 .send_event(crate::agent_manager::AgentEvent::Message {
                     from: from.clone(),
@@ -811,6 +832,12 @@ impl AgentEngine {
                             detail: Some("Thinking".to_string()),
                         })
                         .await;
+                    if let Some(tx) = &self.repl_events_tx {
+                        let _ = tx.send(ReplEvent::Status {
+                            status: "thinking".to_string(),
+                            detail: Some("Thinking".to_string()),
+                        });
+                    }
                 }
 
                 // For file mutations, emit a brief user-visible summary line.
@@ -900,6 +927,12 @@ impl AgentEngine {
                             detail: Some("Thinking".to_string()),
                         })
                         .await;
+                    if let Some(tx) = &self.repl_events_tx {
+                        let _ = tx.send(ReplEvent::Status {
+                            status: "thinking".to_string(),
+                            detail: Some("Thinking".to_string()),
+                        });
+                    }
                 }
                 messages.push(ChatMessage {
                     role: "user".to_string(),
@@ -1001,7 +1034,7 @@ impl AgentEngine {
                 self.cfg.ws_root.display(),
                 self.role,
                 task,
-                tools::tool_schema_json(allowed_tools.as_ref())
+                self.tools.tool_schema_json(allowed_tools.as_ref())
             ),
         });
         self.push_context_record(
@@ -1242,6 +1275,12 @@ impl AgentEngine {
                 })
                 .await;
         }
+        if let Some(tx) = &self.repl_events_tx {
+            let _ = tx.send(ReplEvent::Status {
+                status: "working".to_string(),
+                detail: Some("Running".to_string()),
+            });
+        }
 
         // Sync world state before running the loop if we have a manager
         if let Some(manager) = self.tools.get_manager() {
@@ -1326,6 +1365,12 @@ impl AgentEngine {
                         detail: Some("Thinking".to_string()),
                     })
                     .await;
+            }
+            if let Some(tx) = &self.repl_events_tx {
+                let _ = tx.send(ReplEvent::Status {
+                    status: "thinking".to_string(),
+                    detail: Some("Thinking".to_string()),
+                });
             }
 
             let summary_count = self.maybe_compact_model_messages(&mut messages, "loop_iter");
@@ -1498,20 +1543,9 @@ impl AgentEngine {
     }
 
     fn outbound_target(&self) -> String {
-        let kind = self
-            .spec
-            .as_ref()
-            .map(|s| s.kind)
-            .unwrap_or(AgentKind::Main);
-
-        if kind == AgentKind::Subagent {
-            return self
-                .parent_agent_id
-                .clone()
-                .unwrap_or_else(|| "user".to_string());
-        }
-
-        "user".to_string()
+        self.parent_agent_id
+            .clone()
+            .unwrap_or_else(|| "user".to_string())
     }
 
     fn estimate_tokens_for_text(text: &str) -> usize {
@@ -1792,16 +1826,29 @@ impl AgentEngine {
         let allowed = spec
             .tools
             .iter()
-            .filter_map(|tool| tools::canonical_tool_name(tool).map(str::to_string))
+            .filter_map(|tool| {
+                // Builtin tools are resolved via canonical_tool_name.
+                if let Some(name) = tools::canonical_tool_name(tool) {
+                    return Some(name.to_string());
+                }
+                // Skill tools are recognised by the registry.
+                if self.tools.has_skill_tool(tool) {
+                    return Some(tool.to_string());
+                }
+                None
+            })
             .collect::<HashSet<String>>();
 
         Some(allowed)
     }
 
     fn is_tool_allowed(&self, allowed: &HashSet<String>, requested_tool: &str) -> bool {
-        tools::canonical_tool_name(requested_tool)
-            .map(|tool| allowed.contains(tool))
-            .unwrap_or(false)
+        // Builtin tools: check via canonical name.
+        if let Some(canonical) = tools::canonical_tool_name(requested_tool) {
+            return allowed.contains(canonical);
+        }
+        // Skill tools: check by exact name.
+        allowed.contains(requested_tool)
     }
 
     fn agent_allows_policy(&self, capability: AgentPolicyCapability) -> bool {

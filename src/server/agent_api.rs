@@ -1,4 +1,4 @@
-use crate::config::{AgentKind, AgentPolicyCapability};
+use crate::config::AgentPolicyCapability;
 use crate::server::{AgentStatusKind, ServerEvent, ServerState};
 use crate::state_fs::StateFile;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
@@ -22,14 +22,11 @@ async fn agent_allows_policy(
     }
 }
 
-async fn first_patch_main_agent(state: &Arc<ServerState>, root: &PathBuf) -> Option<String> {
+async fn first_patch_agent(state: &Arc<ServerState>, root: &PathBuf) -> Option<String> {
     let entries = state.manager.list_agent_specs(root).await.ok()?;
     entries
         .into_iter()
-        .find(|entry| {
-            entry.spec.kind == AgentKind::Main
-                && entry.spec.allows_policy(AgentPolicyCapability::Patch)
-        })
+        .find(|entry| entry.spec.allows_policy(AgentPolicyCapability::Patch))
         .map(|entry| entry.agent_id)
 }
 
@@ -45,21 +42,6 @@ pub(crate) async fn set_task(
     Json(req): Json<TaskRequest>,
 ) -> impl IntoResponse {
     let root = PathBuf::from(&req.project_root);
-    let kind = state
-        .manager
-        .resolve_agent_kind(&root, &req.agent_id)
-        .await
-        .unwrap_or(AgentKind::Main);
-
-    if kind == AgentKind::Subagent {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "subagent tasks must be created via delegate_to_agent from a main agent"
-            })),
-        )
-            .into_response();
-    }
 
     match state
         .manager
@@ -125,22 +107,6 @@ pub(crate) async fn run_agent(
     let events_tx = state.events_tx.clone();
     let manager = state.manager.clone();
     let state_clone = state.clone();
-
-    let kind = state
-        .manager
-        .resolve_agent_kind(&root, &req.agent_id)
-        .await
-        .unwrap_or(AgentKind::Main);
-
-    if kind == AgentKind::Subagent {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "subagents cannot be run directly; delegate from a main agent"
-            })),
-        )
-            .into_response();
-    }
 
     match state
         .manager
@@ -208,7 +174,7 @@ pub(crate) async fn run_agent(
                 if is_finalize_agent {
                     if let crate::engine::AgentOutcome::Task(packet) = &outcome {
                         if let Ok(ctx) = manager.get_or_create_project(root.clone()).await {
-                            let assignee = first_patch_main_agent(&state_clone, &root)
+                            let assignee = first_patch_agent(&state_clone, &root)
                                 .await
                                 .unwrap_or_else(|| "unassigned".to_string());
                             let task_id = format!("task-{}", crate::util::now_ts_secs());

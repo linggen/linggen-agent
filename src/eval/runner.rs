@@ -43,10 +43,66 @@ pub async fn run_single_task(
     let tmpdir = std::env::temp_dir().join(format!("linggen-eval-{}-{}", safe_name, ts));
     std::fs::create_dir_all(&tmpdir)?;
 
-    // 2. Copy workspace/ contents into tmpdir
-    let workspace_src = task_dir.join("workspace");
-    if workspace_src.exists() {
-        copy_dir_recursive(&workspace_src, &tmpdir)?;
+    // 2. Setup workspace — either via setup_script or the default copy+git-init flow
+    if let Some(ref setup_script) = task_def.setup_script {
+        // Run custom setup script (e.g. clone a real repo, checkout a commit)
+        let script_path = task_dir.join(setup_script);
+        if !script_path.exists() {
+            anyhow::bail!(
+                "setup_script not found: {}",
+                script_path.display()
+            );
+        }
+        let setup_output = std::process::Command::new("bash")
+            .arg(&script_path)
+            .current_dir(&tmpdir)
+            .env("EVAL_WORKSPACE", &tmpdir)
+            .env("EVAL_TASK_NAME", &task_def.name)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()?;
+        if !setup_output.status.success() {
+            let stderr = String::from_utf8_lossy(&setup_output.stderr);
+            anyhow::bail!(
+                "setup_script failed (exit {}): {}",
+                setup_output.status.code().unwrap_or(-1),
+                stderr
+            );
+        }
+    } else {
+        // Default flow: copy workspace/ contents, git init
+        let workspace_src = task_dir.join("workspace");
+        if workspace_src.exists() {
+            copy_dir_recursive(&workspace_src, &tmpdir)?;
+        }
+
+        let git_init = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&tmpdir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        if let Ok(status) = git_init {
+            if status.success() {
+                let _ = std::process::Command::new("git")
+                    .args(["add", "-A"])
+                    .current_dir(&tmpdir)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let _ = std::process::Command::new("git")
+                    .args(["commit", "-m", "eval baseline", "--allow-empty"])
+                    .current_dir(&tmpdir)
+                    .env("GIT_AUTHOR_NAME", "eval")
+                    .env("GIT_AUTHOR_EMAIL", "eval@linggen")
+                    .env("GIT_COMMITTER_NAME", "eval")
+                    .env("GIT_COMMITTER_EMAIL", "eval@linggen")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
     }
 
     // 3. Copy agents/ from ws_root into tmpdir so AgentManager finds specs
@@ -54,35 +110,6 @@ pub async fn run_single_task(
     if agents_src.exists() {
         let agents_dst = tmpdir.join("agents");
         copy_dir_recursive(&agents_src, &agents_dst)?;
-    }
-
-    // 4. git init in tmpdir (agent needs .git root for workspace detection)
-    let git_init = std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(&tmpdir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    if let Ok(status) = git_init {
-        if status.success() {
-            let _ = std::process::Command::new("git")
-                .args(["add", "-A"])
-                .current_dir(&tmpdir)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            let _ = std::process::Command::new("git")
-                .args(["commit", "-m", "eval baseline", "--allow-empty"])
-                .current_dir(&tmpdir)
-                .env("GIT_AUTHOR_NAME", "eval")
-                .env("GIT_AUTHOR_EMAIL", "eval@linggen")
-                .env("GIT_COMMITTER_NAME", "eval")
-                .env("GIT_COMMITTER_EMAIL", "eval@linggen")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
     }
 
     // 5. Create SkillManager, AgentManager (Db is shared across tasks)
@@ -135,7 +162,7 @@ pub async fn run_single_task(
         .unwrap_or("grade.sh");
     let grade_script = task_dir.join(grade_script_name);
 
-    let grade_result = run_grader(&grade_script, &tmpdir, &task_def.name).await?;
+    let grade_result = run_grader(&grade_script, &tmpdir, &task_def.name, task_def.grade_timeout_secs).await?;
 
     let duration = start.elapsed();
 

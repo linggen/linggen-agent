@@ -90,14 +90,12 @@ export interface SkillInfo {
 export interface AgentInfo {
   name: string;
   description: string;
-  kind?: 'main' | 'subagent';
 }
 
 export interface AgentFileInfo {
   agent_id: string;
   name: string;
   description: string;
-  kind: 'main' | 'subagent' | string;
   path: string;
 }
 
@@ -152,7 +150,7 @@ export interface AgentRunInfo {
   repo_path: string;
   session_id: string;
   agent_id: string;
-  agent_kind: 'main' | 'subagent' | string;
+  agent_kind?: string | null;
   parent_run_id?: string | null;
   status: 'running' | 'completed' | 'failed' | 'cancelled' | string;
   detail?: string | null;
@@ -195,3 +193,45 @@ export interface AgentRunContextResponse {
   summary: AgentRunContextSummary;
   messages?: AgentRunContextMessage[] | null;
 }
+
+export interface SkillToolParamDef {
+  type: string;
+  required: boolean;
+  default?: any;
+  description: string;
+}
+
+export interface SkillToolDef {
+  name: string;
+  description: string;
+  cmd: string;
+  args: Record<string, SkillToolParamDef>;
+  returns?: string | null;
+  timeout_ms: number;
+}
+
+export interface SkillInfoFull {
+  name: string;
+  description: string;
+  content: string;
+  source: { type: 'Embedded' | 'Global' | 'Project' };
+  tool_defs: SkillToolDef[];
+}
+
+export interface SkillFileInfo {
+  name: string;
+  path: string;
+  source: string;
+}
+
+export interface MarketplaceSkill {
+  skill_id: string;
+  name: string;
+  url: string;
+  description?: string | null;
+  install_count: number;
+  git_ref?: string | null;
+  content?: string | null;
+}
+
+export type ManagementTab = 'models' | 'agents' | 'skills' | 'general';

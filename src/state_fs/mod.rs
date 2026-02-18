@@ -43,14 +43,43 @@ impl StateFs {
         Self { root }
     }
 
-    pub fn read_file(&self, rel_path: &str) -> Result<(StateFile, String)> {
+    /// Resolve a relative path and verify it stays within the state root.
+    fn safe_resolve(&self, rel_path: &str) -> Result<PathBuf> {
         let path = self.root.join(rel_path);
+        let canonical = path
+            .canonicalize()
+            .or_else(|_| {
+                // File might not exist yet (write case). Canonicalize the parent instead.
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                    let canon_parent = parent.canonicalize()?;
+                    Ok(canon_parent.join(path.file_name().unwrap_or_default()))
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "cannot resolve path",
+                    ))
+                }
+            })?;
+        let canon_root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+        if !canonical.starts_with(&canon_root) {
+            anyhow::bail!(
+                "Path traversal rejected: {} escapes state root {}",
+                rel_path,
+                canon_root.display()
+            );
+        }
+        Ok(canonical)
+    }
+
+    pub fn read_file(&self, rel_path: &str) -> Result<(StateFile, String)> {
+        let path = self.safe_resolve(rel_path)?;
         let content = fs::read_to_string(&path)?;
         self.parse_markdown(&content)
     }
 
     pub fn write_file(&self, rel_path: &str, state: &StateFile, body: &str) -> Result<()> {
-        let path = self.root.join(rel_path);
+        let path = self.safe_resolve(rel_path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }

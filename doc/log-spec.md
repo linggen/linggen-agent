@@ -2,6 +2,7 @@
 
 ## Goals
 
+- Make sure AI coding tool like Claude code can locate and fix bug.
 - Log all important steps in each service lifecycle and data path.
 - Keep logs easy to read and easy to analyze in development and production.
 - Prevent log storms with throttling and rate limits.

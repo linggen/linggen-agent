@@ -5,6 +5,7 @@ url = "http://127.0.0.1:11434"
 #model = "qwen3-coder-next"
 model = "qwen3.5:cloud"
 keep_alive = "20m"
+context_window = 131072
 
 
 # [[models]]

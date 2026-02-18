@@ -2,6 +2,7 @@ mod agent_api;
 mod chat_api;
 pub(crate) mod chat_helpers;
 mod config_api;
+mod marketplace_api;
 mod projects_api;
 mod workspace_api;
 
@@ -34,11 +35,13 @@ use agent_api::{cancel_agent_run, run_agent, set_task};
 use chat_api::{chat_handler, clear_chat_history_api, get_settings_api, update_settings_api};
 use config_api::{get_config_api, update_config_api};
 use projects_api::{
-    add_project, create_session, delete_agent_file_api, get_agent_context_api, get_agent_file_api,
-    list_agent_children_api, list_agent_files_api, list_agent_runs_api, list_agents_api,
-    list_models_api, list_projects, list_sessions, list_skills, remove_project, remove_session_api,
-    upsert_agent_file_api,
+    add_project, create_session, delete_agent_file_api, delete_skill_file_api,
+    get_agent_context_api, get_agent_file_api, get_skill_file_api, list_agent_children_api,
+    list_agent_files_api, list_agent_runs_api, list_agents_api, list_models_api, list_projects,
+    list_sessions, list_skill_files_api, list_skills, remove_project, remove_session_api,
+    upsert_agent_file_api, upsert_skill_file_api,
 };
+use marketplace_api::{marketplace_install, marketplace_list, marketplace_search, marketplace_uninstall};
 use workspace_api::{get_agent_tree, get_workspace_state, list_files, read_file_api};
 
 #[derive(RustEmbed)]
@@ -257,7 +260,20 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
             lifecycle,
         } => {
             if status.eq_ignore_ascii_case("idle") && lifecycle.is_none() {
-                return None;
+                // Still emit the idle event so the UI can transition agent status.
+                return Some(UiSseMessage {
+                    id: format!("act-{seq}"),
+                    seq,
+                    rev: seq,
+                    ts_ms,
+                    kind: UI_KIND_ACTIVITY.to_string(),
+                    phase: Some(UI_PHASE_DONE.to_string()),
+                    text: None,
+                    agent_id: Some(agent_id),
+                    session_id: None,
+                    project_root: None,
+                    data: Some(json!({ "status": "idle" })),
+                });
             }
             let phase = lifecycle.or_else(|| {
                 if status.eq_ignore_ascii_case("idle") {
@@ -656,6 +672,14 @@ pub async fn start_server(
         .route("/api/models", get(list_models_api))
         .route("/api/config", get(get_config_api).post(update_config_api))
         .route("/api/skills", get(list_skills))
+        .route("/api/marketplace/search", get(marketplace_search))
+        .route("/api/marketplace/list", get(marketplace_list))
+        .route("/api/marketplace/install", post(marketplace_install))
+        .route("/api/marketplace/uninstall", delete(marketplace_uninstall))
+        .route("/api/skill-files", get(list_skill_files_api))
+        .route("/api/skill-file", get(get_skill_file_api))
+        .route("/api/skill-file", post(upsert_skill_file_api))
+        .route("/api/skill-file", delete(delete_skill_file_api))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions", post(create_session))
         .route("/api/sessions", delete(remove_session_api))
@@ -671,12 +695,13 @@ pub async fn start_server(
         .route("/api/file", get(read_file_api))
         .route("/api/workspace/state", get(get_workspace_state))
         .route("/api/events", get(events_handler))
+        .route("/api/health", get(health_handler))
         .route("/api/utils/pick-folder", get(pick_folder))
         .route("/api/utils/ollama-status", get(get_ollama_status))
         .fallback(static_handler)
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     info!("Server running on http://localhost:{}", port);
     axum::serve(listener, app).await?;
 
@@ -742,18 +767,17 @@ async fn events_handler(
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
+async fn health_handler() -> impl IntoResponse {
+    axum::Json(json!({ "ok": true }))
+}
+
 async fn pick_folder() -> impl IntoResponse {
     (axum::http::StatusCode::NOT_IMPLEMENTED, "Folder picker not implemented").into_response()
 }
 
 async fn get_ollama_status(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    // We'll just check the first ollama model we find
     let models_guard = state.manager.models.read().await;
-    let models = models_guard.list_models();
-    let ollama_model = models.iter().find(|m| m.provider == "ollama");
-
-    if let Some(m) = ollama_model {
-        let client = crate::ollama::OllamaClient::new(m.url.clone(), m.api_key.clone());
+    if let Some(client) = models_guard.first_ollama_client() {
         match client.get_ps().await {
             Ok(status) => axum::Json(status).into_response(),
             Err(e) => {

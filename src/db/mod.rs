@@ -93,7 +93,8 @@ pub struct AgentRunRecord {
     pub repo_path: String,
     pub session_id: String,
     pub agent_id: String,
-    pub agent_kind: crate::config::AgentKind,
+    #[serde(default)]
+    pub agent_kind: Option<String>,
     pub parent_run_id: Option<String>,
     pub status: AgentRunStatus,
     pub detail: Option<String>,

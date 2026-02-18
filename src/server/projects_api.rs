@@ -1,4 +1,4 @@
-use crate::config::{AgentKind, AgentSpec};
+use crate::config::AgentSpec;
 use crate::server::chat_helpers::sanitize_message_for_ui;
 use crate::server::{ServerEvent, ServerState};
 use crate::skills::Skill;
@@ -45,7 +45,6 @@ struct AgentFileListItem {
     agent_id: String,
     name: String,
     description: String,
-    kind: String,
     path: String,
 }
 
@@ -61,13 +60,6 @@ struct AgentFileResponse {
 struct AgentFileWriteResponse {
     path: String,
     agent_id: String,
-}
-
-fn kind_label(kind: AgentKind) -> &'static str {
-    match kind {
-        AgentKind::Main => "main",
-        AgentKind::Subagent => "subagent",
-    }
 }
 
 fn canonical_project_root(project_root: &str) -> PathBuf {
@@ -147,7 +139,6 @@ pub(crate) async fn list_agent_files_api(
                         agent_id: entry.agent_id,
                         name: entry.spec.name,
                         description: entry.spec.description,
-                        kind: kind_label(entry.spec.kind).to_string(),
                         path: rel,
                     }
                 })
@@ -370,6 +361,197 @@ pub(crate) async fn list_skills(State(state): State<Arc<ServerState>>) -> impl I
     Json(skills).into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Skill-file CRUD (mirrors agent-file endpoints)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub(crate) struct SkillFileQuery {
+    project_root: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct UpsertSkillFileRequest {
+    project_root: String,
+    path: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct DeleteSkillFileRequest {
+    project_root: String,
+    path: String,
+}
+
+#[derive(Serialize)]
+struct SkillFileListItem {
+    name: String,
+    path: String,
+    source: String,
+}
+
+#[derive(Serialize)]
+struct SkillFileResponse {
+    path: String,
+    content: String,
+    valid: bool,
+    error: Option<String>,
+}
+
+fn normalize_skill_md_path(path: &str) -> Result<String, String> {
+    let raw = path.trim().replace('\\', "/");
+    if raw.is_empty() {
+        return Err("path is required".to_string());
+    }
+    if raw.starts_with('/') || raw.contains("..") {
+        return Err("path must be a relative markdown path under .linggen/skills/".to_string());
+    }
+    let rel = if raw.starts_with(".linggen/skills/") {
+        raw
+    } else {
+        format!(".linggen/skills/{}", raw)
+    };
+    if !rel.to_ascii_lowercase().ends_with(".md") {
+        return Err("skill files must end with .md".to_string());
+    }
+    if !rel
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_' || c == '.')
+    {
+        return Err("path contains unsupported characters".to_string());
+    }
+    let suffix = rel.strip_prefix(".linggen/skills/").unwrap_or("");
+    if suffix.is_empty() || suffix.split('/').any(|seg| seg.is_empty()) {
+        return Err("invalid skill markdown path".to_string());
+    }
+    Ok(rel)
+}
+
+pub(crate) async fn list_skill_files_api(
+    Query(query): Query<ProjectQuery>,
+) -> impl IntoResponse {
+    let root = canonical_project_root(&query.project_root);
+    let skills_dir = root.join(".linggen/skills");
+    if !skills_dir.exists() {
+        return Json(Vec::<SkillFileListItem>::new()).into_response();
+    }
+    let entries = match std::fs::read_dir(&skills_dir) {
+        Ok(entries) => entries,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    };
+    let mut items: Vec<SkillFileListItem> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map_or(false, |ext| ext == "md") {
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(path.as_path())
+                .to_string_lossy()
+                .to_string();
+            let name = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            items.push(SkillFileListItem {
+                name,
+                path: rel,
+                source: "project".to_string(),
+            });
+        }
+    }
+    items.sort_by(|a, b| a.name.cmp(&b.name));
+    Json(items).into_response()
+}
+
+pub(crate) async fn get_skill_file_api(
+    Query(query): Query<SkillFileQuery>,
+) -> impl IntoResponse {
+    let root = canonical_project_root(&query.project_root);
+    let rel = match normalize_skill_md_path(&query.path) {
+        Ok(path) => path,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
+    let full_path = root.join(&rel);
+    let content = match std::fs::read_to_string(&full_path) {
+        Ok(content) => content,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    // Validate frontmatter
+    let valid = content.starts_with("---")
+        && content.splitn(3, "---").count() >= 3
+        && serde_yaml::from_str::<serde_yaml::Value>(
+            content.splitn(3, "---").nth(1).unwrap_or(""),
+        )
+        .is_ok();
+    Json(SkillFileResponse {
+        path: rel,
+        content,
+        valid,
+        error: if valid {
+            None
+        } else {
+            Some("Invalid YAML frontmatter".to_string())
+        },
+    })
+    .into_response()
+}
+
+pub(crate) async fn upsert_skill_file_api(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<UpsertSkillFileRequest>,
+) -> impl IntoResponse {
+    let root = canonical_project_root(&req.project_root);
+    let rel = match normalize_skill_md_path(&req.path) {
+        Ok(path) => path,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
+    // Validate frontmatter minimally
+    if !req.content.starts_with("---") {
+        return (StatusCode::BAD_REQUEST, "Skill must start with YAML frontmatter").into_response();
+    }
+    let full_path = root.join(&rel);
+    if let Some(parent) = full_path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+        }
+    }
+    if let Err(err) = std::fs::write(&full_path, &req.content) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+    }
+    // Reload skills cache
+    if let Err(err) = state.skill_manager.load_all(Some(&root)).await {
+        tracing::warn!("Failed to reload skills after write: {}", err);
+    }
+    let _ = state.events_tx.send(ServerEvent::StateUpdated);
+    Json(serde_json::json!({ "path": rel })).into_response()
+}
+
+pub(crate) async fn delete_skill_file_api(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<DeleteSkillFileRequest>,
+) -> impl IntoResponse {
+    let root = canonical_project_root(&req.project_root);
+    let rel = match normalize_skill_md_path(&req.path) {
+        Ok(path) => path,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
+    let full_path = root.join(&rel);
+    if !full_path.exists() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if let Err(err) = std::fs::remove_file(&full_path) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+    }
+    // Reload skills cache
+    if let Err(err) = state.skill_manager.load_all(Some(&root)).await {
+        tracing::warn!("Failed to reload skills after delete: {}", err);
+    }
+    let _ = state.events_tx.send(ServerEvent::StateUpdated);
+    StatusCode::OK.into_response()
+}
+
 pub(crate) async fn list_sessions(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<ProjectQuery>,
@@ -390,7 +572,11 @@ pub(crate) async fn create_session(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
-    let id = format!("sess-{}", crate::util::now_ts_secs());
+    let id = format!(
+        "sess-{}-{}",
+        crate::util::now_ts_secs(),
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
     let session = crate::db::SessionInfo {
         id: id.clone(),
         repo_path: req.project_root,

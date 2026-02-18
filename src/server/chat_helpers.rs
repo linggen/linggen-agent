@@ -72,7 +72,14 @@ pub(crate) fn queue_preview(message: &str) -> String {
     if trimmed.len() <= LIMIT {
         trimmed.to_string()
     } else {
-        format!("{}...", &trimmed[..LIMIT])
+        // Find a char boundary at or before LIMIT to avoid panic on multi-byte UTF-8.
+        let end = trimmed
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= LIMIT)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &trimmed[..end])
     }
 }
 

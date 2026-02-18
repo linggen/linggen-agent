@@ -22,6 +22,10 @@ pub struct EvalTaskDef {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub grade_script: Option<String>,
+    #[serde(default)]
+    pub setup_script: Option<String>,
+    #[serde(default)]
+    pub grade_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]

@@ -16,8 +16,22 @@ pub(crate) async fn get_config_api(State(state): State<Arc<ServerState>>) -> imp
 
 pub(crate) async fn update_config_api(
     State(state): State<Arc<ServerState>>,
-    Json(new_config): Json<Config>,
+    Json(mut new_config): Json<Config>,
 ) -> impl IntoResponse {
+    // Preserve existing API keys when the client sends back the redacted placeholder.
+    let current = state.manager.get_config_snapshot().await;
+    for model in &mut new_config.models {
+        if model.api_key.as_deref() == Some("***") {
+            // Find the matching model in the current config and keep its real key.
+            let existing_key = current
+                .models
+                .iter()
+                .find(|m| m.id == model.id)
+                .and_then(|m| m.api_key.clone());
+            model.api_key = existing_key;
+        }
+    }
+
     if let Err(e) = new_config.validate() {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }

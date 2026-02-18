@@ -25,7 +25,7 @@ async function getMermaid() {
   if (!mermaidInitialized) {
     mermaidInstance.initialize({
       startOnLoad: false,
-      securityLevel: 'loose',
+      securityLevel: 'strict',
       theme: 'default',
     });
     mermaidInitialized = true;
@@ -453,6 +453,8 @@ const isProgressLineText = (text?: string) => {
     t.startsWith('Reading file:') ||
     t === 'Writing file...' ||
     t.startsWith('Writing file:') ||
+    t === 'Editing file...' ||
+    t.startsWith('Editing file:') ||
     t === 'Running command...' ||
     t.startsWith('Running command:') ||
     t === 'Searching...' ||
@@ -473,6 +475,7 @@ const summarizeCollapsedActivity = (entries: string[], inProgress = false) => {
   const runCount = normalized.filter((v) => v.startsWith('ran command') || v.includes('running command')).length;
   const delegateCount = normalized.filter((v) => v.startsWith('delegated to ') || v.includes('delegating')).length;
   const writeCount = normalized.filter((v) => v.startsWith('wrote ') || v.includes('writing file')).length;
+  const editCount = normalized.filter((v) => v.startsWith('edited ') || v.includes('editing file')).length;
   const listCount = normalized.filter((v) => v.startsWith('listed files') || v.includes('listing files') || v.includes('glob')).length;
 
   if (readCount > 0 || searchCount > 0 || listCount > 0) {
@@ -487,6 +490,7 @@ const summarizeCollapsedActivity = (entries: string[], inProgress = false) => {
   if (runCount > 0) parts.push(`${runCount} command${runCount > 1 ? 's' : ''}`);
   if (delegateCount > 0) parts.push(`${delegateCount} delegation${delegateCount > 1 ? 's' : ''}`);
   if (writeCount > 0) parts.push(`${writeCount} file write${writeCount > 1 ? 's' : ''}`);
+  if (editCount > 0) parts.push(`${editCount} file edit${editCount > 1 ? 's' : ''}`);
   if (listCount > 0) parts.push(`${listCount} listing${listCount > 1 ? 's' : ''}`);
   if (parts.length > 0) return `Worked: ${parts.join(', ')}`;
   
@@ -505,8 +509,12 @@ const activityHeadline = (msg: ChatMessage, entries: string[]) => {
 
 const activityEntriesForDetails = (msg: ChatMessage, entries: string[]) => {
   if (msg.isGenerating) return entries;
-  // Hide transient "doing" phases once work is done.
-  return entries.filter((entry) => !isProgressLineText(entry));
+  // Hide transient status-only lines (Thinking, Model loading) once work is done,
+  // but keep tool activity lines (even "doing" forms) so the detail section stays expandable.
+  return entries.filter((entry) => {
+    const t = entry.trim();
+    return t !== 'Thinking...' && t !== 'Thinking' && t !== 'Model loading...' && t !== 'Model loading' && t !== 'Running';
+  });
 };
 
 const activityEntriesForMessage = (msg: ChatMessage): string[] => {
@@ -1444,20 +1452,22 @@ export const ChatPanel: React.FC<{
             >
               {hasActivitySummary && (
                 hasActivityDetails ? (
-                  <details className="mb-1 text-[11px] text-slate-500 dark:text-slate-400" open={msg.isGenerating}>
-                    <summary className="cursor-pointer select-none flex items-center gap-1.5">
-                      {msg.isGenerating && (
+                  <details className="group mb-1 text-[11px] text-slate-500 dark:text-slate-400" open={msg.isGenerating || undefined}>
+                    <summary className="cursor-pointer select-none list-none flex items-center gap-1.5 [&::-webkit-details-marker]:hidden">
+                      {msg.isGenerating ? (
                         <span className="flex gap-0.5">
                           <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce [animation-delay:-0.3s]" />
                           <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce [animation-delay:-0.15s]" />
                           <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce" />
                         </span>
+                      ) : (
+                        <span className="text-[9px] text-slate-400 dark:text-slate-500 transition-transform group-open:rotate-90">&#9654;</span>
                       )}
                       <span>{activityHeadline(msg, activityEntries)}</span>
                     </summary>
-                    <div className="mt-1 space-y-0.5 pl-2 border-l border-slate-300/60 dark:border-white/15">
+                    <div className="mt-1 space-y-0.5 pl-4 border-l-2 border-slate-200/80 dark:border-white/10">
                       {detailActivityEntries.map((entry, idx) => (
-                        <div key={`${idx}-${entry}`} className="truncate">
+                        <div key={`${idx}-${entry}`} className="truncate text-slate-400 dark:text-slate-500">
                           {entry}
                         </div>
                       ))}

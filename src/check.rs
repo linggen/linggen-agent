@@ -53,7 +53,14 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    let mut out = s[..max].to_string();
+    // Find a char boundary at or before max to avoid panic on multi-byte UTF-8.
+    let end = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= max)
+        .last()
+        .unwrap_or(0);
+    let mut out = s[..end].to_string();
     out.push_str("\n... (truncated)\n");
     out
 }

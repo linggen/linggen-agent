@@ -1,4 +1,4 @@
-# Sanji Code Style Specification
+# Code Style Specification
 
 ## Goals
 
