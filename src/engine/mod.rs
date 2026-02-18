@@ -1814,6 +1814,27 @@ impl AgentEngine {
     }
 
     fn allowed_tool_names(&self) -> Option<HashSet<String>> {
+        // When a skill is active and declares allowed-tools, those take
+        // precedence — the agent can only use the tools the skill permits.
+        if let Some(skill) = &self.active_skill {
+            if !skill.allowed_tools.is_empty() {
+                let allowed = skill
+                    .allowed_tools
+                    .iter()
+                    .filter_map(|tool| {
+                        if let Some(name) = tools::canonical_tool_name(tool) {
+                            return Some(name.to_string());
+                        }
+                        if self.tools.has_skill_tool(tool) {
+                            return Some(tool.to_string());
+                        }
+                        None
+                    })
+                    .collect::<HashSet<String>>();
+                return Some(allowed);
+            }
+        }
+
         let spec = self.spec.as_ref()?;
         if spec.tools.is_empty() {
             return None;

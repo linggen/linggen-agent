@@ -2,15 +2,10 @@ pub mod marketplace;
 
 use crate::engine::skill_tool::SkillToolDef;
 use anyhow::Result;
-use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use tokio::sync::Mutex;
-
-#[derive(RustEmbed)]
-#[folder = "src/skills/embedded/"]
-pub struct EmbeddedSkills;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Skill {
@@ -45,7 +40,6 @@ fn default_user_invocable() -> bool {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum SkillSource {
-    Embedded,
     Global,
     Project,
     Compat,
@@ -92,17 +86,7 @@ impl SkillManager {
         let mut skills = self.skills.lock().await;
         skills.clear();
 
-        // 1. Load Embedded Skills (lowest priority)
-        for file in EmbeddedSkills::iter() {
-            if let Some(content) = EmbeddedSkills::get(&file) {
-                let text = String::from_utf8_lossy(&content.data).to_string();
-                if let Ok(skill) = self.parse_skill(&text, SkillSource::Embedded) {
-                    skills.insert(skill.name.clone(), skill);
-                }
-            }
-        }
-
-        // 2. Load Compat Skills (~/.claude/skills/, ~/.codex/skills/)
+        // 1. Load Compat Skills (~/.claude/skills/, ~/.codex/skills/)
         if let Some(home) = dirs::home_dir() {
             for compat_dir_name in &[".claude/skills", ".codex/skills"] {
                 let compat_dir = home.join(compat_dir_name);
@@ -112,7 +96,7 @@ impl SkillManager {
             }
         }
 
-        // 3. Load Global Skills (~/.linggen/skills/)
+        // 2. Load Global Skills (~/.linggen/skills/)
         if let Some(home) = dirs::home_dir() {
             let global_dir = home.join(".linggen/skills");
             let _ = self
@@ -120,7 +104,7 @@ impl SkillManager {
                 .await;
         }
 
-        // 4. Load Project Skills (.linggen/skills/) — highest priority
+        // 3. Load Project Skills (.linggen/skills/) — highest priority
         if let Some(root) = project_root {
             let project_dir = root.join(".linggen/skills");
             let _ = self

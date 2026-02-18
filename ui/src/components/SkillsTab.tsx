@@ -6,9 +6,9 @@ import { CM6Editor } from './CM6Editor';
 const sectionCls = 'bg-white dark:bg-[#141414] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm';
 
 const sourceBadgeCls: Record<string, string> = {
-  Embedded: 'bg-slate-500/10 text-slate-600 dark:text-slate-400',
   Global: 'bg-purple-500/10 text-purple-600 dark:text-purple-400',
   Project: 'bg-green-500/10 text-green-600 dark:text-green-400',
+  Compat: 'bg-slate-500/10 text-slate-600 dark:text-slate-400',
 };
 
 const defaultSkillTemplate = (name: string) => `---
@@ -167,15 +167,15 @@ export const SkillsTab: React.FC<{
   };
 
   const groups: SkillGroup[] = (() => {
-    const bySource: Record<string, SkillInfoFull[]> = { Embedded: [], Global: [], Project: [] };
+    const bySource: Record<string, SkillInfoFull[]> = { Global: [], Project: [], Compat: [] };
     for (const skill of allSkills) {
-      const src = skill.source?.type || 'Embedded';
+      const src = skill.source?.type || 'Global';
       (bySource[src] ??= []).push(skill);
     }
     return [
-      { label: 'Embedded', source: 'Embedded', skills: bySource.Embedded },
       { label: 'Global', source: 'Global', skills: bySource.Global },
       { label: 'Project', source: 'Project', skills: bySource.Project },
+      { label: 'Compat', source: 'Compat', skills: bySource.Compat },
     ].filter((g) => g.skills.length > 0);
   })();
 

@@ -630,8 +630,7 @@ async fn run_skill_dispatch(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // Resolve the skill and build the task for the loop.
-    let mut skill_default_task: Option<String> = None;
+    // Resolve the skill.
     if let Some(manager) = engine.tools.get_manager() {
         if let Some(skill) = manager.skill_manager.get_skill(cmd).await {
             if !skill.user_invocable {
@@ -646,16 +645,27 @@ async fn run_skill_dispatch(
                 .await;
                 return;
             }
-            // Build a default task from the skill's metadata when no user args given.
+            // If no arguments given and the skill has a usage hint, respond immediately
+            // with a subcommand list instead of spinning up the agent loop.
             if user_args.is_none() {
                 if let Some(hint) = &skill.argument_hint {
-                    skill_default_task = Some(format!(
-                        "The user invoked /{} without arguments. Usage: /{} {}. Show them the usage and ask what they want to do.",
-                        skill.name, skill.name, hint
-                    ));
-                } else {
-                    skill_default_task =
-                        Some(format!("Run the '{}' skill: {}", skill.name, skill.description));
+                    let subcommands: Vec<String> = hint
+                        .split('|')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!("  `/{} {}`", skill.name, s))
+                        .collect();
+                    let usage_msg = format!(
+                        "{}\n\n**Commands:**\n{}",
+                        skill.description,
+                        subcommands.join("\n"),
+                    );
+                    persist_and_emit_message(
+                        &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+                        &ctx.agent_id, "user", &usage_msg, ctx.session_id.as_deref(), false,
+                    )
+                    .await;
+                    return;
                 }
             }
             engine.active_skill = Some(skill);
@@ -663,7 +673,6 @@ async fn run_skill_dispatch(
     }
 
     let task_for_loop = user_args
-        .or(skill_default_task)
         .unwrap_or_else(|| "Initialize this workspace and summarize status.".to_string());
 
     engine.observations.clear();

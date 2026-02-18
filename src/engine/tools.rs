@@ -1208,6 +1208,7 @@ pub(crate) fn validate_shell_command(cmd: &str) -> Result<()> {
         "ls", "pwd", "cat", "head", "tail", "wc", "cut", "sort", "uniq", "tr", "sed", "awk",
         "find", "fd", "rg", "grep", "git", "cargo", "rustc", "npm", "pnpm", "yarn", "node",
         "python", "python3", "pip", "pip3", "pytest", "go", "make", "just",
+        "bash", "sh", "curl", "jq",
     ]
     .into_iter()
     .collect();

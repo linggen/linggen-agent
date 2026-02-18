@@ -81,11 +81,8 @@ export interface SubagentInfo {
   paths: string[];
 }
 
-export interface SkillInfo {
-  name: string;
-  description: string;
-  source: { type: string };
-}
+/** @deprecated Use SkillInfoFull instead */
+export type SkillInfo = SkillInfoFull;
 
 export interface AgentInfo {
   name: string;
@@ -214,8 +211,14 @@ export interface SkillInfoFull {
   name: string;
   description: string;
   content: string;
-  source: { type: 'Embedded' | 'Global' | 'Project' };
+  source: { type: 'Global' | 'Project' | 'Compat' };
   tool_defs: SkillToolDef[];
+  user_invocable?: boolean;
+  allowed_tools?: string[];
+  argument_hint?: string | null;
+  model?: string | null;
+  trigger?: string | null;
+  agent?: string | null;
 }
 
 export interface SkillFileInfo {

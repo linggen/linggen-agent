@@ -448,7 +448,10 @@ const isProgressLineText = (text?: string) => {
   if (!t) return false;
   return (
     t === 'Thinking...' ||
+    t === 'Thinking' ||
     t === 'Model loading...' ||
+    t === 'Model loading' ||
+    t === 'Running' ||
     t === 'Reading file...' ||
     t.startsWith('Reading file:') ||
     t === 'Writing file...' ||
@@ -1437,7 +1440,7 @@ export const ChatPanel: React.FC<{
             : msg.isThinking
               ? 'text-slate-500 dark:text-slate-400 italic opacity-60'
               : isStatusLine && !hasActivity
-                ? 'text-blue-700 dark:text-blue-300 italic'
+                ? 'text-amber-600/70 dark:text-amber-400/70 italic text-[12px]'
                 : 'text-slate-800 dark:text-slate-200';
           return (
           <div
