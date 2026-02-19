@@ -32,7 +32,7 @@ use tokio_stream::StreamExt;
 use tracing::info;
 
 use agent_api::{cancel_agent_run, run_agent, set_task};
-use chat_api::{chat_handler, clear_chat_history_api, get_settings_api, update_settings_api};
+use chat_api::{chat_handler, clear_chat_history_api};
 use config_api::{get_config_api, update_config_api};
 use projects_api::{
     add_project, create_session, delete_agent_file_api, delete_skill_file_api,
@@ -137,10 +137,6 @@ pub enum ServerEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         lifecycle: Option<String>, // "doing" | "done"
     },
-    SettingsUpdated {
-        project_root: String,
-        mode: String,
-    },
     QueueUpdated {
         project_root: String,
         session_id: String,
@@ -208,7 +204,6 @@ const UI_KIND_TOKEN: &str = "token";
 
 const UI_PHASE_SYNC: &str = "sync";
 const UI_PHASE_OUTCOME: &str = "outcome";
-const UI_PHASE_SETTINGS_UPDATED: &str = "settings_updated";
 const UI_PHASE_CONTEXT_USAGE: &str = "context_usage";
 const UI_PHASE_SUBAGENT_SPAWNED: &str = "subagent_spawned";
 const UI_PHASE_SUBAGENT_RESULT: &str = "subagent_result";
@@ -353,19 +348,6 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
             session_id: None,
             project_root: None,
             data: Some(json!({ "outcome": outcome })),
-        }),
-        ServerEvent::SettingsUpdated { project_root, mode } => Some(UiSseMessage {
-            id: format!("run-settings-{project_root}-{seq}"),
-            seq,
-            rev: seq,
-            ts_ms,
-            kind: UI_KIND_RUN.to_string(),
-            phase: Some(UI_PHASE_SETTINGS_UPDATED.to_string()),
-            text: Some(format!("Mode set to {}", mode)),
-            agent_id: None,
-            session_id: None,
-            project_root: Some(project_root.clone()),
-            data: Some(json!({ "project_root": project_root, "mode": mode })),
         }),
         ServerEvent::ContextUsage {
             agent_id,
@@ -692,8 +674,6 @@ pub async fn prepare_server(
         .route("/api/sessions", post(create_session))
         .route("/api/sessions", patch(rename_session_api))
         .route("/api/sessions", delete(remove_session_api))
-        .route("/api/settings", get(get_settings_api))
-        .route("/api/settings", post(update_settings_api))
         .route("/api/task", post(set_task))
         .route("/api/run", post(run_agent))
         .route("/api/agent-cancel", post(cancel_agent_run))

@@ -14,7 +14,6 @@ use crate::engine::tools::ToolCall;
 use crate::ollama::ChatMessage;
 use crate::skills::Skill;
 use anyhow::Result;
-use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
@@ -24,7 +23,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt as TokioStreamExt;
 use tracing::{info, warn};
 
-pub use actions::{model_message_log_parts, parse_all_actions, parse_first_action, ModelAction};
+pub use actions::{model_message_log_parts, parse_all_actions, ModelAction};
 
 #[derive(Debug, Clone)]
 pub enum ThinkingEvent {
@@ -141,17 +140,10 @@ pub struct AgentEngine {
     pub chat_history: Vec<ChatMessage>,
     // Active skill if any
     pub active_skill: Option<Skill>,
-    pub prompt_mode: PromptMode,
     pub parent_agent_id: Option<String>,
     pub run_id: Option<String>,
     pub thinking_tx: Option<mpsc::UnboundedSender<ThinkingEvent>>,
     pub repl_events_tx: Option<mpsc::UnboundedSender<ReplEvent>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptMode {
-    Structured,
-    Chat,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -202,7 +194,6 @@ impl AgentEngine {
             next_context_id: 1,
             chat_history: Vec::new(),
             active_skill: None,
-            prompt_mode: PromptMode::Structured,
             parent_agent_id: None,
             run_id: None,
             thinking_tx: None,
@@ -258,14 +249,6 @@ impl AgentEngine {
         self.task.clone()
     }
 
-    pub fn set_prompt_mode(&mut self, mode: PromptMode) {
-        self.prompt_mode = mode;
-    }
-
-    pub fn get_prompt_mode(&self) -> PromptMode {
-        self.prompt_mode
-    }
-
     /// Load skill-defined tools into the registry based on the agent spec's skills list.
     /// Skills with `disable_model_invocation == true` are skipped (their tools are not
     /// registered in the model-facing tool schema).
@@ -282,202 +265,6 @@ impl AgentEngine {
                 }
             }
         }
-    }
-
-    pub async fn chat_stream(
-        &mut self,
-        message: &str,
-        _session_id: Option<&str>,
-        mode: PromptMode,
-    ) -> Result<impl Stream<Item = Result<String>> + Send + Unpin> {
-        let message_preview = chat_input_log_preview(message);
-        info!(
-            "Processing chat stream for role {:?}: {}",
-            self.role, message_preview
-        );
-
-        // Skill activation is handled by the caller (chat_api.rs run_skill_dispatch).
-        // Here we only strip the slash-command prefix if present, for backward compat
-        // with callers that pass through the raw user message.
-        let clean_message = if message.starts_with('/') {
-            let parts: Vec<&str> = message.splitn(2, ' ').collect();
-            if parts.len() > 1 {
-                parts[1].to_string()
-            } else {
-                "I'm ready to use this skill. How can I help?".to_string()
-            }
-        } else {
-            message.to_string()
-        };
-
-        let mut messages = vec![ChatMessage {
-            role: "system".to_string(),
-            content: self.system_prompt(),
-        }];
-        self.push_context_record(
-            ContextType::System,
-            Some("chat_stream_prompt".to_string()),
-            None,
-            None,
-            messages[0].content.clone(),
-            serde_json::json!({ "mode": format!("{:?}", mode) }),
-        );
-        let allowed_tools = self.allowed_tool_names();
-
-        // Add workspace context to the first message if history is short
-        if self.chat_history.len() == 0 {
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: format!(
-                    "Workspace root: {}\nCurrent Role: {:?}\n\nTask: {}\n\nTool schema:\n{}",
-                    self.cfg.ws_root.display(),
-                    self.role,
-                    self.task.as_deref().unwrap_or("No task set yet."),
-                    self.tools.tool_schema_json(allowed_tools.as_ref())
-                ),
-            });
-        }
-
-        messages.extend(self.chat_history.clone());
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: clean_message,
-        });
-        self.push_context_record(
-            ContextType::UserInput,
-            Some("chat_stream_input".to_string()),
-            Some("user".to_string()),
-            self.agent_id.clone(),
-            messages
-                .last()
-                .map(|m| m.content.clone())
-                .unwrap_or_default(),
-            serde_json::json!({ "source": "chat_stream" }),
-        );
-        let summary_count = self.maybe_compact_model_messages(&mut messages, "chat_stream");
-        self.emit_context_usage_event("chat_stream", &messages, summary_count)
-            .await;
-
-        let stream = self
-            .model_manager
-            .chat_text_stream(&self.model_id, &messages)
-            .await?;
-
-        Ok(stream)
-    }
-
-    pub async fn finalize_chat(
-        &mut self,
-        user_message: &str,
-        assistant_response: &str,
-        session_id: Option<&str>,
-        mode: PromptMode,
-    ) -> Result<()> {
-        let mut clean_message = user_message.to_string();
-        if user_message.starts_with('/') {
-            let parts: Vec<&str> = user_message.splitn(2, ' ').collect();
-            if parts.len() > 1 {
-                clean_message = parts[1].to_string();
-            } else {
-                clean_message = "I'm ready to use this skill. How can I help?".to_string();
-            }
-        }
-
-        self.chat_history.push(ChatMessage {
-            role: "user".to_string(),
-            content: clean_message.clone(),
-        });
-        let already_recorded_user_input = self
-            .context_records
-            .last()
-            .map(|r| r.context_type == ContextType::UserInput && r.content == clean_message)
-            .unwrap_or(false);
-        if !already_recorded_user_input {
-            self.push_context_record(
-                ContextType::UserInput,
-                Some("chat_input".to_string()),
-                Some("user".to_string()),
-                self.agent_id.clone(),
-                clean_message.clone(),
-                serde_json::json!({ "source": "finalize_chat" }),
-            );
-        }
-
-        let final_content = if mode == PromptMode::Chat {
-            // Strip known internal XML-style tags from chat responses if they leak.
-            // Only strip specific tags to avoid destroying legitimate `<`/`>` content.
-            let cleaned = regex::Regex::new(
-                r"</?(?:search_indexing|internal_note|tool_call|agent_directive|system)[^>]*>"
-            )
-            .map(|re| re.replace_all(assistant_response, "").to_string())
-            .unwrap_or_else(|_| assistant_response.to_string());
-            cleaned.trim().to_string()
-        } else {
-            // Try to parse the response as JSON to extract a user-facing summary.
-            if let Ok(action) = serde_json::from_str::<ModelAction>(assistant_response) {
-                match action {
-                    ModelAction::FinalizeTask { packet } => {
-                        format!(
-                            "I've finalized the task: {}. You can review it in the Planning section.",
-                            packet.title
-                        )
-                    }
-                    ModelAction::Tool { tool, .. } => {
-                        format!(
-                            "I'm using the tool: {}. I will continue automatically.",
-                            tool
-                        )
-                    }
-                    ModelAction::Patch { .. } => {
-                        "I've proposed a code patch. I will apply it now.".to_string()
-                    }
-                    ModelAction::Done { message } => {
-                        message.unwrap_or_else(|| "Task completed.".to_string())
-                    }
-                }
-            } else {
-                // If JSON parsing fails, it might be because of leaked tags.
-                // We don't strip them here because we want to see the error,
-                // but for the final display we can be more lenient.
-                assistant_response.to_string()
-            }
-        };
-
-        // Record assistant response in DB
-        if let Some(manager) = self.tools.get_manager() {
-            let target = self.outbound_target();
-            let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
-                repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
-                session_id: session_id.unwrap_or("default").to_string(),
-                agent_id: self
-                    .agent_id
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                from_id: self
-                    .agent_id
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                to_id: target,
-                content: final_content.clone(),
-                timestamp: crate::util::now_ts_secs(),
-                is_observation: false,
-            });
-        }
-
-        self.chat_history.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: final_content.clone(),
-        });
-        self.push_context_record(
-            ContextType::AssistantReply,
-            Some("chat_reply".to_string()),
-            self.agent_id.clone(),
-            Some("user".to_string()),
-            final_content,
-            serde_json::json!({ "mode": format!("{:?}", mode) }),
-        );
-
-        Ok(())
     }
 
     pub async fn manager_db_add_observation(
@@ -1165,29 +952,10 @@ impl AgentEngine {
     async fn handle_finalize_action(
         &mut self,
         packet: TaskPacket,
-        messages: &mut Vec<ChatMessage>,
+        _messages: &mut Vec<ChatMessage>,
         session_id: Option<&str>,
     ) -> LoopControl {
         info!("Agent finalized task: {}", packet.title);
-        if !self.agent_allows_policy(AgentPolicyCapability::Finalize) {
-            warn!("Agent tried to finalize task without Finalize policy");
-            self.push_context_record(
-                ContextType::Error,
-                Some("finalize_not_allowed".to_string()),
-                self.agent_id.clone(),
-                None,
-                "Agent policy does not allow Finalize.".to_string(),
-                serde_json::json!({
-                    "required_policy": "Finalize",
-                    "agent": self.agent_id.clone(),
-                }),
-            );
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: "Error: This agent is not allowed to output 'finalize_task'. Add `Finalize` to the agent frontmatter `policy` to enable it.".to_string(),
-            });
-            return LoopControl::Continue;
-        }
         // Persist the structured final answer for the UI (DB-backed chat).
         let msg = serde_json::json!({ "type": "finalize_task", "packet": packet }).to_string();
         let _ = self
@@ -1516,7 +1284,7 @@ impl AgentEngine {
         }
 
         self.active_skill = None;
-        let fallback = "I couldn't complete this automatically within the current tool loop limit. Please refine the request or switch to `/mode chat` for a direct answer."
+        let fallback = "I couldn't complete this automatically within the current tool loop limit. Please refine the request and try again."
             .to_string();
         self.push_context_record(
             ContextType::Status,

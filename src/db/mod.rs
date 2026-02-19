@@ -56,22 +56,6 @@ pub enum AgentRunStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ProjectMode {
-    Chat,
-    Auto,
-}
-
-impl std::fmt::Display for ProjectMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Chat => write!(f, "chat"),
-            Self::Auto => write!(f, "auto"),
-        }
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileActivity {
     pub repo_path: String,
@@ -84,7 +68,6 @@ pub struct FileActivity {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProjectSettings {
     pub repo_path: String,
-    pub mode: ProjectMode,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -107,14 +90,25 @@ pub struct Db {
 }
 
 impl Db {
-    pub fn new() -> Result<Self> {
-        let config_dir = dirs::data_dir()
-            .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
-            .ok_or_else(|| anyhow::anyhow!("Could not find data directory"))?
-            .join("linggen-agent");
+    pub fn open_at(db_path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let db = Database::create(db_path)?;
+        let write_txn = db.begin_write()?;
+        {
+            let _ = write_txn.open_table(PROJECTS_TABLE)?;
+            let _ = write_txn.open_table(FILE_ACTIVITY_TABLE)?;
+            let _ = write_txn.open_table(SESSIONS_TABLE)?;
+            let _ = write_txn.open_table(CHAT_HISTORY_TABLE)?;
+            let _ = write_txn.open_table(PROJECT_SETTINGS_TABLE)?;
+            let _ = write_txn.open_table(AGENT_RUNS_TABLE)?;
+        }
+        write_txn.commit()?;
+        Ok(Self { db: Arc::new(db) })
+    }
 
-        std::fs::create_dir_all(&config_dir)?;
-        let db_path = config_dir.join("agent_state.redb");
+    pub fn new() -> Result<Self> {
+        let data_dir = crate::paths::data_dir();
+        std::fs::create_dir_all(&data_dir)?;
+        let db_path = data_dir.join("agent_state.redb");
 
         let db = Database::create(db_path)?;
 
@@ -150,7 +144,6 @@ impl Db {
             if settings_table.get(path.as_str())?.is_none() {
                 let settings = ProjectSettings {
                     repo_path: path.clone(),
-                    mode: ProjectMode::Auto,
                 };
                 let settings_val = serde_json::to_string(&settings)?;
                 settings_table.insert(path.as_str(), settings_val.as_str())?;
@@ -207,24 +200,8 @@ impl Db {
         } else {
             Ok(ProjectSettings {
                 repo_path: repo_path.to_string(),
-                mode: ProjectMode::Auto,
             })
         }
-    }
-
-    pub fn set_project_mode(&self, repo_path: &str, mode: ProjectMode) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(PROJECT_SETTINGS_TABLE)?;
-            let settings = ProjectSettings {
-                repo_path: repo_path.to_string(),
-                mode,
-            };
-            let val = serde_json::to_string(&settings)?;
-            table.insert(repo_path, val.as_str())?;
-        }
-        write_txn.commit()?;
-        Ok(())
     }
 
     pub fn remove_activity(&self, repo_path: &str, file_path: &str) -> Result<()> {
@@ -503,5 +480,185 @@ impl Db {
             }
         }
         Ok(history)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> (Db, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.redb");
+        let db = Db::open_at(&db_path).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_add_and_list_projects() {
+        let (db, _dir) = temp_db();
+        db.add_project("/tmp/project1".into(), "project1".into())
+            .unwrap();
+        db.add_project("/tmp/project2".into(), "project2".into())
+            .unwrap();
+        let projects = db.list_projects().unwrap();
+        assert_eq!(projects.len(), 2);
+        let names: Vec<&str> = projects.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"project1"));
+        assert!(names.contains(&"project2"));
+    }
+
+    #[test]
+    fn test_remove_project() {
+        let (db, _dir) = temp_db();
+        db.add_project("/tmp/p".into(), "p".into()).unwrap();
+        assert_eq!(db.list_projects().unwrap().len(), 1);
+        db.remove_project("/tmp/p").unwrap();
+        assert_eq!(db.list_projects().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_project_settings_default() {
+        let (db, _dir) = temp_db();
+        let settings = db.get_project_settings("/tmp/nonexistent").unwrap();
+        assert_eq!(settings.repo_path, "/tmp/nonexistent");
+    }
+
+    #[test]
+    fn test_sessions_crud() {
+        let (db, _dir) = temp_db();
+        let session = SessionInfo {
+            id: "s1".into(),
+            repo_path: "/tmp/p".into(),
+            title: "Test Session".into(),
+            created_at: 1000,
+        };
+        db.add_session(session).unwrap();
+        let sessions = db.list_sessions("/tmp/p").unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "Test Session");
+
+        db.rename_session("/tmp/p", "s1", "Renamed").unwrap();
+        let sessions = db.list_sessions("/tmp/p").unwrap();
+        assert_eq!(sessions[0].title, "Renamed");
+
+        db.remove_session("/tmp/p", "s1").unwrap();
+        assert_eq!(db.list_sessions("/tmp/p").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_agent_runs_crud() {
+        let (db, _dir) = temp_db();
+        let run = AgentRunRecord {
+            run_id: "r1".into(),
+            repo_path: "/tmp/p".into(),
+            session_id: "s1".into(),
+            agent_id: "ling".into(),
+            agent_kind: None,
+            parent_run_id: None,
+            status: AgentRunStatus::Running,
+            detail: None,
+            started_at: 1000,
+            ended_at: None,
+        };
+        db.add_agent_run(run).unwrap();
+
+        let fetched = db.get_agent_run("r1").unwrap().unwrap();
+        assert_eq!(fetched.status, AgentRunStatus::Running);
+
+        db.update_agent_run("r1", AgentRunStatus::Completed, Some("done".into()), Some(2000))
+            .unwrap();
+        let fetched = db.get_agent_run("r1").unwrap().unwrap();
+        assert_eq!(fetched.status, AgentRunStatus::Completed);
+        assert_eq!(fetched.detail.as_deref(), Some("done"));
+        assert_eq!(fetched.ended_at, Some(2000));
+
+        let runs = db.list_agent_runs("/tmp/p", None).unwrap();
+        assert_eq!(runs.len(), 1);
+
+        let runs = db.list_agent_runs("/tmp/p", Some("s1")).unwrap();
+        assert_eq!(runs.len(), 1);
+        let runs = db.list_agent_runs("/tmp/p", Some("other")).unwrap();
+        assert_eq!(runs.len(), 0);
+    }
+
+    #[test]
+    fn test_agent_run_children() {
+        let (db, _dir) = temp_db();
+        let parent = AgentRunRecord {
+            run_id: "parent".into(),
+            repo_path: "/tmp/p".into(),
+            session_id: "s1".into(),
+            agent_id: "ling".into(),
+            agent_kind: None,
+            parent_run_id: None,
+            status: AgentRunStatus::Running,
+            detail: None,
+            started_at: 1000,
+            ended_at: None,
+        };
+        let child = AgentRunRecord {
+            run_id: "child".into(),
+            parent_run_id: Some("parent".into()),
+            started_at: 1001,
+            ..parent.clone()
+        };
+        db.add_agent_run(parent).unwrap();
+        db.add_agent_run(child).unwrap();
+
+        let children = db.list_agent_children("parent").unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].run_id, "child");
+    }
+
+    #[test]
+    fn test_file_activity() {
+        let (db, _dir) = temp_db();
+        let activity = FileActivity {
+            repo_path: "/tmp/p".into(),
+            file_path: "src/main.rs".into(),
+            agent_id: "ling".into(),
+            status: FileActivityStatus::Working,
+            last_modified: 1000,
+        };
+        db.record_activity(activity).unwrap();
+        let activities = db.get_repo_activity("/tmp/p").unwrap();
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].file_path, "src/main.rs");
+
+        db.rename_activity("/tmp/p", "src/main.rs", "src/lib.rs")
+            .unwrap();
+        let activities = db.get_repo_activity("/tmp/p").unwrap();
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].file_path, "src/lib.rs");
+
+        db.remove_activity("/tmp/p", "src/lib.rs").unwrap();
+        assert_eq!(db.get_repo_activity("/tmp/p").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_chat_history() {
+        let (db, _dir) = temp_db();
+        let msg = ChatMessageRecord {
+            repo_path: "/tmp/p".into(),
+            session_id: "s1".into(),
+            agent_id: "ling".into(),
+            from_id: "user".into(),
+            to_id: "ling".into(),
+            content: "hello".into(),
+            timestamp: 1000,
+            is_observation: false,
+        };
+        db.add_chat_message(msg).unwrap();
+        let history = db.get_chat_history("/tmp/p", "s1", Some("ling")).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "hello");
+
+        let cleared = db.clear_chat_history("/tmp/p", "s1").unwrap();
+        assert_eq!(cleared, 1);
+        assert_eq!(
+            db.get_chat_history("/tmp/p", "s1", None).unwrap().len(),
+            0
+        );
     }
 }

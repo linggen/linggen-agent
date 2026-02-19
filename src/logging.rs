@@ -91,13 +91,10 @@ pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Result<Path
 }
 
 fn resolve_log_dir(configured: Option<&str>) -> Result<PathBuf> {
-    let base = dirs::data_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
-        .ok_or_else(|| anyhow!("Could not find data directory"))?;
     let dir = if let Some(path) = configured {
         expand_tilde(path)
     } else {
-        base.join("linggen-agent").join("logs")
+        crate::paths::logs_dir()
     };
     std::fs::create_dir_all(&dir)?;
     Ok(dir)

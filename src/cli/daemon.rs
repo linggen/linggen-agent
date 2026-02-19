@@ -12,27 +12,19 @@ use std::os::unix::process::CommandExt;
 // ---------------------------------------------------------------------------
 
 fn agent_pid_file() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".linggen/ling.pid")
+    crate::paths::linggen_home().join("ling.pid")
 }
 
 fn agent_log_file() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".linggen/ling.log")
+    crate::paths::linggen_home().join("ling.log")
 }
 
 fn memory_pid_file() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".linggen/ling-mem.pid")
+    crate::paths::linggen_home().join("ling-mem.pid")
 }
 
 fn memory_log_file() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".linggen/ling-mem.log")
+    crate::paths::linggen_home().join("ling-mem.log")
 }
 
 /// Find the ling-mem server binary in common locations.
@@ -368,20 +360,25 @@ pub async fn status(config: &Config, config_path: Option<&Path>) -> Result<()> {
     // Models and agents counts
     println!("  Models:      {}", config.models.len());
 
-    let agents_dir = PathBuf::from("agents");
-    let agent_count = if agents_dir.exists() {
-        fs::read_dir(&agents_dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
-                    .count()
-            })
-            .unwrap_or(0)
-    } else {
-        0
+    // Count agents from both global and project directories (dedup by filename stem)
+    let mut agent_ids = std::collections::HashSet::new();
+    let count_md = |dir: &Path, seen: &mut std::collections::HashSet<String>| {
+        if dir.exists() {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for e in entries.filter_map(|e| e.ok()) {
+                    let p = e.path();
+                    if p.extension().map_or(false, |ext| ext == "md") {
+                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                            seen.insert(stem.to_lowercase());
+                        }
+                    }
+                }
+            }
+        }
     };
-    println!("  Agents:      {}", agent_count);
+    count_md(&crate::paths::global_agents_dir(), &mut agent_ids);
+    count_md(&PathBuf::from("agents"), &mut agent_ids);
+    println!("  Agents:      {}", agent_ids.len());
 
     println!();
     Ok(())

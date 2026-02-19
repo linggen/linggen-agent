@@ -76,12 +76,10 @@ pub async fn run(action: SkillsAction, _config: &Config) -> Result<()> {
             let mut found = false;
 
             let dirs_to_scan: Vec<(PathBuf, &str)> = [
-                dirs::home_dir().map(|h| (h.join(".linggen/skills"), "global")),
+                Some((crate::paths::global_skills_dir(), "global")),
                 crate::workspace::resolve_workspace_root(None)
                     .ok()
                     .map(|ws| (ws.join(".linggen/skills"), "project")),
-                dirs::home_dir().map(|h| (h.join(".claude/skills"), "compat (~/.claude)")),
-                dirs::home_dir().map(|h| (h.join(".codex/skills"), "compat (~/.codex)")),
             ]
             .into_iter()
             .flatten()

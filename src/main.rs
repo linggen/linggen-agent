@@ -8,6 +8,7 @@ mod eval;
 mod logging;
 mod ollama;
 mod openai;
+mod paths;
 mod repl;
 mod server;
 mod skills;

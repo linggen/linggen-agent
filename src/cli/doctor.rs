@@ -136,14 +136,10 @@ async fn check_models(config: &Config) {
 }
 
 fn check_skills_dirs() {
-    let home = dirs::home_dir();
-    let dirs_to_check: Vec<(PathBuf, &str)> = [
-        home.as_ref().map(|h| (h.join(".linggen/skills"), "global")),
-        Some((PathBuf::from(".linggen/skills"), "project")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let dirs_to_check: Vec<(PathBuf, &str)> = vec![
+        (crate::paths::global_skills_dir(), "global"),
+        (PathBuf::from(".linggen/skills"), "project"),
+    ];
 
     for (dir, scope) in dirs_to_check {
         if dir.exists() {
@@ -164,9 +160,11 @@ fn check_skills_dirs() {
 }
 
 fn check_agents_dir() {
-    let agents_dir = PathBuf::from("agents");
-    if agents_dir.exists() {
-        let count = std::fs::read_dir(&agents_dir)
+    let count_md = |dir: &Path| -> usize {
+        if !dir.exists() {
+            return 0;
+        }
+        std::fs::read_dir(dir)
             .map(|entries| {
                 entries
                     .filter_map(|e| e.ok())
@@ -177,22 +175,41 @@ fn check_agents_dir() {
                     })
                     .count()
             })
-            .unwrap_or(0);
-        ok("Agents", &format!("{} agent files", count));
+            .unwrap_or(0)
+    };
+
+    // Global agents
+    let global_dir = crate::paths::global_agents_dir();
+    if global_dir.exists() {
+        let count = count_md(&global_dir);
+        ok(
+            "Agents (global)",
+            &format!("{} agent files in {}", count, global_dir.display()),
+        );
     } else {
-        info("Agents", "agents/ directory not found");
+        info(
+            "Agents (global)",
+            &format!("{} (not found)", global_dir.display()),
+        );
+    }
+
+    // Project agents
+    let project_dir = PathBuf::from("agents");
+    if project_dir.exists() {
+        let count = count_md(&project_dir);
+        ok("Agents (project)", &format!("{} agent files", count));
+    } else {
+        info("Agents (project)", "agents/ directory not found");
     }
 }
 
 fn check_log_dir(config: &Config) {
-    let log_dir = config
+    let log_dir: Option<PathBuf> = config
         .logging
         .directory
         .as_deref()
         .map(PathBuf::from)
-        .or_else(|| {
-            dirs::data_dir().map(|d| d.join("linggen-agent").join("logs"))
-        });
+        .or_else(|| Some(crate::paths::logs_dir()));
 
     match log_dir {
         Some(dir) if dir.exists() => {

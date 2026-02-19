@@ -518,7 +518,6 @@ const App: React.FC = () => {
     const stored = window.localStorage.getItem(SELECTED_AGENT_STORAGE_KEY);
     return stored || '';
   });
-  const [currentMode, setCurrentMode] = useState<'chat' | 'auto'>('auto');
   const [agentStatus, setAgentStatus] = useState<Record<string, 'idle' | 'model_loading' | 'thinking' | 'calling_tool' | 'working'>>({});
   // Derived: true when any agent is actively working
   const isRunning = Object.values(agentStatus).some((s) => s !== 'idle');
@@ -1103,18 +1102,6 @@ const App: React.FC = () => {
     }
   }, []);
 
-  const fetchSettings = useCallback(async () => {
-    if (!selectedProjectRoot) return;
-    try {
-      const resp = await fetch(`/api/settings?project_root=${encodeURIComponent(selectedProjectRoot)}`);
-      if (!resp.ok) return;
-      const data = await resp.json();
-      setCurrentMode(data.mode === 'chat' ? 'chat' : 'auto');
-    } catch (e) {
-      console.error('Failed to fetch settings:', e);
-    }
-  }, [selectedProjectRoot]);
-
   const fetchAgentRuns = useCallback(async () => {
     if (!selectedProjectRoot) return;
     try {
@@ -1151,22 +1138,6 @@ const App: React.FC = () => {
     }
   };
 
-  const updateMode = async (mode: 'chat' | 'auto') => {
-    if (!selectedProjectRoot) return;
-    try {
-      const resp = await fetch('/api/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_root: selectedProjectRoot, mode }),
-      });
-      if (!resp.ok) return;
-      const data = await resp.json();
-      setCurrentMode(data.mode === 'chat' ? 'chat' : 'auto');
-    } catch (e) {
-      console.error('Failed to update mode:', e);
-    }
-  };
-
   useEffect(() => {
     fetchProjects();
     fetchSkills();
@@ -1185,13 +1156,12 @@ const App: React.FC = () => {
       fetchAgentTree(selectedProjectRoot);
       fetchAgentRuns();
       fetchSessions();
-      fetchSettings();
       fetchAgents(selectedProjectRoot);
       setAgentStatus({});
       setAgentStatusText({});
       setQueuedMessages([]);
     }
-  }, [selectedProjectRoot, fetchFiles, fetchWorkspaceState, fetchAgentTree, fetchAgentRuns, fetchSessions, fetchSettings, fetchAgents]);
+  }, [selectedProjectRoot, fetchFiles, fetchWorkspaceState, fetchAgentTree, fetchAgentRuns, fetchSessions, fetchAgents]);
 
   useEffect(() => {
     if (projects.length === 0) return;
@@ -1261,11 +1231,6 @@ const App: React.FC = () => {
                       : prev[agentIdKey]?.tokenLimit,
                 },
               }));
-            }
-          } else if (item.phase === 'settings_updated') {
-            if (item.project_root === selectedProjectRoot) {
-              const mode = String(item.data?.mode || '').toLowerCase();
-              setCurrentMode(mode === 'chat' ? 'chat' : 'auto');
             }
           } else if (item.phase === 'change_report' && item.data) {
             fetchWorkspaceState();
@@ -1605,8 +1570,6 @@ const App: React.FC = () => {
         copyChatStatus={copyChatStatus}
         clearChat={clearChat}
         isRunning={isRunning}
-        currentMode={currentMode}
-        onModeChange={updateMode}
         agentContext={agentContext}
         onOpenMemory={() => setCurrentPage('memory')}
         onOpenSettings={() => setCurrentPage('settings')}

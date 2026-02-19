@@ -2,11 +2,15 @@ use crate::skills::marketplace;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
+/// Default agent specs shipped with linggen-agent.
+const DEFAULT_AGENTS: &[(&str, &str)] = &[
+    ("ling.md", include_str!("../../agents/ling.md")),
+    ("coder.md", include_str!("../../agents/coder.md")),
+];
+
 pub async fn run(global: bool, root: Option<PathBuf>) -> Result<()> {
     let target_dir = if global {
-        dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
-            .join(".linggen/skills")
+        crate::paths::global_skills_dir()
     } else {
         let ws = root
             .or_else(|| crate::workspace::resolve_workspace_root(None).ok())
@@ -32,6 +36,32 @@ pub async fn run(global: bool, root: Option<PathBuf>) -> Result<()> {
         println!("No skills found in repository.");
     } else {
         println!("Installed {} skills:", installed.len());
+        for name in &installed {
+            println!("  - {}", name);
+        }
+    }
+
+    // Install default agent specs to ~/.linggen/agents/ if they don't already exist.
+    install_default_agents()?;
+
+    Ok(())
+}
+
+fn install_default_agents() -> Result<()> {
+    let agents_dir = crate::paths::global_agents_dir();
+    std::fs::create_dir_all(&agents_dir)?;
+
+    let mut installed = Vec::new();
+    for (filename, content) in DEFAULT_AGENTS {
+        let dest = agents_dir.join(filename);
+        if !dest.exists() {
+            std::fs::write(&dest, content)?;
+            installed.push(*filename);
+        }
+    }
+
+    if !installed.is_empty() {
+        println!("Installed default agents to {}:", agents_dir.display());
         for name in &installed {
             println!("  - {}", name);
         }

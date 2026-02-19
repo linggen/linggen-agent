@@ -282,17 +282,10 @@ impl Config {
         candidates.push(PathBuf::from("linggen-agent.runtime.toml"));
         candidates.push(PathBuf::from("linggen-agent.toml"));
 
-        if let Some(dir) = dirs::config_dir() {
-            let cfg_dir = dir.join("linggen-agent");
-            candidates.push(cfg_dir.join("linggen-agent.runtime.toml"));
-            candidates.push(cfg_dir.join("linggen-agent.toml"));
-        }
-
-        if let Some(dir) = dirs::data_dir() {
-            let data_dir = dir.join("linggen-agent");
-            candidates.push(data_dir.join("linggen-agent.runtime.toml"));
-            candidates.push(data_dir.join("linggen-agent.toml"));
-        }
+        // Consolidated location: ~/.linggen/config/
+        let cfg_dir = crate::paths::config_dir();
+        candidates.push(cfg_dir.join("linggen-agent.runtime.toml"));
+        candidates.push(cfg_dir.join("linggen-agent.toml"));
 
         for path in candidates {
             if path.exists() {
@@ -309,12 +302,7 @@ impl Config {
         if let Some(dir) = config_dir {
             return dir.join("linggen-agent.runtime.toml");
         }
-        if let Some(dir) = dirs::data_dir() {
-            return dir
-                .join("linggen-agent")
-                .join("linggen-agent.runtime.toml");
-        }
-        PathBuf::from("linggen-agent.runtime.toml")
+        crate::paths::config_dir().join("linggen-agent.runtime.toml")
     }
 
     pub fn save_runtime(&self, config_dir: Option<&Path>) -> Result<PathBuf> {
@@ -384,7 +372,7 @@ impl Default for Config {
                 keep_alive: None,
                 context_window: None,
             }],
-            server: ServerConfig { port: 8080 },
+            server: ServerConfig { port: 9898 },
             agent: AgentConfig {
                 max_iters: 10,
                 write_safety_mode: WriteSafetyMode::default(),
@@ -400,5 +388,291 @@ impl Default for Config {
             routing: RoutingConfig::default(),
             memory: MemoryConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_config() -> Config {
+        Config::default()
+    }
+
+    // ---- Config::validate tests ----
+
+    #[test]
+    fn test_validate_default_config() {
+        valid_config().validate().unwrap();
+    }
+
+    #[test]
+    fn test_validate_empty_models() {
+        let mut cfg = valid_config();
+        cfg.models.clear();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("At least one model"));
+    }
+
+    #[test]
+    fn test_validate_empty_model_id() {
+        let mut cfg = valid_config();
+        cfg.models[0].id = "  ".to_string();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("Model ID cannot be empty"));
+    }
+
+    #[test]
+    fn test_validate_duplicate_model_ids() {
+        let mut cfg = valid_config();
+        let dup = cfg.models[0].clone();
+        cfg.models.push(dup);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("Duplicate model ID"));
+    }
+
+    #[test]
+    fn test_validate_unknown_provider() {
+        let mut cfg = valid_config();
+        cfg.models[0].provider = "anthropic".to_string();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("unknown provider"));
+    }
+
+    #[test]
+    fn test_validate_bad_url_scheme() {
+        let mut cfg = valid_config();
+        cfg.models[0].url = "ftp://example.com".to_string();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("http://"));
+    }
+
+    #[test]
+    fn test_validate_port_zero() {
+        let mut cfg = valid_config();
+        cfg.server.port = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("port must be greater than 0"));
+    }
+
+    #[test]
+    fn test_validate_max_iters_zero() {
+        let mut cfg = valid_config();
+        cfg.agent.max_iters = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("max_iters must be greater than 0"));
+    }
+
+    #[test]
+    fn test_validate_max_iters_too_large() {
+        let mut cfg = valid_config();
+        cfg.agent.max_iters = 1001;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("must not exceed 1000"));
+    }
+
+    #[test]
+    fn test_validate_openai_provider() {
+        let mut cfg = valid_config();
+        cfg.models[0].provider = "openai".to_string();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn test_validate_https_url() {
+        let mut cfg = valid_config();
+        cfg.models[0].url = "https://api.openai.com/v1".to_string();
+        cfg.validate().unwrap();
+    }
+
+    // ---- AgentPolicy tests ----
+
+    #[test]
+    fn test_agent_policy_allows() {
+        let policy = AgentPolicy {
+            allow: vec![AgentPolicyCapability::Patch, AgentPolicyCapability::Finalize],
+            delegate_targets: vec![],
+        };
+        assert!(policy.allows(AgentPolicyCapability::Patch));
+        assert!(policy.allows(AgentPolicyCapability::Finalize));
+        assert!(!policy.allows(AgentPolicyCapability::Delegate));
+    }
+
+    #[test]
+    fn test_agent_policy_delegate_targets_empty_allows_all() {
+        let policy = AgentPolicy {
+            allow: vec![],
+            delegate_targets: vec![],
+        };
+        assert!(policy.allows_delegate_target("any_agent"));
+        assert!(policy.allows_delegate_target("CODER"));
+    }
+
+    #[test]
+    fn test_agent_policy_delegate_targets_restrict() {
+        let policy = AgentPolicy {
+            allow: vec![],
+            delegate_targets: vec!["coder".to_string()],
+        };
+        assert!(policy.allows_delegate_target("coder"));
+        assert!(policy.allows_delegate_target("CODER")); // case insensitive
+        assert!(!policy.allows_delegate_target("reviewer"));
+    }
+
+    #[test]
+    fn test_agent_policy_deserialize_list() {
+        let yaml = "[Patch, Finalize]";
+        let policy: AgentPolicy = serde_yml::from_str(yaml).unwrap();
+        assert!(policy.allows(AgentPolicyCapability::Patch));
+        assert!(policy.allows(AgentPolicyCapability::Finalize));
+        assert!(policy.delegate_targets.is_empty());
+    }
+
+    #[test]
+    fn test_agent_policy_deserialize_object() {
+        let yaml = r#"
+allow: [Patch, Delegate]
+delegate_targets: [coder, reviewer]
+"#;
+        let policy: AgentPolicy = serde_yml::from_str(yaml).unwrap();
+        assert!(policy.allows(AgentPolicyCapability::Patch));
+        assert!(policy.allows(AgentPolicyCapability::Delegate));
+        assert!(policy.allows_delegate_target("coder"));
+        assert!(policy.allows_delegate_target("reviewer"));
+    }
+
+    #[test]
+    fn test_agent_policy_normalize_dedup() {
+        let yaml = "[Patch, Patch, Finalize]";
+        let policy: AgentPolicy = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(policy.allow.len(), 2);
+    }
+
+    #[test]
+    fn test_agent_policy_normalize_delegate_targets() {
+        let yaml = r#"
+allow: []
+delegate_targets: ["  Coder  ", "coder", "REVIEWER", ""]
+"#;
+        let policy: AgentPolicy = serde_yml::from_str(yaml).unwrap();
+        // Should deduplicate, lowercase, trim, and remove empty
+        assert_eq!(policy.delegate_targets.len(), 2);
+        assert!(policy.delegate_targets.contains(&"coder".to_string()));
+        assert!(policy.delegate_targets.contains(&"reviewer".to_string()));
+    }
+
+    // ---- AgentSpec::from_markdown_content tests ----
+
+    #[test]
+    fn test_agent_spec_from_markdown_valid() {
+        let md = r#"---
+name: ling
+description: General-purpose assistant
+tools:
+  - Read
+  - Write
+  - Bash
+---
+You are a helpful assistant."#;
+        let (spec, prompt) = AgentSpec::from_markdown_content(md).unwrap();
+        assert_eq!(spec.name, "ling");
+        assert_eq!(spec.description, "General-purpose assistant");
+        assert_eq!(spec.tools, vec!["Read", "Write", "Bash"]);
+        assert_eq!(prompt, "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn test_agent_spec_missing_frontmatter() {
+        let md = "Just a regular markdown file";
+        let err = AgentSpec::from_markdown_content(md).unwrap_err();
+        assert!(err.to_string().contains("must start with YAML frontmatter"));
+    }
+
+    #[test]
+    fn test_agent_spec_missing_closing_delimiter() {
+        let md = "---\nname: test\ndescription: test\ntools: []\n";
+        let err = AgentSpec::from_markdown_content(md).unwrap_err();
+        assert!(err.to_string().contains("missing closing frontmatter"));
+    }
+
+    #[test]
+    fn test_agent_spec_with_policy() {
+        let md = r#"---
+name: coder
+description: Implementation agent
+tools: [Read, Write, Edit]
+policy:
+  allow: [Patch, Finalize]
+  delegate_targets: [reviewer]
+---
+Write code."#;
+        let (spec, _) = AgentSpec::from_markdown_content(md).unwrap();
+        assert!(spec.allows_policy(AgentPolicyCapability::Patch));
+        assert!(!spec.allows_policy(AgentPolicyCapability::Delegate));
+        assert!(spec.policy.allows_delegate_target("reviewer"));
+    }
+
+    #[test]
+    fn test_agent_spec_with_optional_fields() {
+        let md = r#"---
+name: test
+description: Test agent
+tools: []
+skills:
+  - memory
+work_globs:
+  - "src/**/*.rs"
+default_lock_globs:
+  - "Cargo.lock"
+---
+Prompt."#;
+        let (spec, _) = AgentSpec::from_markdown_content(md).unwrap();
+        assert_eq!(spec.skills, vec!["memory"]);
+        assert_eq!(spec.work_globs, vec!["src/**/*.rs"]);
+        assert_eq!(spec.default_lock_globs, vec!["Cargo.lock"]);
+    }
+
+    // ---- WriteSafetyMode tests ----
+
+    #[test]
+    fn test_write_safety_mode_default() {
+        assert_eq!(WriteSafetyMode::default(), WriteSafetyMode::Warn);
+    }
+
+    #[test]
+    fn test_write_safety_mode_serde() {
+        let modes = [
+            (WriteSafetyMode::Strict, "\"strict\""),
+            (WriteSafetyMode::Warn, "\"warn\""),
+            (WriteSafetyMode::Off, "\"off\""),
+        ];
+        for (mode, expected) in &modes {
+            let serialized = serde_json::to_string(mode).unwrap();
+            assert_eq!(&serialized, expected);
+            let deserialized: WriteSafetyMode = serde_json::from_str(expected).unwrap();
+            assert_eq!(&deserialized, mode);
+        }
+    }
+
+    // ---- MemoryConfig defaults ----
+
+    #[test]
+    fn test_memory_config_defaults() {
+        let mc = MemoryConfig::default();
+        assert_eq!(mc.server_port, 8787);
+        assert_eq!(mc.server_url, "http://127.0.0.1:8787");
+        assert!(mc.auto_start);
+    }
+
+    // ---- Config TOML round-trip ----
+
+    #[test]
+    fn test_config_toml_roundtrip() {
+        let cfg = Config::default();
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.models.len(), cfg.models.len());
+        assert_eq!(parsed.server.port, cfg.server.port);
+        assert_eq!(parsed.agent.max_iters, cfg.agent.max_iters);
     }
 }

@@ -22,7 +22,7 @@ pub fn list_builtin_skills() -> Vec<BuiltInSkillInfo> {
         ("linggen", "Cross-project code search, indexed context, prompt enhancement, and server management."),
     ];
 
-    let global_skills_dir = dirs::home_dir().map(|h| h.join(".linggen/skills"));
+    let global_skills_dir = Some(crate::paths::global_skills_dir());
 
     defs.iter()
         .map(|(name, desc)| {
@@ -74,7 +74,6 @@ fn default_user_invocable() -> bool {
 pub enum SkillSource {
     Global,
     Project,
-    Compat,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,25 +117,15 @@ impl SkillManager {
         let mut skills = self.skills.lock().await;
         skills.clear();
 
-        // 1. Load Compat Skills (~/.claude/skills/, ~/.codex/skills/)
-        if let Some(home) = dirs::home_dir() {
-            for compat_dir_name in &[".claude/skills", ".codex/skills"] {
-                let compat_dir = home.join(compat_dir_name);
-                let _ = self
-                    .load_from_dir_nested(&compat_dir, SkillSource::Compat, &mut *skills)
-                    .await;
-            }
-        }
-
-        // 2. Load Global Skills (~/.linggen/skills/)
-        if let Some(home) = dirs::home_dir() {
-            let global_dir = home.join(".linggen/skills");
+        // 1. Load Global Skills (~/.linggen/skills/)
+        {
+            let global_dir = crate::paths::global_skills_dir();
             let _ = self
                 .load_from_dir_nested(&global_dir, SkillSource::Global, &mut *skills)
                 .await;
         }
 
-        // 3. Load Project Skills (.linggen/skills/) — highest priority
+        // 2. Load Project Skills (.linggen/skills/) — highest priority
         if let Some(root) = project_root {
             let project_dir = root.join(".linggen/skills");
             let _ = self
@@ -259,5 +248,171 @@ impl SkillManager {
     pub async fn list_skills(&self) -> Vec<Skill> {
         let skills = self.skills.lock().await;
         skills.values().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_manager() -> SkillManager {
+        SkillManager::new()
+    }
+
+    #[test]
+    fn test_parse_skill_valid() {
+        let mgr = make_manager();
+        let text = r#"---
+name: test-skill
+description: A test skill
+---
+This is the skill content."#;
+        let skill = mgr.parse_skill(text, SkillSource::Global).unwrap();
+        assert_eq!(skill.name, "test-skill");
+        assert_eq!(skill.description, "A test skill");
+        assert_eq!(skill.content, "This is the skill content.");
+        assert!(skill.user_invocable); // default true
+    }
+
+    #[test]
+    fn test_parse_skill_no_frontmatter() {
+        let mgr = make_manager();
+        let err = mgr
+            .parse_skill("no frontmatter here", SkillSource::Global)
+            .unwrap_err();
+        assert!(err.to_string().contains("YAML frontmatter"));
+    }
+
+    #[test]
+    fn test_parse_skill_missing_closing() {
+        let mgr = make_manager();
+        let err = mgr
+            .parse_skill("---\nname: x\ndescription: y\n", SkillSource::Global)
+            .unwrap_err();
+        assert!(err.to_string().contains("closing frontmatter"));
+    }
+
+    #[test]
+    fn test_parse_skill_with_trigger() {
+        let mgr = make_manager();
+        let text = r#"---
+name: commit
+description: Commit helper
+trigger: "/commit"
+---
+Help commit."#;
+        let skill = mgr.parse_skill(text, SkillSource::Project).unwrap();
+        assert_eq!(skill.trigger.as_deref(), Some("/commit"));
+    }
+
+    #[test]
+    fn test_parse_skill_with_all_optional_fields() {
+        let mgr = make_manager();
+        let text = r#"---
+name: advanced
+description: Advanced skill
+user-invocable: false
+disable-model-invocation: true
+argument-hint: "project name"
+allowed-tools: [Read, Write]
+model: gpt-4
+context: my-context
+agent: coder
+---
+Content."#;
+        let skill = mgr.parse_skill(text, SkillSource::Global).unwrap();
+        assert!(!skill.user_invocable);
+        assert!(skill.disable_model_invocation);
+        assert_eq!(skill.argument_hint.as_deref(), Some("project name"));
+        assert_eq!(skill.allowed_tools, vec!["Read", "Write"]);
+        assert_eq!(skill.model.as_deref(), Some("gpt-4"));
+        assert_eq!(skill.context.as_deref(), Some("my-context"));
+        assert_eq!(skill.agent.as_deref(), Some("coder"));
+    }
+
+    #[tokio::test]
+    async fn test_match_trigger_empty() {
+        let mgr = make_manager();
+        assert!(mgr.match_trigger("hello").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_match_trigger_basic() {
+        let mgr = make_manager();
+        {
+            let mut triggers = mgr.triggers.lock().await;
+            triggers.insert("/commit".to_string(), "commit-skill".to_string());
+        }
+        let result = mgr.match_trigger("/commit fix bug").await;
+        assert!(result.is_some());
+        let (name, remaining) = result.unwrap();
+        assert_eq!(name, "commit-skill");
+        assert_eq!(remaining, "fix bug");
+    }
+
+    #[tokio::test]
+    async fn test_match_trigger_longest_wins() {
+        let mgr = make_manager();
+        {
+            let mut triggers = mgr.triggers.lock().await;
+            triggers.insert("/c".to_string(), "short".to_string());
+            triggers.insert("/commit".to_string(), "long".to_string());
+        }
+        let result = mgr.match_trigger("/commit message").await;
+        assert!(result.is_some());
+        let (name, _) = result.unwrap();
+        assert_eq!(name, "long");
+    }
+
+    #[tokio::test]
+    async fn test_match_trigger_no_match() {
+        let mgr = make_manager();
+        {
+            let mut triggers = mgr.triggers.lock().await;
+            triggers.insert("/commit".to_string(), "commit-skill".to_string());
+        }
+        assert!(mgr.match_trigger("hello world").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_load_from_dir_nested() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a flat .md skill
+        let flat_skill = r#"---
+name: flat-skill
+description: Flat skill
+---
+Flat content."#;
+        std::fs::write(dir.path().join("flat.md"), flat_skill).unwrap();
+
+        // Create a nested skill
+        let nested_dir = dir.path().join("nested-skill");
+        std::fs::create_dir(&nested_dir).unwrap();
+        let nested_skill = r#"---
+name: nested-skill
+description: Nested skill
+---
+Nested content."#;
+        std::fs::write(nested_dir.join("SKILL.md"), nested_skill).unwrap();
+
+        let mgr = make_manager();
+        let mut skills = std::collections::HashMap::new();
+        mgr.load_from_dir_nested(dir.path(), SkillSource::Global, &mut skills)
+            .await
+            .unwrap();
+
+        assert_eq!(skills.len(), 2);
+        assert!(skills.contains_key("flat-skill"));
+        assert!(skills.contains_key("nested-skill"));
+    }
+
+    #[test]
+    fn test_list_builtin_skills() {
+        let builtins = list_builtin_skills();
+        assert_eq!(builtins.len(), 2);
+        let names: Vec<&str> = builtins.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"memory"));
+        assert!(names.contains(&"linggen"));
     }
 }

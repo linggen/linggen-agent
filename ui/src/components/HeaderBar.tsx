@@ -26,8 +26,6 @@ export const HeaderBar: React.FC<{
   copyChatStatus: 'idle' | 'copied' | 'error';
   clearChat: () => void;
   isRunning: boolean;
-  currentMode: 'chat' | 'auto';
-  onModeChange: (mode: 'chat' | 'auto') => void;
   agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
   onOpenSettings?: () => void;
   onOpenMemory?: () => void;
@@ -40,8 +38,6 @@ export const HeaderBar: React.FC<{
   copyChatStatus,
   clearChat,
   isRunning,
-  currentMode,
-  onModeChange,
   agentContext,
   onOpenSettings,
   onOpenMemory,
@@ -144,16 +140,6 @@ export const HeaderBar: React.FC<{
           <div className={cn('w-2 h-2 rounded-full', isRunning ? 'bg-green-500 animate-pulse' : 'bg-slate-400')} />
           <span className="text-[10px] font-bold uppercase tracking-widest text-slate-500">{isRunning ? 'Active' : 'Standby'}</span>
         </div>
-        <div className="w-px h-3 bg-slate-300 dark:bg-white/10" />
-        <select
-          value={currentMode}
-          onChange={(e) => onModeChange((e.target.value === 'chat' ? 'chat' : 'auto'))}
-          className="text-[10px] font-bold text-blue-600 dark:text-blue-400 uppercase tracking-widest bg-transparent outline-none"
-          title="Prompt mode"
-        >
-          <option value="auto">Mode: Auto</option>
-          <option value="chat">Mode: Chat</option>
-        </select>
         {onOpenMemory && (
           <>
             <div className="w-px h-3 bg-slate-300 dark:bg-white/10" />
