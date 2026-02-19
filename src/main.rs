@@ -12,52 +12,53 @@ mod repl;
 mod server;
 mod skills;
 mod state_fs;
+mod tui_client;
 mod util;
 mod workspace;
 
-use crate::config::{Config, ModelConfig};
+use crate::config::Config;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(name = "linggen-agent")]
-#[command(about = "Linggen Agent (multi-agent) - autonomous prototype", long_about = None)]
+#[command(name = "ling", version)]
+#[command(about = "Linggen — AI coding agent with semantic memory", long_about = None)]
 struct Cli {
+    /// Workspace root. If omitted, detects by walking up for .git.
+    #[arg(long, global = true)]
+    root: Option<std::path::PathBuf>,
+
+    /// Port for the server
+    #[arg(long, global = true)]
+    port: Option<u16>,
+
+    /// Web UI only, no TUI
+    #[arg(long, default_value_t = false)]
+    web: bool,
+
+    /// Run as background daemon
+    #[arg(short, long, default_value_t = false)]
+    daemon: bool,
+
+    /// Enable dev mode (proxy static assets from Vite dev server)
+    #[arg(long, default_value_t = false)]
+    dev: bool,
+
     #[command(subcommand)]
-    cmd: Command,
+    cmd: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Interactive multi-agent autonomous agent (CLI)
-    Agent {
-        /// Ollama base URL
-        #[arg(long)]
-        ollama_url: Option<String>,
-
-        /// Ollama model name
-        #[arg(long)]
-        model: Option<String>,
-
-        /// Workspace root. If omitted, detects by walking up for .git.
-        #[arg(long)]
-        root: Option<std::path::PathBuf>,
-
-        /// Max agent tool iterations per /run
-        #[arg(long)]
-        max_iters: Option<usize>,
-
-        /// Disable streaming model output (uses non-streaming requests)
-        #[arg(long, default_value_t = false)]
-        no_stream: bool,
-    },
+    /// Stop background daemon
+    Stop,
+    /// Show agent and memory server status
+    Status,
+    /// Diagnose installation health
+    Doctor,
     /// Run eval tasks against the agent
     Eval {
-        /// Workspace root. If omitted, detects by walking up for .git.
-        #[arg(long)]
-        root: Option<std::path::PathBuf>,
-
         /// Filter tasks by name (substring match)
         #[arg(long)]
         filter: Option<String>,
@@ -78,61 +79,77 @@ enum Command {
         #[arg(long, default_value_t = false)]
         verbose: bool,
     },
-    /// Start the agent server with Web UI (Service mode)
-    Serve {
-        /// Port to listen on
-        #[arg(long)]
-        port: Option<u16>,
-
-        /// Ollama base URL
-        #[arg(long)]
-        ollama_url: Option<String>,
-
-        /// Ollama model name
-        #[arg(long)]
-        model: Option<String>,
-
-        /// Workspace root. If omitted, detects by walking up for .git.
-        #[arg(long)]
-        root: Option<std::path::PathBuf>,
-
-        /// Enable dev mode (proxy static assets)
-        #[arg(long, default_value_t = false)]
-        dev: bool,
-    },
-    /// Diagnose installation health
-    Doctor,
-    /// Start server as a background daemon
-    Start {
-        /// Port to listen on
-        #[arg(long)]
-        port: Option<u16>,
-
-        /// Workspace root
-        #[arg(long)]
-        root: Option<std::path::PathBuf>,
-    },
-    /// Stop the background daemon
-    Stop,
-    /// Show server status
-    Status,
     /// Install all skills from linggen/skills repository
     Init {
         /// Install to global ~/.linggen/skills/ instead of project
         #[arg(long, default_value_t = false)]
         global: bool,
-
-        /// Workspace root (for project-scoped install)
-        #[arg(long)]
-        root: Option<std::path::PathBuf>,
     },
-    /// Self-update the binary to the latest release
-    #[command(alias = "update")]
-    Install,
+    /// Install ling (and optionally ling-mem) binaries
+    Install {
+        /// Also install ling-mem
+        #[arg(long, alias = "mem")]
+        memory: bool,
+
+        /// Install both ling and ling-mem
+        #[arg(long)]
+        all: bool,
+    },
+    /// Update ling (and optionally ling-mem) binaries to latest
+    Update {
+        /// Also update ling-mem
+        #[arg(long, alias = "mem")]
+        memory: bool,
+
+        /// Update both ling and ling-mem
+        #[arg(long)]
+        all: bool,
+    },
     /// Manage skills
     Skills {
         #[command(subcommand)]
         action: SkillsAction,
+    },
+    /// Manage memory server
+    #[command(alias = "mem", alias = "m")]
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MemoryAction {
+    /// Start the memory server
+    Start,
+    /// Stop the memory server
+    Stop,
+    /// Show memory server status
+    Status,
+    /// Index a local directory
+    Index {
+        /// Path to the directory to index (defaults to current directory)
+        path: Option<std::path::PathBuf>,
+
+        /// Indexing mode: auto, full, or incremental
+        #[arg(long, default_value = "auto")]
+        mode: String,
+
+        /// Override the default source name
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Include patterns (glob patterns)
+        #[arg(long = "include")]
+        include_patterns: Vec<String>,
+
+        /// Exclude patterns (glob patterns)
+        #[arg(long = "exclude")]
+        exclude_patterns: Vec<String>,
+
+        /// Wait for the indexing job to complete (default: true, use --no-wait to disable)
+        #[arg(long, default_value = "true")]
+        wait: bool,
     },
 }
 
@@ -185,28 +202,31 @@ async fn main() -> Result<()> {
     });
 
     let cli = Cli::parse();
+    let global_root = cli.root;
+    let global_port = cli.port;
 
     // Lightweight subcommands — no tracing/AgentManager needed.
     match &cli.cmd {
-        Command::Doctor => {
+        Some(Command::Doctor) => {
             return cli::doctor::run(&config, config_path.as_deref()).await;
         }
-        Command::Start { port, root } => {
-            return cli::daemon::start(&config, *port, root.clone()).await;
+        Some(Command::Stop) => {
+            return cli::daemon::stop_agent().await;
         }
-        Command::Stop => {
-            return cli::daemon::stop().await;
-        }
-        Command::Status => {
+        Some(Command::Status) => {
             return cli::daemon::status(&config, config_path.as_deref()).await;
         }
-        Command::Init { global, root } => {
-            return cli::init::run(*global, root.clone()).await;
+        Some(Command::Init { global }) => {
+            let root = if *global { None } else { global_root.clone() };
+            return cli::init::run(*global, root).await;
         }
-        Command::Install => {
-            return cli::self_update::run().await;
+        Some(Command::Install { memory, all }) => {
+            return cli::self_update::run(*memory || *all, !*memory || *all).await;
         }
-        Command::Skills { action } => {
+        Some(Command::Update { memory, all }) => {
+            return cli::self_update::run(*memory || *all, !*memory || *all).await;
+        }
+        Some(Command::Skills { action }) => {
             let sa = match action {
                 SkillsAction::Add {
                     name,
@@ -232,10 +252,18 @@ async fn main() -> Result<()> {
             };
             return cli::skills_cmd::run(sa, &config).await;
         }
+        Some(Command::Memory { action }) => {
+            return handle_memory(action, &config).await;
+        }
         _ => {}
     }
 
-    // Full subcommands — need tracing.
+    // Daemon mode: spawn self in background and exit
+    if cli.daemon {
+        return cli::daemon::start_agent(&config, global_port, global_root).await;
+    }
+
+    // Full commands — need tracing.
     let log_dir = match logging::setup_tracing_with_settings(logging::LoggingSettings {
         level: config.logging.level.as_deref(),
         directory: config.logging.directory.as_deref(),
@@ -249,106 +277,14 @@ async fn main() -> Result<()> {
     };
 
     match cli.cmd {
-        Command::Agent {
-            ollama_url,
-            model,
-            root,
-            max_iters,
-            no_stream,
-        } => {
-            let ws_root = workspace::resolve_workspace_root(root)?;
-            let default_model = config
-                .models
-                .first()
-                .cloned()
-                .unwrap_or_else(|| ModelConfig {
-                    id: "default".to_string(),
-                    provider: "ollama".to_string(),
-                    url: "http://127.0.0.1:11434".to_string(),
-                    model: "qwen3-coder".to_string(),
-                    api_key: None,
-                    keep_alive: None,
-                    context_window: None,
-                });
-            let cfg = repl::CoderConfig {
-                ws_root,
-                ollama_url: ollama_url.unwrap_or(default_model.url),
-                model: model.unwrap_or(default_model.model),
-                max_iters: max_iters.unwrap_or(config.agent.max_iters),
-                stream: !no_stream,
-            };
-            repl::run_coder_repl(cfg).await?;
-        }
-        Command::Serve {
-            port,
-            ollama_url: _,
-            model: _,
-            root,
-            dev,
-        } => {
-            let ws_root = workspace::resolve_workspace_root(root)?;
-            let port = port.unwrap_or(config.server.port);
-
-            let db = Arc::new(db::Db::new()?);
-            let skill_manager = Arc::new(skills::SkillManager::new());
-            let config_dir = config_path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            let (manager, rx) = agent_manager::AgentManager::new(config, config_dir, db, skill_manager.clone());
-
-            // Load skills for initial project
-            let _ = skill_manager.load_all(Some(&ws_root)).await;
-
-            // Register initial project
-            let _ = manager.get_or_create_project(ws_root.clone()).await?;
-
-            // Log startup info
-            tracing::info!("--- Linggen Agent Startup ---");
-            if let Some(path) = config_path.as_ref() {
-                tracing::info!("Config File: {}", path.display());
-            } else {
-                tracing::info!("Config File: (default)");
-            }
-            tracing::info!("Workspace Root: {}", ws_root.display());
-            tracing::info!("Server Port: {}", port);
-            if let Some(dir) = log_dir.as_ref() {
-                tracing::info!("Log Directory: {}", dir.display());
-            }
-
-            let config_snap = manager.get_config_snapshot().await;
-            tracing::info!("Max Tool Iterations: {}", config_snap.agent.max_iters);
-
-            {
-                let models_guard = manager.models.read().await;
-                let models = models_guard.list_models();
-                tracing::info!("Configured Models ({}):", models.len());
-                for m in models {
-                    tracing::info!(
-                        "  - ID: {}, Provider: {}, Model: {}, URL: {}",
-                        m.id,
-                        m.provider,
-                        m.model,
-                        m.url
-                    );
-                }
-            }
-
-            let agents = manager.list_agents(&ws_root).await?;
-            tracing::info!("Active Agents ({}):", agents.len());
-            for a in agents {
-                tracing::info!("  - Name: {}, Tools: {:?}", a.name, a.tools);
-            }
-            tracing::info!("------------------------------");
-
-            server::start_server(manager, skill_manager, port, dev, rx).await?;
-        }
-        Command::Eval {
-            root,
+        Some(Command::Eval {
             filter,
             max_iters,
             timeout,
             agent,
             verbose: _,
-        } => {
-            let ws_root = workspace::resolve_workspace_root(root)?;
+        }) => {
+            let ws_root = workspace::resolve_workspace_root(global_root)?;
             let eval_cfg = eval::EvalConfig {
                 ws_root,
                 filter,
@@ -361,15 +297,108 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        // Lightweight commands already handled above.
-        Command::Doctor
-        | Command::Start { .. }
-        | Command::Stop
-        | Command::Status
-        | Command::Init { .. }
-        | Command::Install
-        | Command::Skills { .. } => unreachable!(),
+
+        // Default: bare `ling` → TUI + embedded server (or web-only with --web)
+        None => {
+            let ws_root = workspace::resolve_workspace_root(global_root)?;
+            let port = global_port.unwrap_or(config.server.port);
+
+            let db = Arc::new(db::Db::new()?);
+            let skill_manager = Arc::new(skills::SkillManager::new());
+            let config_dir = config_path
+                .as_ref()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+            let (manager, rx) =
+                agent_manager::AgentManager::new(config, config_dir, db, skill_manager.clone());
+
+            let _ = skill_manager.load_all(Some(&ws_root)).await;
+            let _ = manager.get_or_create_project(ws_root.clone()).await?;
+
+            if cli.web {
+                // Web UI only (foreground, no TUI)
+                tracing::info!("--- Linggen Agent Startup ---");
+                if let Some(path) = config_path.as_ref() {
+                    tracing::info!("Config File: {}", path.display());
+                } else {
+                    tracing::info!("Config File: (default)");
+                }
+                tracing::info!("Workspace Root: {}", ws_root.display());
+                tracing::info!("Server Port: {}", port);
+                if let Some(dir) = log_dir.as_ref() {
+                    tracing::info!("Log Directory: {}", dir.display());
+                }
+
+                let config_snap = manager.get_config_snapshot().await;
+                tracing::info!("Max Tool Iterations: {}", config_snap.agent.max_iters);
+
+                {
+                    let models_guard = manager.models.read().await;
+                    let models = models_guard.list_models();
+                    tracing::info!("Configured Models ({}):", models.len());
+                    for m in models {
+                        tracing::info!(
+                            "  - ID: {}, Provider: {}, Model: {}, URL: {}",
+                            m.id, m.provider, m.model, m.url
+                        );
+                    }
+                }
+
+                let agents = manager.list_agents(&ws_root).await?;
+                tracing::info!("Active Agents ({}):", agents.len());
+                for a in agents {
+                    tracing::info!("  - Name: {}, Tools: {:?}", a.name, a.tools);
+                }
+                tracing::info!("------------------------------");
+
+                server::start_server(manager, skill_manager, port, cli.dev, rx).await?;
+            } else {
+                // TUI + embedded server (default)
+                let handle =
+                    server::prepare_server(manager, skill_manager, port, cli.dev, rx).await?;
+                let result =
+                    repl::run_tui(handle.port, ws_root.to_string_lossy().to_string()).await;
+                handle.task.abort();
+                result?;
+            }
+        }
+
+        // Already handled above
+        Some(Command::Doctor)
+        | Some(Command::Stop)
+        | Some(Command::Status)
+        | Some(Command::Init { .. })
+        | Some(Command::Install { .. })
+        | Some(Command::Update { .. })
+        | Some(Command::Skills { .. })
+        | Some(Command::Memory { .. }) => unreachable!(),
     }
 
     Ok(())
+}
+
+async fn handle_memory(action: &MemoryAction, config: &Config) -> Result<()> {
+    match action {
+        MemoryAction::Start => cli::daemon::start_memory(config).await,
+        MemoryAction::Stop => cli::daemon::stop_memory().await,
+        MemoryAction::Status => cli::daemon::memory_status(config).await,
+        MemoryAction::Index {
+            path,
+            mode,
+            name,
+            include_patterns,
+            exclude_patterns,
+            wait,
+        } => {
+            cli::index_cmd::run(
+                &config.memory.server_url,
+                path.clone(),
+                mode.clone(),
+                name.clone(),
+                include_patterns.clone(),
+                exclude_patterns.clone(),
+                *wait,
+            )
+            .await
+        }
+    }
 }

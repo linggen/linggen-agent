@@ -7,6 +7,38 @@ use std::collections::HashMap;
 use std::path::Path;
 use tokio::sync::Mutex;
 
+/// Built-in skills available for one-click install from the linggen/skills repo.
+#[derive(Debug, Clone, Serialize)]
+pub struct BuiltInSkillInfo {
+    pub name: String,
+    pub description: String,
+    pub installed: bool,
+}
+
+/// Returns the list of built-in skills with their install status.
+pub fn list_builtin_skills() -> Vec<BuiltInSkillInfo> {
+    let defs: &[(&str, &str)] = &[
+        ("memory", "Semantic memory and RAG — index codebases, search semantically, store and retrieve memories."),
+        ("linggen", "Cross-project code search, indexed context, prompt enhancement, and server management."),
+    ];
+
+    let global_skills_dir = dirs::home_dir().map(|h| h.join(".linggen/skills"));
+
+    defs.iter()
+        .map(|(name, desc)| {
+            let installed = global_skills_dir
+                .as_ref()
+                .map(|d| d.join(name).join("SKILL.md").exists())
+                .unwrap_or(false);
+            BuiltInSkillInfo {
+                name: name.to_string(),
+                description: desc.to_string(),
+                installed,
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Skill {
     pub name: String,

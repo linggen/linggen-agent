@@ -116,7 +116,7 @@ pub async fn run_single_task(
     let (config, _config_path) =
         Config::load_with_path().unwrap_or_else(|_| (Config::default(), None));
     let skill_manager = Arc::new(SkillManager::new());
-    let (manager, _rx) = AgentManager::new(config.clone(), None, db, skill_manager.clone());
+    let (manager, _rx) = AgentManager::new(config.clone(), None, db.clone(), skill_manager.clone());
 
     // 6. Get or create agent
     let agent = manager
@@ -193,7 +193,8 @@ pub async fn run_single_task(
     let status_str = if grade_result.passed { "PASS" } else { "FAIL" };
     eprintln!(" {} ({:.1}s)", status_str, duration.as_secs_f64());
 
-    // 11. Cleanup tmpdir
+    // 11. Cleanup tmpdir and remove ephemeral project from DB
+    let _ = db.remove_project(&tmpdir.to_string_lossy());
     let _ = std::fs::remove_dir_all(&tmpdir);
 
     Ok(EvalResult {

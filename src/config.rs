@@ -15,6 +15,8 @@ pub struct Config {
     pub agents: Vec<AgentSpecRef>,
     #[serde(default)]
     pub routing: RoutingConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -201,6 +203,39 @@ pub struct LoggingConfig {
     pub retention_days: Option<u64>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MemoryConfig {
+    #[serde(default = "default_memory_server_port")]
+    pub server_port: u16,
+    #[serde(default = "default_memory_server_url")]
+    pub server_url: String,
+    /// Whether `ling start` should also start the memory server as a sidecar.
+    #[serde(default = "default_true")]
+    pub auto_start: bool,
+}
+
+fn default_memory_server_port() -> u16 {
+    8787
+}
+
+fn default_memory_server_url() -> String {
+    "http://127.0.0.1:8787".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            server_port: default_memory_server_port(),
+            server_url: default_memory_server_url(),
+            auto_start: true,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct RoutingConfig {
     #[serde(default)]
@@ -363,6 +398,7 @@ impl Default for Config {
             },
             agents: Vec::new(),
             routing: RoutingConfig::default(),
+            memory: MemoryConfig::default(),
         }
     }
 }

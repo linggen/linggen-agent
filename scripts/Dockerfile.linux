@@ -1,0 +1,62 @@
+# Dockerfile for Linux builds of ling (Linggen Agent with embedded Web UI)
+# This Dockerfile is designed to be used with docker buildx
+
+# Stage 1: Build the ling binary
+FROM rust:bookworm AS builder
+
+# TARGETARCH is automatically set by Docker Buildx (amd64, arm64, etc.)
+ARG TARGETARCH
+ARG BUILD_VERSION=0.0.0
+
+# Install essential system dependencies
+RUN apt-get update && apt-get install -y \
+    libssl-dev \
+    pkg-config \
+    cmake \
+    curl \
+    libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 20 for UI build
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs
+
+WORKDIR /app
+
+# 1. Pre-build dependencies for caching
+# Copy manifests first to cache dependencies
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release
+
+# 2. Now copy the whole project
+COPY . .
+
+# 3. Build the Web UI (MUST happen before Rust build for rust-embed embedding)
+WORKDIR /app/ui
+# Remove lockfile to avoid architecture mismatches during multi-arch builds
+RUN rm -f package-lock.json && npm install
+RUN npm run build && [ "$(ls -A dist)" ] || (echo "❌ Error: UI build produced no assets" && exit 1)
+
+# 4. Build the real ling binary (with embedded UI)
+ARG BUILD_VERSION
+ENV LINGGEN_BUILD_VERSION=$BUILD_VERSION
+
+WORKDIR /app
+RUN find src -name "*.rs" -exec touch {} + && cargo build --release
+
+# 5. Prepare portable artifacts
+RUN mkdir -p /app/dist-temp && \
+    if [ "$TARGETARCH" = "amd64" ]; then SLUG="x86_64"; else SLUG="aarch64"; fi && \
+    # Validate binary
+    LING_BIN="/app/target/release/ling" && \
+    LING_SIZE=$(stat -c%s "$LING_BIN") && \
+    if [ "$LING_SIZE" -lt 1000000 ]; then echo "❌ Error: ling binary too small ($LING_SIZE bytes)" && exit 1; fi && \
+    # Create tarball (flat — just the binary)
+    mkdir -p /app/dist-temp/ling-flat && \
+    cp "$LING_BIN" /app/dist-temp/ling-flat/ && \
+    cd /app/dist-temp/ling-flat && tar -czf /app/dist-temp/ling-linux-${SLUG}.tar.gz ling
+
+# Stage 2: Artifact extraction
+FROM scratch AS artifacts
+COPY --from=builder /app/dist-temp/*.tar.gz /

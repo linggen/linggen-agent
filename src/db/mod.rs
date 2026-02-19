@@ -315,6 +315,23 @@ impl Db {
         Ok(sessions)
     }
 
+    pub fn rename_session(&self, repo_path: &str, session_id: &str, new_title: &str) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SESSIONS_TABLE)?;
+            let key = format!("{}:{}", repo_path, session_id);
+            let existing = table.get(key.as_str())?.map(|v| v.value().to_string());
+            if let Some(json) = existing {
+                let mut session: SessionInfo = serde_json::from_str(&json)?;
+                session.title = new_title.to_string();
+                let updated = serde_json::to_string(&session)?;
+                table.insert(key.as_str(), updated.as_str())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     pub fn remove_session(&self, repo_path: &str, session_id: &str) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {

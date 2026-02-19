@@ -611,6 +611,27 @@ pub(crate) async fn remove_session_api(
 }
 
 #[derive(Deserialize)]
+pub(crate) struct RenameSessionRequest {
+    project_root: String,
+    session_id: String,
+    title: String,
+}
+
+pub(crate) async fn rename_session_api(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<RenameSessionRequest>,
+) -> impl IntoResponse {
+    match state
+        .manager
+        .db
+        .rename_session(&req.project_root, &req.session_id, &req.title)
+    {
+        Ok(_) => StatusCode::OK,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+#[derive(Deserialize)]
 pub(crate) struct AddProjectRequest {
     path: String,
 }

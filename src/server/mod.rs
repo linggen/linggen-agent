@@ -14,11 +14,11 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 use rust_embed::RustEmbed;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -39,9 +39,9 @@ use projects_api::{
     get_agent_context_api, get_agent_file_api, get_skill_file_api, list_agent_children_api,
     list_agent_files_api, list_agent_runs_api, list_agents_api, list_models_api, list_projects,
     list_sessions, list_skill_files_api, list_skills, remove_project, remove_session_api,
-    upsert_agent_file_api, upsert_skill_file_api,
+    rename_session_api, upsert_agent_file_api, upsert_skill_file_api,
 };
-use marketplace_api::{marketplace_install, marketplace_list, marketplace_search, marketplace_uninstall};
+use marketplace_api::{builtin_skills_install, builtin_skills_list, marketplace_install, marketplace_list, marketplace_search, marketplace_uninstall};
 use workspace_api::{get_agent_tree, get_workspace_state, list_files, read_file_api};
 
 #[derive(RustEmbed)]
@@ -175,7 +175,7 @@ pub enum ServerEvent {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiSseMessage {
     pub id: String,
     pub seq: u64,
@@ -552,13 +552,19 @@ impl ServerState {
     }
 }
 
-pub async fn start_server(
+pub struct ServerHandle {
+    pub state: Arc<ServerState>,
+    pub task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    pub port: u16,
+}
+
+pub async fn prepare_server(
     manager: Arc<AgentManager>,
     skill_manager: Arc<crate::skills::SkillManager>,
     port: u16,
     dev_mode: bool,
     mut agent_events_rx: mpsc::UnboundedReceiver<crate::agent_manager::AgentEvent>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ServerHandle> {
     info!("linggen-agent server starting on port {}...", port);
 
     // SSE can be bursty (tool/status steps). Use a larger buffer to reduce lag drops.
@@ -676,12 +682,15 @@ pub async fn start_server(
         .route("/api/marketplace/list", get(marketplace_list))
         .route("/api/marketplace/install", post(marketplace_install))
         .route("/api/marketplace/uninstall", delete(marketplace_uninstall))
+        .route("/api/builtin-skills", get(builtin_skills_list))
+        .route("/api/builtin-skills/install", post(builtin_skills_install))
         .route("/api/skill-files", get(list_skill_files_api))
         .route("/api/skill-file", get(get_skill_file_api))
         .route("/api/skill-file", post(upsert_skill_file_api))
         .route("/api/skill-file", delete(delete_skill_file_api))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions", post(create_session))
+        .route("/api/sessions", patch(rename_session_api))
         .route("/api/sessions", delete(remove_session_api))
         .route("/api/settings", get(get_settings_api))
         .route("/api/settings", post(update_settings_api))
@@ -698,13 +707,35 @@ pub async fn start_server(
         .route("/api/health", get(health_handler))
         .route("/api/utils/pick-folder", get(pick_folder))
         .route("/api/utils/ollama-status", get(get_ollama_status))
+        .route("/api/memory/{*rest}", get(memory_proxy).post(memory_proxy).delete(memory_proxy))
         .fallback(static_handler)
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
-    info!("Server running on http://localhost:{}", port);
-    axum::serve(listener, app).await?;
+    let actual_port = listener.local_addr()?.port();
+    info!("Server running on http://localhost:{}", actual_port);
 
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await?;
+        Ok(())
+    });
+
+    Ok(ServerHandle {
+        state,
+        task,
+        port: actual_port,
+    })
+}
+
+pub async fn start_server(
+    manager: Arc<AgentManager>,
+    skill_manager: Arc<crate::skills::SkillManager>,
+    port: u16,
+    dev_mode: bool,
+    agent_events_rx: mpsc::UnboundedReceiver<crate::agent_manager::AgentEvent>,
+) -> anyhow::Result<()> {
+    let handle = prepare_server(manager, skill_manager, port, dev_mode, agent_events_rx).await?;
+    handle.task.await??;
     Ok(())
 }
 
@@ -769,6 +800,58 @@ async fn events_handler(
 
 async fn health_handler() -> impl IntoResponse {
     axum::Json(json!({ "ok": true }))
+}
+
+/// Proxy /api/memory/* requests to the ling-mem server.
+async fn memory_proxy(
+    State(state): State<Arc<ServerState>>,
+    axum::extract::Path(rest): axum::extract::Path<String>,
+    method: axum::http::Method,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let config = state.manager.get_config_snapshot().await;
+    let base = config.memory.server_url.trim_end_matches('/');
+    let target_url = format!("{}/api/{}", base, rest);
+
+    let client = reqwest::Client::new();
+    let mut req = client.request(method.clone(), &target_url);
+
+    // Forward content-type header
+    if let Some(ct) = headers.get("content-type") {
+        req = req.header("content-type", ct);
+    }
+
+    if !body.is_empty() {
+        req = req.body(body.to_vec());
+    }
+
+    match req.send().await {
+        Ok(resp) => {
+            let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            Response::builder()
+                .status(status)
+                .header("content-type", ct)
+                .body(axum::body::Body::from(bytes))
+                .unwrap()
+        }
+        Err(e) => Response::builder()
+            .status(axum::http::StatusCode::BAD_GATEWAY)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&json!({ "error": format!("Memory server unreachable: {}", e) }))
+                    .unwrap_or_default(),
+            ))
+            .unwrap(),
+    }
 }
 
 async fn pick_folder() -> impl IntoResponse {

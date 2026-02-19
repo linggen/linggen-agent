@@ -1,12 +1,13 @@
 import React, { useCallback, useMemo, useState, useEffect, useRef } from 'react';
-import { Activity, FilePenLine, Folder, RefreshCw, Trash2 } from 'lucide-react';
-import { AgentTree } from './components/AgentTree';
+import { FilePenLine } from 'lucide-react';
+import { SessionNav } from './components/SessionNav';
 import { AgentsCard } from './components/AgentsCard';
 import { ModelsCard } from './components/ModelsCard';
 import { FilePreview } from './components/FilePreview';
 import { ChatPanel } from './components/ChatPanel';
 import { HeaderBar } from './components/HeaderBar';
 import { SettingsPage } from './components/SettingsPage';
+import { MemoryPage } from './components/MemoryPage';
 import { AgentSpecEditorModal } from './components/AgentSpecEditorModal';
 import type {
   AgentInfo,
@@ -185,14 +186,6 @@ const isStatusLineText = (text: string) =>
 
 const roleFromAgentId = (agentId: string): ChatMessage['role'] =>
   agentId === 'user' ? 'user' : 'agent';
-
-const MODEL_LOADING_ENTRY = 'Model loading...';
-
-const orderActivityEntries = (entries: string[]) => {
-  if (!entries.includes(MODEL_LOADING_ENTRY)) return entries;
-  const rest = entries.filter((entry) => entry !== MODEL_LOADING_ENTRY);
-  return [MODEL_LOADING_ENTRY, ...rest];
-};
 
 const normalizeMessageTextForDedup = (text: string) =>
   (text || '').replace(/\s+/g, ' ').trim();
@@ -498,7 +491,7 @@ const buildSubagentInfos = (
   return out;
 };
 
-type Page = 'main' | 'settings';
+type Page = 'main' | 'settings' | 'memory';
 
 const App: React.FC = () => {
   const [currentPage, setCurrentPage] = useState<Page>('main');
@@ -516,6 +509,7 @@ const App: React.FC = () => {
 
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [sessionCountsByProject, setSessionCountsByProject] = useState<Record<string, number>>({});
 
   const [, setLogs] = useState<string[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
@@ -997,9 +991,9 @@ const App: React.FC = () => {
 
   const createSession = async () => {
     if (!selectedProjectRoot) return;
-    const title = prompt("Enter session title:", "New Chat");
-    if (!title) return;
-    
+    const now = new Date();
+    const title = `Chat ${now.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}, ${now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`;
+
     try {
       const resp = await fetch('/api/sessions', {
         method: 'POST',
@@ -1009,6 +1003,7 @@ const App: React.FC = () => {
       const data = await resp.json();
       setActiveSessionId(data.id);
       fetchSessions();
+      fetchAllSessionCounts();
     } catch (e) {
       addLog(`Error creating session: ${e}`);
     }
@@ -1024,10 +1019,42 @@ const App: React.FC = () => {
       });
       if (activeSessionId === id) setActiveSessionId(null);
       fetchSessions();
+      fetchAllSessionCounts();
     } catch (e) {
       addLog(`Error removing session: ${e}`);
     }
   };
+
+  const renameSession = async (id: string, title: string) => {
+    if (!selectedProjectRoot) return;
+    try {
+      await fetch('/api/sessions', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_root: selectedProjectRoot, session_id: id, title }),
+      });
+      fetchSessions();
+    } catch (e) {
+      addLog(`Error renaming session: ${e}`);
+    }
+  };
+
+  const fetchAllSessionCounts = useCallback(async () => {
+    if (projects.length === 0) return;
+    const counts: Record<string, number> = {};
+    await Promise.all(
+      projects.map(async (project) => {
+        try {
+          const resp = await fetch(`/api/sessions?project_root=${encodeURIComponent(project.path)}`);
+          const data = await resp.json();
+          counts[project.path] = Array.isArray(data) ? data.length : 0;
+        } catch {
+          counts[project.path] = 0;
+        }
+      }),
+    );
+    setSessionCountsByProject(counts);
+  }, [projects]);
 
   const fetchSkills = useCallback(async () => {
     try {
@@ -1169,7 +1196,8 @@ const App: React.FC = () => {
   useEffect(() => {
     if (projects.length === 0) return;
     fetchAllAgentTrees();
-  }, [projects, fetchAllAgentTrees]);
+    fetchAllSessionCounts();
+  }, [projects, fetchAllAgentTrees, fetchAllSessionCounts]);
 
   useEffect(() => {
     if (selectedProjectRoot) {
@@ -1549,18 +1577,6 @@ const App: React.FC = () => {
     }
   };
 
-  const refreshPageState = async () => {
-    if (!selectedProjectRoot) return;
-    fetchWorkspaceState();
-    fetchFiles(currentPath);
-    fetchAllAgentTrees();
-    fetchSessions();
-    fetchSettings();
-    fetchAgents(selectedProjectRoot);
-    fetchModels();
-    fetchOllamaStatus();
-  };
-
   return (
     <>
     {currentPage === 'settings' && (
@@ -1573,77 +1589,54 @@ const App: React.FC = () => {
         projectRoot={selectedProjectRoot}
       />
     )}
-    <div className={`flex flex-col h-screen bg-slate-100/70 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200 font-sans overflow-hidden${currentPage === 'settings' ? ' hidden' : ''}`}>
+    {currentPage === 'memory' && (
+      <MemoryPage
+        onBack={() => setCurrentPage('main')}
+      />
+    )}
+    <div className={`flex flex-col h-screen bg-slate-100/70 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200 font-sans overflow-hidden${currentPage !== 'main' ? ' hidden' : ''}`}>
       {/* Header */}
       <HeaderBar
-        showAddProject={showAddProject}
-        newProjectPath={newProjectPath}
-        setNewProjectPath={setNewProjectPath}
-        addProject={addProject}
-        pickFolder={pickFolder}
         selectedAgent={selectedAgent}
         setSelectedAgent={setSelectedAgent}
         mainAgents={mainAgents}
         agentStatus={agentStatus}
-        sessions={sessions}
-        activeSessionId={activeSessionId}
-        setActiveSessionId={setActiveSessionId}
-        createSession={createSession}
         copyChat={copyChat}
         copyChatStatus={copyChatStatus}
         clearChat={clearChat}
-        removeSession={removeSession}
         isRunning={isRunning}
         currentMode={currentMode}
         onModeChange={updateMode}
         agentContext={agentContext}
+        onOpenMemory={() => setCurrentPage('memory')}
         onOpenSettings={() => setCurrentPage('settings')}
       />
 
       {/* Main Layout */}
       <div className="flex-1 flex overflow-hidden">
         
-        {/* Left: Active Paths */}
-        <aside className="w-72 border-r border-slate-200 dark:border-white/5 flex flex-col bg-white dark:bg-[#0f0f0f]">
-          <div className="p-4 border-b border-slate-200 dark:border-white/5 flex items-center justify-between">
-            <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-2">
-              <Activity size={14} /> Active Paths
-            </h2>
-            <div className="flex items-center gap-1">
-              <button
-                onClick={refreshPageState}
-                disabled={!selectedProjectRoot || isRunning}
-                className="p-1.5 hover:bg-blue-500/10 hover:text-blue-500 rounded-lg text-slate-500 transition-colors disabled:opacity-50"
-                title="Refresh page state"
-              >
-                <RefreshCw size={14} className={isRunning ? 'animate-spin' : ''} />
-              </button>
-              <button
-                onClick={() => setShowAddProject(!showAddProject)}
-                className="p-1.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded-lg text-slate-500"
-                title="Manage Projects"
-              >
-                <Folder size={14} />
-              </button>
-              {selectedProjectRoot && (
-                <button
-                  onClick={() => removeProject(selectedProjectRoot)}
-                  className="p-1.5 hover:bg-red-500/10 hover:text-red-500 rounded-lg text-slate-500 transition-colors"
-                  title="Remove Current Project"
-                >
-                  <Trash2 size={14} />
-                </button>
-              )}
-            </div>
-          </div>
-          <AgentTree
-            projects={projects}
-            selectedProjectRoot={selectedProjectRoot}
-            treesByProject={agentTreesByProject}
-            onSelectProject={setSelectedProjectRoot}
-            onSelectPath={selectAgentPathFromTree}
-          />
-        </aside>
+        {/* Left: Session Navigator */}
+        <SessionNav
+          projects={projects}
+          selectedProjectRoot={selectedProjectRoot}
+          setSelectedProjectRoot={setSelectedProjectRoot}
+          sessions={sessions}
+          activeSessionId={activeSessionId}
+          setActiveSessionId={setActiveSessionId}
+          createSession={createSession}
+          removeSession={removeSession}
+          renameSession={renameSession}
+          sessionCountsByProject={sessionCountsByProject}
+          treesByProject={agentTreesByProject}
+          onSelectPath={selectAgentPathFromTree}
+          showAddProject={showAddProject}
+          setShowAddProject={setShowAddProject}
+          newProjectPath={newProjectPath}
+          setNewProjectPath={setNewProjectPath}
+          addProject={addProject}
+          pickFolder={pickFolder}
+          removeProject={removeProject}
+        />
 
         {/* Center: Chat */}
         <main className="flex-1 flex flex-col overflow-hidden bg-slate-100/40 dark:bg-[#0a0a0a] min-h-0">

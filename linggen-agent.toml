@@ -26,6 +26,11 @@ prompt_loop_breaker = "You are repeatedly calling '{}' with the same arguments a
 level = "debug"
 retention_days = 7
 
+[memory]
+server_port = 8787
+server_url = "http://127.0.0.1:8787"
+auto_start = true
+
 [[agents]]
 id = "lead"
 spec_path = "agents/lead.md"

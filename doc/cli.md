@@ -1,121 +1,82 @@
 # CLI Reference
 
-All subcommands for the `linggen-agent` binary.
+The `ling` binary — Linggen AI coding agent.
 
 ## Related docs
 
 - `doc/framework.md`: runtime design, tool contract, safety rules.
 - `doc/product-spec.md`: product goals, interaction modes, UX.
 
+## Quick reference
+
+```
+ling                              # Start server + TUI (default)
+ling --web                        # Web UI only, no TUI
+ling -d                           # Run as background daemon
+ling --port 8080                  # Custom port
+ling --root /path/to/project      # Custom workspace
+
+ling stop                         # Stop background daemon
+ling status                       # Show agent + memory status
+ling doctor                       # Full health diagnostics
+
+ling memory start                 # Start memory server (aliases: mem, m)
+ling memory stop                  # Stop memory server
+ling memory status                # Memory server status
+ling m index .                    # Index current directory
+
+ling install                      # Install ling
+ling install --memory             # Install ling-mem
+ling install --all                # Install both
+ling update                       # Update ling
+ling update --all                 # Update both
+ling init                         # Bootstrap skills
+ling skills add/remove/list/search
+ling eval                         # Run eval tasks
+```
+
 ## Subcommands overview
 
 | Command | Purpose | Needs full runtime? |
 |:--------|:--------|:--------------------|
-| `agent` | Interactive TUI (REPL) | Yes |
-| `serve` | Start HTTP server + Web UI (foreground) | Yes |
-| `eval` | Run eval tasks against agents | Yes |
+| *(none)* | Interactive TUI + embedded server | Yes |
+| `stop` | Stop background daemon | No |
+| `status` | Show agent + memory server status | No |
 | `doctor` | Diagnose installation health | No |
-| `start` | Start server as background daemon | No |
-| `stop` | Stop the background daemon | No |
-| `status` | Show server/daemon status | No |
+| `memory` | Manage memory server (`start/stop/status/index`) | No |
+| `eval` | Run eval tasks against agents | Yes |
 | `init` | Bulk-install skills from `linggen/skills` | No |
-| `install` | Self-update the binary (alias: `update`) | No |
+| `install` | Install ling (and optionally ling-mem) | No |
+| `update` | Update ling (and optionally ling-mem) | No |
 | `skills` | Manage skills (add/remove/list/search) | No |
 
 "Needs full runtime" means the command initialises tracing, `AgentManager`, database, and skill loading. Lightweight commands only load `Config`.
 
 ---
 
-## agent
+## Default (bare `ling`)
 
-Interactive multi-agent TUI (ratatui REPL).
+Start the agent server with an interactive TUI.
 
 ```
-linggen-agent agent [OPTIONS]
+ling [OPTIONS]
 ```
 
 | Flag | Description |
 |:-----|:-----------|
-| `--ollama-url <URL>` | Ollama base URL (overrides config) |
-| `--model <NAME>` | Model name (overrides config) |
 | `--root <PATH>` | Workspace root (default: detect `.git`) |
-| `--max-iters <N>` | Max tool iterations per run |
-| `--no-stream` | Disable streaming output |
+| `--port <PORT>` | Server port (default: `server.port` from config) |
+| `--web` | Web UI only — foreground server, no TUI |
+| `-d, --daemon` | Run as background daemon (implies `--web`) |
+| `--dev` | Dev mode: proxy static assets to Vite dev server |
 
-## serve
+When no flags are given, `ling` starts the HTTP server on the configured port with the embedded Web UI, then opens the interactive TUI.
 
-Start the HTTP API server with embedded Web UI (foreground process).
+### Daemon mode (`-d`)
 
-```
-linggen-agent serve [OPTIONS]
-```
-
-| Flag | Description |
-|:-----|:-----------|
-| `--port <PORT>` | Listen port (default: `server.port` from config) |
-| `--ollama-url <URL>` | Ollama base URL |
-| `--model <NAME>` | Model name |
-| `--root <PATH>` | Workspace root (default: detect `.git`) |
-| `--dev` | Dev mode: skip embedded static assets, proxy to Vite |
-
-## eval
-
-Run evaluation tasks against agents.
-
-```
-linggen-agent eval [OPTIONS]
-```
-
-| Flag | Description |
-|:-----|:-----------|
-| `--root <PATH>` | Workspace root |
-| `--filter <SUBSTRING>` | Filter tasks by name |
-| `--max-iters <N>` | Override max iterations per task |
-| `--timeout <SECS>` | Per-task timeout (default: 300) |
-| `--agent <ID>` | Override agent for all tasks |
-| `--verbose` | Print agent messages during execution |
-
-Exits with code 1 if any task fails.
-
----
-
-## doctor
-
-Print a diagnostic checklist of the installation.
-
-```
-linggen-agent doctor
-```
-
-Checks (each prints `[OK]`, `[FAIL]`, or `[INFO]` with ANSI colours):
-
-1. Binary version
-2. Config file path
-3. Workspace root detection
-4. Server port reachability (TCP probe, 1 s timeout)
-5. Model connectivity (Ollama `/api/tags`, OpenAI `/models`)
-6. Skills directories (global + project)
-7. Agent definition files count
-8. Log directory exists and is writable
-
-## start
-
-Start the server as a background daemon.
-
-```
-linggen-agent start [OPTIONS]
-```
-
-| Flag | Description |
-|:-----|:-----------|
-| `--port <PORT>` | Listen port (default: `server.port` from config) |
-| `--root <PATH>` | Workspace root |
-
-Behaviour:
-- Checks if the port is already listening; if so, prints a message and exits.
-- Spawns a detached child running `linggen-agent serve --port <PORT>`.
-- Writes PID to `~/.linggen/linggen-agent.pid`.
-- Daemon stdout/stderr goes to `~/.linggen/linggen-agent.log`.
+Spawns a detached child running `ling --web --port <PORT>`:
+- Writes PID to `~/.linggen/ling.pid`.
+- Daemon stdout/stderr goes to `~/.linggen/ling.log`.
 - Polls TCP connect (up to 3 s) and reports readiness.
 
 ## stop
@@ -123,23 +84,116 @@ Behaviour:
 Stop the background daemon.
 
 ```
-linggen-agent stop
+ling stop
 ```
 
-Behaviour:
-- Reads PID from `~/.linggen/linggen-agent.pid`.
-- Sends `SIGTERM`; if still running after 500 ms, sends `SIGKILL`.
-- Removes the PID file.
+Reads PID from `~/.linggen/ling.pid`, sends `SIGTERM`; if still running after 500 ms, sends `SIGKILL`. Removes the PID file.
 
 ## status
 
-Show server and daemon status.
+Show agent and memory server status.
 
 ```
-linggen-agent status
+ling status
 ```
 
-Prints: config path, server port, running state (with PID if available), workspace root, model count, agent count.
+Prints: version, config path, agent server port + running state, memory server port + running state, memory binary location, workspace root, model count, agent count.
+
+## doctor
+
+Print a diagnostic checklist of the installation.
+
+```
+ling doctor
+```
+
+Checks (each prints `[OK]`, `[FAIL]`, or `[INFO]` with ANSI colours):
+
+1. Binary version
+2. Config file path
+3. Workspace root detection
+4. Agent server port reachability (TCP probe, 1 s timeout)
+5. Memory server port reachability
+6. Model connectivity (Ollama `/api/tags`, OpenAI `/models`)
+7. Skills directories (global + project)
+8. Agent definition files count
+9. Log directory exists and is writable
+
+---
+
+## memory
+
+Manage the ling-mem server. Aliases: `mem`, `m`.
+
+```
+ling memory <SUBCOMMAND>
+ling mem <SUBCOMMAND>
+ling m <SUBCOMMAND>
+```
+
+### memory start
+
+Start the memory server as a background process.
+
+```
+ling memory start
+```
+
+Finds the `ling-mem` binary (checks: macOS Application Support, PATH, alongside `ling`), spawns it with `--port <memory.server_port>`. Writes PID to `~/.linggen/ling-mem.pid`, logs to `~/.linggen/ling-mem.log`.
+
+### memory stop
+
+Stop the memory server.
+
+```
+ling memory stop
+```
+
+### memory status
+
+Show memory server status.
+
+```
+ling memory status
+```
+
+### memory index
+
+Index a local directory via the memory server.
+
+```
+ling memory index [PATH] [OPTIONS]
+ling m index .
+```
+
+| Flag | Description |
+|:-----|:-----------|
+| `PATH` | Directory to index (default: current directory) |
+| `--mode <MODE>` | Indexing mode: `auto`, `full`, or `incremental` (default: `auto`) |
+| `--name <NAME>` | Override the source name |
+| `--include <GLOB>` | Include patterns (repeatable) |
+| `--exclude <GLOB>` | Exclude patterns (repeatable) |
+| `--no-wait` | Don't wait for the indexing job to complete |
+
+---
+
+## eval
+
+Run evaluation tasks against agents.
+
+```
+ling eval [OPTIONS]
+```
+
+| Flag | Description |
+|:-----|:-----------|
+| `--filter <SUBSTRING>` | Filter tasks by name |
+| `--max-iters <N>` | Override max iterations per task |
+| `--timeout <SECS>` | Per-task timeout (default: 300) |
+| `--agent <ID>` | Override agent for all tasks |
+| `--verbose` | Print agent messages during execution |
+
+Exits with code 1 if any task fails. The `--root` global flag sets the workspace root.
 
 ---
 
@@ -148,30 +202,43 @@ Prints: config path, server port, running state (with PID if available), workspa
 Bulk-install all skills from the `linggen/skills` GitHub repository.
 
 ```
-linggen-agent init [OPTIONS]
+ling init [OPTIONS]
 ```
 
 | Flag | Description |
 |:-----|:-----------|
 | `--global` | Install to `~/.linggen/skills/` (default: project `.linggen/skills/`) |
-| `--root <PATH>` | Workspace root for project-scoped install |
 
 Downloads the repository as a ZIP, scans for all `SKILL.md` files, and extracts each skill directory.
 
 ## install
 
-Self-update the binary to the latest release.
+Install the `ling` binary (default), and optionally `ling-mem`.
 
 ```
-linggen-agent install
-linggen-agent update      # alias
+ling install              # install ling only (default)
+ling install --memory     # install ling-mem only (alias: --mem)
+ling install --all        # install both
 ```
 
-Behaviour:
-- Fetches `manifest.json` from the latest GitHub release.
-- Compares versions; if up to date, exits early.
-- Downloads the platform-specific binary and atomically replaces the current executable.
-- Gracefully handles "no releases available yet".
+| Flag | Description |
+|:-----|:-----------|
+| `--memory` / `--mem` | Install ling-mem binary |
+| `--all` | Install both ling and ling-mem |
+
+Fetches `manifest.json` from the latest GitHub releases. Downloads platform-specific binaries and installs them. The memory binary is placed alongside the `ling` binary.
+
+## update
+
+Update the `ling` binary (default), and optionally `ling-mem`.
+
+```
+ling update               # update ling only (default)
+ling update --memory      # update ling-mem only (alias: --mem)
+ling update --all         # update both
+```
+
+Same flags as `install`. Compares versions and skips if already up to date.
 
 ---
 
@@ -180,13 +247,13 @@ Behaviour:
 Manage skills (install, remove, list, search).
 
 ```
-linggen-agent skills <SUBCOMMAND>
+ling skills <SUBCOMMAND>
 ```
 
 ### skills add
 
 ```
-linggen-agent skills add <NAME> [OPTIONS]
+ling skills add <NAME> [OPTIONS]
 ```
 
 | Flag | Description |
@@ -199,7 +266,7 @@ linggen-agent skills add <NAME> [OPTIONS]
 ### skills remove
 
 ```
-linggen-agent skills remove <NAME> [OPTIONS]
+ling skills remove <NAME> [OPTIONS]
 ```
 
 | Flag | Description |
@@ -209,7 +276,7 @@ linggen-agent skills remove <NAME> [OPTIONS]
 ### skills list
 
 ```
-linggen-agent skills list
+ling skills list
 ```
 
 Scans `~/.linggen/skills/`, `.linggen/skills/`, `~/.claude/skills/`, `~/.codex/skills/` and prints installed skill names with their source.
@@ -217,10 +284,21 @@ Scans `~/.linggen/skills/`, `.linggen/skills/`, `~/.claude/skills/`, `~/.codex/s
 ### skills search
 
 ```
-linggen-agent skills search <QUERY>
+ling skills search <QUERY>
 ```
 
 Searches the Linggen marketplace (and skills.sh fallback) and prints results.
+
+---
+
+## Global flags
+
+These flags can be used with any command:
+
+| Flag | Description |
+|:-----|:-----------|
+| `--root <PATH>` | Workspace root (default: walk up to find `.git`) |
+| `--port <PORT>` | Server port (default: from config) |
 
 ---
 
@@ -228,16 +306,26 @@ Searches the Linggen marketplace (and skills.sh fallback) and prints results.
 
 | File | Purpose |
 |:-----|:--------|
-| `~/.linggen/linggen-agent.pid` | Daemon PID (created by `start`, removed by `stop`) |
-| `~/.linggen/linggen-agent.log` | Daemon stdout/stderr log |
+| `~/.linggen/ling.pid` | Agent daemon PID (created by `-d`, removed by `stop`) |
+| `~/.linggen/ling.log` | Agent daemon stdout/stderr log |
+| `~/.linggen/ling-mem.pid` | Memory server PID |
+| `~/.linggen/ling-mem.log` | Memory server log |
 
 ## Configuration
 
-All commands load config from `linggen-agent.toml` (see `doc/framework.md` for search order). Lightweight commands (`doctor`, `start`, `stop`, `status`, `init`, `install`, `skills`) only need the config file; they do not initialise the full agent runtime.
+All commands load config from `linggen-agent.toml` (see `doc/framework.md` for search order). Lightweight commands only need the config file; they do not initialise the full agent runtime.
+
+### Memory server config
+
+```toml
+[memory]
+server_port = 8787                      # default
+server_url = "http://127.0.0.1:8787"   # default
+```
 
 ### Model context_window override
 
-For cloud/remote models where the provider API does not report context size (e.g. Ollama `qwen3.5:cloud`), set `context_window` manually:
+For cloud/remote models where the provider API does not report context size:
 
 ```toml
 [[models]]
@@ -250,4 +338,4 @@ context_window = 131072
 
 ## Health endpoint
 
-The server exposes `GET /api/health` returning `{"ok": true}`. Used by `start` for readiness polling.
+The server exposes `GET /api/health` returning `{"ok": true}`. Used by daemon mode for readiness polling.

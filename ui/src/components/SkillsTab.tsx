@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ChevronDown, ChevronRight, Download, FilePlus2, Pencil, Save, Search, Store, Trash2, Wrench, X } from 'lucide-react';
-import type { MarketplaceSkill, SkillInfoFull, SkillFileInfo } from '../types';
+import { ChevronDown, ChevronRight, Download, FilePlus2, Package, Pencil, Save, Search, Store, Trash2, Wrench, X } from 'lucide-react';
+import type { BuiltInSkillInfo, MarketplaceSkill, SkillInfoFull, SkillFileInfo } from '../types';
 import { CM6Editor } from './CM6Editor';
 
 const sectionCls = 'bg-white dark:bg-[#141414] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm';
@@ -50,6 +50,41 @@ export const SkillsTab: React.FC<{
   const [mpUninstalling, setMpUninstalling] = useState<Set<string>>(new Set());
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Built-in skills state
+  const [builtInSkills, setBuiltInSkills] = useState<BuiltInSkillInfo[]>([]);
+  const [biInstalling, setBiInstalling] = useState<Set<string>>(new Set());
+
+  const fetchBuiltInSkills = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/builtin-skills');
+      if (resp.ok) setBuiltInSkills(await resp.json());
+    } catch { /* ignore */ }
+  }, []);
+
+  const installBuiltInSkill = async (name: string) => {
+    setBiInstalling((prev) => new Set(prev).add(name));
+    setError(null);
+    try {
+      const resp = await fetch('/api/builtin-skills/install', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      if (!resp.ok) {
+        setError(await resp.text());
+      } else {
+        await Promise.all([fetchSkills(), fetchSkillFiles(), fetchBuiltInSkills()]);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+    setBiInstalling((prev) => {
+      const next = new Set(prev);
+      next.delete(name);
+      return next;
+    });
+  };
+
   const fetchSkills = useCallback(async () => {
     try {
       const resp = await fetch('/api/skills');
@@ -68,7 +103,8 @@ export const SkillsTab: React.FC<{
   useEffect(() => {
     fetchSkills();
     fetchSkillFiles();
-  }, [fetchSkills, fetchSkillFiles]);
+    fetchBuiltInSkills();
+  }, [fetchSkills, fetchSkillFiles, fetchBuiltInSkills]);
 
   // Marketplace: load popular on tab open
   useEffect(() => {
@@ -368,6 +404,47 @@ export const SkillsTab: React.FC<{
       {/* Local Skills tab */}
       {subTab === 'local' && (
         <>
+          {/* Built-in Skills */}
+          {builtInSkills.length > 0 && (
+            <div className={sectionCls}>
+              <div className="flex items-center gap-2 px-4 py-3">
+                <Package size={14} className="text-blue-500" />
+                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400">Built-in</span>
+                <span className="text-[10px] text-slate-500">{builtInSkills.length} skill{builtInSkills.length !== 1 ? 's' : ''}</span>
+              </div>
+              <div className="px-4 pb-3 space-y-2">
+                {builtInSkills.map((bi) => (
+                  <div key={bi.name} className="flex items-center gap-3 bg-slate-50 dark:bg-white/[0.02] rounded-lg border border-slate-100 dark:border-white/5 px-3 py-2.5">
+                    <div className="flex-1 min-w-0">
+                      <span className="text-xs font-semibold">{bi.name}</span>
+                      <p className="text-[11px] text-slate-500 mt-0.5 line-clamp-1">{bi.description}</p>
+                    </div>
+                    {bi.installed ? (
+                      <div className="flex items-center gap-2 shrink-0">
+                        <span className="text-[10px] font-bold text-green-600 bg-green-500/10 px-1.5 py-0.5 rounded-full">Installed</span>
+                        <button
+                          onClick={() => installBuiltInSkill(bi.name)}
+                          disabled={biInstalling.has(bi.name)}
+                          className="px-2 py-1 text-[10px] font-semibold rounded-md border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5 disabled:opacity-50"
+                        >
+                          {biInstalling.has(bi.name) ? 'Updating...' : 'Update'}
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => installBuiltInSkill(bi.name)}
+                        disabled={biInstalling.has(bi.name)}
+                        className="px-2.5 py-1 text-[10px] font-semibold rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 shrink-0"
+                      >
+                        {biInstalling.has(bi.name) ? 'Installing...' : 'Install'}
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {groups.map((group) => {
             const collapsed = collapsedGroups.has(group.source);
             return (

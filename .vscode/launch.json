@@ -19,6 +19,7 @@
       "name": "Agent UI",
       "type": "pwa-chrome",
       "request": "launch",
+      "runtimeArgs": ["--user-data-dir=${workspaceFolder}/.vscode/chrome-debug"],
       "url": "http://localhost:5173",
       "webRoot": "${workspaceFolder}/ui",
       "preLaunchTask": "npm: dev - agent ui"

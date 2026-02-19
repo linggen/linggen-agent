@@ -1,5 +1,6 @@
 use crate::server::{ServerEvent, ServerState};
 use crate::skills::marketplace::{self, SkillScope};
+use crate::skills;
 use axum::{
     extract::{Json, Query, State},
     http::StatusCode,
@@ -129,6 +130,50 @@ pub(crate) async fn marketplace_uninstall(
         }
         Err(e) => {
             tracing::error!(err = %e, skill = %req.name, "Marketplace uninstall failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in skills
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn builtin_skills_list() -> impl IntoResponse {
+    axum::Json(skills::list_builtin_skills())
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BuiltInInstallRequest {
+    name: String,
+}
+
+pub(crate) async fn builtin_skills_install(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<BuiltInInstallRequest>,
+) -> impl IntoResponse {
+    let target_dir = match marketplace::skill_target_dir(&req.name, SkillScope::Global, None) {
+        Ok(d) => d,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+
+    // Install from linggen/skills repo
+    match marketplace::install_skill(
+        &req.name,
+        Some("https://github.com/linggen/skills"),
+        Some("main"),
+        &target_dir,
+        true, // force overwrite to get latest version
+    )
+    .await
+    {
+        Ok(msg) => {
+            let _ = state.skill_manager.load_all(None).await;
+            let _ = state.events_tx.send(ServerEvent::StateUpdated);
+            axum::Json(serde_json::json!({ "ok": true, "message": msg })).into_response()
+        }
+        Err(e) => {
+            tracing::error!(err = %e, skill = %req.name, "Built-in skill install failed");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     }

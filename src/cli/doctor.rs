@@ -21,7 +21,7 @@ fn info(label: &str, detail: &str) {
 }
 
 pub async fn run(config: &Config, config_path: Option<&Path>) -> Result<()> {
-    println!("linggen-agent doctor\n");
+    println!("ling doctor\n");
 
     // 1. Binary version
     let version = env!("CARGO_PKG_VERSION");
@@ -39,23 +39,36 @@ pub async fn run(config: &Config, config_path: Option<&Path>) -> Result<()> {
         Err(_) => info("Workspace", "none"),
     }
 
-    // 4. Server port
+    // 4. Agent server port
     let port = config.server.port;
     match check_tcp_port(port).await {
-        true => ok("Server", &format!("port {} is listening", port)),
-        false => info("Server", &format!("port {} not reachable", port)),
+        true => ok("Agent server", &format!("port {} is listening", port)),
+        false => info("Agent server", &format!("port {} not reachable", port)),
     }
 
-    // 5. Models
+    // 5. Memory server
+    let mem_port = config.memory.server_port;
+    match check_tcp_port(mem_port).await {
+        true => ok("Memory server", &format!("port {} is listening", mem_port)),
+        false => info("Memory server", &format!("port {} not reachable", mem_port)),
+    }
+
+    // 5b. Memory binary
+    match crate::cli::daemon::find_memory_binary() {
+        Some(bin) => ok("Memory binary", &bin),
+        None => info("Memory binary", "not found (install with: ling install --memory)"),
+    }
+
+    // 6. Models
     check_models(config).await;
 
-    // 6. Skills dirs
+    // 7. Skills dirs
     check_skills_dirs();
 
-    // 7. Agents dir
+    // 8. Agents dir
     check_agents_dir();
 
-    // 8. Log directory
+    // 9. Log directory
     check_log_dir(config);
 
     println!();
