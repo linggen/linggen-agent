@@ -481,7 +481,7 @@ pub(crate) async fn get_skill_file_api(
     // Validate frontmatter
     let valid = content.starts_with("---")
         && content.splitn(3, "---").count() >= 3
-        && serde_yaml::from_str::<serde_yaml::Value>(
+        && serde_yml::from_str::<serde_yml::Value>(
             content.splitn(3, "---").nth(1).unwrap_or(""),
         )
         .is_ok();

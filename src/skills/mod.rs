@@ -210,7 +210,7 @@ impl SkillManager {
         if parts.len() < 3 {
             anyhow::bail!("Skill missing closing frontmatter delimiter");
         }
-        let frontmatter: SkillFrontmatter = serde_yaml::from_str(parts[1])?;
+        let frontmatter: SkillFrontmatter = serde_yml::from_str(parts[1])?;
         let content = parts[2].trim().to_string();
 
         Ok(Skill {
