@@ -37,7 +37,6 @@ pub struct ToolCall {
 
 #[derive(Debug, Serialize)]
 pub enum ToolResult {
-    RepoInfo(String),
     FileList(Vec<String>),
     FileContent {
         path: String,
@@ -77,6 +76,7 @@ pub struct Tools {
     max_delegation_depth: usize,
     run_id: Option<String>,
     agent_policy: Option<AgentPolicy>,
+    memory_dir: Option<PathBuf>,
 }
 
 impl Tools {
@@ -89,6 +89,7 @@ impl Tools {
             max_delegation_depth: 2,
             run_id: None,
             agent_policy: None,
+            memory_dir: None,
         })
     }
 
@@ -113,12 +114,24 @@ impl Tools {
         self.delegation_depth
     }
 
+    pub fn max_delegation_depth(&self) -> usize {
+        self.max_delegation_depth
+    }
+
     pub fn set_policy(&mut self, policy: Option<AgentPolicy>) {
         self.agent_policy = policy;
     }
 
     pub fn set_run_id(&mut self, run_id: Option<String>) {
         self.run_id = run_id;
+    }
+
+    pub fn set_memory_dir(&mut self, dir: PathBuf) {
+        self.memory_dir = Some(dir);
+    }
+
+    pub fn memory_dir(&self) -> Option<&PathBuf> {
+        self.memory_dir.as_ref()
     }
 
     pub fn get_manager(&self) -> Option<Arc<AgentManager>> {
@@ -137,11 +150,6 @@ impl Tools {
             summarize_tool_args(&call.tool, &normalized_args)
         );
         match call.tool.as_str() {
-            "get_repo_info" => Ok(ToolResult::RepoInfo(format!(
-                "root={} platform={}",
-                self.root.display(),
-                std::env::consts::OS
-            ))),
             "Glob" => {
                 let args: ListFilesArgs = serde_json::from_value(normalized_args)
                     .map_err(|e| anyhow::anyhow!("invalid args for Glob: {}", e))?;
@@ -245,6 +253,18 @@ impl Tools {
     }
 
     fn read_file(&self, args: ReadFileArgs) -> Result<ToolResult> {
+        // Check if this is a memory path (absolute, outside workspace)
+        let abs_path = Path::new(&args.path);
+        if abs_path.is_absolute() && self.is_memory_path(abs_path) {
+            if abs_path.exists() && abs_path.is_file() {
+                return self.do_read_file(&args.path, abs_path, args.max_bytes, args.line_range);
+            }
+            return Ok(ToolResult::Success(format!(
+                "file_not_found: {} - Memory file does not exist yet. Use Write to create it.",
+                args.path
+            )));
+        }
+
         let rel = sanitize_rel_path(&self.root, &args.path).unwrap_or_else(|_| args.path.clone());
         let filename = Path::new(&rel)
             .file_name()
@@ -654,15 +674,6 @@ impl Tools {
                 anyhow::bail!("Path {} is locked by another agent", rel);
             }
 
-            // Record activity in DB
-            let _ = manager.db.record_activity(crate::db::FileActivity {
-                repo_path: self.root.to_string_lossy().to_string(),
-                file_path: rel.to_string(),
-                agent_id: agent_id.clone(),
-                status: crate::db::FileActivityStatus::Working,
-                last_modified: crate::util::now_ts_secs(),
-            });
-
             // Live working-place map for active-path UI (in-memory source of truth).
             if self.run_id.is_some() {
                 let repo_path = self.root.to_string_lossy().to_string();
@@ -681,7 +692,55 @@ impl Tools {
         Ok(())
     }
 
+    /// Check if an absolute path is inside the memory directory.
+    fn is_memory_path(&self, path: &Path) -> bool {
+        if let Some(ref mem_dir) = self.memory_dir {
+            if let (Ok(canonical_path), Ok(canonical_mem)) = (
+                path.canonicalize().or_else(|_| {
+                    // File may not exist yet — canonicalize parent
+                    path.parent()
+                        .and_then(|p| p.canonicalize().ok())
+                        .map(|p| p.join(path.file_name().unwrap_or_default()))
+                        .ok_or(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "no parent",
+                        ))
+                }),
+                mem_dir
+                    .canonicalize()
+                    .or_else(|_| Ok::<PathBuf, std::io::Error>(mem_dir.clone())),
+            ) {
+                return canonical_path.starts_with(&canonical_mem);
+            }
+        }
+        false
+    }
+
     fn write_file(&self, args: WriteFileArgs) -> Result<ToolResult> {
+        let abs_path = Path::new(&args.path);
+
+        // Check if this is a memory path (absolute, outside workspace)
+        if abs_path.is_absolute() && self.is_memory_path(abs_path) {
+            if let Some(parent) = abs_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if abs_path.exists() {
+                let existing = fs::read_to_string(abs_path).unwrap_or_default();
+                if existing == args.content {
+                    return Ok(ToolResult::Success(format!(
+                        "File unchanged (content identical): {}",
+                        args.path
+                    )));
+                }
+            }
+            let bytes = args.content.len();
+            fs::write(abs_path, &args.content)?;
+            return Ok(ToolResult::Success(format!(
+                "Memory file written: {} ({} bytes)",
+                args.path, bytes
+            )));
+        }
+
         let rel = sanitize_rel_path(&self.root, &args.path)?;
         let path = self.root.join(&rel);
         let new_content = args.content;
@@ -710,11 +769,52 @@ impl Tools {
     }
 
     fn edit_file(&self, args: EditFileArgs) -> Result<ToolResult> {
-        let rel = sanitize_rel_path(&self.root, &args.path)?;
         if args.old_string.is_empty() {
             anyhow::bail!("old_string must not be empty");
         }
 
+        let abs_path = Path::new(&args.path);
+
+        // Check if this is a memory path (absolute, outside workspace)
+        if abs_path.is_absolute() && self.is_memory_path(abs_path) {
+            if !abs_path.exists() {
+                anyhow::bail!("file not found: {}", args.path);
+            }
+            let existing = fs::read_to_string(abs_path)?;
+            let match_count = existing.matches(&args.old_string).count();
+            if match_count == 0 {
+                anyhow::bail!("old_string was not found in file: {}", args.path);
+            }
+            let replace_all = args.replace_all.unwrap_or(false);
+            if match_count > 1 && !replace_all {
+                anyhow::bail!(
+                    "old_string matched {} locations in {}. Provide a more specific old_string or set replace_all=true.",
+                    match_count,
+                    args.path
+                );
+            }
+            let updated = if replace_all {
+                existing.replace(&args.old_string, &args.new_string)
+            } else {
+                existing.replacen(&args.old_string, &args.new_string, 1)
+            };
+            if updated == existing {
+                return Ok(ToolResult::Success(format!(
+                    "File unchanged (no effective edit): {}",
+                    args.path
+                )));
+            }
+            fs::write(abs_path, updated)?;
+            let replaced = if replace_all { match_count } else { 1 };
+            return Ok(ToolResult::Success(format!(
+                "Edited memory file: {} ({} replacement{})",
+                args.path,
+                replaced,
+                if replaced == 1 { "" } else { "s" }
+            )));
+        }
+
+        let rel = sanitize_rel_path(&self.root, &args.path)?;
         let path = self.root.join(&rel);
         if !path.exists() {
             anyhow::bail!("file not found: {}", rel);
@@ -803,7 +903,12 @@ impl Tools {
         Ok(ToolResult::Success("Locks released".to_string()))
     }
 
-    fn delegate_to_agent(&self, args: DelegateToAgentArgs) -> Result<ToolResult> {
+    /// Validate delegation policy/depth/target without executing.
+    /// Returns the manager and caller agent id on success.
+    pub(crate) fn validate_delegation(
+        &self,
+        args: &DelegateToAgentArgs,
+    ) -> Result<(Arc<AgentManager>, String)> {
         let manager = self
             .manager
             .as_ref()
@@ -812,8 +917,6 @@ impl Tools {
             .agent_id
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Delegation requires caller agent id"))?;
-        let target_agent_id = args.target_agent_id;
-        let task = args.task;
 
         if self.delegation_depth >= self.max_delegation_depth {
             anyhow::bail!(
@@ -831,7 +934,7 @@ impl Tools {
                 caller_id
             );
         }
-        if !policy.allows_delegate_target(&target_agent_id) {
+        if !policy.allows_delegate_target(&args.target_agent_id) {
             let allowed = if policy.delegate_targets.is_empty() {
                 "(none)".to_string()
             } else {
@@ -839,83 +942,130 @@ impl Tools {
             };
             anyhow::bail!(
                 "Delegation denied: target '{}' is not allowed by policy for '{}'. Allowed: {}",
-                target_agent_id,
+                args.target_agent_id,
                 caller_id,
                 allowed
             );
         }
 
+        Ok((manager.clone(), caller_id))
+    }
+
+    fn delegate_to_agent(&self, args: DelegateToAgentArgs) -> Result<ToolResult> {
+        let (manager, caller_id) = self.validate_delegation(&args)?;
         let delegation_depth = self.delegation_depth;
         let max_delegation_depth = self.max_delegation_depth;
+        let ws_root = self.root.clone();
+        let parent_run_id = self.run_id.clone();
+
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let run_id = manager
-                    .begin_agent_run(
-                        &self.root,
-                        None,
-                        &target_agent_id,
-                        self.run_id.clone(),
-                        Some(format!("delegated by {}", caller_id)),
-                    )
-                    .await?;
-
-                manager
-                    .send_event(crate::agent_manager::AgentEvent::Message {
-                        from: caller_id.clone(),
-                        to: target_agent_id.clone(),
-                        content: format!("Delegated task: {}", task),
-                    })
-                    .await;
-
-                manager
-                    .send_event(crate::agent_manager::AgentEvent::SubagentSpawned {
-                        parent_id: caller_id.clone(),
-                        subagent_id: target_agent_id.clone(),
-                        task: task.clone(),
-                    })
-                    .await;
-
-                let agent = manager
-                    .get_or_create_agent(&self.root, &target_agent_id)
-                    .await?;
-                let mut engine = agent.lock().await;
-                engine.set_parent_agent(Some(caller_id.clone()));
-                engine.set_delegation_depth(delegation_depth + 1, max_delegation_depth);
-                engine.set_run_id(Some(run_id.clone()));
-                engine.set_task(task);
-                let run_result = engine.run_agent_loop(None).await;
-
-                // Always clean up cached engine state, even on error
-                engine.set_run_id(None);
-                engine.set_parent_agent(None);
-                engine.set_delegation_depth(0, max_delegation_depth);
-
-                let (outcome, status, detail) = match run_result {
-                    Ok(outcome) => (outcome, crate::db::AgentRunStatus::Completed, None),
-                    Err(err) => {
-                        let msg = err.to_string();
-                        let status = if msg.to_lowercase().contains("cancel") {
-                            crate::db::AgentRunStatus::Cancelled
-                        } else {
-                            crate::db::AgentRunStatus::Failed
-                        };
-                        let _ = manager.finish_agent_run(&run_id, status, Some(msg.clone())).await;
-                        return Err(err);
-                    }
-                };
-                let _ = manager.finish_agent_run(&run_id, status, detail).await;
-
-                manager
-                    .send_event(crate::agent_manager::AgentEvent::SubagentResult {
-                        parent_id: caller_id,
-                        subagent_id: target_agent_id,
-                        outcome: outcome.clone(),
-                    })
-                    .await;
-                Ok(ToolResult::AgentOutcome(outcome))
-            })
+            tokio::runtime::Handle::current().block_on(run_delegation(
+                manager,
+                ws_root,
+                caller_id,
+                args.target_agent_id,
+                args.task,
+                parent_run_id,
+                delegation_depth,
+                max_delegation_depth,
+            ))
         })
     }
+}
+
+/// Execute a single delegation on a fresh, ephemeral engine.
+///
+/// This is a standalone async function (not a method) so it can be spawned onto
+/// a `JoinSet` for parallel execution.  Each call creates its own `AgentEngine`
+/// via `AgentManager::spawn_delegation_engine`, runs the agent loop, and drops
+/// the engine when done.
+pub(crate) async fn run_delegation(
+    manager: Arc<AgentManager>,
+    ws_root: PathBuf,
+    caller_id: String,
+    target_agent_id: String,
+    task: String,
+    parent_run_id: Option<String>,
+    delegation_depth: usize,
+    max_delegation_depth: usize,
+) -> Result<ToolResult> {
+    let run_id = manager
+        .begin_agent_run(
+            &ws_root,
+            None,
+            &target_agent_id,
+            parent_run_id,
+            Some(format!("delegated by {}", caller_id)),
+        )
+        .await?;
+
+    manager
+        .send_event(crate::agent_manager::AgentEvent::Message {
+            from: caller_id.clone(),
+            to: target_agent_id.clone(),
+            content: format!("Delegated task: {}", task),
+        })
+        .await;
+
+    manager
+        .send_event(crate::agent_manager::AgentEvent::SubagentSpawned {
+            parent_id: caller_id.clone(),
+            subagent_id: target_agent_id.clone(),
+            task: task.clone(),
+        })
+        .await;
+
+    let engine_result = manager
+        .spawn_delegation_engine(&ws_root, &target_agent_id)
+        .await;
+    let mut engine = match engine_result {
+        Ok(e) => e,
+        Err(err) => {
+            let _ = manager
+                .finish_agent_run(
+                    &run_id,
+                    crate::project_store::AgentRunStatus::Failed,
+                    Some(err.to_string()),
+                )
+                .await;
+            return Err(err);
+        }
+    };
+
+    engine.set_parent_agent(Some(caller_id.clone()));
+    engine.set_delegation_depth(delegation_depth + 1, max_delegation_depth);
+    engine.set_run_id(Some(run_id.clone()));
+    engine.set_task(task);
+
+    let run_result = engine.run_agent_loop(None).await;
+    // Engine is dropped here — no cleanup of cached state needed.
+
+    let (outcome, status, detail) = match run_result {
+        Ok(outcome) => (outcome, crate::project_store::AgentRunStatus::Completed, None),
+        Err(err) => {
+            let msg = err.to_string();
+            let status = if msg.to_lowercase().contains("cancel") {
+                crate::project_store::AgentRunStatus::Cancelled
+            } else {
+                crate::project_store::AgentRunStatus::Failed
+            };
+            let _ = manager
+                .finish_agent_run(&run_id, status, Some(msg.clone()))
+                .await;
+            return Err(err);
+        }
+    };
+    let _ = manager.finish_agent_run(&run_id, status, detail).await;
+
+    manager
+        .send_event(crate::agent_manager::AgentEvent::SubagentResult {
+            parent_id: caller_id,
+            subagent_id: target_agent_id,
+            outcome: outcome.clone(),
+        })
+        .await;
+
+    Ok(ToolResult::AgentOutcome(outcome))
 }
 
 #[derive(Debug, Deserialize)]
@@ -994,9 +1144,9 @@ struct CaptureScreenshotArgs {
 }
 
 #[derive(Debug, Deserialize)]
-struct DelegateToAgentArgs {
-    target_agent_id: String,
-    task: String,
+pub(crate) struct DelegateToAgentArgs {
+    pub(crate) target_agent_id: String,
+    pub(crate) task: String,
 }
 
 fn build_globset(globs: Option<&[String]>) -> Result<Option<GlobSet>> {
@@ -1245,7 +1395,6 @@ fn first_segment_token(segment: &str) -> Option<&str> {
 
 pub fn canonical_tool_name(tool: &str) -> Option<&'static str> {
     Some(match tool {
-        "get_repo_info" => "get_repo_info",
         "Glob" => "Glob",
         "Read" => "Read",
         "Grep" => "Grep",
@@ -1262,11 +1411,6 @@ pub fn canonical_tool_name(tool: &str) -> Option<&'static str> {
 
 pub(crate) fn full_tool_schema_entries() -> Vec<Value> {
     vec![
-        serde_json::json!({
-            "name": "get_repo_info",
-            "args": {},
-            "returns": "string"
-        }),
         serde_json::json!({
             "name": "Glob",
             "args": {"globs": "string[]?", "max_results": "number?"},

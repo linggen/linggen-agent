@@ -118,11 +118,66 @@ impl ModelManager {
 
         match &instance.client {
             ProviderClient::Ollama(client) => {
-                let stream = client
-                    .chat_text_stream_with_keep_alive(&instance.config.model, messages, keep_alive)
-                    .await?;
+                // Try streaming first; auto-fallback to non-streaming on 503
+                // (e.g. Ollama cloud-proxied models that don't support streaming).
+                // Retry up to 3 times with backoff for 503 errors (model loading).
+                let boxed_stream: Pin<Box<dyn Stream<Item = Result<String>> + Send>> = match client
+                    .chat_text_stream_with_keep_alive(
+                        &instance.config.model,
+                        messages,
+                        keep_alive.clone(),
+                    )
+                    .await
+                {
+                    Ok(stream) => Box::pin(stream),
+                    Err(e) if e.to_string().contains("503") => {
+                        tracing::info!(
+                            "Streaming returned 503 for model '{}', falling back to non-streaming with retry",
+                            instance.config.model
+                        );
+                        let mut last_err = e;
+                        let mut result = None;
+                        for attempt in 0..3u32 {
+                            if attempt > 0 {
+                                let delay = std::time::Duration::from_millis(1000 * (1 << attempt));
+                                tracing::info!(
+                                    "Retry {}/3 for model '{}' after 503 (waiting {}ms)",
+                                    attempt + 1,
+                                    instance.config.model,
+                                    delay.as_millis()
+                                );
+                                tokio::time::sleep(delay).await;
+                            }
+                            match client
+                                .chat_text_with_keep_alive(
+                                    &instance.config.model,
+                                    messages,
+                                    keep_alive.clone(),
+                                )
+                                .await
+                            {
+                                Ok(msg) => {
+                                    result = Some(msg);
+                                    break;
+                                }
+                                Err(e) if e.to_string().contains("503") => {
+                                    last_err = e;
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        match result {
+                            Some(msg) => {
+                                Box::pin(futures_util::stream::once(async move { Ok(msg) }))
+                            }
+                            None => return Err(last_err),
+                        }
+                    }
+                    Err(e) => return Err(e),
+                };
                 Ok(Box::pin(futures_util::stream::unfold(
-                    (Box::pin(stream), _permit),
+                    (boxed_stream, _permit),
                     |(mut stream, permit)| async move {
                         match stream.next().await {
                             Some(item) => Some((item, (stream, permit))),

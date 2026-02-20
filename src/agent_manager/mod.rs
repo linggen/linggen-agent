@@ -1,10 +1,10 @@
 use crate::agent_manager::locks::LockManager;
 use crate::agent_manager::models::ModelManager;
 use crate::config::{AgentPolicyCapability, AgentSpec, Config};
-use crate::db::{AgentRunRecord, Db, ProjectSettings};
-use crate::engine::{AgentEngine, AgentOutcome, AgentRole, EngineConfig};
+use crate::engine::{AgentEngine, AgentOutcome, AgentRole, EngineConfig, Plan};
+use crate::project_store::ProjectStore;
 use crate::skills::SkillManager;
-use crate::state_fs::{StateFile, StateFs};
+use crate::state_fs::{SessionStore, StateFile, StateFs};
 use anyhow::Result;
 use globset::Glob;
 use ignore::gitignore::GitignoreBuilder;
@@ -23,6 +23,7 @@ pub mod routing;
 pub struct ProjectContext {
     pub agents: Mutex<HashMap<String, Arc<Mutex<AgentEngine>>>>,
     pub state_fs: StateFs,
+    pub sessions: SessionStore,
     pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
 }
 
@@ -32,11 +33,15 @@ pub struct AgentManager {
     pub projects: Mutex<HashMap<String, Arc<ProjectContext>>>,
     pub locks: Mutex<LockManager>,
     pub models: RwLock<Arc<ModelManager>>,
-    pub db: Arc<Db>,
+    pub store: Arc<ProjectStore>,
     pub skill_manager: Arc<SkillManager>,
     working_places: Mutex<HashMap<String, HashMap<String, WorkingPlaceEntry>>>,
     cancelled_runs: Mutex<HashSet<String>>,
     events: mpsc::UnboundedSender<AgentEvent>,
+    /// Pending plans awaiting user approval, keyed by "{project_root}|{agent_id}".
+    pending_plans: Mutex<HashMap<String, Plan>>,
+    /// Maps run_id → repo_path for O(1) lookups in finish/get/cancel.
+    run_project_map: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +84,10 @@ pub enum AgentEvent {
         token_limit: Option<usize>,
         compressed: bool,
         summary_count: usize,
+    },
+    PlanUpdate {
+        agent_id: String,
+        plan: Plan,
     },
     StateUpdated,
 }
@@ -259,7 +268,7 @@ impl AgentManager {
     pub fn new(
         config: Config,
         config_dir: Option<PathBuf>,
-        db: Arc<Db>,
+        store: Arc<ProjectStore>,
         skill_manager: Arc<SkillManager>,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<AgentEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -271,11 +280,13 @@ impl AgentManager {
                 projects: Mutex::new(HashMap::new()),
                 locks: Mutex::new(LockManager::new()),
                 models: RwLock::new(models),
-                db,
+                store,
                 skill_manager,
                 working_places: Mutex::new(HashMap::new()),
                 cancelled_runs: Mutex::new(HashSet::new()),
                 events: tx,
+                pending_plans: Mutex::new(HashMap::new()),
+                run_project_map: Mutex::new(HashMap::new()),
             }),
             rx,
         )
@@ -292,14 +303,15 @@ impl AgentManager {
         }
 
         let state_fs = StateFs::new(root.clone());
+        let sessions = self.store.session_store(&key);
         let ctx = Arc::new(ProjectContext {
             agents: Mutex::new(HashMap::new()),
             state_fs,
+            sessions,
             watcher: Mutex::new(None),
         });
 
         // Setup watcher
-        let db_clone = self.db.clone();
         let root_clone = root.clone();
         let events_tx = self.events.clone();
         let mut gitignore_builder = GitignoreBuilder::new(&root);
@@ -316,7 +328,6 @@ impl AgentManager {
         let mut watcher =
             notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
-                    let repo_path = root_clone.to_string_lossy().to_string();
                     let gitignore = gitignore.clone();
                     let is_ignored = |path: &std::path::Path| -> bool {
                         match path.strip_prefix(&root_clone) {
@@ -340,53 +351,20 @@ impl AgentManager {
 
                     match event.kind {
                         EventKind::Remove(_) => {
-                            let mut changed = false;
-                            for path in event.paths {
-                                if is_ignored(&path) {
-                                    continue;
-                                }
-                                if let Ok(rel) = path.strip_prefix(&root_clone) {
-                                    let rel_str = rel.to_string_lossy();
-                                    tracing::info!("File removed on disk: {}", rel_str);
-                                    let _ = db_clone.remove_activity(&repo_path, &rel_str);
-                                    changed = true;
-                                }
-                            }
-                            if changed {
+                            let has_relevant = event.paths.iter().any(|p| !is_ignored(p));
+                            if has_relevant {
                                 let _ = events_tx.send(AgentEvent::StateUpdated);
                             }
                         }
                         EventKind::Modify(notify::event::ModifyKind::Name(
                             notify::event::RenameMode::Both,
                         )) => {
-                            let mut changed = false;
                             if event.paths.len() == 2 {
                                 let old = &event.paths[0];
                                 let new = &event.paths[1];
-                                let old_ignored = is_ignored(old);
-                                let new_ignored = is_ignored(new);
-                                if let (Ok(old_rel), Ok(new_rel)) =
-                                    (old.strip_prefix(&root_clone), new.strip_prefix(&root_clone))
-                                {
-                                    let old_str = old_rel.to_string_lossy();
-                                    let new_str = new_rel.to_string_lossy();
-                                    if !old_ignored && !new_ignored {
-                                        tracing::info!(
-                                            "File renamed on disk: {} -> {}",
-                                            old_str,
-                                            new_str
-                                        );
-                                        let _ = db_clone
-                                            .rename_activity(&repo_path, &old_str, &new_str);
-                                        changed = true;
-                                    } else if !old_ignored && new_ignored {
-                                        let _ = db_clone.remove_activity(&repo_path, &old_str);
-                                        changed = true;
-                                    }
+                                if !is_ignored(old) || !is_ignored(new) {
+                                    let _ = events_tx.send(AgentEvent::StateUpdated);
                                 }
-                            }
-                            if changed {
-                                let _ = events_tx.send(AgentEvent::StateUpdated);
                             }
                         }
                         _ => {}
@@ -397,16 +375,14 @@ impl AgentManager {
         watcher.watch(&root, RecursiveMode::Recursive)?;
         *ctx.watcher.lock().await = Some(watcher);
 
-        projects.insert(key, ctx.clone());
+        projects.insert(key.clone(), ctx.clone());
 
-        // Register in DB if not already there
+        // Register in project store
         let name = root
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        let _ = self
-            .db
-            .add_project(root.to_string_lossy().to_string(), name);
+        let _ = self.store.add_project(key, name);
 
         Ok(ctx)
     }
@@ -471,7 +447,6 @@ impl AgentManager {
             EngineConfig {
                 ws_root: project_root.clone(),
                 max_iters: config.agent.max_iters,
-                stream: true,
                 write_safety_mode: config.agent.write_safety_mode,
                 prompt_loop_breaker: config.agent.prompt_loop_breaker.clone(),
             },
@@ -489,9 +464,96 @@ impl AgentManager {
         engine.set_delegation_depth(0, config.agent.max_delegation_depth);
         engine.load_skill_tools(&self.skill_manager).await;
 
+        // Set up auto memory directory
+        let repo_path_str = project_root.to_string_lossy().to_string();
+        engine.set_memory_dir(self.store.memory_dir(&repo_path_str));
+
         let agent = Arc::new(Mutex::new(engine));
         agents.insert(normalized_id, agent.clone());
         Ok(agent)
+    }
+
+    /// Create a fresh, uncached `AgentEngine` for a single delegation call.
+    ///
+    /// Unlike `get_or_create_agent`, the returned engine is **not** inserted into the project's
+    /// agent cache.  It is intended for one-shot delegation tasks that run concurrently — each
+    /// spawned delegation gets its own engine instance, avoiding the lock contention / deadlock
+    /// that would occur if two delegations tried to share a single `Arc<Mutex<AgentEngine>>`.
+    pub async fn spawn_delegation_engine(
+        self: &Arc<Self>,
+        project_root: &PathBuf,
+        agent_id: &str,
+    ) -> Result<AgentEngine> {
+        let project_root = Self::canonical_project_root(project_root);
+        let normalized_id = Self::normalize_agent_id(agent_id);
+
+        let agent_spec = self
+            .find_agent_spec_for_project(&project_root, &normalized_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Agent '{}' not found in {}/agents",
+                    normalized_id,
+                    project_root.display()
+                )
+            })?;
+
+        let config = self.config.read().await.clone();
+        let models = self.models.read().await.clone();
+
+        let model_id =
+            Self::normalize_model_choice(Self::model_override_for_agent(&config, &normalized_id))
+                .or_else(|| Self::normalize_model_choice(agent_spec.spec.model.clone()))
+                .or_else(|| {
+                    routing::resolve_model(
+                        &config.routing,
+                        None,
+                        &routing::ComplexitySignal {
+                            estimated_tokens: None,
+                            tool_depth: None,
+                            skill_model_hint: None,
+                        },
+                        &config.models,
+                    )
+                })
+                .or_else(|| config.models.first().map(|m| m.id.clone()))
+                .ok_or_else(|| anyhow::anyhow!("No models configured"))?;
+
+        let role = if agent_spec
+            .spec
+            .allows_policy(AgentPolicyCapability::Finalize)
+        {
+            AgentRole::Lead
+        } else if agent_spec.spec.allows_policy(AgentPolicyCapability::Patch) {
+            AgentRole::Coder
+        } else {
+            AgentRole::Operator
+        };
+
+        let mut engine = AgentEngine::new(
+            EngineConfig {
+                ws_root: project_root.clone(),
+                max_iters: config.agent.max_iters,
+                write_safety_mode: config.agent.write_safety_mode,
+                prompt_loop_breaker: config.agent.prompt_loop_breaker.clone(),
+            },
+            models,
+            model_id,
+            role,
+        )?;
+
+        engine.set_spec(
+            normalized_id.clone(),
+            agent_spec.spec,
+            agent_spec.system_prompt,
+        );
+        engine.set_manager_context(self.clone());
+        engine.load_skill_tools(&self.skill_manager).await;
+
+        // Set up auto memory directory
+        let repo_path_str = project_root.to_string_lossy().to_string();
+        engine.set_memory_dir(self.store.memory_dir(&repo_path_str));
+
+        Ok(engine)
     }
 
     pub async fn is_path_allowed(
@@ -633,6 +695,8 @@ impl AgentManager {
         parent_run_id: Option<String>,
         detail: Option<String>,
     ) -> Result<String> {
+        use crate::project_store::{AgentRunRecord, AgentRunStatus};
+
         let project_root = project_root
             .canonicalize()
             .unwrap_or_else(|_| project_root.clone());
@@ -647,12 +711,16 @@ impl AgentManager {
             agent_id: agent_id.to_string(),
             agent_kind: None,
             parent_run_id,
-            status: crate::db::AgentRunStatus::Running,
+            status: AgentRunStatus::Running,
             detail,
             started_at,
             ended_at: None,
         };
-        self.db.add_agent_run(record)?;
+        self.store.run_store(&repo_path).add_run(&record)?;
+        self.run_project_map
+            .lock()
+            .await
+            .insert(run_id.clone(), repo_path.clone());
         self.clear_working_place_for_agent(&repo_path, agent_id)
             .await;
         self.cancelled_runs.lock().await.remove(&run_id);
@@ -662,14 +730,20 @@ impl AgentManager {
     pub async fn finish_agent_run(
         &self,
         run_id: &str,
-        status: crate::db::AgentRunStatus,
+        status: crate::project_store::AgentRunStatus,
         detail: Option<String>,
     ) -> Result<()> {
         let ended_at = Some(crate::util::now_ts_secs());
-        self.db.update_agent_run(run_id, status, detail, ended_at)?;
+        let repo_path = self.run_project_map.lock().await.get(run_id).cloned();
+        if let Some(repo_path) = &repo_path {
+            self.store
+                .run_store(repo_path)
+                .update_run(run_id, status, detail, ended_at)?;
+        }
         self.clear_working_place_for_run(run_id).await;
         let _ = self.events.send(AgentEvent::StateUpdated);
         self.cancelled_runs.lock().await.remove(run_id);
+        self.run_project_map.lock().await.remove(run_id);
         Ok(())
     }
 
@@ -677,30 +751,62 @@ impl AgentManager {
         &self,
         project_root: &PathBuf,
         session_id: Option<&str>,
-    ) -> Result<Vec<AgentRunRecord>> {
+    ) -> Result<Vec<crate::project_store::AgentRunRecord>> {
         let project_root = project_root
             .canonicalize()
             .unwrap_or_else(|_| project_root.clone());
-        self.db
-            .list_agent_runs(&project_root.to_string_lossy(), session_id)
-            .map_err(Into::into)
+        self.store
+            .run_store(&project_root.to_string_lossy())
+            .list_runs(session_id)
     }
 
-    pub async fn list_agent_children(&self, parent_run_id: &str) -> Result<Vec<AgentRunRecord>> {
-        self.db
-            .list_agent_children(parent_run_id)
-            .map_err(Into::into)
+    pub async fn list_agent_children(
+        &self,
+        parent_run_id: &str,
+    ) -> Result<Vec<crate::project_store::AgentRunRecord>> {
+        let repo_path = self
+            .run_project_map
+            .lock()
+            .await
+            .get(parent_run_id)
+            .cloned();
+        if let Some(repo_path) = repo_path {
+            self.store
+                .run_store(&repo_path)
+                .list_children(parent_run_id)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
-    pub async fn get_agent_run(&self, run_id: &str) -> Result<Option<AgentRunRecord>> {
-        self.db.get_agent_run(run_id).map_err(Into::into)
+    pub async fn get_agent_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::project_store::AgentRunRecord>> {
+        let repo_path = self.run_project_map.lock().await.get(run_id).cloned();
+        if let Some(repo_path) = repo_path {
+            self.store.run_store(&repo_path).get_run(run_id)
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn is_run_cancelled(&self, run_id: &str) -> bool {
         self.cancelled_runs.lock().await.contains(run_id)
     }
 
-    pub async fn cancel_run_tree(&self, run_id: &str) -> Result<Vec<AgentRunRecord>> {
+    pub async fn cancel_run_tree(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<crate::project_store::AgentRunRecord>> {
+        use crate::project_store::AgentRunStatus;
+
+        let repo_path = self.run_project_map.lock().await.get(run_id).cloned();
+        let Some(repo_path) = repo_path else {
+            return Ok(Vec::new());
+        };
+        let run_store = self.store.run_store(&repo_path);
+
         let mut stack = vec![run_id.to_string()];
         let mut seen = HashSet::new();
         let mut runs = Vec::new();
@@ -709,18 +815,18 @@ impl AgentManager {
             if !seen.insert(id.clone()) {
                 continue;
             }
-            let Some(run) = self.db.get_agent_run(&id)? else {
+            let Some(run) = run_store.get_run(&id)? else {
                 continue;
             };
-            for child in self.db.list_agent_children(&id)? {
+            for child in run_store.list_children(&id)? {
                 stack.push(child.run_id.clone());
             }
             runs.push(run);
         }
 
-        let to_cancel: Vec<AgentRunRecord> = runs
+        let to_cancel: Vec<crate::project_store::AgentRunRecord> = runs
             .into_iter()
-            .filter(|run| run.status == crate::db::AgentRunStatus::Running)
+            .filter(|run| run.status == AgentRunStatus::Running)
             .collect();
 
         let now = crate::util::now_ts_secs();
@@ -731,9 +837,9 @@ impl AgentManager {
             }
         }
         for run in &to_cancel {
-            let _ = self.db.update_agent_run(
+            let _ = run_store.update_run(
                 &run.run_id,
-                crate::db::AgentRunStatus::Cancelled,
+                AgentRunStatus::Cancelled,
                 Some("cancelled by user".to_string()),
                 Some(now),
             );
@@ -772,17 +878,32 @@ impl AgentManager {
         Ok(())
     }
 
-    pub async fn get_project_settings(&self, project_root: &PathBuf) -> Result<ProjectSettings> {
-        let project_root = project_root
-            .canonicalize()
-            .unwrap_or_else(|_| project_root.clone());
-        self.db
-            .get_project_settings(&project_root.to_string_lossy())
-            .map_err(Into::into)
+    /// Convenience: persist a chat message via the project's flat-file session store.
+    pub async fn add_chat_message(
+        &self,
+        ws_root: &std::path::Path,
+        session_id: &str,
+        msg: &crate::state_fs::sessions::ChatMsg,
+    ) {
+        if let Ok(ctx) = self.get_or_create_project(ws_root.to_path_buf()).await {
+            if let Err(e) = ctx.sessions.add_chat_message(session_id, msg) {
+                tracing::warn!("Failed to persist chat message: {}", e);
+            }
+        }
     }
 
     pub async fn send_event(&self, event: AgentEvent) {
         let _ = self.events.send(event);
+    }
+
+    pub async fn set_pending_plan(&self, project_root: &str, agent_id: &str, plan: Plan) {
+        let key = format!("{}|{}", project_root, agent_id);
+        self.pending_plans.lock().await.insert(key, plan);
+    }
+
+    pub async fn take_pending_plan(&self, project_root: &str, agent_id: &str) -> Option<Plan> {
+        let key = format!("{}|{}", project_root, agent_id);
+        self.pending_plans.lock().await.remove(&key)
     }
 
     pub async fn sync_world_state(&self, project_root: &PathBuf) -> Result<()> {

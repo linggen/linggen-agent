@@ -109,18 +109,12 @@ pub(crate) async fn get_workspace_state(
         let user_stories = ctx.state_fs.read_file("user-stories.md").ok();
         let tasks = ctx.state_fs.list_tasks().unwrap_or_default();
 
-        // Get messages from Redb instead of StateFs
-        let messages = state
-            .manager
-            .db
-            .get_chat_history(
-                &query.project_root,
-                query.session_id.as_deref().unwrap_or("default"),
-                None,
-            )
+        let session_id = query.session_id.as_deref().unwrap_or("default");
+        let messages = ctx
+            .sessions
+            .get_chat_history(session_id, None)
             .unwrap_or_default();
 
-        // Map ChatMessageRecord to the format expected by the UI
         let mapped_messages: Vec<(crate::state_fs::StateFile, String)> = messages
             .into_iter()
             .filter_map(|m| {
@@ -165,7 +159,7 @@ pub(crate) async fn get_agent_tree(
         .await
         .map(|runs| {
             runs.into_iter()
-                .filter(|run| run.status == crate::db::AgentRunStatus::Running)
+                .filter(|run| run.status == crate::project_store::AgentRunStatus::Running)
                 .map(|run| run.agent_id)
                 .collect()
         })

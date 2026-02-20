@@ -17,13 +17,50 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as TokioStreamExt;
 use tracing::{info, warn};
 
-pub use actions::{model_message_log_parts, parse_all_actions, ModelAction};
+pub use actions::{model_message_log_parts, parse_all_actions, ModelAction, PlanItemUpdate};
+
+// ---------------------------------------------------------------------------
+// Plan mode data structures
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanItem {
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub status: PlanItemStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanItemStatus {
+    Pending,
+    InProgress,
+    Done,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Plan {
+    pub summary: String,
+    pub items: Vec<PlanItem>,
+    pub status: PlanStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Planned,
+    Approved,
+    Executing,
+    Completed,
+}
 
 #[derive(Debug, Clone)]
 pub enum ThinkingEvent {
@@ -62,8 +99,6 @@ pub struct TaskPacket {
 pub struct EngineConfig {
     pub ws_root: PathBuf,
     pub max_iters: usize,
-    #[allow(dead_code)]
-    pub stream: bool,
     pub write_safety_mode: crate::config::WriteSafetyMode,
     pub prompt_loop_breaker: Option<String>,
 }
@@ -144,6 +179,13 @@ pub struct AgentEngine {
     pub run_id: Option<String>,
     pub thinking_tx: Option<mpsc::UnboundedSender<ThinkingEvent>>,
     pub repl_events_tx: Option<mpsc::UnboundedSender<ReplEvent>>,
+    // Plan mode
+    pub plan_mode: bool,
+    pub plan: Option<Plan>,
+    /// Path to the current plan's file in ~/.linggen/plans/
+    pub plan_file: Option<PathBuf>,
+    /// Override for plans directory (used in tests for isolation).
+    pub plans_dir_override: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -153,6 +195,13 @@ pub enum AgentOutcome {
     Task(TaskPacket),
     #[serde(rename = "patch")]
     Patch(String),
+    #[serde(rename = "plan")]
+    Plan(Plan),
+    #[serde(rename = "plan_mode_requested")]
+    PlanModeRequested {
+        #[serde(default)]
+        reason: Option<String>,
+    },
     #[serde(rename = "none")]
     None,
 }
@@ -198,6 +247,10 @@ impl AgentEngine {
             run_id: None,
             thinking_tx: None,
             repl_events_tx: None,
+            plan_mode: false,
+            plan: None,
+            plan_file: None,
+            plans_dir_override: None,
         })
     }
 
@@ -245,6 +298,10 @@ impl AgentEngine {
         self.tools.set_run_id(run_id);
     }
 
+    pub fn set_memory_dir(&mut self, dir: PathBuf) {
+        self.tools.set_memory_dir(dir);
+    }
+
     pub fn get_task(&self) -> Option<String> {
         self.task.clone()
     }
@@ -274,22 +331,24 @@ impl AgentEngine {
         session_id: Option<&str>,
     ) -> Result<()> {
         if let Some(manager) = self.tools.get_manager() {
-            let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
-                repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
-                session_id: session_id.unwrap_or("default").to_string(),
-                agent_id: self
-                    .agent_id
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                from_id: "system".to_string(),
-                to_id: self
-                    .agent_id
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                content: format!("Tool {}: {}", tool, rendered),
-                timestamp: crate::util::now_ts_secs(),
-                is_observation: true,
-            });
+            let aid = self
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            manager
+                .add_chat_message(
+                    &self.cfg.ws_root,
+                    session_id.unwrap_or("default"),
+                    &crate::state_fs::sessions::ChatMsg {
+                        agent_id: aid.clone(),
+                        from_id: "system".to_string(),
+                        to_id: aid,
+                        content: format!("Tool {}: {}", tool, rendered),
+                        timestamp: crate::util::now_ts_secs(),
+                        is_observation: true,
+                    },
+                )
+                .await;
         }
         Ok(())
     }
@@ -314,16 +373,20 @@ impl AgentEngine {
                     content: content.to_string(),
                 })
                 .await;
-            let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
-                repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
-                session_id: session_id.unwrap_or("default").to_string(),
-                agent_id: agent_id.clone(),
-                from_id: agent_id.clone(),
-                to_id: target,
-                content: content.to_string(),
-                timestamp: crate::util::now_ts_secs(),
-                is_observation: false,
-            });
+            manager
+                .add_chat_message(
+                    &self.cfg.ws_root,
+                    session_id.unwrap_or("default"),
+                    &crate::state_fs::sessions::ChatMsg {
+                        agent_id: agent_id.clone(),
+                        from_id: agent_id.clone(),
+                        to_id: target,
+                        content: content.to_string(),
+                        timestamp: crate::util::now_ts_secs(),
+                        is_observation: false,
+                    },
+                )
+                .await;
 
             // Nudge UI to refresh immediately.
             manager
@@ -369,14 +432,14 @@ impl AgentEngine {
                 let _ = self
                     .manager_db_add_observation(&canonical_tool, &rendered, session_id)
                     .await;
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: format!(
+                messages.push(ChatMessage::new(
+                    "user",
+                    format!(
                         "Tool '{}' is not allowed for this agent. Use one of [{}].",
                         tool,
                         allowed_list.join(", ")
                     ),
-                });
+                ));
                 return LoopControl::Continue;
             }
         }
@@ -420,13 +483,13 @@ impl AgentEngine {
                             let _ = self
                                 .manager_db_add_observation(action, &rendered, session_id)
                                 .await;
-                            messages.push(ChatMessage {
-                                role: "user".to_string(),
-                                content: format!(
+                            messages.push(ChatMessage::new(
+                                "user",
+                                format!(
                                     "Tool execution blocked for safety: {}. Read the existing file first, then apply a minimal update.",
                                     rendered,
                                 ),
-                            });
+                            ));
                             return LoopControl::Continue;
                         }
                         crate::config::WriteSafetyMode::Warn => {
@@ -466,10 +529,7 @@ impl AgentEngine {
                         canonical_tool
                     )
                 });
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: loop_breaker_prompt,
-            });
+            messages.push(ChatMessage::new("user", loop_breaker_prompt));
             self.push_context_record(
                 ContextType::Error,
                 Some("redundant_tool_loop".to_string()),
@@ -487,10 +547,10 @@ impl AgentEngine {
 
         if let Some(cached) = tool_cache.get(&sig) {
             self.upsert_observation("tool", &canonical_tool, cached.model.clone());
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: Self::observation_text("tool", &canonical_tool, &cached.model),
-            });
+            messages.push(ChatMessage::new(
+                "user",
+                Self::observation_text("tool", &canonical_tool, &cached.model),
+            ));
             return LoopControl::Continue;
         }
 
@@ -549,16 +609,20 @@ impl AgentEngine {
                 "args": safe_args
             })
             .to_string();
-            let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
-                repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
-                session_id: session_id.unwrap_or("default").to_string(),
-                agent_id: from.clone(),
-                from_id: from,
-                to_id: target,
-                content: tool_msg,
-                timestamp: crate::util::now_ts_secs(),
-                is_observation: false,
-            });
+            manager
+                .add_chat_message(
+                    &self.cfg.ws_root,
+                    session_id.unwrap_or("default"),
+                    &crate::state_fs::sessions::ChatMsg {
+                        agent_id: from.clone(),
+                        from_id: from,
+                        to_id: target,
+                        content: tool_msg,
+                        timestamp: crate::util::now_ts_secs(),
+                        is_observation: false,
+                    },
+                )
+                .await;
         }
 
         // --- execute ---
@@ -652,10 +716,10 @@ impl AgentEngine {
                         .await;
                 }
 
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Self::observation_text("tool", &canonical_tool, &rendered_model),
-                });
+                messages.push(ChatMessage::new(
+                    "user",
+                    Self::observation_text("tool", &canonical_tool, &rendered_model),
+                ));
 
                 if canonical_tool == "Grep"
                     && (rendered_model.contains("(no matches)")
@@ -666,10 +730,10 @@ impl AgentEngine {
                     *empty_search_streak = 0;
                 }
                 if *empty_search_streak >= 4 {
-                    messages.push(ChatMessage {
-                        role: "user".to_string(),
-                        content: "Grep returned no matches repeatedly. Change strategy and continue automatically (for example: broaden terms, use Glob to inspect files, then Read likely paths).".to_string(),
-                    });
+                    messages.push(ChatMessage::new(
+                        "user",
+                        "Grep returned no matches repeatedly. Change strategy and continue automatically (for example: broaden terms, use Glob to inspect files, then Read likely paths).",
+                    ));
                     self.push_context_record(
                         ContextType::Error,
                         Some("empty_search_loop".to_string()),
@@ -721,13 +785,13 @@ impl AgentEngine {
                         });
                     }
                 }
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: format!(
+                messages.push(ChatMessage::new(
+                    "user",
+                    format!(
                         "Tool execution failed for tool='{}'. Error: {}. Choose a valid tool+args from the tool schema and try again.",
                         canonical_tool, e
                     ),
-                });
+                ));
             }
         }
         LoopControl::Continue
@@ -767,10 +831,10 @@ impl AgentEngine {
             return Some(LoopControl::Return(AgentOutcome::None));
         }
 
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: "It looks like you are trapped in a loop, sending the same response multiple times. Please try a different approach or tool to make progress.".to_string(),
-        });
+        messages.push(ChatMessage::new(
+            "user",
+            "It looks like you are trapped in a loop, sending the same response multiple times. Please try a different approach or tool to make progress.",
+        ));
         self.push_context_record(
             ContextType::Error,
             Some("loop_detected".to_string()),
@@ -788,12 +852,163 @@ impl AgentEngine {
         &mut self,
         task: &str,
     ) -> (Vec<ChatMessage>, Option<HashSet<String>>, HashSet<String>) {
-        let system = self.system_prompt();
-        let allowed_tools = self.allowed_tool_names();
-        let mut messages = vec![ChatMessage {
-            role: "system".to_string(),
-            content: system,
-        }];
+        let mut system = self.system_prompt();
+
+        // --- Project context files (AGENTS.md, CLAUDE.md, .cursorrules) ---
+        {
+            let context_filenames = ["AGENTS.md", "CLAUDE.md", ".cursorrules"];
+            let mut seen: std::collections::HashSet<std::path::PathBuf> =
+                std::collections::HashSet::new();
+            let mut sections: Vec<(String, String)> = Vec::new();
+
+            let mut dir: Option<&std::path::Path> = Some(self.cfg.ws_root.as_path());
+            while let Some(current) = dir {
+                for filename in &context_filenames {
+                    let filepath = current.join(filename);
+                    if let Ok(canonical) = filepath.canonicalize() {
+                        if seen.contains(&canonical) {
+                            continue;
+                        }
+                        if let Ok(content) = std::fs::read_to_string(&filepath) {
+                            let content = content.trim().to_string();
+                            if !content.is_empty() {
+                                let label = if current == self.cfg.ws_root.as_path() {
+                                    filename.to_string()
+                                } else {
+                                    format!("{} (from {})", filename, current.display())
+                                };
+                                sections.push((label, content));
+                                seen.insert(canonical);
+                            }
+                        }
+                    }
+                }
+                dir = current.parent();
+            }
+
+            // Outermost (general) first, workspace root (specific) last
+            sections.reverse();
+
+            if !sections.is_empty() {
+                system.push_str("\n\n--- PROJECT INSTRUCTIONS ---");
+                for (label, content) in &sections {
+                    system.push_str(&format!("\n\n# {}\n\n{}", label, content));
+                }
+                system.push_str("\n\n--- END PROJECT INSTRUCTIONS ---");
+            }
+        }
+
+        // --- Auto Memory ---
+        if let Some(memory_dir) = self.tools.memory_dir() {
+            let memory_path = memory_dir.join("MEMORY.md");
+            let mem_dir_display = memory_dir.display().to_string();
+            if let Ok(content) = std::fs::read_to_string(&memory_path) {
+                let content = content.trim();
+                if !content.is_empty() {
+                    let truncated: String =
+                        content.lines().take(200).collect::<Vec<_>>().join("\n");
+                    system.push_str(&format!(
+                        "\n\n--- AUTO MEMORY ---\n\
+                         You have a persistent memory directory at `{}`.\n\
+                         Its contents persist across sessions. Use Write/Edit tools to update MEMORY.md.\n\
+                         \n\
+                         Guidelines:\n\
+                         - Save stable patterns, user preferences, key architecture decisions, project structure\n\
+                         - Do NOT save session-specific context, in-progress work, or unverified conclusions\n\
+                         - Keep MEMORY.md concise (under 200 lines)\n\
+                         - When user says \"remember X\", save it immediately\n\
+                         \n## MEMORY.md\n\n{}\n\
+                         --- END AUTO MEMORY ---",
+                        mem_dir_display, truncated
+                    ));
+                }
+            }
+            // Even if MEMORY.md doesn't exist yet, tell the agent about the memory dir
+            if !system.contains("AUTO MEMORY") {
+                system.push_str(&format!(
+                    "\n\n--- AUTO MEMORY ---\n\
+                     You have a persistent memory directory at `{}`.\n\
+                     Its contents persist across sessions. Create MEMORY.md with Write to start saving memories.\n\
+                     \n\
+                     Guidelines:\n\
+                     - Save stable patterns, user preferences, key architecture decisions, project structure\n\
+                     - Do NOT save session-specific context, in-progress work, or unverified conclusions\n\
+                     - Keep MEMORY.md concise (under 200 lines)\n\
+                     - When user says \"remember X\", save it immediately\n\
+                     --- END AUTO MEMORY ---",
+                    mem_dir_display
+                ));
+            }
+        }
+
+        // Task list guidance (always present, not just in plan mode).
+        if !self.plan_mode {
+            system.push_str(
+                "\n\n## Task List\n\
+                 For complex multi-step tasks, you can create a task list to track progress:\n\
+                 {\"type\":\"update_plan\",\"summary\":\"<brief description>\",\"items\":[{\"title\":\"Step 1\",\"status\":\"pending\"},{\"title\":\"Step 2\",\"status\":\"pending\"}]}\n\
+                 Update items as you complete them:\n\
+                 {\"type\":\"update_plan\",\"items\":[{\"title\":\"Step 1\",\"status\":\"done\"}]}\n\
+                 For large tasks that need upfront research and user approval before execution, use:\n\
+                 {\"type\":\"enter_plan_mode\",\"reason\":\"<why planning is needed>\"}\n\
+                 This enters plan mode where you research with read-only tools, produce a plan, and await user approval.\n\
+                 Skip both for simple single-step tasks."
+            );
+        }
+
+        // Plan mode: restrict to read-only tools and instruct the model to produce a plan.
+        if self.plan_mode {
+            system.push_str(
+                "\n\nYou are in PLAN MODE. Your goal is to research the codebase and produce a detailed structured plan.\n\
+                 Do NOT write, edit, or create any files. Only use Read, Glob, Grep, and Bash (read-only commands like ls, git status).\n\n\
+                 When your plan is ready, emit an update_plan action with:\n\
+                 - summary: A clear title for the plan\n\
+                 - items: Each item MUST include a description with:\n\
+                   - Which file(s) to modify (full relative paths)\n\
+                   - What specific changes to make\n\
+                   - Any relevant code patterns or context discovered during research\n\n\
+                 The plan must be detailed enough that someone with no prior context can execute it.\n\
+                 Then emit a done action."
+            );
+        }
+
+        // If executing an approved plan, inject the plan items into the prompt.
+        if let Some(plan) = &self.plan {
+            if plan.status == PlanStatus::Approved || plan.status == PlanStatus::Executing {
+                let items_text = plan
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, item)| {
+                        let desc = item.description.as_deref().unwrap_or("");
+                        format!("{}. [{}] {} {}", i + 1, serde_json::to_string(&item.status).unwrap_or_default().trim_matches('"'), item.title, desc)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                system.push_str(&format!(
+                    "\n\nExecute the following approved plan. After completing each item, emit an update_plan action to mark it done.\n\nPlan: {}\n{}",
+                    plan.summary, items_text
+                ));
+            }
+        }
+
+        let mut allowed_tools = self.allowed_tool_names();
+
+        // In plan mode, restrict to read-only tools.
+        if self.plan_mode {
+            let read_only: HashSet<String> = [
+                "Read", "Glob", "Grep", "Bash",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            allowed_tools = Some(match allowed_tools {
+                Some(existing) => existing.intersection(&read_only).cloned().collect(),
+                None => read_only,
+            });
+        }
+
+        let mut messages = vec![ChatMessage::new("system", system)];
         self.push_context_record(
             ContextType::System,
             Some("structured_loop_prompt".to_string()),
@@ -807,23 +1022,21 @@ impl AgentEngine {
         messages.extend(self.chat_history.clone());
 
         for obs in &self.observations {
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: Self::observation_for_model(obs),
-            });
+            messages.push(ChatMessage::new("user", Self::observation_for_model(obs)));
         }
 
         // Provide tool schema + workspace info (last user message).
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: format!(
-                "Autonomous agent loop started. Ignore any prior greetings or small talk.\n\nWorkspace root: {}\n\nCurrent Role: {:?}\n\nTask: {}\n\nTool schema (respond with one or more JSON tool call objects per turn):\n{}\n\nWhen the task is fully complete, respond with: {{\"type\":\"done\",\"message\":\"<brief summary>\"}}",
+        messages.push(ChatMessage::new(
+            "user",
+            format!(
+                "Autonomous agent loop started. Ignore any prior greetings or small talk.\n\nWorkspace root: {}\nPlatform: {}\n\nCurrent Role: {:?}\n\nTask: {}\n\nTool schema (respond with one or more JSON tool call objects per turn):\n{}\n\nWhen the task is fully complete, respond with: {{\"type\":\"done\",\"message\":\"<brief summary>\"}}",
                 self.cfg.ws_root.display(),
+                std::env::consts::OS,
                 self.role,
                 task,
                 self.tools.tool_schema_json(allowed_tools.as_ref())
             ),
-        });
+        ));
         self.push_context_record(
             ContextType::UserInput,
             Some("structured_bootstrap".to_string()),
@@ -896,10 +1109,10 @@ impl AgentEngine {
                     "agent": self.agent_id.clone(),
                 }),
             );
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: "Error: This agent is not allowed to output 'patch'. Add `Patch` to the agent frontmatter `policy` to enable it.".to_string(),
-            });
+            messages.push(ChatMessage::new(
+                "user",
+                "Error: This agent is not allowed to output 'patch'. Add `Patch` to the agent frontmatter `policy` to enable it.",
+            ));
             return LoopControl::Continue;
         }
         let errs = validate_unified_diff(&diff);
@@ -913,40 +1126,208 @@ impl AgentEngine {
                 errs.join("\n"),
                 serde_json::json!({ "error_count": errs.len() }),
             );
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: format!(
+            messages.push(ChatMessage::new(
+                "user",
+                format!(
                     "The patch failed validation. Fix and respond with a new patch JSON. Errors:\n{}",
                     errs.join("\n")
                 ),
-            });
+            ));
             return LoopControl::Continue;
         }
 
         info!("Patch validated successfully");
 
-        // Record activity in DB for patched files
-        if let Some(manager) = self.tools.get_manager() {
-            if let Some(agent_id) = &self.agent_id {
-                for line in diff.lines() {
-                    if line.starts_with("--- ") || line.starts_with("+++ ") {
-                        let path = line[4..].split_whitespace().next().unwrap_or("");
-                        if path != "/dev/null" && !path.is_empty() {
-                            let _ = manager.db.record_activity(crate::db::FileActivity {
-                                repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
-                                file_path: path.to_string(),
-                                agent_id: agent_id.clone(),
-                                status: crate::db::FileActivityStatus::Done,
-                                last_modified: crate::util::now_ts_secs(),
-                            });
+        self.active_skill = None;
+        LoopControl::Return(AgentOutcome::Patch(diff))
+    }
+
+    async fn handle_update_plan_action(
+        &mut self,
+        summary: Option<String>,
+        items: Vec<PlanItemUpdate>,
+        session_id: Option<&str>,
+    ) -> LoopControl {
+        info!("Agent emitted update_plan with {} items", items.len());
+
+        let plan = if let Some(existing) = &mut self.plan {
+            // Update existing plan: merge item statuses
+            if let Some(s) = summary {
+                existing.summary = s;
+            }
+
+            // Check if every update item matches an existing title.
+            // If any item is new, the model is sending a revised plan —
+            // replace all items to avoid duplicates from rewording.
+            let all_match = items.iter().all(|u| {
+                existing.items.iter().any(|i| i.title == u.title)
+            });
+
+            if all_match {
+                // Pure status update: merge into existing items.
+                for update in &items {
+                    if let Some(item) = existing
+                        .items
+                        .iter_mut()
+                        .find(|i| i.title == update.title)
+                    {
+                        if let Some(status) = &update.status {
+                            item.status = status.clone();
+                        }
+                        if update.description.is_some() {
+                            item.description = update.description.clone();
                         }
                     }
+                }
+            } else {
+                // Revised plan: replace items entirely, preserving status
+                // of items that still match by title.
+                let new_items: Vec<PlanItem> = items
+                    .iter()
+                    .map(|u| {
+                        let prev_status = existing
+                            .items
+                            .iter()
+                            .find(|i| i.title == u.title)
+                            .map(|i| i.status.clone());
+                        PlanItem {
+                            title: u.title.clone(),
+                            description: u.description.clone(),
+                            status: u.status.clone()
+                                .or(prev_status)
+                                .unwrap_or(PlanItemStatus::Pending),
+                        }
+                    })
+                    .collect();
+                existing.items = new_items;
+            }
+            existing.clone()
+        } else {
+            // Create new plan
+            let plan = Plan {
+                summary: summary.unwrap_or_else(|| "Plan".to_string()),
+                items: items
+                    .iter()
+                    .map(|u| PlanItem {
+                        title: u.title.clone(),
+                        description: u.description.clone(),
+                        status: u.status.clone().unwrap_or(PlanItemStatus::Pending),
+                    })
+                    .collect(),
+                status: if self.plan_mode {
+                    PlanStatus::Planned
+                } else {
+                    PlanStatus::Executing
+                },
+            };
+            self.plan = Some(plan.clone());
+            plan
+        };
+
+        // Persist plan to .linggen-agent/plan.md
+        self.write_plan_file(&plan);
+
+        // Emit PlanUpdate event via manager
+        if let Some(manager) = self.tools.get_manager() {
+            let agent_id = self
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            manager
+                .send_event(crate::agent_manager::AgentEvent::PlanUpdate {
+                    agent_id: agent_id.clone(),
+                    plan: plan.clone(),
+                })
+                .await;
+        }
+
+        // Persist the plan as a structured chat message
+        let msg = serde_json::json!({ "type": "plan", "plan": plan }).to_string();
+        let _ = self
+            .manager_db_add_assistant_message(&msg, session_id)
+            .await;
+
+        self.push_context_record(
+            ContextType::Status,
+            Some("update_plan".to_string()),
+            self.agent_id.clone(),
+            Some("user".to_string()),
+            msg,
+            serde_json::json!({ "kind": "update_plan", "item_count": plan.items.len() }),
+        );
+
+        // In plan mode, the plan is ready for user approval — exit the loop immediately.
+        if self.plan_mode {
+            if let Some(p) = &mut self.plan {
+                p.status = PlanStatus::Planned;
+            }
+            if let Some(p) = self.plan.clone() {
+                return LoopControl::Return(AgentOutcome::Plan(p));
+            }
+        }
+
+        // Check if all items are done — if so, mark plan as completed
+        if plan.status == PlanStatus::Executing
+            && plan.items.iter().all(|i| {
+                i.status == PlanItemStatus::Done || i.status == PlanItemStatus::Skipped
+            })
+        {
+            if let Some(p) = &mut self.plan {
+                p.status = PlanStatus::Completed;
+            }
+            if let Some(completed) = self.plan.clone() {
+                self.write_plan_file(&completed);
+                // Send final PlanUpdate event so the UI shows completed status
+                if let Some(manager) = self.tools.get_manager() {
+                    let agent_id = self
+                        .agent_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    manager
+                        .send_event(crate::agent_manager::AgentEvent::PlanUpdate {
+                            agent_id,
+                            plan: completed,
+                        })
+                        .await;
                 }
             }
         }
 
-        self.active_skill = None;
-        LoopControl::Return(AgentOutcome::Patch(diff))
+        LoopControl::Continue
+    }
+
+    /// Mark all pending/in-progress plan items as done and emit a final
+    /// PlanUpdate event.  Called when the agent signals `done` but hasn't
+    /// explicitly completed every plan item.
+    async fn auto_complete_plan(&mut self) {
+        let completed = {
+            let plan = match &mut self.plan {
+                Some(p) if p.status == PlanStatus::Executing => p,
+                _ => return,
+            };
+            for item in &mut plan.items {
+                if item.status == PlanItemStatus::Pending
+                    || item.status == PlanItemStatus::InProgress
+                {
+                    item.status = PlanItemStatus::Done;
+                }
+            }
+            plan.status = PlanStatus::Completed;
+            plan.clone()
+        };
+        self.write_plan_file(&completed);
+        if let Some(manager) = self.tools.get_manager() {
+            let agent_id = self
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            manager
+                .send_event(crate::agent_manager::AgentEvent::PlanUpdate {
+                    agent_id,
+                    plan: completed,
+                })
+                .await;
+        }
     }
 
     async fn handle_finalize_action(
@@ -961,10 +1342,7 @@ impl AgentEngine {
         let _ = self
             .manager_db_add_assistant_message(&msg, session_id)
             .await;
-        self.chat_history.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: msg.clone(),
-        });
+        self.chat_history.push(ChatMessage::new("assistant", msg.clone()));
         self.push_context_record(
             ContextType::AssistantReply,
             Some("finalize_task".to_string()),
@@ -1050,6 +1428,14 @@ impl AgentEngine {
             });
         }
 
+        // Load plan from file if not already set (session resume).
+        if self.plan.is_none() {
+            if let Some(plan) = self.load_latest_plan() {
+                info!("Loaded plan from file: {} ({} items)", plan.summary, plan.items.len());
+                self.plan = Some(plan);
+            }
+        }
+
         // Sync world state before running the loop if we have a manager
         if let Some(manager) = self.tools.get_manager() {
             let _ = manager.sync_world_state(&self.cfg.ws_root).await;
@@ -1072,24 +1458,26 @@ impl AgentEngine {
             serde_json::json!({ "mode": "structured" }),
         );
 
-        // Record start of loop in DB
+        // Record start of loop in session store
         if let Some(manager) = self.tools.get_manager() {
-            let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
-                repo_path: self.cfg.ws_root.to_string_lossy().to_string(),
-                session_id: session_id.unwrap_or("default").to_string(),
-                agent_id: self
-                    .agent_id
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                from_id: "system".to_string(),
-                to_id: self
-                    .agent_id
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                content: format!("Starting autonomous loop for task: {}", task),
-                timestamp: crate::util::now_ts_secs(),
-                is_observation: true,
-            });
+            let aid = self
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            manager
+                .add_chat_message(
+                    &self.cfg.ws_root,
+                    session_id.unwrap_or("default"),
+                    &crate::state_fs::sessions::ChatMsg {
+                        agent_id: aid.clone(),
+                        from_id: "system".to_string(),
+                        to_id: aid,
+                        content: format!("Starting autonomous loop for task: {}", task),
+                        timestamp: crate::util::now_ts_secs(),
+                        is_observation: true,
+                    },
+                )
+                .await;
         }
 
         let (mut messages, allowed_tools, mut read_paths) =
@@ -1099,7 +1487,7 @@ impl AgentEngine {
 
         // Guardrail: repeated search with no matches means no progress.
         let mut empty_search_streak = 0usize;
-        // Guardrail: repeated get_repo_info or other redundant calls.
+        // Guardrail: repeated redundant tool calls.
         let mut redundant_tool_streak = 0usize;
         let mut last_tool_sig = String::new();
         // Guardrail: malformed action JSON can cause endless retries.
@@ -1181,100 +1569,357 @@ impl AgentEngine {
             let actions = match parse_all_actions(&raw) {
                 Ok(v) => v,
                 Err(e) => {
-                    invalid_json_streak += 1;
-                    if invalid_json_streak >= 4 {
-                        let message = "I couldn't continue automatically because the model kept returning malformed structured output.".to_string();
-                        let _ = self
-                            .manager_db_add_assistant_message(&message, session_id)
-                            .await;
-                        self.active_skill = None;
-                        return Ok(AgentOutcome::None);
+                    // Pure prose (no recognizable JSON action) → treat as Done message.
+                    // This handles thinking models that sometimes return plain text
+                    // without a JSON action wrapper.
+                    if !raw.contains('{') {
+                        vec![ModelAction::Done {
+                            message: Some(raw.clone()),
+                        }]
+                    } else {
+                        invalid_json_streak += 1;
+                        if invalid_json_streak >= 4 {
+                            let message = "I couldn't continue automatically because the model kept returning malformed structured output.".to_string();
+                            let _ = self
+                                .manager_db_add_assistant_message(&message, session_id)
+                                .await;
+                            self.active_skill = None;
+                            return Ok(AgentOutcome::None);
+                        }
+                        messages.push(ChatMessage::new(
+                            "user",
+                            format!(
+                                "Your previous response was not valid JSON ({e}). Respond with one or more JSON objects matching the tool schema. Raw was:\n{raw}"
+                            ),
+                        ));
+                        self.push_context_record(
+                            ContextType::Error,
+                            Some("invalid_json".to_string()),
+                            self.agent_id.clone(),
+                            None,
+                            format!("invalid_json: {}", e),
+                            serde_json::json!({ "raw": raw }),
+                        );
+                        continue;
                     }
-                    messages.push(ChatMessage {
-                        role: "user".to_string(),
-                        content: format!(
-                            "Your previous response was not valid JSON ({e}). Respond with one or more JSON objects matching the tool schema. Raw was:\n{raw}"
-                        ),
-                    });
-                    self.push_context_record(
-                        ContextType::Error,
-                        Some("invalid_json".to_string()),
-                        self.agent_id.clone(),
-                        None,
-                        format!("invalid_json: {}", e),
-                        serde_json::json!({ "raw": raw }),
-                    );
-                    continue;
                 }
             };
             invalid_json_streak = 0;
 
-            // Execute all actions sequentially within this turn.
+            // Execute actions with parallel delegation support.
+            //
+            // Consecutive `delegate_to_agent` tool calls are batched and run
+            // concurrently via `tokio::task::JoinSet`, each on a fresh engine
+            // instance.  All other actions execute sequentially as before.
             let mut early_return: Option<AgentOutcome> = None;
-            for action in actions {
-                match action {
-                    ModelAction::Tool { tool, args } => {
-                        match self
-                            .handle_tool_action(
-                                tool,
-                                args,
-                                &allowed_tools,
-                                &mut messages,
-                                &mut tool_cache,
-                                &mut read_paths,
-                                &mut last_tool_sig,
-                                &mut redundant_tool_streak,
-                                &mut empty_search_streak,
-                                session_id,
-                            )
-                            .await
-                        {
-                            LoopControl::Return(outcome) => {
-                                early_return = Some(outcome);
-                                break;
+            let mut actions = actions; // take ownership for drain/remove
+
+            while !actions.is_empty() && early_return.is_none() {
+                // Check if the front action is a delegate_to_agent tool call.
+                let front_is_delegation = match &actions[0] {
+                    ModelAction::Tool { tool, .. } => {
+                        self.tools
+                            .canonical_tool_name(tool)
+                            .unwrap_or(tool.as_str())
+                            == "delegate_to_agent"
+                    }
+                    _ => false,
+                };
+
+                if front_is_delegation {
+                    // Collect a run of consecutive delegate_to_agent actions.
+                    let batch_size = actions
+                        .iter()
+                        .take_while(|a| match a {
+                            ModelAction::Tool { tool, .. } => {
+                                self.tools
+                                    .canonical_tool_name(tool)
+                                    .unwrap_or(tool.as_str())
+                                    == "delegate_to_agent"
                             }
-                            LoopControl::Continue => {}
+                            _ => false,
+                        })
+                        .count();
+                    let batch: Vec<ModelAction> = actions.drain(..batch_size).collect();
+
+                    // Parse DelegateToAgentArgs from each action.
+                    let mut delegation_args: Vec<tools::DelegateToAgentArgs> = Vec::new();
+                    for action in batch {
+                        if let ModelAction::Tool { tool, args } = action {
+                            let normalized = tools::normalize_tool_args(&tool, &args);
+                            match serde_json::from_value::<tools::DelegateToAgentArgs>(normalized) {
+                                Ok(da) => delegation_args.push(da),
+                                Err(e) => {
+                                    messages.push(ChatMessage::new(
+                                        "user",
+                                        format!("Invalid delegate_to_agent args: {}", e),
+                                    ));
+                                }
+                            }
                         }
                     }
-                    ModelAction::Patch { diff } => {
-                        match self.handle_patch_action(diff, &mut messages).await {
-                            LoopControl::Return(outcome) => {
-                                early_return = Some(outcome);
-                                break;
+
+                    if delegation_args.is_empty() {
+                        continue;
+                    }
+
+                    // Permission check (once for the whole batch).
+                    if let Some(allowed) = &allowed_tools {
+                        if !self.is_tool_allowed(allowed, "delegate_to_agent") {
+                            for da in &delegation_args {
+                                messages.push(ChatMessage::new(
+                                    "user",
+                                    format!(
+                                        "Tool 'delegate_to_agent' is not allowed for this agent. Delegation to '{}' blocked.",
+                                        da.target_agent_id
+                                    ),
+                                ));
                             }
-                            LoopControl::Continue => {}
+                            continue;
                         }
                     }
-                    ModelAction::FinalizeTask { packet } => {
-                        match self
-                            .handle_finalize_action(packet, &mut messages, session_id)
-                            .await
-                        {
-                            LoopControl::Return(outcome) => {
-                                early_return = Some(outcome);
-                                break;
+
+                    // Validate all delegations and collect spawn params.
+                    struct DelegationSpawn {
+                        manager: Arc<AgentManager>,
+                        caller_id: String,
+                        target_agent_id: String,
+                        task: String,
+                        parent_run_id: Option<String>,
+                        depth: usize,
+                        max_depth: usize,
+                    }
+                    let mut spawns: Vec<DelegationSpawn> = Vec::new();
+
+                    for da in delegation_args {
+                        match self.tools.builtins.validate_delegation(&da) {
+                            Ok((manager, caller_id)) => {
+                                spawns.push(DelegationSpawn {
+                                    manager,
+                                    caller_id,
+                                    target_agent_id: da.target_agent_id,
+                                    task: da.task,
+                                    parent_run_id: self.run_id.clone(),
+                                    depth: self.tools.builtins.delegation_depth(),
+                                    max_depth: self.tools.builtins.max_delegation_depth(),
+                                });
                             }
-                            LoopControl::Continue => {}
+                            Err(e) => {
+                                let rendered = format!(
+                                    "tool_error: tool=delegate_to_agent target={} error={}",
+                                    da.target_agent_id, e
+                                );
+                                self.upsert_observation(
+                                    "error",
+                                    "delegate_to_agent",
+                                    rendered.clone(),
+                                );
+                                messages.push(ChatMessage::new(
+                                    "user",
+                                    format!(
+                                        "Delegation to '{}' failed validation: {}",
+                                        da.target_agent_id, e
+                                    ),
+                                ));
+                            }
                         }
                     }
-                    ModelAction::Done { message } => {
-                        let msg = message
-                            .unwrap_or_else(|| "Task completed.".to_string());
-                        info!("Agent signalled done: {}", msg);
-                        self.push_context_record(
-                            ContextType::Status,
-                            Some("done".to_string()),
-                            self.agent_id.clone(),
-                            Some("user".to_string()),
-                            msg.clone(),
-                            serde_json::json!({ "kind": "done" }),
-                        );
-                        let _ = self
-                            .manager_db_add_assistant_message(&msg, session_id)
-                            .await;
-                        self.active_skill = None;
-                        early_return = Some(AgentOutcome::None);
-                        break;
+
+                    if spawns.is_empty() {
+                        continue;
+                    }
+
+                    let ws_root = self.cfg.ws_root.clone();
+
+                    // Spawn each delegation on a blocking thread with its own
+                    // tokio runtime.  This sidesteps the non-Send future issue
+                    // (run_agent_loop's future is !Send due to the model stream)
+                    // while still allowing `block_in_place` inside tool execution.
+                    let mut join_set = tokio::task::JoinSet::new();
+                    for (spawn_idx, spawn) in spawns.into_iter().enumerate() {
+                        let ws = ws_root.clone();
+                        join_set.spawn_blocking(move || {
+                            let rt = tokio::runtime::Builder::new_multi_thread()
+                                .enable_all()
+                                .worker_threads(1)
+                                .build()
+                                .expect("failed to create delegation runtime");
+                            let target = spawn.target_agent_id.clone();
+                            let result = rt.block_on(async move {
+                                tools::run_delegation(
+                                    spawn.manager,
+                                    ws,
+                                    spawn.caller_id,
+                                    spawn.target_agent_id,
+                                    spawn.task,
+                                    spawn.parent_run_id,
+                                    spawn.depth,
+                                    spawn.max_depth,
+                                )
+                                .await
+                            });
+                            (spawn_idx, target, result)
+                        });
+                    }
+
+                    // Await all and collect results.
+                    let mut results: Vec<(usize, String, Result<tools::ToolResult>)> = Vec::new();
+                    while let Some(join_result) = join_set.join_next().await {
+                        match join_result {
+                            Ok((idx, target, result)) => {
+                                results.push((idx, target, result));
+                            }
+                            Err(join_err) => {
+                                warn!("Delegation task panicked: {}", join_err);
+                            }
+                        }
+                    }
+
+                    // Sort by original spawn index for deterministic ordering.
+                    results.sort_by_key(|(idx, _, _)| *idx);
+
+                    // Merge results into messages.
+                    for (_idx, target, result) in results {
+                        match result {
+                            Ok(tool_result) => {
+                                let rendered = render_tool_result(&tool_result);
+                                self.upsert_observation(
+                                    "tool",
+                                    "delegate_to_agent",
+                                    rendered.clone(),
+                                );
+                                let _ = self
+                                    .manager_db_add_observation(
+                                        "delegate_to_agent",
+                                        &rendered,
+                                        session_id,
+                                    )
+                                    .await;
+                                messages.push(ChatMessage::new(
+                                    "user",
+                                    Self::observation_text(
+                                        "tool",
+                                        &format!("delegate_to_agent({})", target),
+                                        &rendered,
+                                    ),
+                                ));
+                            }
+                            Err(e) => {
+                                let rendered = format!(
+                                    "tool_error: tool=delegate_to_agent target={} error={}",
+                                    target, e
+                                );
+                                self.upsert_observation(
+                                    "error",
+                                    "delegate_to_agent",
+                                    rendered.clone(),
+                                );
+                                let _ = self
+                                    .manager_db_add_observation(
+                                        "delegate_to_agent",
+                                        &rendered,
+                                        session_id,
+                                    )
+                                    .await;
+                                messages.push(ChatMessage::new(
+                                    "user",
+                                    format!("Delegation to '{}' failed: {}", target, e),
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    // Non-delegation action — handle sequentially.
+                    let action = actions.remove(0);
+                    match action {
+                        ModelAction::Tool { tool, args } => {
+                            match self
+                                .handle_tool_action(
+                                    tool,
+                                    args,
+                                    &allowed_tools,
+                                    &mut messages,
+                                    &mut tool_cache,
+                                    &mut read_paths,
+                                    &mut last_tool_sig,
+                                    &mut redundant_tool_streak,
+                                    &mut empty_search_streak,
+                                    session_id,
+                                )
+                                .await
+                            {
+                                LoopControl::Return(outcome) => {
+                                    early_return = Some(outcome);
+                                }
+                                LoopControl::Continue => {}
+                            }
+                        }
+                        ModelAction::Patch { diff } => {
+                            match self.handle_patch_action(diff, &mut messages).await {
+                                LoopControl::Return(outcome) => {
+                                    early_return = Some(outcome);
+                                }
+                                LoopControl::Continue => {}
+                            }
+                        }
+                        ModelAction::FinalizeTask { packet } => {
+                            match self
+                                .handle_finalize_action(packet, &mut messages, session_id)
+                                .await
+                            {
+                                LoopControl::Return(outcome) => {
+                                    early_return = Some(outcome);
+                                }
+                                LoopControl::Continue => {}
+                            }
+                        }
+                        ModelAction::UpdatePlan { summary, items } => {
+                            match self
+                                .handle_update_plan_action(summary, items, session_id)
+                                .await
+                            {
+                                LoopControl::Return(outcome) => {
+                                    early_return = Some(outcome);
+                                }
+                                LoopControl::Continue => {}
+                            }
+                        }
+                        ModelAction::Done { message } => {
+                            let msg =
+                                message.unwrap_or_else(|| "Task completed.".to_string());
+                            info!("Agent signalled done: {}", msg);
+
+                            // Auto-complete any remaining plan items when the
+                            // agent finishes — the model often forgets to emit
+                            // a final update_plan marking everything done.
+                            self.auto_complete_plan().await;
+
+                            self.push_context_record(
+                                ContextType::Status,
+                                Some("done".to_string()),
+                                self.agent_id.clone(),
+                                Some("user".to_string()),
+                                msg.clone(),
+                                serde_json::json!({ "kind": "done" }),
+                            );
+                            let _ = self
+                                .manager_db_add_assistant_message(&msg, session_id)
+                                .await;
+                            self.active_skill = None;
+                            // In plan mode, return the plan for user approval.
+                            if self.plan_mode {
+                                if let Some(plan) = &mut self.plan {
+                                    plan.status = PlanStatus::Planned;
+                                    early_return = Some(AgentOutcome::Plan(plan.clone()));
+                                    continue;
+                                }
+                            }
+                            early_return = Some(AgentOutcome::None);
+                        }
+                        ModelAction::EnterPlanMode { reason } => {
+                            info!("Agent requested plan mode: {:?}", reason);
+                            early_return = Some(AgentOutcome::PlanModeRequested { reason });
+                        }
                     }
                 }
             }
@@ -1413,13 +2058,7 @@ impl AgentEngine {
             let summary = Self::summarize_message_window(&window);
 
             messages.drain(start..end);
-            messages.insert(
-                start,
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: summary.clone(),
-                },
-            );
+            messages.insert(start, ChatMessage::new("user", summary.clone()));
 
             summary_count += 1;
             self.push_context_record(
@@ -1667,5 +2306,321 @@ impl AgentEngine {
         }
 
         prompt
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan file persistence (.linggen/plans/<slug>.md)
+    // -----------------------------------------------------------------------
+
+    fn plans_dir(&self) -> PathBuf {
+        self.plans_dir_override
+            .clone()
+            .unwrap_or_else(|| crate::paths::plans_dir())
+    }
+
+    /// Convert a plan summary into a filesystem-safe slug.
+    /// Takes first few meaningful words, lowercased, joined by hyphens.
+    /// e.g. "Refactor logging module" → "refactor-logging-module"
+    fn slugify_summary(summary: &str) -> String {
+        let slug: String = summary
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == ' ' { c.to_ascii_lowercase() } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .take(5) // max 5 words
+            .collect::<Vec<_>>()
+            .join("-");
+        if slug.is_empty() { "plan".to_string() } else { slug }
+    }
+
+    /// Find a unique file path in the plans directory for the given slug.
+    /// Returns `<slug>.md`, or `<slug>-2.md`, `<slug>-3.md`, etc. on collision.
+    fn unique_plan_path(&self, slug: &str) -> PathBuf {
+        let dir = self.plans_dir();
+        let base = dir.join(format!("{}.md", slug));
+        if !base.exists() {
+            return base;
+        }
+        for i in 2.. {
+            let path = dir.join(format!("{}-{}.md", slug, i));
+            if !path.exists() {
+                return path;
+            }
+        }
+        unreachable!()
+    }
+
+    fn write_plan_file(&mut self, plan: &Plan) {
+        let dir = self.plans_dir();
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Determine file path: reuse existing if we already have one, otherwise generate new.
+        let path = if let Some(existing) = &self.plan_file {
+            existing.clone()
+        } else {
+            let slug = Self::slugify_summary(&plan.summary);
+            let p = self.unique_plan_path(&slug);
+            self.plan_file = Some(p.clone());
+            p
+        };
+
+        let status_icon = |s: &PlanItemStatus| match s {
+            PlanItemStatus::Pending => "[ ]",
+            PlanItemStatus::InProgress => "[~]",
+            PlanItemStatus::Done => "[x]",
+            PlanItemStatus::Skipped => "[-]",
+        };
+
+        let mut md = format!("# Plan: {}\n\n", plan.summary);
+        md.push_str(&format!("**Status:** {}\n\n", serde_json::to_string(&plan.status)
+            .unwrap_or_default().trim_matches('"')));
+        for item in &plan.items {
+            md.push_str(&format!("- {} {}\n", status_icon(&item.status), item.title));
+            if let Some(desc) = &item.description {
+                md.push_str(&format!("  {}\n", desc));
+            }
+        }
+
+        if let Err(e) = std::fs::write(&path, &md) {
+            warn!("Failed to write plan file {}: {}", path.display(), e);
+        }
+    }
+
+    /// Parse a single plan markdown file into a Plan + its path.
+    fn parse_plan_file(path: &Path) -> Option<Plan> {
+        let content = std::fs::read_to_string(path).ok()?;
+
+        let mut summary = String::new();
+        let mut status = PlanStatus::Executing;
+        let mut items = Vec::new();
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("# Plan: ") {
+                summary = trimmed.strip_prefix("# Plan: ").unwrap_or("").to_string();
+            } else if trimmed.starts_with("**Status:**") {
+                let s = trimmed
+                    .strip_prefix("**Status:**")
+                    .unwrap_or("")
+                    .trim();
+                status = match s {
+                    "planned" => PlanStatus::Planned,
+                    "approved" => PlanStatus::Approved,
+                    "executing" => PlanStatus::Executing,
+                    "completed" => PlanStatus::Completed,
+                    _ => PlanStatus::Executing,
+                };
+            } else if trimmed.starts_with("- [") {
+                let (item_status, title) = if trimmed.starts_with("- [x] ") {
+                    (PlanItemStatus::Done, trimmed.strip_prefix("- [x] ").unwrap_or(""))
+                } else if trimmed.starts_with("- [~] ") {
+                    (PlanItemStatus::InProgress, trimmed.strip_prefix("- [~] ").unwrap_or(""))
+                } else if trimmed.starts_with("- [-] ") {
+                    (PlanItemStatus::Skipped, trimmed.strip_prefix("- [-] ").unwrap_or(""))
+                } else if trimmed.starts_with("- [ ] ") {
+                    (PlanItemStatus::Pending, trimmed.strip_prefix("- [ ] ").unwrap_or(""))
+                } else {
+                    continue;
+                };
+                items.push(PlanItem {
+                    title: title.to_string(),
+                    description: None,
+                    status: item_status,
+                });
+            } else if line.starts_with("  ") && !items.is_empty() {
+                // Description line for the last item (indented with 2+ spaces).
+                if let Some(last) = items.last_mut() {
+                    last.description = Some(line.trim().to_string());
+                }
+            }
+        }
+
+        if summary.is_empty() && items.is_empty() {
+            return None;
+        }
+
+        Some(Plan { summary, items, status })
+    }
+
+    /// Load the most recent non-completed plan from ~/.linggen/plans/.
+    /// Sets `self.plan_file` so subsequent writes update the same file.
+    fn load_latest_plan(&mut self) -> Option<Plan> {
+        let dir = self.plans_dir();
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+            .collect();
+        // Sort by modified time descending (most recent first).
+        entries.sort_by(|a, b| {
+            let ta = a.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let tb = b.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            tb.cmp(&ta)
+        });
+        // Find the most recent non-completed plan.
+        for entry in entries {
+            let path = entry.path();
+            if let Some(plan) = Self::parse_plan_file(&path) {
+                if plan.status != PlanStatus::Completed {
+                    self.plan_file = Some(path);
+                    return Some(plan);
+                }
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_engine(tmp: &std::path::Path) -> AgentEngine {
+        let model_manager = Arc::new(
+            crate::agent_manager::models::ModelManager::new(vec![]),
+        );
+        let mut engine = AgentEngine::new(
+            EngineConfig {
+                ws_root: tmp.to_path_buf(),
+                max_iters: 1,
+                write_safety_mode: crate::config::WriteSafetyMode::Off,
+                prompt_loop_breaker: None,
+            },
+            model_manager,
+            "test".to_string(),
+            AgentRole::Coder,
+        )
+        .unwrap();
+        engine.plans_dir_override = Some(tmp.join(".linggen").join("plans"));
+        engine
+    }
+
+    #[test]
+    fn plan_file_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_test_engine(tmp.path());
+
+        let plan = Plan {
+            summary: "Refactor logging module".to_string(),
+            items: vec![
+                PlanItem {
+                    title: "Read existing code".to_string(),
+                    description: Some("Understand the current structure".to_string()),
+                    status: PlanItemStatus::Done,
+                },
+                PlanItem {
+                    title: "Extract helper function".to_string(),
+                    description: None,
+                    status: PlanItemStatus::InProgress,
+                },
+                PlanItem {
+                    title: "Update tests".to_string(),
+                    description: None,
+                    status: PlanItemStatus::Pending,
+                },
+                PlanItem {
+                    title: "Old migration step".to_string(),
+                    description: None,
+                    status: PlanItemStatus::Skipped,
+                },
+            ],
+            status: PlanStatus::Executing,
+        };
+
+        engine.write_plan_file(&plan);
+
+        // Verify file was written to plans dir as <slug>.md
+        let plan_path = engine.plan_file.as_ref().expect("plan_file should be set");
+        assert!(plan_path.exists());
+        assert_eq!(plan_path.file_name().unwrap(), "refactor-logging-module.md");
+        assert!(plan_path.parent().unwrap().ends_with(".linggen/plans"));
+
+        // Load it back via load_latest_plan
+        let mut engine2 = make_test_engine(tmp.path());
+        let loaded = engine2.load_latest_plan().expect("should load plan");
+
+        assert_eq!(loaded.summary, plan.summary);
+        assert_eq!(loaded.status, PlanStatus::Executing);
+        assert_eq!(loaded.items.len(), 4);
+        assert_eq!(loaded.items[0].title, "Read existing code");
+        assert_eq!(loaded.items[0].status, PlanItemStatus::Done);
+        assert_eq!(loaded.items[0].description.as_deref(), Some("Understand the current structure"));
+        assert_eq!(loaded.items[1].title, "Extract helper function");
+        assert_eq!(loaded.items[1].status, PlanItemStatus::InProgress);
+        assert_eq!(loaded.items[2].status, PlanItemStatus::Pending);
+        assert_eq!(loaded.items[3].status, PlanItemStatus::Skipped);
+    }
+
+    #[test]
+    fn plan_file_slug_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_test_engine(tmp.path());
+
+        let plan1 = Plan {
+            summary: "Fix auth".to_string(),
+            items: vec![PlanItem {
+                title: "Step 1".to_string(),
+                description: None,
+                status: PlanItemStatus::Done,
+            }],
+            status: PlanStatus::Completed,
+        };
+        engine.write_plan_file(&plan1);
+        let path1 = engine.plan_file.clone().unwrap();
+        assert_eq!(path1.file_name().unwrap(), "fix-auth.md");
+
+        // Reset plan_file to force a new file for the second plan.
+        engine.plan_file = None;
+        let plan2 = Plan {
+            summary: "Fix auth".to_string(),
+            items: vec![PlanItem {
+                title: "Step A".to_string(),
+                description: None,
+                status: PlanItemStatus::Pending,
+            }],
+            status: PlanStatus::Executing,
+        };
+        engine.write_plan_file(&plan2);
+        let path2 = engine.plan_file.clone().unwrap();
+        assert_eq!(path2.file_name().unwrap(), "fix-auth-2.md");
+        assert_ne!(path1, path2);
+    }
+
+    #[test]
+    fn slugify_summary_examples() {
+        assert_eq!(AgentEngine::slugify_summary("Refactor logging module"), "refactor-logging-module");
+        assert_eq!(AgentEngine::slugify_summary("Fix the auth bug!"), "fix-the-auth-bug");
+        assert_eq!(AgentEngine::slugify_summary("Add user authentication & session mgmt for v2"), "add-user-authentication-session-mgmt");
+        assert_eq!(AgentEngine::slugify_summary(""), "plan");
+        assert_eq!(AgentEngine::slugify_summary("   "), "plan");
+    }
+
+    #[test]
+    fn load_latest_plan_returns_none_when_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_test_engine(tmp.path());
+        assert!(engine.load_latest_plan().is_none());
+    }
+
+    #[test]
+    fn load_latest_plan_skips_completed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_test_engine(tmp.path());
+
+        // Write a completed plan.
+        let plan = Plan {
+            summary: "Old task".to_string(),
+            items: vec![PlanItem {
+                title: "Done".to_string(),
+                description: None,
+                status: PlanItemStatus::Done,
+            }],
+            status: PlanStatus::Completed,
+        };
+        engine.write_plan_file(&plan);
+
+        // A fresh engine should NOT load the completed plan.
+        let mut engine2 = make_test_engine(tmp.path());
+        assert!(engine2.load_latest_plan().is_none());
     }
 }

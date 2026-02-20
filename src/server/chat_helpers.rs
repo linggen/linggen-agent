@@ -30,7 +30,7 @@ pub(crate) async fn persist_and_emit_message(
         .await;
 }
 
-/// Persist to state_fs + DB without emitting an SSE event.
+/// Persist to flat-file session store without emitting an SSE event.
 pub(crate) async fn persist_message_only(
     manager: &Arc<AgentManager>,
     root: &Path,
@@ -41,21 +41,20 @@ pub(crate) async fn persist_message_only(
     session_id: Option<&str>,
     is_observation: bool,
 ) {
+    let sid = session_id.unwrap_or("default");
     if let Ok(ctx) = manager.get_or_create_project(root.to_path_buf()).await {
-        let _ = ctx
-            .state_fs
-            .append_message(from, to, content, None, session_id);
+        let msg = crate::state_fs::sessions::ChatMsg {
+            agent_id: agent_id.to_string(),
+            from_id: from.to_string(),
+            to_id: to.to_string(),
+            content: content.to_string(),
+            timestamp: crate::util::now_ts_secs(),
+            is_observation,
+        };
+        if let Err(e) = ctx.sessions.add_chat_message(sid, &msg) {
+            tracing::warn!("Failed to persist chat message: {}", e);
+        }
     }
-    let _ = manager.db.add_chat_message(crate::db::ChatMessageRecord {
-        repo_path: root.to_string_lossy().to_string(),
-        session_id: session_id.unwrap_or("default").to_string(),
-        agent_id: agent_id.to_string(),
-        from_id: from.to_string(),
-        to_id: to.to_string(),
-        content: content.to_string(),
-        timestamp: crate::util::now_ts_secs(),
-        is_observation,
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +483,21 @@ pub(crate) fn emit_outcome_event(
                     "diff": diff
                 })
                 .to_string(),
+            });
+        }
+        AgentOutcome::Plan(plan) => {
+            let _ = events_tx.send(ServerEvent::Message {
+                from: from_id.to_string(),
+                to: "user".to_string(),
+                content: serde_json::json!({
+                    "type": "plan",
+                    "plan": plan
+                })
+                .to_string(),
+            });
+            let _ = events_tx.send(ServerEvent::PlanUpdate {
+                agent_id: from_id.to_string(),
+                plan: plan.clone(),
             });
         }
         _ => {}

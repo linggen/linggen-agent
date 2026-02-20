@@ -11,6 +11,8 @@ export interface ChatMessage {
   activityEntries?: string[];
   contextTokens?: number;
   messageCount?: number;
+  toolCount?: number;
+  durationMs?: number;
 }
 
 export interface UiSseMessage {
@@ -293,4 +295,20 @@ export interface MemoryServerStatus {
   status: string;
   message?: string | null;
   progress?: string | null;
+}
+
+// Plan mode types
+export type PlanItemStatus = 'pending' | 'in_progress' | 'done' | 'skipped';
+export type PlanStatus = 'planned' | 'approved' | 'executing' | 'completed';
+
+export interface PlanItem {
+  title: string;
+  description?: string | null;
+  status: PlanItemStatus;
+}
+
+export interface Plan {
+  summary: string;
+  items: PlanItem[];
+  status: PlanStatus;
 }

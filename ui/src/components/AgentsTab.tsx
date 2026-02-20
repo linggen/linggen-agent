@@ -1,7 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { FilePlus2, FileText, Save, Trash2 } from 'lucide-react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
 import type { AgentFileInfo } from '../types';
 import { CM6Editor } from './CM6Editor';
 
@@ -325,20 +323,13 @@ export const AgentsTab: React.FC<{
           </div>
         )}
 
-        {/* Split editor + preview */}
-        <div className="flex-1 grid grid-cols-2 min-h-0">
-          <div className="min-h-0 border-r border-slate-200 dark:border-white/10">
-            {loadingFile ? (
-              <div className="h-full flex items-center justify-center text-xs text-slate-500">Loading file...</div>
-            ) : (
-              <CM6Editor value={content} onChange={setContent} />
-            )}
-          </div>
-          <div className="min-h-0 overflow-auto p-4 bg-slate-50/60 dark:bg-black/20">
-            <div className="markdown-body text-sm break-words">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{content || '_Empty file_'}</ReactMarkdown>
-            </div>
-          </div>
+        {/* Live preview editor */}
+        <div className="flex-1 min-h-0">
+          {loadingFile ? (
+            <div className="h-full flex items-center justify-center text-xs text-slate-500">Loading file...</div>
+          ) : (
+            <CM6Editor value={content} onChange={setContent} livePreview />
+          )}
         </div>
       </section>
     </div>

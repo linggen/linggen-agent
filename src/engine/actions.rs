@@ -1,8 +1,17 @@
-use crate::engine::TaskPacket;
+use crate::engine::{PlanItemStatus, TaskPacket};
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::de::Deserializer;
 use serde_json::Value;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlanItemUpdate {
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub status: Option<PlanItemStatus>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -16,10 +25,21 @@ pub enum ModelAction {
     Patch { diff: String },
     #[serde(rename = "finalize_task")]
     FinalizeTask { packet: TaskPacket },
+    #[serde(rename = "update_plan")]
+    UpdatePlan {
+        #[serde(default)]
+        summary: Option<String>,
+        items: Vec<PlanItemUpdate>,
+    },
     #[serde(rename = "done")]
     Done {
         #[serde(default)]
         message: Option<String>,
+    },
+    #[serde(rename = "enter_plan_mode")]
+    EnterPlanMode {
+        #[serde(default)]
+        reason: Option<String>,
     },
 }
 
@@ -97,7 +117,13 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
 
-    if let Some(tool) = obj.get("tool").and_then(|v| v.as_str()) {
+    // Check "tool" field first, then "name" — models sometimes emit
+    // {"name":"Read","args":{...}} instead of {"type":"tool","tool":"Read","args":{...}}.
+    if let Some(tool) = obj
+        .get("tool")
+        .or_else(|| obj.get("name"))
+        .and_then(|v| v.as_str())
+    {
         if !is_supported_model_tool(tool) {
             return None;
         }
@@ -109,9 +135,9 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
 
     let tool_name = match action_type {
         "Read" | "Grep" | "Write" | "Edit" | "Glob" | "Bash" | "capture_screenshot"
-        | "lock_paths" | "unlock_paths" | "delegate_to_agent" | "get_repo_info" => action_type,
+        | "lock_paths" | "unlock_paths" | "delegate_to_agent" => action_type,
         // Known non-tool action types that should not be treated as tool shorthands.
-        "" | "patch" | "finalize_task" | "done" => return None,
+        "" | "patch" | "finalize_task" | "update_plan" | "done" | "enter_plan_mode" => return None,
         // Unknown type with args present: treat as a skill tool shorthand
         // (e.g. {"type":"my_skill_tool","args":{...}}).
         other if obj.contains_key("args") || obj.contains_key("tool_args") => other,
@@ -349,5 +375,87 @@ Now let me also search:
             })
             .collect();
         assert_eq!(tools, vec!["Glob", "Read", "Grep"]);
+    }
+
+    #[test]
+    fn parse_all_actions_name_field_as_tool() {
+        // Models sometimes emit {"name":"Read","args":{...}} instead of
+        // {"type":"tool","tool":"Read","args":{...}}.
+        let raw = r#"The user wants me to review logging.rs.{"name":"Read","args":{"path":"src/logging.rs"}}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ModelAction::Tool { tool, args } => {
+                assert_eq!(tool, "Read");
+                assert_eq!(args["path"], "src/logging.rs");
+            }
+            _ => panic!("expected tool action"),
+        }
+    }
+
+    #[test]
+    fn parse_all_actions_name_field_standalone() {
+        let raw = r#"{"name":"Glob","args":{"globs":["**/*.rs"]}}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ModelAction::Tool { tool, .. } => assert_eq!(tool, "Glob"),
+            _ => panic!("expected tool action"),
+        }
+    }
+
+    #[test]
+    fn parse_enter_plan_mode_without_reason() {
+        let raw = r#"{"type":"enter_plan_mode"}"#;
+        let action = parse_first_action(raw).expect("expected enter_plan_mode action");
+        match action {
+            ModelAction::EnterPlanMode { reason } => {
+                assert!(reason.is_none());
+            }
+            _ => panic!("expected EnterPlanMode, got {:?}", action),
+        }
+    }
+
+    #[test]
+    fn parse_enter_plan_mode_with_reason() {
+        let raw = r#"{"type":"enter_plan_mode","reason":"complex refactoring needs research"}"#;
+        let action = parse_first_action(raw).expect("expected enter_plan_mode action");
+        match action {
+            ModelAction::EnterPlanMode { reason } => {
+                assert_eq!(reason.as_deref(), Some("complex refactoring needs research"));
+            }
+            _ => panic!("expected EnterPlanMode, got {:?}", action),
+        }
+    }
+
+    #[test]
+    fn parse_enter_plan_mode_not_treated_as_tool() {
+        // enter_plan_mode should be parsed as EnterPlanMode, not as a Tool action.
+        let raw = r#"{"type":"enter_plan_mode","reason":"planning needed"}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], ModelAction::EnterPlanMode { .. }),
+            "expected EnterPlanMode, got {:?}",
+            actions[0]
+        );
+    }
+
+    #[test]
+    fn parse_all_actions_tool_then_enter_plan_mode() {
+        let raw = r#"{"type":"tool","tool":"Read","args":{"path":"src/main.rs"}}
+{"type":"enter_plan_mode","reason":"need to plan"}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 2);
+        match &actions[0] {
+            ModelAction::Tool { tool, .. } => assert_eq!(tool, "Read"),
+            _ => panic!("expected tool action"),
+        }
+        match &actions[1] {
+            ModelAction::EnterPlanMode { reason } => {
+                assert_eq!(reason.as_deref(), Some("need to plan"));
+            }
+            _ => panic!("expected EnterPlanMode"),
+        }
     }
 }

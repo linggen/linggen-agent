@@ -98,7 +98,7 @@ fn normalize_agent_md_path(path: &str) -> Result<String, String> {
 }
 
 pub(crate) async fn list_projects(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    match state.manager.db.list_projects() {
+    match state.manager.store.list_projects() {
         Ok(projects) => Json(projects).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -279,10 +279,20 @@ struct AgentContextSummary {
 }
 
 #[derive(Serialize)]
+struct AgentContextMessage {
+    agent_id: String,
+    from_id: String,
+    to_id: String,
+    content: String,
+    timestamp: u64,
+    is_observation: bool,
+}
+
+#[derive(Serialize)]
 struct AgentContextResponse {
-    run: crate::db::AgentRunRecord,
+    run: crate::project_store::AgentRunRecord,
     summary: AgentContextSummary,
-    messages: Option<Vec<crate::db::ChatMessageRecord>>,
+    messages: Option<Vec<AgentContextMessage>>,
 }
 
 pub(crate) async fn get_agent_context_api(
@@ -295,19 +305,32 @@ pub(crate) async fn get_agent_context_api(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let all_messages = match state.manager.db.get_chat_history(
-        &run.repo_path,
-        &run.session_id,
-        Some(&run.agent_id),
-    ) {
+    let root = canonical_project_root(&run.repo_path);
+    let ctx = match state.manager.get_or_create_project(root).await {
+        Ok(ctx) => ctx,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let all_messages = match ctx
+        .sessions
+        .get_chat_history(&run.session_id, Some(&run.agent_id))
+    {
         Ok(messages) => messages,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
     let end_ts = run.ended_at.unwrap_or(u64::MAX);
-    let messages: Vec<crate::db::ChatMessageRecord> = all_messages
+    let messages: Vec<AgentContextMessage> = all_messages
         .into_iter()
         .filter(|m| m.timestamp >= run.started_at && m.timestamp <= end_ts)
+        .map(|m| AgentContextMessage {
+            agent_id: m.agent_id,
+            from_id: m.from_id,
+            to_id: m.to_id,
+            content: m.content,
+            timestamp: m.timestamp,
+            is_observation: m.is_observation,
+        })
         .collect();
 
     let user_messages = messages.iter().filter(|m| m.from_id == "user").count();
@@ -331,9 +354,8 @@ pub(crate) async fn get_agent_context_api(
         .map(|v| v.eq_ignore_ascii_case("raw"))
         .unwrap_or(false);
 
-    let ui_messages: Vec<crate::db::ChatMessageRecord> = messages
-        .iter()
-        .cloned()
+    let ui_messages: Vec<AgentContextMessage> = messages
+        .into_iter()
         .filter_map(|mut m| {
             let cleaned = sanitize_message_for_ui(&m.from_id, &m.content)?;
             m.content = cleaned;
@@ -556,8 +578,26 @@ pub(crate) async fn list_sessions(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<ProjectQuery>,
 ) -> impl IntoResponse {
-    match state.manager.db.list_sessions(&query.project_root) {
-        Ok(sessions) => Json(sessions).into_response(),
+    let root = canonical_project_root(&query.project_root);
+    match state.manager.get_or_create_project(root).await {
+        Ok(ctx) => match ctx.sessions.list_sessions() {
+            Ok(sessions) => {
+                // Convert to API-compatible format
+                let api_sessions: Vec<serde_json::Value> = sessions
+                    .into_iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "id": s.id,
+                            "repo_path": query.project_root,
+                            "title": s.title,
+                            "created_at": s.created_at,
+                        })
+                    })
+                    .collect();
+                Json(api_sessions).into_response()
+            }
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -577,15 +617,19 @@ pub(crate) async fn create_session(
         crate::util::now_ts_secs(),
         &uuid::Uuid::new_v4().to_string()[..8]
     );
-    let session = crate::db::SessionInfo {
-        id: id.clone(),
-        repo_path: req.project_root,
-        title: req.title,
-        created_at: crate::util::now_ts_secs(),
-    };
-
-    match state.manager.db.add_session(session) {
-        Ok(_) => Json(serde_json::json!({ "id": id })).into_response(),
+    let root = canonical_project_root(&req.project_root);
+    match state.manager.get_or_create_project(root).await {
+        Ok(ctx) => {
+            let meta = crate::state_fs::sessions::SessionMeta {
+                id: id.clone(),
+                title: req.title,
+                created_at: crate::util::now_ts_secs(),
+            };
+            match ctx.sessions.add_session(&meta) {
+                Ok(_) => Json(serde_json::json!({ "id": id })).into_response(),
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -600,12 +644,12 @@ pub(crate) async fn remove_session_api(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<RemoveSessionRequest>,
 ) -> impl IntoResponse {
-    match state
-        .manager
-        .db
-        .remove_session(&req.project_root, &req.session_id)
-    {
-        Ok(_) => StatusCode::OK,
+    let root = canonical_project_root(&req.project_root);
+    match state.manager.get_or_create_project(root).await {
+        Ok(ctx) => match ctx.sessions.remove_session(&req.session_id) {
+            Ok(_) => StatusCode::OK,
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        },
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -621,12 +665,12 @@ pub(crate) async fn rename_session_api(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<RenameSessionRequest>,
 ) -> impl IntoResponse {
-    match state
-        .manager
-        .db
-        .rename_session(&req.project_root, &req.session_id, &req.title)
-    {
-        Ok(_) => StatusCode::OK,
+    let root = canonical_project_root(&req.project_root);
+    match state.manager.get_or_create_project(root).await {
+        Ok(ctx) => match ctx.sessions.rename_session(&req.session_id, &req.title) {
+            Ok(_) => StatusCode::OK,
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        },
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -651,7 +695,7 @@ pub(crate) async fn remove_project(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<AddProjectRequest>, // Reuse same struct for path
 ) -> impl IntoResponse {
-    match state.manager.db.remove_project(&req.path) {
+    match state.manager.store.remove_project(&req.path) {
         Ok(_) => {
             // Also remove from active projects map
             let mut projects = state.manager.projects.lock().await;

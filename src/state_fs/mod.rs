@@ -1,7 +1,11 @@
+pub mod sessions;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+
+pub use sessions::SessionStore;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -39,7 +43,16 @@ pub struct StateFs {
 
 impl StateFs {
     pub fn new(ws_root: PathBuf) -> Self {
-        let root = ws_root.join(".linggen-agent/workspace");
+        let root = ws_root.join(".linggen/workspace");
+        // Compat: warn if old directory exists but new one doesn't
+        let old_root = ws_root.join(".linggen-agent/workspace");
+        if old_root.exists() && !root.exists() {
+            tracing::warn!(
+                "Legacy state directory exists at {}; new location is {}. Please migrate manually.",
+                old_root.display(),
+                root.display()
+            );
+        }
         Self { root }
     }
 
@@ -86,40 +99,6 @@ impl StateFs {
         let yaml = serde_yml::to_string(state)?;
         let content = format!("---\n{}---\n\n{}", yaml, body);
         fs::write(path, content)?;
-        Ok(())
-    }
-
-    pub fn append_message(
-        &self,
-        from: &str,
-        to: &str,
-        content: &str,
-        task_id: Option<String>,
-        session_id: Option<&str>,
-    ) -> Result<()> {
-        let path = if let Some(sid) = session_id {
-            self.root.join("sessions").join(format!("{}.md", sid))
-        } else {
-            self.root.join("messages.md")
-        };
-        let ts = crate::util::now_ts_secs();
-        let id = format!("msg-{}", ts);
-
-        let msg = StateFile::Message {
-            id,
-            from: from.to_string(),
-            to: to.to_string(),
-            ts,
-            task_id,
-        };
-
-        let yaml = serde_yml::to_string(&msg)?;
-        let entry = format!("\n---\n{}---\n\n{}\n", yaml, content);
-
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        file.write_all(entry.as_bytes())?;
         Ok(())
     }
 

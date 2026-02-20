@@ -27,13 +27,15 @@ impl TuiClient {
             .unwrap_or(false)
     }
 
+    /// Send a chat message. Returns the `session_id` from the server response
+    /// (useful when the server auto-creates a new session).
     pub async fn send_chat(
         &self,
         project_root: &str,
         agent_id: &str,
         message: &str,
         session_id: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let mut body = json!({
             "project_root": project_root,
             "agent_id": agent_id,
@@ -52,6 +54,66 @@ impl TuiClient {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("Chat request failed ({}): {}", status, text);
+        }
+        let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
+        Ok(resp_body
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(String::from))
+    }
+
+    pub async fn approve_plan(
+        &self,
+        project_root: &str,
+        agent_id: &str,
+        session_id: Option<&str>,
+        clear_context: bool,
+    ) -> Result<()> {
+        let mut body = json!({
+            "project_root": project_root,
+            "agent_id": agent_id,
+            "clear_context": clear_context,
+        });
+        if let Some(sid) = session_id {
+            body["session_id"] = json!(sid);
+        }
+        let resp = self
+            .client
+            .post(format!("{}/api/plan/approve", self.base_url))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Plan approve failed ({}): {}", status, text);
+        }
+        Ok(())
+    }
+
+    pub async fn reject_plan(
+        &self,
+        project_root: &str,
+        agent_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        let mut body = json!({
+            "project_root": project_root,
+            "agent_id": agent_id,
+        });
+        if let Some(sid) = session_id {
+            body["session_id"] = json!(sid);
+        }
+        let resp = self
+            .client
+            .post(format!("{}/api/plan/reject", self.base_url))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Plan reject failed ({}): {}", status, text);
         }
         Ok(())
     }

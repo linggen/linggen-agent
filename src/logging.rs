@@ -14,6 +14,8 @@ pub struct LoggingSettings<'a> {
     pub level: Option<&'a str>,
     pub directory: Option<&'a str>,
     pub retention_days: Option<u64>,
+    /// When true, suppress stdout logging (TUI mode owns the terminal).
+    pub suppress_stdout: bool,
 }
 
 pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Result<PathBuf> {
@@ -34,15 +36,22 @@ pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Result<Path
     // Second-level timestamp precision to keep logs readable.
     let time_format = ChronoUtc::new("%Y-%m-%dT%H:%M:%S".to_string());
 
-    let stdout_layer = tracing_subscriber::fmt::layer()
-        .with_target(false)
-        .with_thread_ids(false)
-        .with_thread_names(false)
-        .with_file(true)
-        .with_line_number(true)
-        .with_level(true)
-        .compact()
-        .with_timer(time_format.clone());
+    // Stdout layer is None in TUI mode — ratatui owns the terminal.
+    let stdout_layer = if settings.suppress_stdout {
+        None
+    } else {
+        Some(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_thread_ids(false)
+                .with_thread_names(false)
+                .with_file(true)
+                .with_line_number(true)
+                .with_level(true)
+                .compact()
+                .with_timer(time_format.clone()),
+        )
+    };
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
@@ -58,7 +67,7 @@ pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Result<Path
     let default_filter = || {
         let base = settings.level.unwrap_or("info");
         EnvFilter::new(format!(
-            "linggen_agent={level},linggen-agent={level},linggen={level},\
+            "ling={level},linggen_agent={level},linggen-agent={level},linggen={level},\
              axum=warn,tower_http=warn,hyper=warn,hyper_util=warn,reqwest=warn,\
              mio=warn,reqwest_retry=warn",
             level = base
@@ -68,7 +77,7 @@ pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Result<Path
     // When level is explicitly set, override RUST_LOG; otherwise, use RUST_LOG first, then default
     let filter = if let Some(level) = settings.level {
         EnvFilter::try_new(format!(
-            "linggen_agent={level},linggen-agent={level},linggen={level},\
+            "ling={level},linggen_agent={level},linggen-agent={level},linggen={level},\
              axum=warn,tower_http=warn,hyper=warn,hyper_util=warn,reqwest=warn,\
              mio=warn,reqwest_retry=warn"
         ))

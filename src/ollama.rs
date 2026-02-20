@@ -76,12 +76,10 @@ impl OllamaClient {
     }
 
     /// Plain text chat (no structured output enforcement).
-    #[allow(dead_code)]
     pub async fn chat_text(&self, model: &str, messages: &[ChatMessage]) -> Result<String> {
         self.chat_text_with_keep_alive(model, messages, None).await
     }
 
-    #[allow(dead_code)]
     pub async fn chat_text_with_keep_alive(
         &self,
         model: &str,
@@ -117,7 +115,17 @@ impl OllamaClient {
         }
 
         let payload: ChatResponse = resp.json().await?;
-        Ok(payload.message.content)
+        // Concat thinking + content so the engine's stream_with_thinking
+        // can split them naturally via looks_like_json_action_start.
+        let mut result = String::new();
+        if let Some(thinking) = &payload.message.thinking {
+            if !thinking.is_empty() {
+                result.push_str(thinking);
+                result.push('\n');
+            }
+        }
+        result.push_str(&payload.message.content);
+        Ok(result)
     }
 
     /// Streaming text chat.
@@ -183,7 +191,13 @@ impl OllamaClient {
             // Ollama sends one JSON object per line
             let payload: ChatResponse = serde_json::from_str(&line)
                 .map_err(|e| anyhow::anyhow!("json parse error: {} (line: {})", e, line))?;
-            Ok(payload.message.content)
+            // Emit thinking tokens followed by content tokens
+            let mut result = String::new();
+            if let Some(thinking) = &payload.message.thinking {
+                result.push_str(thinking);
+            }
+            result.push_str(&payload.message.content);
+            Ok(result)
         });
 
         Ok(token_stream)
@@ -420,6 +434,18 @@ pub struct OllamaPsModelDetails {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            thinking: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

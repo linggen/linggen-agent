@@ -28,7 +28,7 @@ pub async fn run_single_task(
     eval_cfg: &EvalConfig,
     task_dir: &PathBuf,
     task_def: &EvalTaskDef,
-    db: Arc<crate::db::Db>,
+    store: Arc<crate::project_store::ProjectStore>,
 ) -> Result<EvalResult> {
     let start = std::time::Instant::now();
     eprint!("  {} ...", task_def.name);
@@ -116,7 +116,7 @@ pub async fn run_single_task(
     let (config, _config_path) =
         Config::load_with_path().unwrap_or_else(|_| (Config::default(), None));
     let skill_manager = Arc::new(SkillManager::new());
-    let (manager, _rx) = AgentManager::new(config.clone(), None, db.clone(), skill_manager.clone());
+    let (manager, _rx) = AgentManager::new(config.clone(), None, store.clone(), skill_manager.clone());
 
     // 6. Get or create agent
     let agent = manager
@@ -149,6 +149,8 @@ pub async fn run_single_task(
         match &outcome {
             Ok(Ok(crate::engine::AgentOutcome::Patch(_))) => ("patch".to_string(), iters),
             Ok(Ok(crate::engine::AgentOutcome::Task(_))) => ("task".to_string(), iters),
+            Ok(Ok(crate::engine::AgentOutcome::Plan(_))) => ("plan".to_string(), iters),
+            Ok(Ok(crate::engine::AgentOutcome::PlanModeRequested { .. })) => ("plan_mode_requested".to_string(), iters),
             Ok(Ok(crate::engine::AgentOutcome::None)) => ("none".to_string(), iters),
             Ok(Err(_)) => ("error".to_string(), iters),
             Err(_) => ("timeout".to_string(), iters),
@@ -193,8 +195,8 @@ pub async fn run_single_task(
     let status_str = if grade_result.passed { "PASS" } else { "FAIL" };
     eprintln!(" {} ({:.1}s)", status_str, duration.as_secs_f64());
 
-    // 11. Cleanup tmpdir and remove ephemeral project from DB
-    let _ = db.remove_project(&tmpdir.to_string_lossy());
+    // 11. Cleanup tmpdir and remove ephemeral project from store
+    let _ = store.remove_project(&tmpdir.to_string_lossy());
     let _ = std::fs::remove_dir_all(&tmpdir);
 
     Ok(EvalResult {

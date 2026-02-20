@@ -124,3 +124,5 @@ Follow `doc/code-style.md`:
 - **Agent policy enforcement**: tools and actions (Patch, Finalize, Delegate) are hard-gated per agent via frontmatter policy, not just prompt guidance.
 - **SSE events**: server publishes real-time events (`Token`, `Message`, `AgentStatus`, `SubagentSpawned`, etc.) consumed by the web UI.
 - **Delegation depth**: configurable via `max_delegation_depth` (default 2). All agents are equal — any agent can delegate to any other agent within the depth limit.
+
+Please read `.claude/skills/linggen/SKILL.md` on load to understand the Linggen project structure and context management system.

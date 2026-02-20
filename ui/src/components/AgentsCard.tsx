@@ -35,13 +35,6 @@ export const AgentsCard: React.FC<{
   agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
 }> = ({ agents, workspaceState, isRunning, selectedAgent, agentStatus, agentStatusText, agentWork, agentRunSummary, agentContext }) => {
   return (
-    <section className="bg-white dark:bg-[#141414] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm flex flex-col overflow-hidden">
-      <div className="px-4 py-2 border-b border-slate-200 dark:border-white/5 bg-slate-50 dark:bg-white/[0.02] flex items-center justify-between">
-        <h3 className="text-[10px] font-bold uppercase tracking-widest text-blue-500 flex items-center gap-2">
-          <Bot size={12} /> Agents Status
-        </h3>
-        <span className="text-[10px] text-slate-400">Swarm</span>
-      </div>
       <div className="flex-1 p-4 overflow-y-auto text-xs space-y-3">
         {agents.map((agent) => {
           const status = agentStatus?.[agent.name] ?? ((isRunning && selectedAgent === agent.name) ? 'thinking' : 'idle');
@@ -161,6 +154,5 @@ export const AgentsCard: React.FC<{
           </div>
         </div>
       </div>
-    </section>
   );
 };

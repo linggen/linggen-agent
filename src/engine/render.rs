@@ -4,7 +4,6 @@ use std::path::Path;
 
 pub fn render_tool_result(r: &ToolResult) -> String {
     match r {
-        ToolResult::RepoInfo(v) => format!("repo_info: {}", v),
         ToolResult::FileList(v) => {
             if v.is_empty() {
                 "files:\n(no files)".to_string()

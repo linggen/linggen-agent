@@ -32,7 +32,7 @@ use tokio_stream::StreamExt;
 use tracing::info;
 
 use agent_api::{cancel_agent_run, run_agent, set_task};
-use chat_api::{chat_handler, clear_chat_history_api};
+use chat_api::{approve_plan_handler, chat_handler, clear_chat_history_api, reject_plan_handler};
 use config_api::{get_config_api, update_config_api};
 use projects_api::{
     add_project, create_session, delete_agent_file_api, delete_skill_file_api,
@@ -169,6 +169,10 @@ pub enum ServerEvent {
         files: Vec<serde_json::Value>,
         truncated_count: usize,
     },
+    PlanUpdate {
+        agent_id: String,
+        plan: crate::engine::Plan,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +212,7 @@ const UI_PHASE_CONTEXT_USAGE: &str = "context_usage";
 const UI_PHASE_SUBAGENT_SPAWNED: &str = "subagent_spawned";
 const UI_PHASE_SUBAGENT_RESULT: &str = "subagent_result";
 const UI_PHASE_CHANGE_REPORT: &str = "change_report";
+const UI_PHASE_PLAN_UPDATE: &str = "plan_update";
 const UI_PHASE_DOING: &str = "doing";
 const UI_PHASE_DONE: &str = "done";
 
@@ -452,6 +457,19 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
                 "truncated_count": truncated_count,
             })),
         }),
+        ServerEvent::PlanUpdate { agent_id, plan } => Some(UiSseMessage {
+            id: format!("run-plan-{agent_id}-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: UI_KIND_RUN.to_string(),
+            phase: Some(UI_PHASE_PLAN_UPDATE.to_string()),
+            text: Some("Plan updated".to_string()),
+            agent_id: Some(agent_id),
+            session_id: None,
+            project_root: None,
+            data: Some(json!({ "plan": plan })),
+        }),
     }
 }
 
@@ -636,6 +654,11 @@ pub async fn prepare_server(
                             summary_count,
                         });
                     }
+                    crate::agent_manager::AgentEvent::PlanUpdate { agent_id, plan } => {
+                        let _ = state_clone
+                            .events_tx
+                            .send(ServerEvent::PlanUpdate { agent_id, plan });
+                    }
                     crate::agent_manager::AgentEvent::TaskUpdate { .. } => {
                         // UI will refresh state from DB
                         let _ = state_clone.events_tx.send(ServerEvent::StateUpdated);
@@ -679,6 +702,8 @@ pub async fn prepare_server(
         .route("/api/agent-cancel", post(cancel_agent_run))
         .route("/api/chat", post(chat_handler))
         .route("/api/chat/clear", post(clear_chat_history_api))
+        .route("/api/plan/approve", post(approve_plan_handler))
+        .route("/api/plan/reject", post(reject_plan_handler))
         .route("/api/workspace/tree", get(get_agent_tree))
         .route("/api/files", get(list_files))
         .route("/api/file", get(read_file_api))

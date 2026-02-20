@@ -1,5 +1,5 @@
 import React from 'react';
-import { Copy, Database, Eraser, Settings } from 'lucide-react';
+import { Copy, Database, Eraser, Maximize2, Minimize2, Settings } from 'lucide-react';
 import { cn } from '../lib/cn';
 import type { AgentInfo } from '../types';
 
@@ -27,6 +27,8 @@ export const HeaderBar: React.FC<{
   clearChat: () => void;
   isRunning: boolean;
   agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
+  verboseMode?: boolean;
+  onToggleVerbose?: () => void;
   onOpenSettings?: () => void;
   onOpenMemory?: () => void;
 }> = ({
@@ -39,6 +41,8 @@ export const HeaderBar: React.FC<{
   clearChat,
   isRunning,
   agentContext,
+  verboseMode,
+  onToggleVerbose,
   onOpenSettings,
   onOpenMemory,
 }) => {
@@ -133,6 +137,20 @@ export const HeaderBar: React.FC<{
         >
           <Eraser size={14} />
         </button>
+        {onToggleVerbose && (
+          <button
+            onClick={onToggleVerbose}
+            className={cn(
+              'p-1.5 rounded-md transition-colors shrink-0',
+              verboseMode
+                ? 'bg-blue-500/10 text-blue-600'
+                : 'hover:bg-slate-100 dark:hover:bg-white/5 text-slate-500'
+            )}
+            title={verboseMode ? 'Compact mode' : 'Verbose mode'}
+          >
+            {verboseMode ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+          </button>
+        )}
       </div>
 
       <div className="flex items-center gap-4 bg-slate-100 dark:bg-white/5 px-3 py-1.5 rounded-full border border-slate-200 dark:border-white/10 shadow-sm justify-self-end">

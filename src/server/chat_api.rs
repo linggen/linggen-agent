@@ -24,6 +24,15 @@ pub(crate) struct ChatRequest {
     agent_id: String,
     message: String,
     session_id: Option<String>,
+    mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PlanActionRequest {
+    project_root: String,
+    agent_id: String,
+    session_id: Option<String>,
+    clear_context: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -104,6 +113,8 @@ fn git_status_for_repo(repo_root: &Path) -> Option<(HashSet<String>, HashMap<Str
     }
     Some((paths, status_by_path))
 }
+
+
 
 fn capture_git_snapshot(project_root: &Path) -> Option<GitChangeSnapshot> {
     let repo_output = Command::new("git")
@@ -304,15 +315,15 @@ async fn run_loop_with_tracking(
         match &result {
             Ok(_) => {
                 let _ = manager
-                    .finish_agent_run(&run_id, crate::db::AgentRunStatus::Completed, None)
+                    .finish_agent_run(&run_id, crate::project_store::AgentRunStatus::Completed, None)
                     .await;
             }
             Err(err) => {
                 let msg = err.to_string();
                 let status = if msg.to_lowercase().contains("cancel") {
-                    crate::db::AgentRunStatus::Cancelled
+                    crate::project_store::AgentRunStatus::Cancelled
                 } else {
-                    crate::db::AgentRunStatus::Failed
+                    crate::project_store::AgentRunStatus::Failed
                 };
                 let _ = manager.finish_agent_run(&run_id, status, Some(msg)).await;
             }
@@ -330,27 +341,27 @@ pub(crate) async fn clear_chat_history_api(
         .session_id
         .clone()
         .unwrap_or_else(|| "default".to_string());
-    match state
-        .manager
-        .db
-        .clear_chat_history(&req.project_root, &session_id)
-    {
-        Ok(removed) => {
-            // Also clear in-memory chat history for all agents in this project/session
-            if let Ok(root) = PathBuf::from(&req.project_root).canonicalize() {
-                if let Ok(ctx) = state.manager.get_or_create_project(root).await {
-                    let agents = ctx.agents.lock().await;
-                    for agent_mutex in agents.values() {
-                        let mut agent = agent_mutex.lock().await;
-                        agent.chat_history.clear();
-                        agent.observations.clear();
-                    }
+    let root = match PathBuf::from(&req.project_root).canonicalize() {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    match state.manager.get_or_create_project(root).await {
+        Ok(ctx) => match ctx.sessions.clear_chat_history(&session_id) {
+            Ok(removed) => {
+                // Also clear in-memory chat history for all agents in this project/session
+                let agents = ctx.agents.lock().await;
+                for agent_mutex in agents.values() {
+                    let mut agent = agent_mutex.lock().await;
+                    agent.chat_history.clear();
+                    agent.observations.clear();
                 }
-            }
+                drop(agents);
 
-            let _ = state.events_tx.send(ServerEvent::StateUpdated);
-            Json(serde_json::json!({ "removed": removed })).into_response()
-        }
+                let _ = state.events_tx.send(ServerEvent::StateUpdated);
+                Json(serde_json::json!({ "removed": removed })).into_response()
+            }
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -541,6 +552,99 @@ async fn run_trigger_dispatch(
     }
 }
 
+/// Dispatch plan mode: agent researches codebase and produces a structured plan (read-only).
+async fn run_plan_dispatch(
+    ctx: &ChatRunCtx,
+    engine: &mut crate::engine::AgentEngine,
+) {
+    ctx.state
+        .send_agent_status(
+            ctx.agent_id.clone(),
+            AgentStatusKind::Thinking,
+            Some("Planning".to_string()),
+        )
+        .await;
+
+    // Extract task from "/plan <task>" prefix or use full message.
+    let task_text = ctx
+        .clean_msg
+        .strip_prefix("/plan ")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ctx.clean_msg.trim());
+
+    engine.plan_mode = true;
+    engine.plan = None;
+    engine.observations.clear();
+    engine.task = Some(task_text.to_string());
+
+    // Wire up the thinking channel.
+    let (thinking_tx, mut thinking_rx) = tokio::sync::mpsc::unbounded_channel();
+    engine.thinking_tx = Some(thinking_tx);
+
+    let events_tx_clone = ctx.events_tx.clone();
+    let agent_id_clone = ctx.agent_id.clone();
+    tokio::spawn(async move {
+        while let Some(event) = thinking_rx.recv().await {
+            match event {
+                crate::engine::ThinkingEvent::Token(token) => {
+                    let _ = events_tx_clone.send(ServerEvent::Token {
+                        agent_id: agent_id_clone.clone(),
+                        token,
+                        done: false,
+                        thinking: true,
+                    });
+                }
+                crate::engine::ThinkingEvent::Done => {
+                    let _ = events_tx_clone.send(ServerEvent::Token {
+                        agent_id: agent_id_clone.clone(),
+                        token: String::new(),
+                        done: true,
+                        thinking: true,
+                    });
+                }
+            }
+        }
+    });
+
+    let outcome = run_loop_with_tracking(
+        &ctx.manager,
+        &ctx.root,
+        engine,
+        &ctx.agent_id,
+        ctx.session_id.as_deref(),
+        "chat:plan",
+    )
+    .await;
+
+    engine.thinking_tx = None;
+    engine.plan_mode = false;
+
+    match outcome {
+        Ok(ref outcome) => {
+            emit_outcome_event(outcome, &ctx.events_tx, &ctx.agent_id);
+            if let crate::engine::AgentOutcome::Plan(ref plan) = outcome {
+                // Always wait for explicit user approval before execution.
+                ctx.manager
+                    .set_pending_plan(
+                        &ctx.root.to_string_lossy(),
+                        &ctx.agent_id,
+                        plan.clone(),
+                    )
+                    .await;
+            }
+        }
+        Err(err) => {
+            let _ = ctx.events_tx.send(ServerEvent::Message {
+                from: ctx.agent_id.clone(),
+                to: "user".to_string(),
+                content: format!("Error: {}", err),
+            });
+        }
+    }
+    let _ = ctx.events_tx.send(ServerEvent::StateUpdated);
+}
+
 /// Dispatch the structured (auto) mode agent loop.
 async fn run_structured_loop(
     ctx: &ChatRunCtx,
@@ -591,6 +695,14 @@ async fn run_structured_loop(
     // Drop the thinking sender so the forwarder task exits.
     engine.thinking_tx = None;
 
+    // Agent requested plan mode — re-dispatch using existing plan machinery.
+    if let Ok(crate::engine::AgentOutcome::PlanModeRequested { ref reason }) = outcome {
+        let plan_task = reason.clone().unwrap_or_else(|| ctx.clean_msg.clone());
+        engine.task = Some(plan_task);
+        run_plan_dispatch(ctx, engine).await;
+        return;
+    }
+
     if let Ok(outcome) = &outcome {
         emit_outcome_event(outcome, &ctx.events_tx, &ctx.agent_id);
         let no_explicit_mutations: HashMap<String, String> = HashMap::new();
@@ -609,13 +721,47 @@ async fn run_structured_loop(
     let _ = ctx.events_tx.send(ServerEvent::StateUpdated);
 }
 
+/// Generate a session title from the first few words of the user's message.
+fn auto_session_title(message: &str) -> String {
+    let words: Vec<&str> = message.split_whitespace().collect();
+    if words.is_empty() {
+        return "New Chat".to_string();
+    }
+    let first: String = words.iter().take(6).copied().collect::<Vec<_>>().join(" ");
+    if first.chars().count() > 50 {
+        let s: String = first.chars().take(47).collect();
+        format!("{}...", s.trim_end())
+    } else if words.len() > 6 {
+        format!("{first}...")
+    } else {
+        first
+    }
+}
+
 pub(crate) async fn chat_handler(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
     let root = PathBuf::from(&req.project_root);
     let project_root_str = root.to_string_lossy().to_string();
-    let session_id = req.session_id.clone();
+
+    // Auto-create a new session when none is provided, instead of falling
+    // back to a hidden "default" session.
+    let session_id: Option<String> = if req.session_id.is_some() {
+        req.session_id.clone()
+    } else {
+        let now = crate::util::now_ts_secs();
+        let new_id = format!("sess-{}-{}", now, &uuid::Uuid::new_v4().to_string()[..8]);
+        if let Ok(ctx) = state.manager.get_or_create_project(root.clone()).await {
+            let meta = crate::state_fs::sessions::SessionMeta {
+                id: new_id.clone(),
+                title: auto_session_title(&req.message),
+                created_at: now,
+            };
+            let _ = ctx.sessions.add_session(&meta);
+        }
+        Some(new_id)
+    };
     let effective_session_id = session_id.clone().unwrap_or_else(|| "default".to_string());
     let events_tx = state.events_tx.clone();
 
@@ -665,6 +811,7 @@ pub(crate) async fn chat_handler(
                     .await;
             }
 
+            let session_id_response = session_id.clone(); // for the HTTP response
             let events_tx_clone = events_tx.clone();
             let target_id_clone = target_id.clone();
             let clean_msg_clone = clean_msg.clone();
@@ -674,6 +821,7 @@ pub(crate) async fn chat_handler(
             let queued_item_id = queued_item.as_ref().map(|q| q.id.clone());
             let session_id_for_queue = effective_session_id.clone();
             let project_root_for_queue = project_root_str.clone();
+            let req_mode = req.mode.clone();
 
             if !was_busy {
                 // Emit and persist user message immediately if the target agent is not busy.
@@ -742,7 +890,13 @@ pub(crate) async fn chat_handler(
                     git_baseline,
                 };
 
-                if clean_msg_clone.trim_start().starts_with('/') {
+                let is_plan_mode = req_mode.as_deref() == Some("plan")
+                    || clean_msg_clone.trim_start().starts_with("/plan ");
+
+                if is_plan_mode {
+                    // 0. Plan mode dispatch
+                    run_plan_dispatch(&ctx, &mut engine).await;
+                } else if clean_msg_clone.trim_start().starts_with('/') {
                     // 1. Slash-command skill dispatch
                     run_skill_dispatch(&ctx, &mut engine).await;
                 } else if let Some((skill_name, remaining)) =
@@ -764,10 +918,208 @@ pub(crate) async fn chat_handler(
             });
 
             let status = if was_busy { "queued" } else { "started" };
-            Json(serde_json::json!({ "status": status })).into_response()
+            Json(serde_json::json!({ "status": status, "session_id": session_id_response })).into_response()
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+pub(crate) async fn approve_plan_handler(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<PlanActionRequest>,
+) -> impl IntoResponse {
+    let root = PathBuf::from(&req.project_root);
+    let root_str = root.to_string_lossy().to_string();
+    let session_id = req.session_id.clone();
+    let clear_context = req.clear_context.unwrap_or(false);
+
+    let plan = state
+        .manager
+        .take_pending_plan(&root_str, &req.agent_id)
+        .await;
+    let Some(mut plan) = plan else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "No pending plan" })),
+        )
+            .into_response();
+    };
+
+    plan.status = crate::engine::PlanStatus::Approved;
+
+    let agent = match state.manager.get_or_create_agent(&root, &req.agent_id).await {
+        Ok(a) => a,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Agent not found" })),
+            )
+                .into_response();
+        }
+    };
+
+    let events_tx = state.events_tx.clone();
+    let manager = state.manager.clone();
+    let agent_id = req.agent_id.clone();
+    let state_clone = state.clone();
+
+    // Emit approval message.
+    persist_and_emit_message(
+        &state.manager,
+        &events_tx,
+        &root,
+        &agent_id,
+        "user",
+        &agent_id,
+        "Plan approved. Starting execution.",
+        session_id.as_deref(),
+        false,
+    )
+    .await;
+
+    let root_clone = root.clone();
+
+    tokio::spawn(async move {
+        let mut engine = agent.lock().await;
+
+        state_clone
+            .send_agent_status(
+                agent_id.clone(),
+                AgentStatusKind::Thinking,
+                Some("Executing plan".to_string()),
+            )
+            .await;
+
+        let git_baseline = capture_git_snapshot(&root_clone);
+
+        // Set the approved plan on the engine.
+        engine.plan = Some(plan);
+        engine.plan_mode = false;
+        if clear_context {
+            // Full context clear — plan file is the sole source of truth
+            engine.observations.clear();
+            engine.context_records.clear();
+            engine.next_context_id = 1;
+            engine.chat_history.clear();
+            engine.task = Some(format!(
+                "Execute the approved plan: {}",
+                engine.plan.as_ref().map(|p| p.summary.as_str()).unwrap_or("Plan")
+            ));
+        } else {
+            // Keep context, just clear observations
+            engine.observations.clear();
+            if engine.task.is_none() {
+                if let Some(ref p) = engine.plan {
+                    engine.task = Some(format!("Execute the approved plan: {}", p.summary));
+                }
+            }
+        }
+
+        // Wire up thinking channel.
+        let (thinking_tx, mut thinking_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.thinking_tx = Some(thinking_tx);
+
+        let events_tx_inner = events_tx.clone();
+        let agent_id_inner = agent_id.clone();
+        tokio::spawn(async move {
+            while let Some(event) = thinking_rx.recv().await {
+                match event {
+                    crate::engine::ThinkingEvent::Token(token) => {
+                        let _ = events_tx_inner.send(ServerEvent::Token {
+                            agent_id: agent_id_inner.clone(),
+                            token,
+                            done: false,
+                            thinking: true,
+                        });
+                    }
+                    crate::engine::ThinkingEvent::Done => {
+                        let _ = events_tx_inner.send(ServerEvent::Token {
+                            agent_id: agent_id_inner.clone(),
+                            token: String::new(),
+                            done: true,
+                            thinking: true,
+                        });
+                    }
+                }
+            }
+        });
+
+        let outcome = run_loop_with_tracking(
+            &manager,
+            &root_clone,
+            &mut engine,
+            &agent_id,
+            session_id.as_deref(),
+            "chat:plan-execution",
+        )
+        .await;
+
+        engine.thinking_tx = None;
+
+        if let Ok(ref outcome) = outcome {
+            emit_outcome_event(outcome, &events_tx, &agent_id);
+            let no_explicit_mutations: HashMap<String, String> = HashMap::new();
+            emit_change_report_if_any(
+                &manager,
+                &events_tx,
+                &root_clone,
+                &agent_id,
+                session_id.as_deref(),
+                git_baseline.as_ref(),
+                &no_explicit_mutations,
+            )
+            .await;
+        } else if let Err(err) = outcome {
+            let _ = events_tx.send(ServerEvent::Message {
+                from: agent_id.clone(),
+                to: "user".to_string(),
+                content: format!("Error: {}", err),
+            });
+        }
+        let _ = events_tx.send(ServerEvent::StateUpdated);
+
+        state_clone
+            .send_agent_status(agent_id.clone(), AgentStatusKind::Idle, Some("Idle".to_string()))
+            .await;
+    });
+
+    Json(serde_json::json!({ "status": "approved" })).into_response()
+}
+
+pub(crate) async fn reject_plan_handler(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<PlanActionRequest>,
+) -> impl IntoResponse {
+    let root = PathBuf::from(&req.project_root);
+    let root_str = root.to_string_lossy().to_string();
+
+    let removed = state
+        .manager
+        .take_pending_plan(&root_str, &req.agent_id)
+        .await;
+
+    if removed.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "No pending plan" })),
+        )
+            .into_response();
+    }
+
+    persist_and_emit_message(
+        &state.manager,
+        &state.events_tx,
+        &root,
+        &req.agent_id,
+        &req.agent_id,
+        "user",
+        "Plan rejected.",
+        req.session_id.as_deref(),
+        false,
+    )
+    .await;
+
+    Json(serde_json::json!({ "status": "rejected" })).into_response()
 }
 
 #[cfg(test)]

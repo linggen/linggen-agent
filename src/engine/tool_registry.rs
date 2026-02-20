@@ -4,7 +4,7 @@ use crate::agent_manager::AgentManager;
 use crate::config::AgentPolicy;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 
@@ -88,7 +88,6 @@ impl ToolRegistry {
     /// All known tool names (builtins + skill tools).
     pub fn all_tool_names(&self) -> Vec<String> {
         let mut names: Vec<String> = vec![
-            "get_repo_info",
             "Glob",
             "Read",
             "Grep",
@@ -135,5 +134,13 @@ impl ToolRegistry {
 
     pub fn workspace_root(&self) -> &Path {
         self.builtins.workspace_root()
+    }
+
+    pub fn set_memory_dir(&mut self, dir: PathBuf) {
+        self.builtins.set_memory_dir(dir);
+    }
+
+    pub fn memory_dir(&self) -> Option<&PathBuf> {
+        self.builtins.memory_dir()
     }
 }

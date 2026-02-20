@@ -3,6 +3,7 @@ import { Send, X, Sparkles } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { cn } from '../lib/cn';
+import DiffView, { diffStats } from './DiffView';
 import type {
   AgentInfo,
   AgentRunInfo,
@@ -503,6 +504,51 @@ const summarizeCollapsedActivity = (entries: string[], inProgress = false) => {
   return `${first} -> ${last}`;
 };
 
+const formatCompactTokens = (n: number): string => {
+  if (!Number.isFinite(n) || n <= 0) return '';
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}m`;
+  if (n >= 10_000) return `${Math.round(n / 1000)}k`;
+  if (n >= 1_000) return `${(n / 1000).toFixed(1)}k`;
+  return `${n}`;
+};
+
+const formatDurationSec = (ms: number): string => {
+  if (!ms || ms <= 0) return '';
+  const secs = Math.round(ms / 1000);
+  if (secs < 60) return `${secs}s`;
+  const mins = Math.floor(secs / 60);
+  const remainSecs = secs % 60;
+  return remainSecs > 0 ? `${mins}m${remainSecs}s` : `${mins}m`;
+};
+
+const buildCompactSummary = (msg: ChatMessage, toolCount: number): string => {
+  const parts: string[] = [`${toolCount} tool use${toolCount === 1 ? '' : 's'}`];
+  if (msg.contextTokens && msg.contextTokens > 0) {
+    parts.push(`${formatCompactTokens(msg.contextTokens)} tokens`);
+  }
+  if (msg.durationMs && msg.durationMs > 0) {
+    parts.push(formatDurationSec(msg.durationMs));
+  }
+  return `Done (${parts.join(' \u00b7 ')})`;
+};
+
+/** Strip "Step N: " prefix from plan item title for dedup. */
+const stripStepPrefix = (s: string): string => {
+  const m = s.match(/^Step \d+: (.+)$/);
+  return m ? m[1] : s;
+};
+
+/** Deduplicate plan items: normalize by stripping "Step N: " prefixes, keep first. */
+const dedupPlanItems = (items: any[]): any[] => {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const normalized = stripStepPrefix(item.title || '');
+    if (seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  });
+};
+
 const activityHeadline = (msg: ChatMessage, entries: string[]) => {
   const computed = summarizeCollapsedActivity(entries, msg.isGenerating);
   const summary = msg.isGenerating ? (computed || msg.activitySummary || '') : (msg.activitySummary || computed || '');
@@ -834,6 +880,10 @@ export const ChatPanel: React.FC<{
   cancellingRunIds?: Record<string, boolean>;
   onCancelRun?: (runId: string) => void | Promise<void>;
   onSendMessage: (message: string, targetAgent?: string) => void;
+  pendingPlan?: import('../types').Plan | null;
+  onApprovePlan?: () => void;
+  onRejectPlan?: () => void;
+  verboseMode?: boolean;
 }> = ({
   chatMessages,
   queuedMessages,
@@ -853,6 +903,10 @@ export const ChatPanel: React.FC<{
   cancellingRunIds,
   onCancelRun,
   onSendMessage,
+  pendingPlan,
+  onApprovePlan,
+  onRejectPlan,
+  verboseMode,
 }) => {
   const [chatInput, setChatInput] = useState('');
   const [showSkillDropdown, setShowSkillDropdown] = useState(false);
@@ -873,6 +927,7 @@ export const ChatPanel: React.FC<{
   const [childrenByRunId, setChildrenByRunId] = useState<Record<string, AgentRunInfo[]>>({});
   const [loadingChildrenByRunId, setLoadingChildrenByRunId] = useState<Record<string, boolean>>({});
   const [childrenErrorByRunId, setChildrenErrorByRunId] = useState<Record<string, string>>({});
+  const [expandedMessages, setExpandedMessages] = useState<Set<string>>(new Set());
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   const mainAgentIds = useMemo(
@@ -1442,6 +1497,16 @@ export const ChatPanel: React.FC<{
               : isStatusLine && !hasActivity
                 ? 'text-amber-600/70 dark:text-amber-400/70 italic text-[12px]'
                 : 'text-slate-800 dark:text-slate-200';
+          const toolCount = msg.toolCount || activityEntries.length;
+          const isExpanded = verboseMode || expandedMessages.has(key);
+          const toggleExpand = () => {
+            setExpandedMessages((prev) => {
+              const next = new Set(prev);
+              if (next.has(key)) next.delete(key);
+              else next.add(key);
+              return next;
+            });
+          };
           return (
           <div
             key={key}
@@ -1454,20 +1519,35 @@ export const ChatPanel: React.FC<{
               )}
             >
               {hasActivitySummary && (
-                hasActivityDetails ? (
-                  <details className="group mb-1 text-[11px] text-slate-500 dark:text-slate-400" open={msg.isGenerating || undefined}>
-                    <summary className="cursor-pointer select-none list-none flex items-center gap-1.5 [&::-webkit-details-marker]:hidden">
-                      {msg.isGenerating ? (
-                        <span className="flex gap-0.5">
-                          <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce [animation-delay:-0.3s]" />
-                          <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce [animation-delay:-0.15s]" />
-                          <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce" />
-                        </span>
-                      ) : (
-                        <span className="text-[9px] text-slate-400 dark:text-slate-500 transition-transform group-open:rotate-90">&#9654;</span>
-                      )}
-                      <span>{activityHeadline(msg, activityEntries)}</span>
-                    </summary>
+                msg.isGenerating ? (
+                  /* Active (in-progress): show last tool call + "+N more" */
+                  <div className="mb-1 text-[11px] text-slate-500 dark:text-slate-400">
+                    <div className="flex items-center gap-1.5">
+                      <span className="flex gap-0.5">
+                        <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce [animation-delay:-0.3s]" />
+                        <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce [animation-delay:-0.15s]" />
+                        <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce" />
+                      </span>
+                      <span>{activityEntries[activityEntries.length - 1] || activityHeadline(msg, activityEntries)}</span>
+                    </div>
+                    {activityEntries.length > 1 && (
+                      <div className="pl-4 text-slate-400 dark:text-slate-500 italic">
+                        +{activityEntries.length - 1} more tool use{activityEntries.length - 1 === 1 ? '' : 's'}
+                      </div>
+                    )}
+                  </div>
+                ) : isExpanded && hasActivityDetails ? (
+                  /* Verbose (expanded): show all entries */
+                  <div className="mb-1 text-[11px] text-slate-500 dark:text-slate-400">
+                    <div
+                      className="cursor-pointer select-none flex items-center gap-1.5"
+                      onClick={toggleExpand}
+                    >
+                      <span className="text-[9px] text-slate-400 dark:text-slate-500">&#9660;</span>
+                      <span className="text-green-600 dark:text-green-400 font-medium">
+                        {buildCompactSummary(msg, toolCount)}
+                      </span>
+                    </div>
                     <div className="mt-1 space-y-0.5 pl-4 border-l-2 border-slate-200/80 dark:border-white/10">
                       {detailActivityEntries.map((entry, idx) => (
                         <div key={`${idx}-${entry}`} className="truncate text-slate-400 dark:text-slate-500">
@@ -1475,7 +1555,18 @@ export const ChatPanel: React.FC<{
                         </div>
                       ))}
                     </div>
-                  </details>
+                  </div>
+                ) : hasActivityDetails ? (
+                  /* Compact (collapsed): show "Done (N tool uses · Xk tokens · Ys)" */
+                  <div
+                    className="mb-1 text-[11px] cursor-pointer select-none flex items-center gap-1.5"
+                    onClick={toggleExpand}
+                  >
+                    <span className="text-[9px] text-slate-400 dark:text-slate-500">&#9654;</span>
+                    <span className="text-green-600 dark:text-green-400 font-medium">
+                      {buildCompactSummary(msg, toolCount)}
+                    </span>
+                  </div>
                 ) : (
                   <div className="mb-1 text-[11px] text-slate-500 dark:text-slate-400">
                     {activityHeadline(msg, activityEntries)}
@@ -1487,6 +1578,66 @@ export const ChatPanel: React.FC<{
                 if (hideStatusBodyText) return null;
                 try {
                   const parsed = JSON.parse(displayText);
+                  if (parsed.type === 'plan' && parsed.plan) {
+                    const plan = parsed.plan;
+                    const statusColor: Record<string, string> = {
+                      planned: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
+                      approved: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
+                      executing: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
+                      completed: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
+                    };
+                    const itemIcon: Record<string, string> = {
+                      pending: '○',
+                      in_progress: '◑',
+                      done: '●',
+                      skipped: '⊘',
+                    };
+                    const itemColor: Record<string, string> = {
+                      pending: 'text-slate-400',
+                      in_progress: 'text-blue-500',
+                      done: 'text-emerald-500',
+                      skipped: 'text-slate-300 dark:text-slate-600',
+                    };
+                    return (
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-blue-500">Plan</span>
+                          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${statusColor[plan.status] || statusColor.planned}`}>
+                            {plan.status}
+                          </span>
+                        </div>
+                        <div className="text-[12px] opacity-90">{plan.summary}</div>
+                        <div className="space-y-1">
+                          {dedupPlanItems(plan.items || []).map((item: any, idx: number) => (
+                            <div key={idx} className="flex items-start gap-1.5 text-[11px]">
+                              <span className={`${itemColor[item.status] || 'text-slate-400'} font-mono`}>
+                                {itemIcon[item.status] || '○'}
+                              </span>
+                              <span className={item.status === 'skipped' ? 'line-through opacity-50' : ''}>
+                                {item.title}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                        {plan.status === 'planned' && onApprovePlan && onRejectPlan && (
+                          <div className="flex gap-2 pt-1">
+                            <button
+                              onClick={onApprovePlan}
+                              className="px-3 py-1 text-[11px] font-semibold rounded-md bg-emerald-600 text-white hover:bg-emerald-700"
+                            >
+                              Approve &amp; Execute
+                            </button>
+                            <button
+                              onClick={onRejectPlan}
+                              className="px-3 py-1 text-[11px] font-semibold rounded-md border border-slate-300 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/5"
+                            >
+                              Reject
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  }
                   if (parsed.type === 'finalize_task' && parsed.packet) {
                     const packet = parsed.packet;
                     const userStories: string[] = Array.isArray(packet.user_stories) ? packet.user_stories : [];
@@ -1524,28 +1675,58 @@ export const ChatPanel: React.FC<{
                       .map((item: any) => ({
                         path: typeof item?.path === 'string' ? item.path : '',
                         summary: typeof item?.summary === 'string' ? item.summary : '',
+                        diff: typeof item?.diff === 'string' ? item.diff : '',
                       }))
                       .filter((item: any) => item.path);
                     const truncatedCount = Number(parsed.truncated_count || 0);
                     const reviewHint =
                       typeof parsed.review_hint === 'string' ? parsed.review_hint : '';
                     return (
-                      <div className="space-y-2">
+                      <div className="space-y-1">
                         <div className="font-bold text-blue-500">
                           Changed files ({files.length}
                           {truncatedCount > 0 ? ` +${truncatedCount} more` : ''})
                         </div>
-                        {files.map((file: any, idx: number) => (
-                          <div
-                            key={`${file.path}-${idx}`}
-                            className="flex flex-wrap items-center gap-2 rounded-md border border-slate-200 dark:border-white/10 bg-slate-50/80 dark:bg-white/[0.03] px-2 py-1.5 text-[11px]"
-                          >
-                            <span className="text-slate-500 dark:text-slate-300">
-                              {file.summary || 'Updated'}
-                            </span>
-                            <span className="font-mono text-[11px]">{file.path}</span>
-                          </div>
-                        ))}
+                        {files.map((file: any, idx: number) => {
+                          const hasDiff = !!file.diff && !file.diff.startsWith('(diff');
+                          const stats = hasDiff ? diffStats(file.diff) : null;
+                          if (!hasDiff) {
+                            return (
+                              <div
+                                key={`${file.path}-${idx}`}
+                                className="flex flex-wrap items-center gap-2 rounded-md border border-slate-200 dark:border-white/10 bg-slate-50/80 dark:bg-white/[0.03] px-2 py-1.5 text-[11px]"
+                              >
+                                <span className="text-slate-500 dark:text-slate-300">
+                                  {file.summary || 'Updated'}
+                                </span>
+                                <span className="font-mono text-[11px]">{file.path}</span>
+                              </div>
+                            );
+                          }
+                          return (
+                            <details
+                              key={`${file.path}-${idx}`}
+                              className="rounded-md border border-slate-200 dark:border-white/10 bg-slate-50/80 dark:bg-white/[0.03] text-[11px]"
+                            >
+                              <summary className="cursor-pointer px-2 py-1.5 select-none flex flex-wrap items-center gap-2">
+                                <span className="text-slate-500 dark:text-slate-300">
+                                  {file.summary || 'Updated'}
+                                </span>
+                                <span className="font-mono text-[11px]">{file.path}</span>
+                                {stats && (
+                                  <span className="ml-auto font-mono text-[10px]">
+                                    {stats.added > 0 && <span className="text-green-600 dark:text-green-400">+{stats.added}</span>}
+                                    {stats.added > 0 && stats.deleted > 0 && ' '}
+                                    {stats.deleted > 0 && <span className="text-red-600 dark:text-red-400">-{stats.deleted}</span>}
+                                  </span>
+                                )}
+                              </summary>
+                              <div className="px-1 pb-1">
+                                <DiffView diff={file.diff} />
+                              </div>
+                            </details>
+                          );
+                        })}
                         {reviewHint && (
                           <div className="text-[11px] text-slate-500 dark:text-slate-400">
                             {reviewHint}

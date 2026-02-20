@@ -1,8 +1,11 @@
 import React, { useCallback, useMemo, useState, useEffect, useRef } from 'react';
-import { FilePenLine } from 'lucide-react';
+import { Bot, FilePenLine, Sparkles, Zap } from 'lucide-react';
 import { SessionNav } from './components/SessionNav';
 import { AgentsCard } from './components/AgentsCard';
+import { TaskListCard } from './components/TaskListCard';
 import { ModelsCard } from './components/ModelsCard';
+import { CollapsibleCard } from './components/CollapsibleCard';
+import { SkillsCard } from './components/SkillsCard';
 import { FilePreview } from './components/FilePreview';
 import { ChatPanel } from './components/ChatPanel';
 import { HeaderBar } from './components/HeaderBar';
@@ -28,6 +31,7 @@ import type {
 } from './types';
 
 const SELECTED_AGENT_STORAGE_KEY = 'linggen-agent:selected-agent';
+const VERBOSE_MODE_STORAGE_KEY = 'linggen-agent:verbose-mode';
 const LIVE_MESSAGE_GRACE_MS = 10_000;
 const TOKEN_RATE_WINDOW_MS = 8_000;
 const TOKEN_RATE_IDLE_RESET_MS = 10_000;
@@ -292,6 +296,7 @@ const addActivityEntry = (msg: ChatMessage, entry: string): ChatMessage => {
     ...msg,
     activityEntries: filtered,
     activitySummary: summarizeActivityEntries(filtered, Boolean(msg.isGenerating)),
+    toolCount: filtered.length,
   };
 };
 
@@ -495,6 +500,7 @@ type Page = 'main' | 'settings' | 'memory';
 
 const App: React.FC = () => {
   const [currentPage, setCurrentPage] = useState<Page>('main');
+  const [initialSettingsTab, setInitialSettingsTab] = useState<import('./types').ManagementTab | undefined>(undefined);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [selectedProjectRoot, setSelectedProjectRoot] = useState<string>('');
   const [agentTree, setAgentTree] = useState<Record<string, AgentTreeItem>>({});
@@ -533,6 +539,15 @@ const App: React.FC = () => {
   const [showAgentSpecEditor, setShowAgentSpecEditor] = useState(false);
   
   const [workspaceState, setWorkspaceState] = useState<WorkspaceState | null>(null);
+  const [pendingPlan, setPendingPlan] = useState<import('./types').Plan | null>(null);
+  const [pendingPlanAgentId, setPendingPlanAgentId] = useState<string | null>(null);
+  const [activePlan, setActivePlan] = useState<import('./types').Plan | null>(null);
+  const [verboseMode, setVerboseMode] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return window.localStorage.getItem(VERBOSE_MODE_STORAGE_KEY) === 'true';
+  });
+  const runStartTsRef = useRef<Record<string, number>>({});
+  const latestContextTokensRef = useRef<Record<string, number>>({});
   
   const chatEndRef = useRef<HTMLDivElement>(null);
   const lastChatCountRef = useRef(0);
@@ -710,14 +725,27 @@ const App: React.FC = () => {
     }
   }, []);
 
+  const isPlanMessage = useCallback((msg: ChatMessage): boolean => {
+    try {
+      const parsed = JSON.parse(msg.text);
+      return parsed?.type === 'plan' && !!parsed?.plan;
+    } catch {
+      return false;
+    }
+  }, []);
+
   const likelySameMessage = useCallback((a: ChatMessage, b: ChatMessage) => {
+    // Plan messages from the same agent are always the same (content changes on updates).
+    if (isPlanMessage(a) && isPlanMessage(b)) {
+      return (a.from || a.role) === (b.from || b.role);
+    }
     if (!sameMessageContent(a, b)) return false;
     if (isStructuredAgentMessage(a) || isStructuredAgentMessage(b)) return true;
     const ta = a.timestampMs ?? 0;
     const tb = b.timestampMs ?? 0;
     if (ta === 0 || tb === 0) return true;
     return Math.abs(ta - tb) <= 120_000;
-  }, [sameMessageContent, isStructuredAgentMessage]);
+  }, [sameMessageContent, isStructuredAgentMessage, isPlanMessage]);
 
   const mergeChatMessages = useCallback((persisted: ChatMessage[], live: ChatMessage[]) => {
     if (persisted.length === 0) return live;
@@ -751,14 +779,28 @@ const App: React.FC = () => {
       }
     );
     const merged = [...persistedWithActivity, ...uniqueExtras];
+
+    // Deduplicate plan messages: keep only the last plan per agent.
+    const lastPlanIdx = new Map<string, number>();
+    merged.forEach((m, idx) => {
+      if (isPlanMessage(m)) {
+        lastPlanIdx.set(m.from || m.role || '', idx);
+      }
+    });
+
     const seen = new Set<string>();
-    return merged.filter((m) => {
+    return merged.filter((m, idx) => {
+      // For plan messages, only keep the last one per agent.
+      if (isPlanMessage(m)) {
+        const agent = m.from || m.role || '';
+        return lastPlanIdx.get(agent) === idx;
+      }
       const key = chatMessageKey(m);
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
-  }, [chatMessageKey, likelySameMessage]);
+  }, [chatMessageKey, likelySameMessage, isPlanMessage]);
 
   useEffect(() => {
     if (chatMessages.length > lastChatCountRef.current) {
@@ -981,8 +1023,14 @@ const App: React.FC = () => {
     if (!selectedProjectRoot) return;
     try {
       const resp = await fetch(`/api/sessions?project_root=${encodeURIComponent(selectedProjectRoot)}`);
-      const data = await resp.json();
+      const data: SessionInfo[] = await resp.json();
       setSessions(data);
+      // Auto-select the most recent session when none is active
+      setActiveSessionId((prev) => {
+        if (prev && data.some((s: SessionInfo) => s.id === prev)) return prev;
+        if (data.length > 0) return data[0].id;
+        return null;
+      });
     } catch (e) {
       console.error('Failed to fetch sessions:', e);
     }
@@ -1160,6 +1208,7 @@ const App: React.FC = () => {
       setAgentStatus({});
       setAgentStatusText({});
       setQueuedMessages([]);
+      setActivePlan(null);
     }
   }, [selectedProjectRoot, fetchFiles, fetchWorkspaceState, fetchAgentTree, fetchAgentRuns, fetchSessions, fetchAgents]);
 
@@ -1191,6 +1240,10 @@ const App: React.FC = () => {
   }, [selectedAgent]);
 
   useEffect(() => {
+    window.localStorage.setItem(VERBOSE_MODE_STORAGE_KEY, String(verboseMode));
+  }, [verboseMode]);
+
+  useEffect(() => {
     if (mainAgentIds.length === 0) return;
     if (!mainAgentIds.includes(selectedAgent.toLowerCase())) {
       // Default to 'ling' if available, otherwise first agent
@@ -1220,10 +1273,12 @@ const App: React.FC = () => {
                 ? item.data.agent_id.toLowerCase()
                 : (item.agent_id || '').toLowerCase();
             if (agentIdKey) {
+              const estTokens = Number(item.data.estimated_tokens || 0);
+              latestContextTokensRef.current[agentIdKey] = estTokens;
               setAgentContext((prev) => ({
                 ...prev,
                 [agentIdKey]: {
-                  tokens: Number(item.data.estimated_tokens || 0),
+                  tokens: estTokens,
                   messages: Number(item.data.message_count || 0),
                   tokenLimit:
                     typeof item.data.token_limit === 'number'
@@ -1232,6 +1287,44 @@ const App: React.FC = () => {
                 },
               }));
             }
+          } else if (item.phase === 'plan_update' && item.data?.plan) {
+            const plan = item.data.plan as import('./types').Plan;
+            const agentId = String(item.agent_id || '');
+            // Always update sidebar task list card.
+            setActivePlan(plan);
+            if (plan.status === 'planned') {
+              setPendingPlan(plan);
+              setPendingPlanAgentId(agentId);
+            }
+            // Update or insert plan message in chat (replace existing plan msg from same agent).
+            const planText = JSON.stringify({ type: 'plan', plan });
+            setChatMessages((prev) => {
+              const existingIdx = prev.findIndex((m) => {
+                if ((m.from || m.role) !== agentId) return false;
+                try {
+                  const parsed = JSON.parse(m.text);
+                  return parsed?.type === 'plan';
+                } catch { return false; }
+              });
+              if (existingIdx >= 0) {
+                const next = [...prev];
+                next[existingIdx] = {
+                  ...next[existingIdx],
+                  text: planText,
+                  timestampMs: Date.now(),
+                  timestamp: new Date().toLocaleTimeString(),
+                };
+                return next;
+              }
+              return [...prev, {
+                role: 'agent' as const,
+                from: agentId,
+                to: 'user',
+                text: planText,
+                timestamp: new Date().toLocaleTimeString(),
+                timestampMs: Date.now(),
+              }];
+            });
           } else if (item.phase === 'change_report' && item.data) {
             fetchWorkspaceState();
             fetchFiles(currentPath);
@@ -1284,6 +1377,11 @@ const App: React.FC = () => {
             }
           }
 
+          // Track run start time on first activity for an agent
+          if (!runStartTsRef.current[agentId]) {
+            runStartTsRef.current[agentId] = Date.now();
+          }
+
           // Only add tool call status lines as activity entries (not "Thinking"/"Model loading").
           if (statusText.length > 0 && item.phase !== 'done') {
             setChatMessages((prev) => appendGeneratingActivity(prev, agentId, statusText));
@@ -1293,6 +1391,12 @@ const App: React.FC = () => {
           }
 
           if (nextStatus === 'idle' || item.phase === 'done' || item.phase === 'failed') {
+            const startTs = runStartTsRef.current[agentId];
+            const elapsed = startTs ? Date.now() - startTs : undefined;
+            const ctxTokens = latestContextTokensRef.current[agentId] || undefined;
+            // Reset run start time for this agent
+            delete runStartTsRef.current[agentId];
+
             setChatMessages((prev) => {
               const idx = findLastGeneratingMessageIndex(prev, agentId);
               if (idx < 0) return prev;
@@ -1302,10 +1406,14 @@ const App: React.FC = () => {
               if (msgText && !isStatusLineText(msgText)) return prev;
               const next = [...prev];
               const entries = Array.isArray(next[idx].activityEntries) ? next[idx].activityEntries : [];
+              const nonTransient = entries.filter((e: string) => !isTransientStatus(e));
               next[idx] = {
                 ...next[idx],
                 isGenerating: false,
                 activitySummary: summarizeActivityEntries(entries, false) || next[idx].activitySummary,
+                toolCount: nonTransient.length || next[idx].toolCount,
+                durationMs: elapsed || next[idx].durationMs,
+                contextTokens: ctxTokens || next[idx].contextTokens,
               };
               return next;
             });
@@ -1361,12 +1469,23 @@ const App: React.FC = () => {
           if (!content) return;
           if (shouldHideInternalChatMessage(from, content)) return;
 
+          // Skip plan JSON messages — handled by plan_update SSE event
+          try {
+            const parsed = JSON.parse(content);
+            if (parsed?.type === 'plan' && parsed?.plan) return;
+          } catch (_e) { /* not JSON, continue */ }
+
           if (from !== 'user' && isStatusLineText(content)) {
             setChatMessages((prev) => appendGeneratingActivity(prev, from, content));
             return;
           }
 
           const tsMs = Number(item.ts_ms || Date.now());
+          const msgStartTs = runStartTsRef.current[from];
+          const msgElapsed = msgStartTs ? Date.now() - msgStartTs : undefined;
+          const msgCtxTokens = latestContextTokensRef.current[from] || undefined;
+          delete runStartTsRef.current[from];
+
           setChatMessages((prev) => {
             const generatingIdx = findLastGeneratingMessageIndex(prev, from);
             if (generatingIdx >= 0) {
@@ -1374,6 +1493,7 @@ const App: React.FC = () => {
               const existingEntries = Array.isArray(next[generatingIdx].activityEntries)
                 ? next[generatingIdx].activityEntries
                 : [];
+              const nonTransient = existingEntries.filter((e: string) => !isTransientStatus(e));
               next[generatingIdx] = {
                 ...next[generatingIdx],
                 text: content,
@@ -1384,6 +1504,9 @@ const App: React.FC = () => {
                 timestampMs: tsMs,
                 activitySummary:
                   summarizeActivityEntries(existingEntries, false) || next[generatingIdx].activitySummary,
+                toolCount: nonTransient.length || next[generatingIdx].toolCount,
+                durationMs: msgElapsed || next[generatingIdx].durationMs,
+                contextTokens: msgCtxTokens || next[generatingIdx].contextTokens,
               };
               return next;
             }
@@ -1478,6 +1601,11 @@ const App: React.FC = () => {
         }),
       });
       const data = await resp.json();
+      // If the server auto-created a session, adopt it
+      if (data?.session_id && !activeSessionId) {
+        setActiveSessionId(data.session_id);
+        fetchSessions();
+      }
       if (data?.status === 'queued') {
         return;
       }
@@ -1504,9 +1632,48 @@ const App: React.FC = () => {
       });
       setChatMessages([]);
       setQueuedMessages([]);
+      setActivePlan(null);
       fetchWorkspaceState();
     } catch (e) {
       addLog(`Error clearing chat: ${e}`);
+    }
+  };
+
+  const approvePlan = async () => {
+    if (!pendingPlanAgentId || !selectedProjectRoot) return;
+    try {
+      await fetch('/api/plan/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_root: selectedProjectRoot,
+          agent_id: pendingPlanAgentId,
+          session_id: activeSessionId,
+        }),
+      });
+      setPendingPlan(null);
+      setPendingPlanAgentId(null);
+    } catch (e) {
+      addLog(`Error approving plan: ${e}`);
+    }
+  };
+
+  const rejectPlan = async () => {
+    if (!pendingPlanAgentId || !selectedProjectRoot) return;
+    try {
+      await fetch('/api/plan/reject', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_root: selectedProjectRoot,
+          agent_id: pendingPlanAgentId,
+          session_id: activeSessionId,
+        }),
+      });
+      setPendingPlan(null);
+      setPendingPlanAgentId(null);
+    } catch (e) {
+      addLog(`Error rejecting plan: ${e}`);
     }
   };
 
@@ -1548,10 +1715,12 @@ const App: React.FC = () => {
       <SettingsPage
         onBack={() => {
           setCurrentPage('main');
+          setInitialSettingsTab(undefined);
           fetchModels();
           fetchOllamaStatus();
         }}
         projectRoot={selectedProjectRoot}
+        initialTab={initialSettingsTab}
       />
     )}
     {currentPage === 'memory' && (
@@ -1571,6 +1740,8 @@ const App: React.FC = () => {
         clearChat={clearChat}
         isRunning={isRunning}
         agentContext={agentContext}
+        verboseMode={verboseMode}
+        onToggleVerbose={() => setVerboseMode((v) => !v)}
         onOpenMemory={() => setCurrentPage('memory')}
         onOpenSettings={() => setCurrentPage('settings')}
       />
@@ -1623,12 +1794,17 @@ const App: React.FC = () => {
               cancellingRunIds={cancellingRunIds}
               onCancelRun={cancelAgentRun}
               onSendMessage={sendChatMessage}
+              pendingPlan={pendingPlan}
+              onApprovePlan={approvePlan}
+              onRejectPlan={rejectPlan}
+              verboseMode={verboseMode}
             />
           </div>
         </main>
 
         {/* Right: Status */}
         <aside className="w-80 border-l border-slate-200 dark:border-white/5 flex flex-col bg-slate-100/40 dark:bg-[#0a0a0a] p-4 gap-4 overflow-y-auto">
+          <TaskListCard plan={activePlan} />
           <div className="bg-white dark:bg-[#141414] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm p-3">
             <button
               onClick={() => setShowAgentSpecEditor(true)}
@@ -1639,23 +1815,53 @@ const App: React.FC = () => {
               Edit Agent Markdown
             </button>
           </div>
-          <AgentsCard
-            agents={mainAgents}
-            workspaceState={workspaceState}
-            isRunning={isRunning}
-            selectedAgent={selectedAgent}
-            agentStatus={agentStatus}
-            agentStatusText={agentStatusText}
-            agentWork={agentWork}
-            agentRunSummary={agentRunSummary}
-            agentContext={agentContext}
-          />
-          <ModelsCard
-            models={models}
-            ollamaStatus={ollamaStatus}
-            chatMessages={chatMessages}
-            tokensPerSec={tokensPerSec}
-          />
+          <CollapsibleCard
+            title="AGENTS STATUS"
+            icon={<Bot size={12} />}
+            iconColor="text-blue-500"
+            badge={`${mainAgents.length} agent${mainAgents.length !== 1 ? 's' : ''}`}
+            defaultOpen
+          >
+            <AgentsCard
+              agents={mainAgents}
+              workspaceState={workspaceState}
+              isRunning={isRunning}
+              selectedAgent={selectedAgent}
+              agentStatus={agentStatus}
+              agentStatusText={agentStatusText}
+              agentWork={agentWork}
+              agentRunSummary={agentRunSummary}
+              agentContext={agentContext}
+            />
+          </CollapsibleCard>
+          <CollapsibleCard
+            title="SKILLS"
+            icon={<Zap size={12} />}
+            iconColor="text-amber-500"
+            badge={`${skills.length} loaded`}
+            defaultOpen={skills.length > 0}
+          >
+            <SkillsCard
+              skills={skills}
+              onManageSkills={() => {
+                setInitialSettingsTab('skills');
+                setCurrentPage('settings');
+              }}
+            />
+          </CollapsibleCard>
+          <CollapsibleCard
+            title="MODELS STATUS"
+            icon={<Sparkles size={12} />}
+            iconColor="text-purple-500"
+            badge={`${models.length} model${models.length !== 1 ? 's' : ''}`}
+          >
+            <ModelsCard
+              models={models}
+              ollamaStatus={ollamaStatus}
+              chatMessages={chatMessages}
+              tokensPerSec={tokensPerSec}
+            />
+          </CollapsibleCard>
         </aside>
       </div>
 

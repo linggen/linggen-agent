@@ -390,25 +390,7 @@ export const SessionNav: React.FC<SessionNavProps> = ({
               {/* Sessions list */}
               {isExpanded && (
                 <div className="ml-3 mt-0.5 space-y-0.5">
-                  {/* Default session */}
-                  <button
-                    onClick={() => {
-                      setSelectedProjectRoot(project.path);
-                      setActiveSessionId(null);
-                    }}
-                    className={cn(
-                      'w-full text-left px-2.5 py-2 rounded-lg transition-colors text-[11px]',
-                      isSelected && activeSessionId === null
-                        ? 'bg-blue-100/80 dark:bg-blue-500/15 border-l-2 border-blue-500'
-                        : 'hover:bg-slate-50 dark:hover:bg-white/5',
-                    )}
-                  >
-                    <div className="font-medium text-slate-800 dark:text-slate-200">
-                      Default Session
-                    </div>
-                  </button>
-
-                  {/* Named sessions */}
+                  {/* Sessions */}
                   {filteredSessions.map((session) => {
                     const isActive = isSelected && activeSessionId === session.id;
                     const isRenaming = renamingSessionId === session.id;

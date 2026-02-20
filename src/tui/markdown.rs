@@ -1,0 +1,197 @@
+/// Lightweight inline markdown to ratatui conversion.
+///
+/// Handles: headers, bold, italic, inline code, code fences, lists.
+/// Does not attempt full CommonMark — just the most common constructs.
+
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+
+pub fn markdown_to_lines(input: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut in_code_block = false;
+
+    for raw_line in input.lines() {
+        if raw_line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            if in_code_block {
+                // Opening fence — render a dim separator
+                lines.push(Line::from(Span::styled(
+                    "  ┌──────────────────────────────────────",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "  └──────────────────────────────────────",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            continue;
+        }
+
+        if in_code_block {
+            lines.push(Line::from(vec![
+                Span::styled("  │ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    raw_line.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+            continue;
+        }
+
+        let trimmed = raw_line.trim();
+
+        // Headers
+        if let Some(rest) = trimmed.strip_prefix("### ") {
+            lines.push(Line::from(Span::styled(
+                format!("   {rest}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            lines.push(Line::from(Span::styled(
+                format!("  {rest}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )));
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("# ") {
+            lines.push(Line::from(Span::styled(
+                rest.to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )));
+            continue;
+        }
+
+        // Bullet lists
+        if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+            let mut spans = vec![Span::styled(
+                "  · ",
+                Style::default().fg(Color::DarkGray),
+            )];
+            spans.extend(parse_inline_markdown(rest));
+            lines.push(Line::from(spans));
+            continue;
+        }
+
+        // Numbered lists
+        if let Some(dot_pos) = trimmed.find(". ") {
+            let prefix = &trimmed[..dot_pos];
+            if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
+                let rest = &trimmed[dot_pos + 2..];
+                let mut spans = vec![Span::styled(
+                    format!("  {}. ", prefix),
+                    Style::default().fg(Color::DarkGray),
+                )];
+                spans.extend(parse_inline_markdown(rest));
+                lines.push(Line::from(spans));
+                continue;
+            }
+        }
+
+        // Empty line
+        if trimmed.is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+
+        // Regular paragraph line — parse inline markdown
+        let spans = parse_inline_markdown(trimmed);
+        let mut full_spans = vec![Span::raw("  ".to_string())];
+        full_spans.extend(spans);
+        lines.push(Line::from(full_spans));
+    }
+
+    lines
+}
+
+/// Parse inline markdown: **bold**, *italic*, `code`, and plain text.
+fn parse_inline_markdown(input: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut chars = input.chars().peekable();
+    let mut buf = String::new();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '`' => {
+                // Flush plain buffer
+                if !buf.is_empty() {
+                    spans.push(Span::raw(std::mem::take(&mut buf)));
+                }
+                // Collect until closing backtick
+                let mut code = String::new();
+                for c in chars.by_ref() {
+                    if c == '`' {
+                        break;
+                    }
+                    code.push(c);
+                }
+                spans.push(Span::styled(
+                    code,
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            '*' => {
+                // Check for bold (**) vs italic (*)
+                if chars.peek() == Some(&'*') {
+                    chars.next(); // consume second *
+                    if !buf.is_empty() {
+                        spans.push(Span::raw(std::mem::take(&mut buf)));
+                    }
+                    let mut bold = String::new();
+                    loop {
+                        match chars.next() {
+                            Some('*') if chars.peek() == Some(&'*') => {
+                                chars.next();
+                                break;
+                            }
+                            Some(c) => bold.push(c),
+                            None => break,
+                        }
+                    }
+                    spans.push(Span::styled(
+                        bold,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    if !buf.is_empty() {
+                        spans.push(Span::raw(std::mem::take(&mut buf)));
+                    }
+                    let mut italic = String::new();
+                    for c in chars.by_ref() {
+                        if c == '*' {
+                            break;
+                        }
+                        italic.push(c);
+                    }
+                    spans.push(Span::styled(
+                        italic,
+                        Style::default().add_modifier(Modifier::ITALIC),
+                    ));
+                }
+            }
+            _ => {
+                buf.push(ch);
+            }
+        }
+    }
+
+    if !buf.is_empty() {
+        spans.push(Span::raw(buf));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::raw(String::new()));
+    }
+
+    spans
+}

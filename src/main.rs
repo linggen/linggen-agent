@@ -2,15 +2,16 @@ mod agent_manager;
 mod check;
 mod cli;
 mod config;
-mod db;
 mod engine;
 mod eval;
 mod logging;
 mod ollama;
 mod openai;
 mod paths;
+mod project_store;
 mod repl;
 mod server;
+mod tui;
 mod skills;
 mod state_fs;
 mod tui_client;
@@ -265,10 +266,13 @@ async fn main() -> Result<()> {
     }
 
     // Full commands — need tracing.
+    // Suppress stdout logging in TUI mode — ratatui owns the terminal.
+    let will_run_tui = !cli.web && cli.cmd.is_none();
     let log_dir = match logging::setup_tracing_with_settings(logging::LoggingSettings {
         level: config.logging.level.as_deref(),
         directory: config.logging.directory.as_deref(),
         retention_days: config.logging.retention_days,
+        suppress_stdout: will_run_tui,
     }) {
         Ok(path) => Some(path),
         Err(err) => {
@@ -304,13 +308,13 @@ async fn main() -> Result<()> {
             let ws_root = workspace::resolve_workspace_root(global_root)?;
             let port = global_port.unwrap_or(config.server.port);
 
-            let db = Arc::new(db::Db::new()?);
+            let store = Arc::new(project_store::ProjectStore::new());
             let skill_manager = Arc::new(skills::SkillManager::new());
             let config_dir = config_path
                 .as_ref()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()));
             let (manager, rx) =
-                agent_manager::AgentManager::new(config, config_dir, db, skill_manager.clone());
+                agent_manager::AgentManager::new(config, config_dir, store, skill_manager.clone());
 
             let _ = skill_manager.load_all(Some(&ws_root)).await;
             let _ = manager.get_or_create_project(ws_root.clone()).await?;

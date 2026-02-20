@@ -16,13 +16,18 @@ const tabs: { key: ManagementTab; label: string }[] = [
 export const SettingsPage: React.FC<{
   onBack: () => void;
   projectRoot?: string;
-}> = ({ onBack, projectRoot = '' }) => {
-  const [activeTab, setActiveTab] = useState<ManagementTab>('models');
+  initialTab?: ManagementTab;
+}> = ({ onBack, projectRoot = '', initialTab }) => {
+  const [activeTab, setActiveTab] = useState<ManagementTab>(initialTab || 'models');
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [originalConfig, setOriginalConfig] = useState<AppConfig | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
+
+  useEffect(() => {
+    if (initialTab) setActiveTab(initialTab);
+  }, [initialTab]);
 
   const dirty = config !== null && originalConfig !== null && JSON.stringify(config) !== JSON.stringify(originalConfig);
 

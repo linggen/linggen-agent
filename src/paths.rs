@@ -44,3 +44,13 @@ pub fn global_skills_dir() -> PathBuf {
     linggen_home().join("skills")
 }
 
+/// `~/.linggen/plans/`
+pub fn plans_dir() -> PathBuf {
+    linggen_home().join("plans")
+}
+
+/// `~/.linggen/projects/`
+pub fn projects_dir() -> PathBuf {
+    linggen_home().join("projects")
+}
+

@@ -145,7 +145,7 @@ pub(crate) async fn run_agent(
                         let _ = manager
                             .finish_agent_run(
                                 &run_id,
-                                crate::db::AgentRunStatus::Completed,
+                                crate::project_store::AgentRunStatus::Completed,
                                 None,
                             )
                             .await;
@@ -154,9 +154,9 @@ pub(crate) async fn run_agent(
                     Err(err) => {
                         let msg = err.to_string();
                         let status = if msg.to_lowercase().contains("cancel") {
-                            crate::db::AgentRunStatus::Cancelled
+                            crate::project_store::AgentRunStatus::Cancelled
                         } else {
-                            crate::db::AgentRunStatus::Failed
+                            crate::project_store::AgentRunStatus::Failed
                         };
                         let _ = manager.finish_agent_run(&run_id, status, Some(msg)).await;
                         crate::engine::AgentOutcome::None

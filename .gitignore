@@ -9,6 +9,8 @@ Cargo.lock
 
 # Linggen Agent State
 /.linggen-agent
+/.linggen/sessions
+/.linggen/workspace
 *.redb
 *.log
 
