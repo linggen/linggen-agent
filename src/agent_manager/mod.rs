@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::time::Instant;
 use tracing::{info, warn};
 
 pub mod locks;
@@ -42,6 +43,8 @@ pub struct AgentManager {
     pending_plans: Mutex<HashMap<String, Plan>>,
     /// Maps run_id → repo_path for O(1) lookups in finish/get/cancel.
     run_project_map: Mutex<HashMap<String, String>>,
+    /// Last activity time per agent, keyed by "{project_root}|{agent_id}".
+    last_activity: Mutex<HashMap<String, Instant>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +290,7 @@ impl AgentManager {
                 events: tx,
                 pending_plans: Mutex::new(HashMap::new()),
                 run_project_map: Mutex::new(HashMap::new()),
+                last_activity: Mutex::new(HashMap::new()),
             }),
             rx,
         )
@@ -743,6 +747,13 @@ impl AgentManager {
         self.clear_working_place_for_run(run_id).await;
         let _ = self.events.send(AgentEvent::StateUpdated);
         self.cancelled_runs.lock().await.remove(run_id);
+        // Record activity for the agent that just finished
+        if let Some(repo_path) = &repo_path {
+            // Look up agent_id from the run record
+            if let Ok(Some(run)) = self.store.run_store(repo_path).get_run(run_id) {
+                self.update_agent_activity(repo_path, &run.agent_id).await;
+            }
+        }
         self.run_project_map.lock().await.remove(run_id);
         Ok(())
     }
@@ -763,6 +774,7 @@ impl AgentManager {
     pub async fn list_agent_children(
         &self,
         parent_run_id: &str,
+        project_root: Option<&str>,
     ) -> Result<Vec<crate::project_store::AgentRunRecord>> {
         let repo_path = self
             .run_project_map
@@ -770,6 +782,7 @@ impl AgentManager {
             .await
             .get(parent_run_id)
             .cloned();
+        let repo_path = repo_path.or_else(|| project_root.map(|p| p.to_string()));
         if let Some(repo_path) = repo_path {
             self.store
                 .run_store(&repo_path)
@@ -782,8 +795,10 @@ impl AgentManager {
     pub async fn get_agent_run(
         &self,
         run_id: &str,
+        project_root: Option<&str>,
     ) -> Result<Option<crate::project_store::AgentRunRecord>> {
         let repo_path = self.run_project_map.lock().await.get(run_id).cloned();
+        let repo_path = repo_path.or_else(|| project_root.map(|p| p.to_string()));
         if let Some(repo_path) = repo_path {
             self.store.run_store(&repo_path).get_run(run_id)
         } else {
@@ -904,6 +919,76 @@ impl AgentManager {
     pub async fn take_pending_plan(&self, project_root: &str, agent_id: &str) -> Option<Plan> {
         let key = format!("{}|{}", project_root, agent_id);
         self.pending_plans.lock().await.remove(&key)
+    }
+
+    /// Record that an agent performed activity (finished run, received message, etc.)
+    pub async fn update_agent_activity(&self, project_root: &str, agent_id: &str) {
+        let key = format!("{}|{}", project_root, agent_id);
+        self.last_activity.lock().await.insert(key, Instant::now());
+    }
+
+    /// How long an agent has been idle (since last activity).
+    pub async fn get_agent_idle_duration(
+        &self,
+        project_root: &str,
+        agent_id: &str,
+    ) -> std::time::Duration {
+        let key = format!("{}|{}", project_root, agent_id);
+        let activity = self.last_activity.lock().await;
+        match activity.get(&key) {
+            Some(instant) => instant.elapsed(),
+            None => std::time::Duration::from_secs(u64::MAX), // never active = infinitely idle
+        }
+    }
+
+    /// Get the effective idle config for an agent, merging:
+    /// 1. Mission-level per-agent config (highest priority)
+    /// 2. DB agent override
+    /// 3. Agent markdown defaults (lowest priority)
+    pub async fn get_effective_idle_config(
+        &self,
+        project_root: &PathBuf,
+        agent_id: &str,
+    ) -> (Option<String>, u64) {
+        let project_root_str = project_root.to_string_lossy().to_string();
+
+        // 1. Start with markdown defaults
+        let spec = self
+            .find_agent_spec_for_project(project_root, agent_id)
+            .ok()
+            .flatten();
+        let mut idle_prompt = spec.as_ref().and_then(|s| s.spec.idle_prompt.clone());
+        let mut idle_interval = spec
+            .as_ref()
+            .and_then(|s| s.spec.idle_interval_secs)
+            .unwrap_or(60);
+
+        // 2. Override with DB agent override
+        if let Ok(Some(overr)) = self.store.get_agent_override(&project_root_str, agent_id) {
+            if let Some(prompt) = overr.idle_prompt {
+                idle_prompt = Some(prompt);
+            }
+            if let Some(interval) = overr.idle_interval_secs {
+                idle_interval = interval;
+            }
+        }
+
+        // 3. Override with mission-level per-agent config
+        if let Ok(Some(mission)) = self.store.get_mission(&project_root_str) {
+            if let Some(ma) = mission.agents.iter().find(|a| a.id.eq_ignore_ascii_case(agent_id)) {
+                if let Some(prompt) = &ma.idle_prompt {
+                    idle_prompt = Some(prompt.clone());
+                }
+                if let Some(interval) = ma.idle_interval_secs {
+                    idle_interval = interval;
+                }
+            }
+        }
+
+        // Enforce minimum 30 seconds
+        idle_interval = idle_interval.max(30);
+
+        (idle_prompt, idle_interval)
     }
 
     pub async fn sync_world_state(&self, project_root: &PathBuf) -> Result<()> {

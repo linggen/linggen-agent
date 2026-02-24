@@ -2,6 +2,7 @@ mod agent_api;
 mod chat_api;
 pub(crate) mod chat_helpers;
 mod config_api;
+pub(crate) mod idle_scheduler;
 mod marketplace_api;
 mod projects_api;
 mod workspace_api;
@@ -31,7 +32,10 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tracing::info;
 
-use agent_api::{cancel_agent_run, run_agent, set_task};
+use agent_api::{
+    cancel_agent_run, clear_mission, get_agent_override, get_mission, list_missions, run_agent,
+    set_agent_override, set_mission, set_task,
+};
 use chat_api::{approve_plan_handler, chat_handler, clear_chat_history_api, reject_plan_handler};
 use config_api::{get_config_api, update_config_api};
 use projects_api::{
@@ -41,7 +45,7 @@ use projects_api::{
     list_sessions, list_skill_files_api, list_skills, remove_project, remove_session_api,
     rename_session_api, upsert_agent_file_api, upsert_skill_file_api,
 };
-use marketplace_api::{builtin_skills_install, builtin_skills_list, marketplace_install, marketplace_list, marketplace_search, marketplace_uninstall};
+use marketplace_api::{builtin_skills_install, builtin_skills_install_all, builtin_skills_list, marketplace_install, marketplace_list, marketplace_search, marketplace_uninstall};
 use workspace_api::{get_agent_tree, get_workspace_state, list_files, read_file_api};
 
 #[derive(RustEmbed)]
@@ -54,6 +58,9 @@ pub struct ServerState {
     pub events_tx: broadcast::Sender<ServerEvent>,
     pub skill_manager: Arc<crate::skills::SkillManager>,
     pub queued_chats: Arc<Mutex<HashMap<String, Vec<QueuedChatItem>>>>,
+    /// Senders for interrupt messages keyed by queue_key. Used to inject user
+    /// messages into a running agent loop so the model can adapt mid-run.
+    pub interrupt_tx: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
     status_seq: AtomicU64,
     active_statuses: Arc<Mutex<HashMap<String, ActiveStatusRecord>>>,
     pub queue_seq: AtomicU64,
@@ -172,6 +179,10 @@ pub enum ServerEvent {
     PlanUpdate {
         agent_id: String,
         plan: crate::engine::Plan,
+    },
+    IdlePromptTriggered {
+        agent_id: String,
+        project_root: String,
     },
 }
 
@@ -470,6 +481,22 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
             project_root: None,
             data: Some(json!({ "plan": plan })),
         }),
+        ServerEvent::IdlePromptTriggered {
+            agent_id,
+            project_root,
+        } => Some(UiSseMessage {
+            id: format!("idle-trigger-{agent_id}-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: UI_KIND_ACTIVITY.to_string(),
+            phase: Some(UI_PHASE_DOING.to_string()),
+            text: Some("Idle prompt triggered".to_string()),
+            agent_id: Some(agent_id),
+            session_id: None,
+            project_root: Some(project_root),
+            data: Some(json!({ "status": "idle_prompt_triggered" })),
+        }),
     }
 }
 
@@ -576,6 +603,7 @@ pub async fn prepare_server(
         events_tx,
         skill_manager,
         queued_chats: Arc::new(Mutex::new(HashMap::new())),
+        interrupt_tx: Arc::new(Mutex::new(HashMap::new())),
         status_seq: AtomicU64::new(1),
         active_statuses: Arc::new(Mutex::new(HashMap::new())),
         queue_seq: AtomicU64::new(1),
@@ -689,6 +717,7 @@ pub async fn prepare_server(
         .route("/api/marketplace/uninstall", delete(marketplace_uninstall))
         .route("/api/builtin-skills", get(builtin_skills_list))
         .route("/api/builtin-skills/install", post(builtin_skills_install))
+        .route("/api/builtin-skills/install-all", post(builtin_skills_install_all))
         .route("/api/skill-files", get(list_skill_files_api))
         .route("/api/skill-file", get(get_skill_file_api))
         .route("/api/skill-file", post(upsert_skill_file_api))
@@ -700,6 +729,9 @@ pub async fn prepare_server(
         .route("/api/task", post(set_task))
         .route("/api/run", post(run_agent))
         .route("/api/agent-cancel", post(cancel_agent_run))
+        .route("/api/mission", get(get_mission).post(set_mission).delete(clear_mission))
+        .route("/api/missions", get(list_missions))
+        .route("/api/agent-override", get(get_agent_override).post(set_agent_override))
         .route("/api/chat", post(chat_handler))
         .route("/api/chat/clear", post(clear_chat_history_api))
         .route("/api/plan/approve", post(approve_plan_handler))
@@ -715,6 +747,12 @@ pub async fn prepare_server(
         .route("/api/memory/{*rest}", get(memory_proxy).post(memory_proxy).delete(memory_proxy))
         .fallback(static_handler)
         .with_state(state.clone());
+
+    // Spawn the idle scheduler for mission-driven autonomous behavior.
+    {
+        let scheduler_state = state.clone();
+        tokio::spawn(idle_scheduler::idle_scheduler_loop(scheduler_state));
+    }
 
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     let actual_port = listener.local_addr()?.port();

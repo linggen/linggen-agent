@@ -53,6 +53,7 @@ export const SkillsTab: React.FC<{
   // Built-in skills state
   const [builtInSkills, setBuiltInSkills] = useState<BuiltInSkillInfo[]>([]);
   const [biInstalling, setBiInstalling] = useState<Set<string>>(new Set());
+  const [biInstallingAll, setBiInstallingAll] = useState(false);
 
   const fetchBuiltInSkills = useCallback(async () => {
     try {
@@ -83,6 +84,22 @@ export const SkillsTab: React.FC<{
       next.delete(name);
       return next;
     });
+  };
+
+  const installAllBuiltInSkills = async () => {
+    setBiInstallingAll(true);
+    setError(null);
+    try {
+      const resp = await fetch('/api/builtin-skills/install-all', { method: 'POST' });
+      if (!resp.ok) {
+        setError(await resp.text());
+      } else {
+        await Promise.all([fetchSkills(), fetchSkillFiles(), fetchBuiltInSkills()]);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+    setBiInstallingAll(false);
   };
 
   const fetchSkills = useCallback(async () => {
@@ -411,6 +428,15 @@ export const SkillsTab: React.FC<{
                 <Package size={14} className="text-blue-500" />
                 <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400">Built-in</span>
                 <span className="text-[10px] text-slate-500">{builtInSkills.length} skill{builtInSkills.length !== 1 ? 's' : ''}</span>
+                {builtInSkills.some((bi) => !bi.installed) && (
+                  <button
+                    onClick={installAllBuiltInSkills}
+                    disabled={biInstallingAll}
+                    className="ml-auto px-2.5 py-1 text-[10px] font-semibold rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    {biInstallingAll ? 'Installing...' : 'Install All'}
+                  </button>
+                )}
               </div>
               <div className="px-4 pb-3 space-y-2">
                 {builtInSkills.map((bi) => (

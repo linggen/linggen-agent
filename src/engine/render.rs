@@ -54,6 +54,19 @@ pub fn render_tool_result(r: &ToolResult) -> String {
         ToolResult::AgentOutcome(outcome) => {
             format!("agent_outcome: {:?}", outcome)
         }
+        ToolResult::WebSearchResults { query, results } => {
+            let mut out = format!("WebSearch: \"{}\" ({} results)\n", query, results.len());
+            for (i, r) in results.iter().enumerate() {
+                out.push_str(&format!(
+                    "{}. {} — {}\n   {}\n",
+                    i + 1,
+                    r.title,
+                    r.url,
+                    r.snippet
+                ));
+            }
+            out
+        }
     }
 }
 
@@ -98,6 +111,7 @@ pub fn render_tool_result_public(r: &ToolResult) -> String {
                 path, truncated, shown_note, preview
             )
         }
+        ToolResult::WebSearchResults { .. } => render_tool_result(r),
         other => render_tool_result(other),
     }
 }

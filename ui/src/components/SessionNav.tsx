@@ -175,7 +175,9 @@ export const SessionNav: React.FC<SessionNavProps> = ({
   pickFolder,
   removeProject,
 }) => {
-  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() =>
+    selectedProjectRoot ? new Set([selectedProjectRoot]) : new Set(),
+  );
   const [searchQuery, setSearchQuery] = useState('');
   const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
@@ -234,6 +236,18 @@ export const SessionNav: React.FC<SessionNavProps> = ({
     setRenamingSessionId(null);
   };
 
+  // Auto-expand the selected project so sessions are visible
+  useEffect(() => {
+    if (selectedProjectRoot) {
+      setExpandedProjects((prev) => {
+        if (prev.has(selectedProjectRoot)) return prev;
+        const next = new Set(prev);
+        next.add(selectedProjectRoot);
+        return next;
+      });
+    }
+  }, [selectedProjectRoot]);
+
   const lowerQuery = searchQuery.toLowerCase();
 
   // Compute live activity entries for selected project
@@ -243,7 +257,7 @@ export const SessionNav: React.FC<SessionNavProps> = ({
   }, [selectedProjectRoot, treesByProject]);
 
   return (
-    <aside className="w-72 border-r border-slate-200 dark:border-white/5 flex flex-col bg-white dark:bg-[#0f0f0f] h-full">
+    <div className="flex-1 flex flex-col min-h-0">
       {/* Header: New Chat + New Project */}
       <div className="p-3 border-b border-slate-200 dark:border-white/5 flex items-center gap-2">
         <button
@@ -532,6 +546,6 @@ export const SessionNav: React.FC<SessionNavProps> = ({
           )}
         </div>
       )}
-    </aside>
+    </div>
   );
 };

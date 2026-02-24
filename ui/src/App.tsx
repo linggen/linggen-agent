@@ -1,7 +1,7 @@
 import React, { useCallback, useMemo, useState, useEffect, useRef } from 'react';
-import { Bot, FilePenLine, Sparkles, Zap } from 'lucide-react';
-import { SessionNav } from './components/SessionNav';
+import { Bot, FilePenLine, Sparkles, Target, Zap } from 'lucide-react';
 import { AgentsCard } from './components/AgentsCard';
+import { SessionNav } from './components/SessionNav';
 import { TaskListCard } from './components/TaskListCard';
 import { ModelsCard } from './components/ModelsCard';
 import { CollapsibleCard } from './components/CollapsibleCard';
@@ -11,6 +11,8 @@ import { ChatPanel } from './components/ChatPanel';
 import { HeaderBar } from './components/HeaderBar';
 import { SettingsPage } from './components/SettingsPage';
 import { MemoryPage } from './components/MemoryPage';
+import { MissionPage } from './components/MissionPage';
+import { MissionSidebarCard } from './components/MissionSidebarCard';
 import { AgentSpecEditorModal } from './components/AgentSpecEditorModal';
 import type {
   AgentInfo,
@@ -28,6 +30,8 @@ import type {
   SkillInfo,
   SubagentInfo,
   UiSseMessage,
+  IdlePromptEvent,
+  MissionInfo,
 } from './types';
 
 const SELECTED_AGENT_STORAGE_KEY = 'linggen-agent:selected-agent';
@@ -496,7 +500,7 @@ const buildSubagentInfos = (
   return out;
 };
 
-type Page = 'main' | 'settings' | 'memory';
+type Page = 'main' | 'settings' | 'memory' | 'mission';
 
 const App: React.FC = () => {
   const [currentPage, setCurrentPage] = useState<Page>('main');
@@ -539,6 +543,9 @@ const App: React.FC = () => {
   const [showAgentSpecEditor, setShowAgentSpecEditor] = useState(false);
   
   const [workspaceState, setWorkspaceState] = useState<WorkspaceState | null>(null);
+  const [mission, setMission] = useState<MissionInfo | null>(null);
+  const [missionDraft, setMissionDraft] = useState<string | null>(null);
+  const [idlePromptEvents, setIdlePromptEvents] = useState<IdlePromptEvent[]>([]);
   const [pendingPlan, setPendingPlan] = useState<import('./types').Plan | null>(null);
   const [pendingPlanAgentId, setPendingPlanAgentId] = useState<string | null>(null);
   const [activePlan, setActivePlan] = useState<import('./types').Plan | null>(null);
@@ -1165,6 +1172,64 @@ const App: React.FC = () => {
     }
   }, [selectedProjectRoot, activeSessionId, addLog]);
 
+  const missionEndpointAvailable = useRef<boolean | null>(null);
+  const prevMissionProjectRoot = useRef(selectedProjectRoot);
+
+  // Reset endpoint availability when switching projects
+  if (selectedProjectRoot !== prevMissionProjectRoot.current) {
+    missionEndpointAvailable.current = null;
+    prevMissionProjectRoot.current = selectedProjectRoot;
+  }
+
+  const fetchMission = useCallback(async () => {
+    if (!selectedProjectRoot) return;
+    if (missionEndpointAvailable.current === false) return;
+    try {
+      const url = new URL('/api/mission', window.location.origin);
+      url.searchParams.append('project_root', selectedProjectRoot);
+      const resp = await fetch(url.toString());
+      if (resp.status === 404) {
+        missionEndpointAvailable.current = false;
+        return;
+      }
+      missionEndpointAvailable.current = true;
+      if (!resp.ok) return;
+      const data = await resp.json();
+      setMission(data?.text ? data : null);
+    } catch {
+      // silently ignore — mission endpoint may not be available
+    }
+  }, [selectedProjectRoot]);
+
+  const saveMission = async (text: string) => {
+    if (!selectedProjectRoot || !text.trim()) return;
+    try {
+      await fetch('/api/mission', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_root: selectedProjectRoot, text: text.trim(), agents: [] }),
+      });
+      setMissionDraft(null);
+      fetchMission();
+    } catch (e) {
+      addLog(`Error setting mission: ${e}`);
+    }
+  };
+
+  const clearMission = async () => {
+    if (!selectedProjectRoot) return;
+    try {
+      await fetch('/api/mission', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_root: selectedProjectRoot }),
+      });
+      setMission(null);
+    } catch (e) {
+      addLog(`Error clearing mission: ${e}`);
+    }
+  };
+
   const cancelAgentRun = async (runId: string) => {
     if (!runId) return;
     setCancellingRunIds((prev) => ({ ...prev, [runId]: true }));
@@ -1205,12 +1270,13 @@ const App: React.FC = () => {
       fetchAgentRuns();
       fetchSessions();
       fetchAgents(selectedProjectRoot);
+      fetchMission();
       setAgentStatus({});
       setAgentStatusText({});
       setQueuedMessages([]);
       setActivePlan(null);
     }
-  }, [selectedProjectRoot, fetchFiles, fetchWorkspaceState, fetchAgentTree, fetchAgentRuns, fetchSessions, fetchAgents]);
+  }, [selectedProjectRoot, fetchFiles, fetchWorkspaceState, fetchAgentTree, fetchAgentRuns, fetchSessions, fetchAgents, fetchMission]);
 
   useEffect(() => {
     if (projects.length === 0) return;
@@ -1292,7 +1358,7 @@ const App: React.FC = () => {
             const agentId = String(item.agent_id || '');
             // Always update sidebar task list card.
             setActivePlan(plan);
-            if (plan.status === 'planned') {
+            if (plan.status === 'planned' && plan.origin === 'user_requested') {
               setPendingPlan(plan);
               setPendingPlanAgentId(agentId);
             }
@@ -1347,6 +1413,19 @@ const App: React.FC = () => {
           const statusRaw = String(item.data?.status || '').trim();
           const nextStatus = normalizeAgentStatus(statusRaw);
           const statusText = String(item.text || '').trim();
+
+          // Capture idle_prompt_triggered events for Mission activity tab
+          if (statusRaw === 'idle_prompt_triggered') {
+            setIdlePromptEvents((prev) => {
+              const evt: IdlePromptEvent = {
+                agent_id: agentId,
+                project_root: String(item.project_root || ''),
+                timestamp: Date.now(),
+              };
+              const next = [evt, ...prev];
+              return next.length > 100 ? next.slice(0, 100) : next;
+            });
+          }
 
           if (statusRaw) {
             // Don't update agent status badge on "done" lifecycle events — those describe
@@ -1568,12 +1647,6 @@ const App: React.FC = () => {
       },
     ]);
 
-    const trimmed = userMessage.trim().toLowerCase();
-    if (trimmed === '/mode chat') {
-      setCurrentMode('chat');
-    } else if (trimmed === '/mode auto') {
-      setCurrentMode('auto');
-    }
     if (userMessage.startsWith('/user_story ')) {
       const story = userMessage.substring(12).trim();
       addLog(`Setting user story: ${story}`);
@@ -1728,49 +1801,96 @@ const App: React.FC = () => {
         onBack={() => setCurrentPage('main')}
       />
     )}
+    {currentPage === 'mission' && (
+      <MissionPage
+        onBack={() => setCurrentPage('main')}
+        projectRoot={selectedProjectRoot}
+        agents={agents}
+        agentStatus={agentStatus}
+        agentRunSummary={agentRunSummary}
+        mission={mission}
+        missionDraft={missionDraft}
+        onMissionDraftChange={setMissionDraft}
+        onSaveMission={saveMission}
+        onClearMission={clearMission}
+        idlePromptEvents={idlePromptEvents}
+      />
+    )}
     <div className={`flex flex-col h-screen bg-slate-100/70 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200 font-sans overflow-hidden${currentPage !== 'main' ? ' hidden' : ''}`}>
       {/* Header */}
       <HeaderBar
-        selectedAgent={selectedAgent}
-        setSelectedAgent={setSelectedAgent}
-        mainAgents={mainAgents}
-        agentStatus={agentStatus}
         copyChat={copyChat}
         copyChatStatus={copyChatStatus}
         clearChat={clearChat}
         isRunning={isRunning}
-        agentContext={agentContext}
         verboseMode={verboseMode}
         onToggleVerbose={() => setVerboseMode((v) => !v)}
+        onOpenMission={() => setCurrentPage('mission')}
+        missionActive={!!mission?.active}
         onOpenMemory={() => setCurrentPage('memory')}
         onOpenSettings={() => setCurrentPage('settings')}
       />
 
       {/* Main Layout */}
       <div className="flex-1 flex overflow-hidden">
-        
-        {/* Left: Session Navigator */}
-        <SessionNav
-          projects={projects}
-          selectedProjectRoot={selectedProjectRoot}
-          setSelectedProjectRoot={setSelectedProjectRoot}
-          sessions={sessions}
-          activeSessionId={activeSessionId}
-          setActiveSessionId={setActiveSessionId}
-          createSession={createSession}
-          removeSession={removeSession}
-          renameSession={renameSession}
-          sessionCountsByProject={sessionCountsByProject}
-          treesByProject={agentTreesByProject}
-          onSelectPath={selectAgentPathFromTree}
-          showAddProject={showAddProject}
-          setShowAddProject={setShowAddProject}
-          newProjectPath={newProjectPath}
-          setNewProjectPath={setNewProjectPath}
-          addProject={addProject}
-          pickFolder={pickFolder}
-          removeProject={removeProject}
-        />
+
+        {/* Left: Sessions + Agents */}
+        <div className="w-72 border-r border-slate-200 dark:border-white/5 flex flex-col bg-white dark:bg-[#0f0f0f] h-full">
+          <SessionNav
+            projects={projects}
+            selectedProjectRoot={selectedProjectRoot}
+            setSelectedProjectRoot={setSelectedProjectRoot}
+            sessions={sessions}
+            activeSessionId={activeSessionId}
+            setActiveSessionId={setActiveSessionId}
+            createSession={createSession}
+            removeSession={removeSession}
+            renameSession={renameSession}
+            sessionCountsByProject={sessionCountsByProject}
+            treesByProject={agentTreesByProject}
+            onSelectPath={selectAgentPathFromTree}
+            showAddProject={showAddProject}
+            setShowAddProject={setShowAddProject}
+            newProjectPath={newProjectPath}
+            setNewProjectPath={setNewProjectPath}
+            addProject={addProject}
+            pickFolder={pickFolder}
+            removeProject={removeProject}
+          />
+          <div className="border-t border-slate-200 dark:border-white/5">
+            <CollapsibleCard
+              title="AGENTS"
+              icon={<Bot size={12} />}
+              iconColor="text-blue-500"
+              badge={`${mainAgents.length}`}
+              defaultOpen
+              headerAction={
+                <button
+                  onClick={() => setShowAgentSpecEditor(true)}
+                  disabled={!selectedProjectRoot}
+                  title="Edit agent markdown specs"
+                  className="p-1 rounded hover:bg-slate-200 dark:hover:bg-white/10 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 disabled:opacity-30 transition-colors"
+                >
+                  <FilePenLine size={12} />
+                </button>
+              }
+            >
+              <AgentsCard
+                agents={mainAgents}
+                workspaceState={workspaceState}
+                isRunning={isRunning}
+                selectedAgent={selectedAgent}
+                setSelectedAgent={setSelectedAgent}
+                agentStatus={agentStatus}
+                agentStatusText={agentStatusText}
+                agentWork={agentWork}
+                agentRunSummary={agentRunSummary}
+                agentContext={agentContext}
+                projectRoot={selectedProjectRoot}
+              />
+            </CollapsibleCard>
+          </div>
+        </div>
 
         {/* Center: Chat */}
         <main className="flex-1 flex flex-col overflow-hidden bg-slate-100/40 dark:bg-[#0a0a0a] min-h-0">
@@ -1779,6 +1899,7 @@ const App: React.FC = () => {
               chatMessages={chatMessages}
               queuedMessages={queuedMessages}
               chatEndRef={chatEndRef}
+              projectRoot={selectedProjectRoot}
               selectedAgent={selectedAgent}
               setSelectedAgent={setSelectedAgent}
               skills={skills}
@@ -1802,35 +1923,35 @@ const App: React.FC = () => {
           </div>
         </main>
 
-        {/* Right: Status */}
-        <aside className="w-80 border-l border-slate-200 dark:border-white/5 flex flex-col bg-slate-100/40 dark:bg-[#0a0a0a] p-4 gap-4 overflow-y-auto">
-          <TaskListCard plan={activePlan} />
-          <div className="bg-white dark:bg-[#141414] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm p-3">
-            <button
-              onClick={() => setShowAgentSpecEditor(true)}
-              disabled={!selectedProjectRoot}
-              className="w-full inline-flex items-center justify-center gap-2 px-3 py-2 text-xs font-semibold rounded-lg border border-slate-200 dark:border-white/10 hover:bg-slate-50 dark:hover:bg-white/5 disabled:opacity-50"
-            >
-              <FilePenLine size={14} />
-              Edit Agent Markdown
-            </button>
-          </div>
+        {/* Right: Mission, Models, Skills */}
+        <aside className="w-72 border-l border-slate-200 dark:border-white/5 flex flex-col bg-slate-100/40 dark:bg-[#0a0a0a] p-3 gap-3 overflow-y-auto">
           <CollapsibleCard
-            title="AGENTS STATUS"
-            icon={<Bot size={12} />}
-            iconColor="text-blue-500"
-            badge={`${mainAgents.length} agent${mainAgents.length !== 1 ? 's' : ''}`}
+            title="MISSION"
+            icon={<Target size={12} />}
+            iconColor={mission ? 'text-green-500' : 'text-slate-400'}
+            badge={mission ? 'Active' : 'None'}
             defaultOpen
           >
-            <AgentsCard
+            <MissionSidebarCard
+              mission={mission}
+              projectRoot={selectedProjectRoot}
+              onOpenMission={() => setCurrentPage('mission')}
+            />
+          </CollapsibleCard>
+          <TaskListCard plan={activePlan} />
+          <CollapsibleCard
+            title="MODELS"
+            icon={<Sparkles size={12} />}
+            iconColor="text-purple-500"
+            badge={`${models.length}`}
+            defaultOpen
+          >
+            <ModelsCard
+              models={models}
               agents={mainAgents}
-              workspaceState={workspaceState}
-              isRunning={isRunning}
-              selectedAgent={selectedAgent}
-              agentStatus={agentStatus}
-              agentStatusText={agentStatusText}
-              agentWork={agentWork}
-              agentRunSummary={agentRunSummary}
+              ollamaStatus={ollamaStatus}
+              chatMessages={chatMessages}
+              tokensPerSec={tokensPerSec}
               agentContext={agentContext}
             />
           </CollapsibleCard>
@@ -1847,19 +1968,6 @@ const App: React.FC = () => {
                 setInitialSettingsTab('skills');
                 setCurrentPage('settings');
               }}
-            />
-          </CollapsibleCard>
-          <CollapsibleCard
-            title="MODELS STATUS"
-            icon={<Sparkles size={12} />}
-            iconColor="text-purple-500"
-            badge={`${models.length} model${models.length !== 1 ? 's' : ''}`}
-          >
-            <ModelsCard
-              models={models}
-              ollamaStatus={ollamaStatus}
-              chatMessages={chatMessages}
-              tokensPerSec={tokensPerSec}
             />
           </CollapsibleCard>
         </aside>

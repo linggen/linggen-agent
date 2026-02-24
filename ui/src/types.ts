@@ -89,6 +89,9 @@ export type SkillInfo = SkillInfoFull;
 export interface AgentInfo {
   name: string;
   description: string;
+  model?: string | null;
+  idle_prompt?: string | null;
+  idle_interval_secs?: number | null;
 }
 
 export interface AgentFileInfo {
@@ -247,6 +250,35 @@ export interface BuiltInSkillInfo {
 
 export type ManagementTab = 'models' | 'agents' | 'skills' | 'general';
 
+// --- Mission types ---
+
+export type MissionTab = 'editor' | 'agents' | 'history' | 'activity';
+
+export interface MissionInfo {
+  text: string;
+  created_at: number;
+  active: boolean;
+  agents: MissionAgentConfig[];
+}
+
+export interface MissionAgentConfig {
+  id: string;
+  idle_prompt?: string | null;
+  idle_interval_secs?: number | null;
+}
+
+export interface AgentOverrideConfig {
+  agent_id: string;
+  idle_prompt: string | null;
+  idle_interval_secs: number | null;
+}
+
+export interface IdlePromptEvent {
+  agent_id: string;
+  project_root: string;
+  timestamp: number;
+}
+
 // --- Memory server types ---
 
 export interface MemorySource {
@@ -300,6 +332,7 @@ export interface MemoryServerStatus {
 // Plan mode types
 export type PlanItemStatus = 'pending' | 'in_progress' | 'done' | 'skipped';
 export type PlanStatus = 'planned' | 'approved' | 'executing' | 'completed';
+export type PlanOrigin = 'user_requested' | 'model_managed';
 
 export interface PlanItem {
   title: string;
@@ -311,4 +344,5 @@ export interface Plan {
   summary: string;
   items: PlanItem[];
   status: PlanStatus;
+  origin?: PlanOrigin;
 }

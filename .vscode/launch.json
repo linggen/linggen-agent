@@ -5,9 +5,9 @@
       "name": "Agent Server",
       "type": "lldb",
       "request": "launch",
-      "program": "${workspaceFolder}/target/debug/linggen-agent",
-      "preLaunchTask": "cargo build agent",
-      "args": ["serve", "--dev"],
+      "program": "${workspaceFolder}/target/debug/ling",
+      "preLaunchTask": "build agent all",
+      "args": ["--web", "--dev"],
       "cwd": "${workspaceFolder}",
       "env": {
         "RUST_LOG": "info",
@@ -17,12 +17,21 @@
     },
     {
       "name": "Agent UI",
-      "type": "pwa-chrome",
+      "type": "chrome",
       "request": "launch",
-      "runtimeArgs": ["--user-data-dir=${workspaceFolder}/.vscode/chrome-debug"],
+      "runtimeArgs": [
+        "--user-data-dir=${workspaceFolder}/.vscode/chrome-debug"
+      ],
       "url": "http://localhost:5173",
       "webRoot": "${workspaceFolder}/ui",
-      "preLaunchTask": "npm: dev - agent ui"
+      "preLaunchTask": "build and dev agent ui"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Agent Server + UI",
+      "configurations": ["Agent Server", "Agent UI"],
+      "stopAll": true
     }
   ]
 }

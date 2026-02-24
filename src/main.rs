@@ -317,6 +317,22 @@ async fn main() -> Result<()> {
                 agent_manager::AgentManager::new(config, config_dir, store, skill_manager.clone());
 
             let _ = skill_manager.load_all(Some(&ws_root)).await;
+
+            // Auto-install built-in skills if none found
+            if skill_manager.list_skills().await.is_empty() {
+                let sm = skill_manager.clone();
+                let ws = ws_root.clone();
+                tokio::spawn(async move {
+                    tracing::info!("No skills found, auto-installing built-in skills...");
+                    if let Err(e) = auto_install_builtin_skills().await {
+                        tracing::warn!("Auto-install skills failed: {e}");
+                        return;
+                    }
+                    let _ = sm.load_all(Some(&ws)).await;
+                    tracing::info!("Built-in skills installed");
+                });
+            }
+
             let _ = manager.get_or_create_project(ws_root.clone()).await?;
 
             if cli.web {
@@ -378,6 +394,18 @@ async fn main() -> Result<()> {
         | Some(Command::Memory { .. }) => unreachable!(),
     }
 
+    Ok(())
+}
+
+async fn auto_install_builtin_skills() -> Result<()> {
+    let target = crate::paths::global_skills_dir();
+    let zip_url =
+        skills::marketplace::build_github_zip_url("linggen", "skills", "main");
+    let client = skills::marketplace::http_client()?;
+    let temp_zip = skills::marketplace::download_to_temp(&client, &zip_url).await?;
+    let result = skills::marketplace::extract_all_skills_from_zip(&temp_zip, &target);
+    let _ = std::fs::remove_file(&temp_zip);
+    result?;
     Ok(())
 }
 

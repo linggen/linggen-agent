@@ -59,6 +59,10 @@ pub enum ToolResult {
         denied: Vec<String>,
     },
     AgentOutcome(crate::engine::AgentOutcome),
+    WebSearchResults {
+        query: String,
+        results: Vec<super::web_search::WebSearchResult>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -213,6 +217,19 @@ impl Tools {
                 let args: DelegateToAgentArgs = serde_json::from_value(normalized_args)
                     .map_err(|e| anyhow::anyhow!("invalid args for delegate_to_agent: {}", e))?;
                 self.delegate_to_agent(args)
+            }
+            "WebSearch" => {
+                let args: WebSearchArgs = serde_json::from_value(normalized_args)
+                    .map_err(|e| anyhow::anyhow!("invalid args for WebSearch: {}", e))?;
+                let max = args.max_results.unwrap_or(5).min(10);
+                let results = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(super::web_search::duckduckgo_search(&args.query, max))
+                })?;
+                Ok(ToolResult::WebSearchResults {
+                    query: args.query,
+                    results,
+                })
             }
             _ => anyhow::bail!("unknown tool: {}", call.tool),
         }
@@ -1149,6 +1166,13 @@ pub(crate) struct DelegateToAgentArgs {
     pub(crate) task: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct WebSearchArgs {
+    #[serde(alias = "q")]
+    query: String,
+    max_results: Option<usize>,
+}
+
 fn build_globset(globs: Option<&[String]>) -> Result<Option<GlobSet>> {
     let Some(globs) = globs else {
         return Ok(None);
@@ -1405,6 +1429,7 @@ pub fn canonical_tool_name(tool: &str) -> Option<&'static str> {
         "lock_paths" => "lock_paths",
         "unlock_paths" => "unlock_paths",
         "delegate_to_agent" => "delegate_to_agent",
+        "WebSearch" | "web_search" => "WebSearch",
         _ => return None,
     })
 }
@@ -1456,6 +1481,12 @@ pub(crate) fn full_tool_schema_entries() -> Vec<Value> {
             "args": {"target_agent_id": "string", "task": "string"},
             "returns": "{agent_outcome}",
             "notes": "Delegates a task to another agent. Subject to max delegation depth."
+        }),
+        serde_json::json!({
+            "name": "WebSearch",
+            "args": {"query": "string", "max_results": "number?"},
+            "returns": "{results:[{title,url,snippet}]}",
+            "notes": "Search the web via DuckDuckGo. Default 5 results, max 10."
         }),
     ]
 }

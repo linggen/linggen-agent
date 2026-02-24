@@ -137,7 +137,21 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
         "Read" | "Grep" | "Write" | "Edit" | "Glob" | "Bash" | "capture_screenshot"
         | "lock_paths" | "unlock_paths" | "delegate_to_agent" => action_type,
         // Known non-tool action types that should not be treated as tool shorthands.
-        "" | "patch" | "finalize_task" | "update_plan" | "done" | "enter_plan_mode" => return None,
+        "" | "patch" | "finalize_task" | "update_plan" | "done" | "enter_plan_mode" => {
+            // Fallback: if the object has a text-like field but no action type,
+            // treat it as a Done message. This handles models that emit
+            // {"response":"..."} or {"message":"..."} instead of a proper action.
+            if action_type.is_empty() {
+                for key in &["response", "message", "text", "content", "answer"] {
+                    if let Some(val) = obj.get(*key).and_then(|v| v.as_str()) {
+                        return Some(ModelAction::Done {
+                            message: Some(val.to_string()),
+                        });
+                    }
+                }
+            }
+            return None;
+        }
         // Unknown type with args present: treat as a skill tool shorthand
         // (e.g. {"type":"my_skill_tool","args":{...}}).
         other if obj.contains_key("args") || obj.contains_key("tool_args") => other,
@@ -457,5 +471,39 @@ Now let me also search:
             }
             _ => panic!("expected EnterPlanMode"),
         }
+    }
+
+    #[test]
+    fn parse_response_json_as_done() {
+        // Models sometimes emit {"response":"..."} instead of {"type":"done","message":"..."}.
+        // This should be treated as a Done action.
+        let raw = r#"{"response":"Hi there! I can help you with that."}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ModelAction::Done { message } => {
+                assert_eq!(
+                    message.as_deref(),
+                    Some("Hi there! I can help you with that.")
+                );
+            }
+            _ => panic!("expected Done action, got {:?}", actions[0]),
+        }
+    }
+
+    #[test]
+    fn parse_message_json_as_done() {
+        let raw = r#"{"message":"Task complete."}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], ModelAction::Done { message } if message.as_deref() == Some("Task complete.")));
+    }
+
+    #[test]
+    fn parse_text_json_as_done() {
+        let raw = r#"{"text":"Here is the answer."}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], ModelAction::Done { message } if message.as_deref() == Some("Here is the answer.")));
     }
 }

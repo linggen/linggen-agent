@@ -12,6 +12,30 @@
       "problemMatcher": ["$rustc"]
     },
     {
+      "label": "build agent ui",
+      "type": "shell",
+      "command": "npm run build",
+      "options": {
+        "cwd": "${workspaceFolder}/ui"
+      },
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "build agent all",
+      "dependsOn": ["build agent ui", "cargo build agent"],
+      "dependsOrder": "parallel",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "build and dev agent ui",
+      "dependsOn": ["build agent ui", "npm: dev - agent ui"],
+      "dependsOrder": "sequence",
+      "problemMatcher": [],
+      "isBackground": true
+    },
+    {
       "label": "npm: dev - agent ui",
       "type": "shell",
       "command": "npm run dev -- --host 127.0.0.1 --port 5173",

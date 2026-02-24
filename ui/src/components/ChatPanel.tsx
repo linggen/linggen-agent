@@ -197,13 +197,17 @@ const looksLikeCodeLine = (line: string) =>
     line
   );
 
+type WebSearchResultItem = { title: string; url: string; snippet: string };
 type RenderChunk =
   | { type: 'text'; text: string }
-  | { type: 'bash'; exitCode?: string; stdout: string; stderr: string };
+  | { type: 'bash'; exitCode?: string; stdout: string; stderr: string }
+  | { type: 'websearch'; query: string; results: WebSearchResultItem[] };
 
 const BASH_OUTPUT_HEADER_RE = /^Bash output \(exit_code:\s*([^)]+)\):\s*$/i;
 const TOOL_BASH_OUTPUT_HEADER_RE =
   /^Tool\s+Bash\s*:\s*Bash output \(exit_code:\s*([^)]+)\):\s*$/i;
+const WEBSEARCH_HEADER_RE = /^(?:Tool\s+WebSearch\s*:\s*)?WebSearch:\s*"([^"]+)"\s*\((\d+)\s*results?\)/i;
+const WEBSEARCH_RESULT_RE = /^\d+\.\s+(.+?)\s+—\s+(\S+)$/;
 
 const trimTrailingEmptyLines = (lines: string[]) => {
   const out = [...lines];
@@ -236,6 +240,41 @@ const parseBashOutputChunks = (text: string): RenderChunk[] => {
   while (i < lines.length) {
     const line = lines[i] || '';
     const trimmed = line.trim();
+
+    // Detect WebSearch result blocks
+    const wsMatch = WEBSEARCH_HEADER_RE.exec(trimmed);
+    if (wsMatch) {
+      flushText();
+      const query = wsMatch[1];
+      const results: WebSearchResultItem[] = [];
+      i += 1;
+      while (i < lines.length) {
+        const rl = (lines[i] || '').trim();
+        if (!rl) { i += 1; continue; }
+        const rm = WEBSEARCH_RESULT_RE.exec(rl);
+        if (rm) {
+          const title = rm[1];
+          const url = rm[2];
+          i += 1;
+          // Next line is the snippet (indented)
+          const snippet = (i < lines.length ? (lines[i] || '').trim() : '');
+          if (snippet && !WEBSEARCH_RESULT_RE.test(snippet) && !WEBSEARCH_HEADER_RE.test(snippet)) {
+            results.push({ title, url, snippet });
+            i += 1;
+          } else {
+            results.push({ title, url, snippet: '' });
+          }
+        } else if (/^\d+\.\s/.test(rl)) {
+          // Malformed result line — skip
+          i += 1;
+        } else {
+          break;
+        }
+      }
+      chunks.push({ type: 'websearch', query, results });
+      continue;
+    }
+
     let exitCode: string | undefined;
     let atStdout = false;
 
@@ -316,6 +355,39 @@ const renderAgentMessageBody = (text: string) => {
         if (chunk.type === 'text') {
           return <MarkdownContent key={`text-${idx}`} text={chunk.text} />;
         }
+        if (chunk.type === 'websearch') {
+          return (
+            <details
+              key={`ws-${idx}`}
+              open
+              className="rounded-md border border-blue-200 dark:border-blue-800/40 bg-blue-50/50 dark:bg-blue-950/20 text-[12px]"
+            >
+              <summary className="cursor-pointer px-2 py-1.5 text-slate-600 dark:text-slate-300 select-none flex items-center gap-2">
+                <span className="font-semibold">WebSearch</span>
+                <span className="text-[10px] text-slate-500">&quot;{chunk.query}&quot; &mdash; {chunk.results.length} result{chunk.results.length === 1 ? '' : 's'}</span>
+              </summary>
+              <div className="px-2 pb-2 space-y-1">
+                {chunk.results.map((r, ri) => (
+                  <div key={ri} className="rounded border border-slate-200/60 dark:border-white/10 bg-white dark:bg-black/30 px-2 py-1.5">
+                    <a
+                      href={/^https?:\/\//i.test(r.url) ? r.url : '#'}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-blue-600 dark:text-blue-400 hover:underline font-medium text-[12px] break-all"
+                    >
+                      {r.title || r.url}
+                    </a>
+                    <div className="text-[10px] text-slate-400 dark:text-slate-500 truncate">{r.url}</div>
+                    {r.snippet && <div className="text-[11px] text-slate-600 dark:text-slate-400 mt-0.5 line-clamp-2">{r.snippet}</div>}
+                  </div>
+                ))}
+                {chunk.results.length === 0 && (
+                  <div className="text-[11px] text-slate-400 italic px-1">No results found</div>
+                )}
+              </div>
+            </details>
+          );
+        }
         const stdoutLines = lineCount(chunk.stdout);
         const stderrLines = lineCount(chunk.stderr);
         return (
@@ -374,7 +446,15 @@ const sanitizeAgentMessageText = (text: string) => {
       kept.push(trimmed.replace(/^Tool\s+Bash\s*:\s*/i, ''));
       continue;
     }
-    if (TOOL_RESULT_LINE_RE.test(trimmed)) continue;
+    if (TOOL_RESULT_LINE_RE.test(trimmed)) {
+      // Preserve WebSearch results — strip the "Tool WebSearch:" prefix but keep the content
+      const wsToolMatch = /^Tool\s+WebSearch\s*:\s*(.*)$/i.exec(trimmed);
+      if (wsToolMatch) {
+        kept.push(wsToolMatch[1]);
+        continue;
+      }
+      continue;
+    }
     if (START_AUTONOMOUS_LINE_RE.test(trimmed)) continue;
     if (CONTENT_OMITTED_LINE_RE.test(trimmed)) continue;
     if (readFileRelated && looksLikeCodeLine(trimmed)) continue;
@@ -430,17 +510,51 @@ const mergeMessageStreams = (contextMessages: ChatMessage[], liveMessages: ChatM
   });
 };
 
+/**
+ * Maps a "done" activity line to its "doing" counterpart so the
+ * in-progress entry can be replaced by the completed one.
+ */
+const doingFormOf = (done: string): string | null => {
+  // "Read file: X" → "Reading file: X"
+  if (done.startsWith('Read file:')) return 'Reading file:' + done.slice('Read file:'.length);
+  // "Listed files: X" → "Listing files: X"
+  if (done.startsWith('Listed files:')) return 'Listing files:' + done.slice('Listed files:'.length);
+  // "Wrote file: X" → "Writing file: X"
+  if (done.startsWith('Wrote file:')) return 'Writing file:' + done.slice('Wrote file:'.length);
+  // "Edited file: X" → "Editing file: X"
+  if (done.startsWith('Edited file:')) return 'Editing file:' + done.slice('Edited file:'.length);
+  // "Ran command: X" → "Running command: X"
+  if (done.startsWith('Ran command:')) return 'Running command:' + done.slice('Ran command:'.length);
+  // "Searched for: X" → "Searching: X"  (prefix differs)
+  if (done.startsWith('Searched for:')) return 'Searching:' + done.slice('Searched for:'.length);
+  // "Searched: X" → "Searching: X"
+  if (done.startsWith('Searched:')) return 'Searching:' + done.slice('Searched:'.length);
+  // "Delegated to X" → "Delegating to subagent: X"
+  if (done.startsWith('Delegated to ')) return 'Delegating to subagent: ' + done.slice('Delegated to '.length);
+  return null;
+};
+
 const dedupeActivityEntries = (entries: string[]) => {
   const seen = new Set<string>();
   const out: string[] = [];
+  // First pass: collect all entries
   for (const raw of entries) {
     const clean = String(raw || '').trim();
     if (!clean || seen.has(clean)) continue;
     seen.add(clean);
     out.push(clean);
   }
-  if (!out.includes('Model loading...')) return out;
-  const rest = out.filter((entry) => entry !== 'Model loading...');
+  // Second pass: remove "doing" entries that have a matching "done" entry
+  const doingToRemove = new Set<string>();
+  for (const entry of out) {
+    const doing = doingFormOf(entry);
+    if (doing && seen.has(doing)) {
+      doingToRemove.add(doing);
+    }
+  }
+  const filtered = doingToRemove.size > 0 ? out.filter((e) => !doingToRemove.has(e)) : out;
+  if (!filtered.includes('Model loading...')) return filtered;
+  const rest = filtered.filter((entry) => entry !== 'Model loading...');
   return ['Model loading...', ...rest];
 };
 
@@ -865,6 +979,7 @@ export const ChatPanel: React.FC<{
   chatMessages: ChatMessage[];
   queuedMessages: QueuedChatItem[];
   chatEndRef: React.RefObject<HTMLDivElement | null>;
+  projectRoot?: string | null;
   selectedAgent: string;
   setSelectedAgent: (value: string) => void;
   skills: SkillInfo[];
@@ -888,6 +1003,7 @@ export const ChatPanel: React.FC<{
   chatMessages,
   queuedMessages,
   chatEndRef,
+  projectRoot,
   selectedAgent,
   setSelectedAgent,
   skills,
@@ -927,6 +1043,15 @@ export const ChatPanel: React.FC<{
   const [childrenByRunId, setChildrenByRunId] = useState<Record<string, AgentRunInfo[]>>({});
   const [loadingChildrenByRunId, setLoadingChildrenByRunId] = useState<Record<string, boolean>>({});
   const [childrenErrorByRunId, setChildrenErrorByRunId] = useState<Record<string, string>>({});
+  const notFoundRunIds = useRef<Set<string>>(new Set());
+  const prevProjectRootRef = useRef(projectRoot);
+
+  // Reset stale caches when project changes
+  if (projectRoot !== prevProjectRootRef.current) {
+    notFoundRunIds.current.clear();
+    prevProjectRootRef.current = projectRoot;
+  }
+
   const [expandedMessages, setExpandedMessages] = useState<Set<string>>(new Set());
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -1096,6 +1221,7 @@ export const ChatPanel: React.FC<{
   const fetchRunContext = useCallback(
     (runId?: string, force = false) => {
       if (!runId) return;
+      if (notFoundRunIds.current.has(runId)) return;
       if (loadingContextByRunId[runId]) return;
       if (!force && runContextById[runId]) return;
       setLoadingContextByRunId((prev) => ({ ...prev, [runId]: true }));
@@ -1109,7 +1235,9 @@ export const ChatPanel: React.FC<{
           const url = new URL('/api/agent-context', window.location.origin);
           url.searchParams.append('run_id', runId);
           url.searchParams.append('view', 'raw');
+          if (projectRoot) url.searchParams.append('project_root', projectRoot);
           const resp = await fetch(url.toString());
+          if (resp.status === 404) { notFoundRunIds.current.add(runId); return; }
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           const data = (await resp.json()) as AgentRunContextResponse;
           setRunContextById((prev) => ({ ...prev, [runId]: data }));
@@ -1125,12 +1253,13 @@ export const ChatPanel: React.FC<{
         }
       })();
     },
-    [runContextById, loadingContextByRunId]
+    [runContextById, loadingContextByRunId, projectRoot]
   );
 
   const fetchRunChildren = useCallback(
     (runId?: string, force = false) => {
       if (!runId) return;
+      if (notFoundRunIds.current.has(runId)) return;
       if (loadingChildrenByRunId[runId]) return;
       if (!force && childrenByRunId[runId]) return;
       setLoadingChildrenByRunId((prev) => ({ ...prev, [runId]: true }));
@@ -1143,7 +1272,9 @@ export const ChatPanel: React.FC<{
         try {
           const url = new URL('/api/agent-children', window.location.origin);
           url.searchParams.append('run_id', runId);
+          if (projectRoot) url.searchParams.append('project_root', projectRoot);
           const resp = await fetch(url.toString());
+          if (resp.status === 404) { notFoundRunIds.current.add(runId); return; }
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           const data = (await resp.json()) as AgentRunInfo[];
           setChildrenByRunId((prev) => ({ ...prev, [runId]: Array.isArray(data) ? data : [] }));
@@ -1159,7 +1290,7 @@ export const ChatPanel: React.FC<{
         }
       })();
     },
-    [childrenByRunId, loadingChildrenByRunId]
+    [childrenByRunId, loadingChildrenByRunId, projectRoot]
   );
 
   useEffect(() => {
@@ -1268,36 +1399,6 @@ export const ChatPanel: React.FC<{
     }[] = [];
 
     const beforeSlash = chatInput.substring(0, chatInput.lastIndexOf('/'));
-
-    if ('mode'.includes(skillFilter)) {
-      suggestions.push({
-        key: 'cmd-mode',
-        label: '/mode',
-        description: 'Switch between chat and auto.',
-        apply: () => {
-          setChatInput(`${beforeSlash}/mode `);
-          setSkillFilter('mode');
-          setShowSkillDropdown(true);
-        },
-      });
-    }
-
-    if (skillFilter.startsWith('mode')) {
-      [
-        { cmd: '/mode chat', desc: 'Plain-text answers (summaries, explanations).' },
-        { cmd: '/mode auto', desc: 'Structured planning responses (user stories + criteria).' },
-      ].forEach((item) => {
-        suggestions.push({
-          key: item.cmd,
-          label: item.cmd,
-          description: item.desc,
-          apply: () => {
-            setChatInput(`${item.cmd} `);
-            setShowSkillDropdown(false);
-          },
-        });
-      });
-    }
 
     skills
       .filter(
@@ -1601,7 +1702,9 @@ export const ChatPanel: React.FC<{
                     return (
                       <div className="space-y-2">
                         <div className="flex items-center gap-2">
-                          <span className="font-bold text-blue-500">Plan</span>
+                          <span className="font-bold text-blue-500">
+                            {plan.origin === 'user_requested' ? 'Plan' : 'Tasks'}
+                          </span>
                           <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${statusColor[plan.status] || statusColor.planned}`}>
                             {plan.status}
                           </span>
@@ -1619,7 +1722,7 @@ export const ChatPanel: React.FC<{
                             </div>
                           ))}
                         </div>
-                        {plan.status === 'planned' && onApprovePlan && onRejectPlan && (
+                        {plan.status === 'planned' && plan.origin === 'user_requested' && onApprovePlan && onRejectPlan && (
                           <div className="flex gap-2 pt-1">
                             <button
                               onClick={onApprovePlan}
@@ -1734,6 +1837,17 @@ export const ChatPanel: React.FC<{
                         )}
                       </div>
                     );
+                  }
+                  // JSON object with a text-like field — extract and render as markdown
+                  const textContent =
+                    typeof parsed.response === 'string' ? parsed.response
+                    : typeof parsed.text === 'string' ? parsed.text
+                    : typeof parsed.content === 'string' ? parsed.content
+                    : typeof parsed.message === 'string' ? parsed.message
+                    : typeof parsed.answer === 'string' ? parsed.answer
+                    : null;
+                  if (textContent) {
+                    return renderAgentMessageBody(textContent);
                   }
                   return renderAgentMessageBody(displayText);
                 } catch (_e) {

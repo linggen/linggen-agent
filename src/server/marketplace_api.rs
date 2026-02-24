@@ -178,3 +178,41 @@ pub(crate) async fn builtin_skills_install(
         }
     }
 }
+
+pub(crate) async fn builtin_skills_install_all(
+    State(state): State<Arc<ServerState>>,
+) -> impl IntoResponse {
+    let target = crate::paths::global_skills_dir();
+    let zip_url = marketplace::build_github_zip_url("linggen", "skills", "main");
+    let client = match marketplace::http_client() {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let temp_zip = match marketplace::download_to_temp(&client, &zip_url).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(err = %e, "Failed to download skills repo");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+
+    let result = marketplace::extract_all_skills_from_zip(&temp_zip, &target);
+    let _ = std::fs::remove_file(&temp_zip);
+
+    match result {
+        Ok(installed) => {
+            let _ = state.skill_manager.load_all(None).await;
+            let _ = state.events_tx.send(ServerEvent::StateUpdated);
+            axum::Json(serde_json::json!({
+                "ok": true,
+                "installed": installed,
+                "message": format!("Installed {} skills", installed.len()),
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "Failed to extract skills from ZIP");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { ArrowLeft, Database, Search, Plus, RefreshCw, Trash2, FolderOpen, CheckCircle, XCircle, Loader2, HardDrive } from 'lucide-react';
 import type { MemorySource, MemoryIndexingJob, MemorySearchResult, MemoryServerStatus } from '../types';
 
@@ -39,7 +39,7 @@ async function indexSource(sourceId: string, mode: string): Promise<{ job_id: st
 
 async function fetchJobs(): Promise<MemoryIndexingJob[]> {
   const resp = await fetch(`${MEMORY_API}/jobs`);
-  if (!resp.ok) return [];
+  if (!resp.ok) throw new Error(`Failed to list jobs: ${resp.status}`);
   const data = await resp.json();
   return data.jobs || [];
 }
@@ -193,19 +193,23 @@ export const MemoryPage: React.FC<{
   const [newSourcePath, setNewSourcePath] = useState('');
   const [newSourceName, setNewSourceName] = useState('');
 
-  const refreshData = useCallback(async () => {
+  const serverReachable = useRef(true);
+
+  const refreshData = useCallback(async (manual = false) => {
+    // Don't auto-poll if server was unreachable; only retry on manual refresh
+    if (!manual && !serverReachable.current) return;
     setLoading(true);
-    setError(null);
+    if (manual) setError(null);
     try {
-      const [st, sr, jb] = await Promise.all([
-        fetchMemoryStatus(),
-        fetchSources(),
-        fetchJobs(),
-      ]);
+      const st = await fetchMemoryStatus();
+      serverReachable.current = true;
       setStatus(st);
+      setError(null);
+      const [sr, jb] = await Promise.all([fetchSources(), fetchJobs()]);
       setSources(sr);
       setJobs(jb);
     } catch (e: any) {
+      serverReachable.current = false;
       setError(e.message || 'Failed to connect to memory server');
     } finally {
       setLoading(false);
@@ -213,8 +217,8 @@ export const MemoryPage: React.FC<{
   }, []);
 
   useEffect(() => {
-    refreshData();
-    const interval = setInterval(refreshData, 5000);
+    refreshData(true);
+    const interval = setInterval(() => refreshData(false), 5000);
     return () => clearInterval(interval);
   }, [refreshData]);
 
@@ -222,7 +226,7 @@ export const MemoryPage: React.FC<{
     setIndexingIds((prev) => new Set(prev).add(sourceId));
     try {
       await indexSource(sourceId, 'auto');
-      setTimeout(refreshData, 1000);
+      setTimeout(() => refreshData(true), 1000);
     } finally {
       setIndexingIds((prev) => {
         const next = new Set(prev);
@@ -241,7 +245,7 @@ export const MemoryPage: React.FC<{
       setShowAddSource(false);
       setNewSourcePath('');
       setNewSourceName('');
-      setTimeout(refreshData, 1000);
+      setTimeout(() => refreshData(true), 1000);
     } catch (e: any) {
       alert(e.message || 'Failed to add source');
     }
@@ -269,7 +273,7 @@ export const MemoryPage: React.FC<{
           {error && <span className="text-[10px] text-red-500">{error}</span>}
         </div>
         <div className="ml-auto flex items-center gap-1">
-          <button onClick={refreshData} className="p-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-white/5 text-slate-500 transition-colors" title="Refresh">
+          <button onClick={() => refreshData(true)} className="p-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-white/5 text-slate-500 transition-colors" title="Refresh">
             <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
           </button>
         </div>

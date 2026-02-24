@@ -250,13 +250,14 @@ pub(crate) async fn list_agent_runs_api(
 #[derive(Deserialize)]
 pub(crate) struct AgentChildrenQuery {
     run_id: String,
+    project_root: Option<String>,
 }
 
 pub(crate) async fn list_agent_children_api(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<AgentChildrenQuery>,
 ) -> impl IntoResponse {
-    match state.manager.list_agent_children(&query.run_id).await {
+    match state.manager.list_agent_children(&query.run_id, query.project_root.as_deref()).await {
         Ok(runs) => Json(runs).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -266,6 +267,7 @@ pub(crate) async fn list_agent_children_api(
 pub(crate) struct AgentContextQuery {
     run_id: String,
     view: Option<String>, // "summary" | "raw"
+    project_root: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -299,7 +301,7 @@ pub(crate) async fn get_agent_context_api(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<AgentContextQuery>,
 ) -> impl IntoResponse {
-    let run = match state.manager.get_agent_run(&query.run_id).await {
+    let run = match state.manager.get_agent_run(&query.run_id, query.project_root.as_deref()).await {
         Ok(Some(run)) => run,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),

@@ -19,6 +19,8 @@ pub struct BuiltInSkillInfo {
 pub fn list_builtin_skills() -> Vec<BuiltInSkillInfo> {
     let defs: &[(&str, &str)] = &[
         ("memory", "Semantic memory and RAG — index codebases, search semantically, store and retrieve memories."),
+        ("skiller", "Search, install, and manage skills from the marketplace and skills.sh registry."),
+        ("discord", "Social messaging with Discord friends — send messages, poll for new messages, manage contacts."),
         ("linggen", "Cross-project code search, indexed context, prompt enhancement, and server management."),
     ];
 
@@ -74,6 +76,7 @@ fn default_user_invocable() -> bool {
 pub enum SkillSource {
     Global,
     Project,
+    Compat,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,7 +128,14 @@ impl SkillManager {
                 .await;
         }
 
-        // 2. Load Project Skills (.linggen/skills/) — highest priority
+        // 2. Load Compat Skills (~/.claude/skills/, ~/.codex/skills/)
+        for compat_dir in crate::paths::compat_skills_dirs() {
+            let _ = self
+                .load_from_dir_nested(&compat_dir, SkillSource::Compat, &mut *skills)
+                .await;
+        }
+
+        // 3. Load Project Skills (.linggen/skills/) — highest priority
         if let Some(root) = project_root {
             let project_dir = root.join(".linggen/skills");
             let _ = self
@@ -410,9 +420,11 @@ Nested content."#;
     #[test]
     fn test_list_builtin_skills() {
         let builtins = list_builtin_skills();
-        assert_eq!(builtins.len(), 2);
+        assert_eq!(builtins.len(), 4);
         let names: Vec<&str> = builtins.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"memory"));
+        assert!(names.contains(&"skiller"));
+        assert!(names.contains(&"discord"));
         assert!(names.contains(&"linggen"));
     }
 }

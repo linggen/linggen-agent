@@ -98,6 +98,7 @@ impl ToolRegistry {
             "lock_paths",
             "unlock_paths",
             "delegate_to_agent",
+            "WebSearch",
         ]
         .into_iter()
         .map(String::from)

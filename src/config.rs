@@ -54,6 +54,10 @@ pub struct AgentSpec {
     pub default_lock_globs: Vec<String>,
     #[serde(default)]
     pub policy: AgentPolicy,
+    #[serde(default)]
+    pub idle_prompt: Option<String>,
+    #[serde(default)]
+    pub idle_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
@@ -630,6 +634,34 @@ Prompt."#;
         assert_eq!(spec.skills, vec!["memory"]);
         assert_eq!(spec.work_globs, vec!["src/**/*.rs"]);
         assert_eq!(spec.default_lock_globs, vec!["Cargo.lock"]);
+    }
+
+    #[test]
+    fn test_agent_spec_with_idle_fields() {
+        let md = r#"---
+name: ling
+description: Lead agent
+tools: [Read, Glob]
+idle_prompt: "Review mission progress and delegate tasks."
+idle_interval_secs: 60
+---
+You are the lead."#;
+        let (spec, _) = AgentSpec::from_markdown_content(md).unwrap();
+        assert_eq!(spec.idle_prompt.as_deref(), Some("Review mission progress and delegate tasks."));
+        assert_eq!(spec.idle_interval_secs, Some(60));
+    }
+
+    #[test]
+    fn test_agent_spec_without_idle_fields() {
+        let md = r#"---
+name: coder
+description: Implementation agent
+tools: [Read, Write]
+---
+Write code."#;
+        let (spec, _) = AgentSpec::from_markdown_content(md).unwrap();
+        assert!(spec.idle_prompt.is_none());
+        assert!(spec.idle_interval_secs.is_none());
     }
 
     // ---- WriteSafetyMode tests ----

@@ -4,7 +4,8 @@ The `ling` binary — Linggen AI coding agent.
 
 ## Related docs
 
-- `doc/framework.md`: runtime design, tool contract, safety rules.
+- `doc/tools.md`: tool contract, safety rules.
+- `doc/agentic-loop.md`: runtime design, loop behaviour.
 - `doc/product-spec.md`: product goals, interaction modes, UX.
 
 ## Quick reference
@@ -313,7 +314,7 @@ These flags can be used with any command:
 
 ## Configuration
 
-All commands load config from `linggen-agent.toml` (see `doc/framework.md` for search order). Lightweight commands only need the config file; they do not initialise the full agent runtime.
+All commands load config from `linggen-agent.toml` (see `doc/storage.md` for search order). Lightweight commands only need the config file; they do not initialise the full agent runtime.
 
 ### Memory server config
 

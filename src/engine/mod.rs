@@ -4,6 +4,7 @@ pub mod render;
 pub mod skill_tool;
 pub mod tool_registry;
 pub mod tools;
+pub mod web_search;
 
 use crate::agent_manager::models::ModelManager;
 use crate::agent_manager::AgentManager;
@@ -51,6 +52,8 @@ pub struct Plan {
     pub summary: String,
     pub items: Vec<PlanItem>,
     pub status: PlanStatus,
+    #[serde(default)]
+    pub origin: PlanOrigin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -60,6 +63,19 @@ pub enum PlanStatus {
     Approved,
     Executing,
     Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanOrigin {
+    UserRequested,
+    ModelManaged,
+}
+
+impl Default for PlanOrigin {
+    fn default() -> Self {
+        PlanOrigin::ModelManaged
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +195,8 @@ pub struct AgentEngine {
     pub run_id: Option<String>,
     pub thinking_tx: Option<mpsc::UnboundedSender<ThinkingEvent>>,
     pub repl_events_tx: Option<mpsc::UnboundedSender<ReplEvent>>,
+    /// Receiver for user interrupt messages injected while the agent loop is running.
+    pub interrupt_rx: Option<mpsc::UnboundedReceiver<String>>,
     // Plan mode
     pub plan_mode: bool,
     pub plan: Option<Plan>,
@@ -247,6 +265,7 @@ impl AgentEngine {
             run_id: None,
             thinking_tx: None,
             repl_events_tx: None,
+            interrupt_rx: None,
             plan_mode: false,
             plan: None,
             plan_file: None,
@@ -1203,7 +1222,13 @@ impl AgentEngine {
             }
             existing.clone()
         } else {
-            // Create new plan
+            // Create new plan.
+            // User-requested plans (plan_mode) need approval; model task lists execute immediately.
+            let (origin, status) = if self.plan_mode {
+                (PlanOrigin::UserRequested, PlanStatus::Planned)
+            } else {
+                (PlanOrigin::ModelManaged, PlanStatus::Executing)
+            };
             let plan = Plan {
                 summary: summary.unwrap_or_else(|| "Plan".to_string()),
                 items: items
@@ -1214,11 +1239,8 @@ impl AgentEngine {
                         status: u.status.clone().unwrap_or(PlanItemStatus::Pending),
                     })
                     .collect(),
-                status: if self.plan_mode {
-                    PlanStatus::Planned
-                } else {
-                    PlanStatus::Executing
-                },
+                status,
+                origin,
             };
             self.plan = Some(plan.clone());
             plan
@@ -1256,14 +1278,9 @@ impl AgentEngine {
             serde_json::json!({ "kind": "update_plan", "item_count": plan.items.len() }),
         );
 
-        // In plan mode, the plan is ready for user approval — exit the loop immediately.
-        if self.plan_mode {
-            if let Some(p) = &mut self.plan {
-                p.status = PlanStatus::Planned;
-            }
-            if let Some(p) = self.plan.clone() {
-                return LoopControl::Return(AgentOutcome::Plan(p));
-            }
+        // New plan requires user approval — exit the loop immediately.
+        if plan.status == PlanStatus::Planned {
+            return LoopControl::Return(AgentOutcome::Plan(plan));
         }
 
         // Check if all items are done — if so, mark plan as completed
@@ -1507,6 +1524,25 @@ impl AgentEngine {
 
             if self.is_cancelled().await {
                 anyhow::bail!("run cancelled");
+            }
+
+            // Drain any user interrupt messages that arrived while we were working.
+            // Cap at 5 per iteration to prevent context explosion from rapid user input.
+            if let Some(rx) = &mut self.interrupt_rx {
+                let mut interrupt_count = 0;
+                while interrupt_count < 5 {
+                    match rx.try_recv() {
+                        Ok(msg) => {
+                            info!("Injecting user interrupt message into loop context");
+                            messages.push(ChatMessage::new(
+                                "user",
+                                format!("[User message received while you are working]\n{}", msg),
+                            ));
+                            interrupt_count += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
 
             if let Some(manager) = self.tools.get_manager() {
@@ -2371,9 +2407,15 @@ impl AgentEngine {
             PlanItemStatus::Skipped => "[-]",
         };
 
+        let origin_str = match plan.origin {
+            PlanOrigin::UserRequested => "user_requested",
+            PlanOrigin::ModelManaged => "model_managed",
+        };
+
         let mut md = format!("# Plan: {}\n\n", plan.summary);
         md.push_str(&format!("**Status:** {}\n\n", serde_json::to_string(&plan.status)
             .unwrap_or_default().trim_matches('"')));
+        md.push_str(&format!("**Origin:** {}\n\n", origin_str));
         for item in &plan.items {
             md.push_str(&format!("- {} {}\n", status_icon(&item.status), item.title));
             if let Some(desc) = &item.description {
@@ -2392,6 +2434,7 @@ impl AgentEngine {
 
         let mut summary = String::new();
         let mut status = PlanStatus::Executing;
+        let mut origin = PlanOrigin::ModelManaged;
         let mut items = Vec::new();
 
         for line in content.lines() {
@@ -2409,6 +2452,15 @@ impl AgentEngine {
                     "executing" => PlanStatus::Executing,
                     "completed" => PlanStatus::Completed,
                     _ => PlanStatus::Executing,
+                };
+            } else if trimmed.starts_with("**Origin:**") {
+                let o = trimmed
+                    .strip_prefix("**Origin:**")
+                    .unwrap_or("")
+                    .trim();
+                origin = match o {
+                    "user_requested" => PlanOrigin::UserRequested,
+                    _ => PlanOrigin::ModelManaged,
                 };
             } else if trimmed.starts_with("- [") {
                 let (item_status, title) = if trimmed.starts_with("- [x] ") {
@@ -2439,7 +2491,7 @@ impl AgentEngine {
             return None;
         }
 
-        Some(Plan { summary, items, status })
+        Some(Plan { summary, items, status, origin })
     }
 
     /// Load the most recent non-completed plan from ~/.linggen/plans/.
@@ -2525,6 +2577,7 @@ mod tests {
                 },
             ],
             status: PlanStatus::Executing,
+            origin: PlanOrigin::ModelManaged,
         };
 
         engine.write_plan_file(&plan);
@@ -2541,6 +2594,7 @@ mod tests {
 
         assert_eq!(loaded.summary, plan.summary);
         assert_eq!(loaded.status, PlanStatus::Executing);
+        assert_eq!(loaded.origin, PlanOrigin::ModelManaged);
         assert_eq!(loaded.items.len(), 4);
         assert_eq!(loaded.items[0].title, "Read existing code");
         assert_eq!(loaded.items[0].status, PlanItemStatus::Done);
@@ -2564,6 +2618,7 @@ mod tests {
                 status: PlanItemStatus::Done,
             }],
             status: PlanStatus::Completed,
+            origin: PlanOrigin::ModelManaged,
         };
         engine.write_plan_file(&plan1);
         let path1 = engine.plan_file.clone().unwrap();
@@ -2579,6 +2634,7 @@ mod tests {
                 status: PlanItemStatus::Pending,
             }],
             status: PlanStatus::Executing,
+            origin: PlanOrigin::ModelManaged,
         };
         engine.write_plan_file(&plan2);
         let path2 = engine.plan_file.clone().unwrap();
@@ -2616,6 +2672,7 @@ mod tests {
                 status: PlanItemStatus::Done,
             }],
             status: PlanStatus::Completed,
+            origin: PlanOrigin::ModelManaged,
         };
         engine.write_plan_file(&plan);
 

@@ -445,11 +445,15 @@ async fn run_skill_dispatch(
     )
     .await;
 
+    let interrupt_key = wire_interrupt_channel(ctx, engine).await;
+
     let outcome = run_loop_with_tracking(
         &ctx.manager, &ctx.root, engine, &ctx.agent_id,
         ctx.session_id.as_deref(), "chat:skill",
     )
     .await;
+
+    unwire_interrupt_channel(ctx, engine, &interrupt_key).await;
 
     if let Err(e) = outcome {
         tracing::warn!("Skill loop failed: {}", e);
@@ -524,11 +528,15 @@ async fn run_trigger_dispatch(
     )
     .await;
 
+    let interrupt_key = wire_interrupt_channel(ctx, engine).await;
+
     let outcome = run_loop_with_tracking(
         &ctx.manager, &ctx.root, engine, &ctx.agent_id,
         ctx.session_id.as_deref(), "chat:trigger",
     )
     .await;
+
+    unwire_interrupt_channel(ctx, engine, &interrupt_key).await;
 
     if let Err(e) = outcome {
         tracing::warn!("Trigger skill loop failed: {}", e);
@@ -582,6 +590,9 @@ async fn run_plan_dispatch(
     let (thinking_tx, mut thinking_rx) = tokio::sync::mpsc::unbounded_channel();
     engine.thinking_tx = Some(thinking_tx);
 
+    // Wire up the interrupt channel so user messages reach the running loop.
+    let interrupt_key = wire_interrupt_channel(ctx, engine).await;
+
     let events_tx_clone = ctx.events_tx.clone();
     let agent_id_clone = ctx.agent_id.clone();
     tokio::spawn(async move {
@@ -618,6 +629,7 @@ async fn run_plan_dispatch(
     .await;
 
     engine.thinking_tx = None;
+    unwire_interrupt_channel(ctx, engine, &interrupt_key).await;
     engine.plan_mode = false;
 
     match outcome {
@@ -645,6 +657,38 @@ async fn run_plan_dispatch(
     let _ = ctx.events_tx.send(ServerEvent::StateUpdated);
 }
 
+/// Wire the interrupt channel into the engine and store the sender in ServerState.
+/// Returns the interrupt_key used to look up the sender later for cleanup.
+async fn wire_interrupt_channel(
+    ctx: &ChatRunCtx,
+    engine: &mut crate::engine::AgentEngine,
+) -> String {
+    let (interrupt_tx, interrupt_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    engine.interrupt_rx = Some(interrupt_rx);
+
+    let interrupt_key = queue_key(
+        &ctx.root.to_string_lossy(),
+        ctx.session_id.as_deref().unwrap_or(""),
+        &ctx.agent_id,
+    );
+    {
+        let mut guard = ctx.state.interrupt_tx.lock().await;
+        guard.insert(interrupt_key.clone(), interrupt_tx);
+    }
+    interrupt_key
+}
+
+/// Remove the interrupt channel from both the engine and ServerState.
+async fn unwire_interrupt_channel(
+    ctx: &ChatRunCtx,
+    engine: &mut crate::engine::AgentEngine,
+    interrupt_key: &str,
+) {
+    engine.interrupt_rx = None;
+    let mut guard = ctx.state.interrupt_tx.lock().await;
+    guard.remove(interrupt_key);
+}
+
 /// Dispatch the structured (auto) mode agent loop.
 async fn run_structured_loop(
     ctx: &ChatRunCtx,
@@ -660,6 +704,9 @@ async fn run_structured_loop(
     // Wire up the thinking channel so streaming thinking tokens reach the UI.
     let (thinking_tx, mut thinking_rx) = tokio::sync::mpsc::unbounded_channel();
     engine.thinking_tx = Some(thinking_tx);
+
+    // Wire up the interrupt channel so user messages reach the running loop.
+    let interrupt_key = wire_interrupt_channel(ctx, engine).await;
 
     let events_tx_clone = ctx.events_tx.clone();
     let agent_id_clone = ctx.agent_id.clone();
@@ -694,12 +741,27 @@ async fn run_structured_loop(
 
     // Drop the thinking sender so the forwarder task exits.
     engine.thinking_tx = None;
+    unwire_interrupt_channel(ctx, engine, &interrupt_key).await;
 
     // Agent requested plan mode — re-dispatch using existing plan machinery.
     if let Ok(crate::engine::AgentOutcome::PlanModeRequested { ref reason }) = outcome {
         let plan_task = reason.clone().unwrap_or_else(|| ctx.clean_msg.clone());
         engine.task = Some(plan_task);
         run_plan_dispatch(ctx, engine).await;
+        return;
+    }
+
+    // Agent created a plan that needs approval — store as pending.
+    if let Ok(crate::engine::AgentOutcome::Plan(ref plan)) = outcome {
+        emit_outcome_event(outcome.as_ref().unwrap(), &ctx.events_tx, &ctx.agent_id);
+        ctx.manager
+            .set_pending_plan(
+                &ctx.root.to_string_lossy(),
+                &ctx.agent_id,
+                plan.clone(),
+            )
+            .await;
+        let _ = ctx.events_tx.send(ServerEvent::StateUpdated);
         return;
     }
 
@@ -809,6 +871,15 @@ pub(crate) async fn chat_handler(
                 }
                 emit_queue_updated(&state, &project_root_str, &effective_session_id, &target_id)
                     .await;
+
+                // Send through interrupt channel so the running loop sees the message.
+                {
+                    let interrupt_guard = state.interrupt_tx.lock().await;
+                    let ikey = queue_key(&project_root_str, &effective_session_id, &target_id);
+                    if let Some(tx) = interrupt_guard.get(&ikey) {
+                        let _ = tx.send(clean_msg.clone());
+                    }
+                }
             }
 
             let session_id_response = session_id.clone(); // for the HTTP response
@@ -823,21 +894,20 @@ pub(crate) async fn chat_handler(
             let project_root_for_queue = project_root_str.clone();
             let req_mode = req.mode.clone();
 
-            if !was_busy {
-                // Emit and persist user message immediately if the target agent is not busy.
-                persist_and_emit_message(
-                    &state.manager,
-                    &events_tx,
-                    &root,
-                    &target_id,
-                    "user",
-                    &target_id,
-                    &clean_msg,
-                    session_id.as_deref(),
-                    false,
-                )
-                .await;
-            }
+            // Persist and emit user message immediately (even when busy) so it
+            // appears in the UI chat history right away.
+            persist_and_emit_message(
+                &state.manager,
+                &events_tx,
+                &root,
+                &target_id,
+                "user",
+                &target_id,
+                &clean_msg,
+                session_id.as_deref(),
+                false,
+            )
+            .await;
 
             tokio::spawn(async move {
                 let mut engine = agent.lock().await;
@@ -861,12 +931,6 @@ pub(crate) async fn chat_handler(
                         &project_root_for_queue,
                         &session_id_for_queue,
                         &target_id_clone,
-                    )
-                    .await;
-
-                    persist_and_emit_message(
-                        &manager, &events_tx_clone, &root_clone, &target_id_clone,
-                        "user", &target_id_clone, &clean_msg_clone, session_id.as_deref(), false,
                     )
                     .await;
                 }
@@ -1019,6 +1083,19 @@ pub(crate) async fn approve_plan_handler(
         let (thinking_tx, mut thinking_rx) = tokio::sync::mpsc::unbounded_channel();
         engine.thinking_tx = Some(thinking_tx);
 
+        // Wire up interrupt channel.
+        let (interrupt_tx_ch, interrupt_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        engine.interrupt_rx = Some(interrupt_rx);
+        let interrupt_key = queue_key(
+            &root_clone.to_string_lossy(),
+            session_id.as_deref().unwrap_or(""),
+            &agent_id,
+        );
+        {
+            let mut guard = state_clone.interrupt_tx.lock().await;
+            guard.insert(interrupt_key.clone(), interrupt_tx_ch);
+        }
+
         let events_tx_inner = events_tx.clone();
         let agent_id_inner = agent_id.clone();
         tokio::spawn(async move {
@@ -1055,6 +1132,11 @@ pub(crate) async fn approve_plan_handler(
         .await;
 
         engine.thinking_tx = None;
+        engine.interrupt_rx = None;
+        {
+            let mut guard = state_clone.interrupt_tx.lock().await;
+            guard.remove(&interrupt_key);
+        }
 
         if let Ok(ref outcome) = outcome {
             emit_outcome_event(outcome, &events_tx, &agent_id);

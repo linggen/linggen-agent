@@ -8,9 +8,15 @@ Please read `.claude/skills/memory/SKILL.md` on load to understand the Linggen M
 
 Read files under `doc/` and follow them. If you find wrong content in any doc file, confirm with the user.
 
-- `doc/product-spec.md` — product goals, interaction modes, UX surface
-- `doc/framework.md` — runtime design, tool contract, safety rules
-- `doc/multi-agents.md` — multi-agent runtime, events, API contract
+- `doc/product-spec.md` — vision, OS analogy, product goals, UX surface
+- `doc/agentic-loop.md` — kernel: loop, interrupts, PTC, cancellation
+- `doc/agents.md` — process management: lifecycle, delegation, scheduling
+- `doc/skills.md` — dynamic extensions: format, discovery, triggers
+- `doc/tools.md` — syscall interface: built-in tools, safety
+- `doc/events.md` — IPC: SSE events, message queue, APIs
+- `doc/models.md` — hardware abstraction: providers, routing
+- `doc/storage.md` — filesystem layout: all persistent state, data formats
+- `doc/cli.md` — CLI reference
 - `doc/code-style.md` — code style rules (flat logic, small files/functions, clean code)
 - `doc/log-spec.md` — logging levels, throttling, output targets
 
@@ -74,7 +80,7 @@ Linggen Agent is a local-first, multi-agent coding assistant. Two entry points: 
 - **`server/`** — Axum HTTP server. `mod.rs` sets up routes and static asset serving. `chat_api.rs` handles chat/run endpoints and SSE streaming. `chat_helpers.rs` has shared chat logic. `agent_api.rs` has run inspection APIs. `projects_api.rs` handles project/session CRUD. `workspace_api.rs` serves workspace file tree.
 - **`agent_manager/`** — Agent lifecycle management, run records, cancellation, model routing. `models.rs` handles multi-model provider dispatch (Ollama, OpenAI-compatible).
 - **`ollama.rs`** — Ollama API client (streaming and non-streaming chat completions).
-- **`db/`** — Persistent state using redb (embedded key-value store). Projects, sessions, chat messages, run records.
+- **`project_store/`** — Persistent state using filesystem JSON files. Projects, missions, agent overrides, run records.
 - **`skills/`** — Skill manager for loading embedded and project-local skill definitions.
 - **`state_fs/`** — Filesystem-backed project state (`.linggen-agent/` directory).
 - **`repl.rs`** — Interactive CLI REPL mode (ratatui TUI).
@@ -86,13 +92,16 @@ Linggen Agent is a local-first, multi-agent coding assistant. Two entry points: 
 
 React 19 + TypeScript + Tailwind CSS v4 + Vite. Key files:
 
-- **`App.tsx`** — Main app component. Manages projects, sessions, agents, SSE event handling, settings.
+- **`App.tsx`** — Main app component. Manages projects, sessions, agents, SSE event handling, page routing (`main`, `settings`, `memory`, `mission`).
 - **`components/ChatPanel.tsx`** — Chat interface with message rendering, tool activity display, markdown/code rendering.
+- **`components/MissionPage.tsx`** — Dedicated mission management page with 4 tabs: Editor, Agent Config, History, Activity.
+- **`components/MemoryPage.tsx`** — Memory server management (indexed sources, search, jobs).
+- **`components/SettingsPage.tsx`** — Settings management (models, agents, skills, general config).
 - **`components/AgentsCard.tsx`** — Agent status cards with run history and timeline badges.
 - **`components/AgentTree.tsx`** — Agent hierarchy visualization.
-- **`components/HeaderBar.tsx`** — Top navigation bar.
+- **`components/HeaderBar.tsx`** — Top navigation bar with page navigation (Mission, Memory, Settings).
 - **`components/ModelsCard.tsx`** — Model configuration display.
-- **`types.ts`** — Shared TypeScript type definitions.
+- **`types.ts`** — Shared TypeScript type definitions (includes mission types: `MissionInfo`, `MissionTab`, `IdlePromptEvent`).
 
 ### Agent Definitions (`agents/`)
 
