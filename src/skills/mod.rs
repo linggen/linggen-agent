@@ -5,6 +5,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 /// Built-in skills available for one-click install from the linggen/skills repo.
@@ -15,30 +17,125 @@ pub struct BuiltInSkillInfo {
     pub installed: bool,
 }
 
-/// Returns the list of built-in skills with their install status.
-pub fn list_builtin_skills() -> Vec<BuiltInSkillInfo> {
-    let defs: &[(&str, &str)] = &[
-        ("memory", "Semantic memory and RAG — index codebases, search semantically, store and retrieve memories."),
-        ("skiller", "Search, install, and manage skills from the marketplace and skills.sh registry."),
-        ("discord", "Social messaging with Discord friends — send messages, poll for new messages, manage contacts."),
-        ("linggen", "Cross-project code search, indexed context, prompt enhancement, and server management."),
-    ];
+const GITHUB_CONTENTS_URL: &str = "https://api.github.com/repos/linggen/skills/contents/";
+const GITHUB_RAW_URL: &str = "https://raw.githubusercontent.com/linggen/skills/main";
+const CACHE_TTL: Duration = Duration::from_secs(600); // 10 min
+const SKIP_DIRS: &[&str] = &[".claude", ".cursor", ".linggen", ".git"];
 
-    let global_skills_dir = Some(crate::paths::global_skills_dir());
+type BuiltInCache = Mutex<Option<(Instant, Vec<BuiltInSkillInfo>)>>;
 
-    defs.iter()
-        .map(|(name, desc)| {
-            let installed = global_skills_dir
-                .as_ref()
-                .map(|d| d.join(name).join("SKILL.md").exists())
-                .unwrap_or(false);
-            BuiltInSkillInfo {
-                name: name.to_string(),
-                description: desc.to_string(),
-                installed,
+fn builtin_cache() -> &'static BuiltInCache {
+    static CACHE: OnceLock<BuiltInCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Fetches the list of built-in skills from the linggen/skills GitHub repo.
+/// Results are cached for 10 minutes. On error, returns cached data or empty vec.
+pub async fn fetch_builtin_skills() -> Vec<BuiltInSkillInfo> {
+    // Check cache
+    {
+        let cache = builtin_cache().lock().await;
+        if let Some((ts, ref skills)) = *cache {
+            if ts.elapsed() < CACHE_TTL {
+                return skills.clone();
             }
-        })
-        .collect()
+        }
+    }
+
+    // Fetch from GitHub
+    match fetch_builtin_skills_inner().await {
+        Ok(skills) => {
+            let mut cache = builtin_cache().lock().await;
+            *cache = Some((Instant::now(), skills.clone()));
+            skills
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "Failed to fetch built-in skills from GitHub");
+            // Return stale cache if available
+            let cache = builtin_cache().lock().await;
+            if let Some((_, ref skills)) = *cache {
+                return skills.clone();
+            }
+            vec![]
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct GitHubContentEntry {
+    name: String,
+    #[serde(rename = "type")]
+    entry_type: String,
+}
+
+async fn fetch_builtin_skills_inner() -> Result<Vec<BuiltInSkillInfo>> {
+    let client = crate::skills::marketplace::http_client()?;
+
+    // List repo contents
+    let entries: Vec<GitHubContentEntry> = client
+        .get(GITHUB_CONTENTS_URL)
+        .header("Accept", "application/vnd.github.v3+json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let global_skills_dir = crate::paths::global_skills_dir();
+
+    let mut skills = Vec::new();
+    for entry in &entries {
+        if entry.entry_type != "dir" || SKIP_DIRS.contains(&entry.name.as_str()) {
+            continue;
+        }
+
+        // Fetch raw SKILL.md for this directory
+        let raw_url = format!("{}/{}/SKILL.md", GITHUB_RAW_URL, entry.name);
+        let resp = match client.get(&raw_url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue, // skip dirs without SKILL.md
+        };
+        let text = match resp.text().await {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        // Parse frontmatter for name + description
+        let (name, description) = match parse_frontmatter_meta(&text) {
+            Some(pair) => pair,
+            None => continue,
+        };
+
+        let installed = global_skills_dir.join(&entry.name).join("SKILL.md").exists();
+
+        skills.push(BuiltInSkillInfo {
+            name,
+            description,
+            installed,
+        });
+    }
+
+    Ok(skills)
+}
+
+/// Extract `name` and `description` from YAML frontmatter in a SKILL.md file.
+fn parse_frontmatter_meta(text: &str) -> Option<(String, String)> {
+    if !text.starts_with("---") {
+        return None;
+    }
+    let parts: Vec<&str> = text.splitn(3, "---").collect();
+    if parts.len() < 3 {
+        return None;
+    }
+
+    #[derive(Deserialize)]
+    struct Meta {
+        name: String,
+        description: String,
+    }
+
+    let meta: Meta = serde_yml::from_str(parts[1]).ok()?;
+    Some((meta.name, meta.description))
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -76,7 +173,7 @@ fn default_user_invocable() -> bool {
 pub enum SkillSource {
     Global,
     Project,
-    Compat,
+    Compat { label: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,9 +226,10 @@ impl SkillManager {
         }
 
         // 2. Load Compat Skills (~/.claude/skills/, ~/.codex/skills/)
-        for compat_dir in crate::paths::compat_skills_dirs() {
+        for (compat_dir, label) in crate::paths::compat_skills_dirs() {
+            let source = SkillSource::Compat { label: label.to_string() };
             let _ = self
-                .load_from_dir_nested(&compat_dir, SkillSource::Compat, &mut *skills)
+                .load_from_dir_nested(&compat_dir, source, &mut *skills)
                 .await;
         }
 
@@ -418,13 +516,20 @@ Nested content."#;
     }
 
     #[test]
-    fn test_list_builtin_skills() {
-        let builtins = list_builtin_skills();
-        assert_eq!(builtins.len(), 4);
-        let names: Vec<&str> = builtins.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"memory"));
-        assert!(names.contains(&"skiller"));
-        assert!(names.contains(&"discord"));
-        assert!(names.contains(&"linggen"));
+    fn test_parse_frontmatter_meta() {
+        let text = "---\nname: memory\ndescription: A memory skill\n---\nContent here.";
+        let (name, desc) = parse_frontmatter_meta(text).unwrap();
+        assert_eq!(name, "memory");
+        assert_eq!(desc, "A memory skill");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_meta_no_frontmatter() {
+        assert!(parse_frontmatter_meta("no frontmatter").is_none());
+    }
+
+    #[test]
+    fn test_parse_frontmatter_meta_missing_closing() {
+        assert!(parse_frontmatter_meta("---\nname: x\ndescription: y\n").is_none());
     }
 }

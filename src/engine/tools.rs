@@ -9,12 +9,13 @@ use headless_chrome::Browser;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::{broadcast, Mutex};
 use tracing::info;
 
 /// Check if a hostname falls in the RFC 1918 172.16.0.0/12 range (172.16.x.x – 172.31.x.x).
@@ -63,6 +64,59 @@ pub enum ToolResult {
         query: String,
         results: Vec<super::web_search::WebSearchResult>,
     },
+    WebFetchContent {
+        url: String,
+        content: String,
+        content_type: String,
+        truncated: bool,
+    },
+    AskUserResponse {
+        answers: Vec<AskUserAnswer>,
+    },
+}
+
+// ── AskUser types ───────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AskUserQuestion {
+    pub question: String,
+    pub header: String,
+    pub options: Vec<AskUserOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AskUserOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub preview: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AskUserArgs {
+    questions: Vec<AskUserQuestion>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AskUserAnswer {
+    pub question_index: usize,
+    pub selected: Vec<String>,
+    pub custom_text: Option<String>,
+}
+
+/// Bridge between the synchronous tool executor and the async server state,
+/// allowing the AskUser tool to emit SSE events and block on user responses.
+pub struct AskUserBridge {
+    pub events_tx: broadcast::Sender<crate::server::ServerEvent>,
+    pub pending: Arc<Mutex<HashMap<String, PendingAskUser>>>,
+}
+
+pub struct PendingAskUser {
+    pub agent_id: String,
+    pub sender: tokio::sync::oneshot::Sender<Vec<AskUserAnswer>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +135,7 @@ pub struct Tools {
     run_id: Option<String>,
     agent_policy: Option<AgentPolicy>,
     memory_dir: Option<PathBuf>,
+    ask_user_bridge: Option<Arc<AskUserBridge>>,
 }
 
 impl Tools {
@@ -94,6 +149,7 @@ impl Tools {
             run_id: None,
             agent_policy: None,
             memory_dir: None,
+            ask_user_bridge: None,
         })
     }
 
@@ -136,6 +192,14 @@ impl Tools {
 
     pub fn memory_dir(&self) -> Option<&PathBuf> {
         self.memory_dir.as_ref()
+    }
+
+    pub fn set_ask_user_bridge(&mut self, bridge: Arc<AskUserBridge>) {
+        self.ask_user_bridge = Some(bridge);
+    }
+
+    pub fn ask_user_bridge(&self) -> Option<&Arc<AskUserBridge>> {
+        self.ask_user_bridge.as_ref()
     }
 
     pub fn get_manager(&self) -> Option<Arc<AgentManager>> {
@@ -230,6 +294,103 @@ impl Tools {
                     query: args.query,
                     results,
                 })
+            }
+            "WebFetch" => {
+                let args: WebFetchArgs = serde_json::from_value(normalized_args)
+                    .map_err(|e| anyhow::anyhow!("invalid args for WebFetch: {}", e))?;
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(super::web_fetch::fetch_url(&args.url, args.max_bytes))
+                })?;
+                Ok(ToolResult::WebFetchContent {
+                    url: result.url,
+                    content: result.content,
+                    content_type: result.content_type,
+                    truncated: result.truncated,
+                })
+            }
+            "Skill" => {
+                let args: SkillArgs = serde_json::from_value(normalized_args)
+                    .map_err(|e| anyhow::anyhow!("invalid args for Skill: {}", e))?;
+                self.invoke_skill(args)
+            }
+            "AskUser" => {
+                let args: AskUserArgs = serde_json::from_value(normalized_args)
+                    .map_err(|e| anyhow::anyhow!("invalid args for AskUser: {}", e))?;
+
+                // Validate question count.
+                if args.questions.is_empty() || args.questions.len() > 4 {
+                    anyhow::bail!("AskUser requires 1-4 questions, got {}", args.questions.len());
+                }
+                for (i, q) in args.questions.iter().enumerate() {
+                    if q.options.len() < 2 || q.options.len() > 4 {
+                        anyhow::bail!(
+                            "AskUser question {} requires 2-4 options, got {}",
+                            i, q.options.len()
+                        );
+                    }
+                }
+
+                // Sub-agents cannot use AskUser.
+                if self.delegation_depth > 0 {
+                    return Ok(ToolResult::Success(
+                        "AskUser is not available for delegated sub-agents. Return your question to the parent agent instead.".to_string()
+                    ));
+                }
+
+                let bridge = match &self.ask_user_bridge {
+                    Some(b) => Arc::clone(b),
+                    None => {
+                        return Ok(ToolResult::Success(
+                            "AskUser is not available in CLI mode.".to_string()
+                        ));
+                    }
+                };
+
+                let question_id = uuid::Uuid::new_v4().to_string();
+                let agent_id = self.agent_id.clone().unwrap_or_default();
+
+                // Emit SSE event to push the question to the UI.
+                let _ = bridge.events_tx.send(crate::server::ServerEvent::AskUser {
+                    agent_id: agent_id.clone(),
+                    question_id: question_id.clone(),
+                    questions: args.questions,
+                });
+
+                // Create a oneshot channel and register it for the response endpoint.
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        bridge.pending.lock().await.insert(
+                            question_id.clone(),
+                            PendingAskUser { agent_id, sender: tx },
+                        );
+                    })
+                });
+
+                // Block until the user responds or timeout (5 minutes).
+                let response = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        tokio::time::timeout(Duration::from_secs(300), rx).await
+                    })
+                });
+
+                // Cleanup: remove from pending map regardless of outcome.
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        bridge.pending.lock().await.remove(&question_id);
+                    })
+                });
+
+                match response {
+                    Ok(Ok(answers)) => Ok(ToolResult::AskUserResponse { answers }),
+                    Ok(Err(_)) => Ok(ToolResult::Success(
+                        "AskUser cancelled: the question was dismissed.".to_string(),
+                    )),
+                    Err(_) => Ok(ToolResult::Success(
+                        "AskUser timed out: no response within 5 minutes.".to_string(),
+                    )),
+                }
             }
             _ => anyhow::bail!("unknown tool: {}", call.tool),
         }
@@ -988,6 +1149,53 @@ impl Tools {
             ))
         })
     }
+
+    fn invoke_skill(&self, args: SkillArgs) -> Result<ToolResult> {
+        let manager = self
+            .manager
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Skill tool requires AgentManager context"))?;
+
+        let skill = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(manager.skill_manager.get_skill(&args.skill))
+        });
+
+        match skill {
+            Some(skill) => {
+                if skill.disable_model_invocation {
+                    anyhow::bail!(
+                        "Skill '{}' is user-only (disable_model_invocation). It can only be invoked by the user via /{}.",
+                        args.skill, args.skill
+                    );
+                }
+                let mut content = format!(
+                    "<skill-name>{}</skill-name>\n\n{}\n\n{}",
+                    skill.name, skill.description, skill.content
+                );
+                if let Some(ref extra_args) = args.args {
+                    content.push_str(&format!("\n\nSkill arguments: {}", extra_args));
+                }
+                Ok(ToolResult::Success(content))
+            }
+            None => {
+                let available = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(manager.skill_manager.list_skills())
+                });
+                let names: Vec<String> = available
+                    .iter()
+                    .filter(|s| !s.disable_model_invocation)
+                    .map(|s| s.name.clone())
+                    .collect();
+                anyhow::bail!(
+                    "Skill '{}' not found. Available skills: [{}]",
+                    args.skill,
+                    names.join(", ")
+                );
+            }
+        }
+    }
 }
 
 /// Execute a single delegation on a fresh, ephemeral engine.
@@ -1171,6 +1379,19 @@ struct WebSearchArgs {
     #[serde(alias = "q")]
     query: String,
     max_results: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebFetchArgs {
+    url: String,
+    max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillArgs {
+    #[serde(alias = "name")]
+    skill: String,
+    args: Option<String>,
 }
 
 fn build_globset(globs: Option<&[String]>) -> Result<Option<GlobSet>> {
@@ -1430,6 +1651,9 @@ pub fn canonical_tool_name(tool: &str) -> Option<&'static str> {
         "unlock_paths" => "unlock_paths",
         "delegate_to_agent" => "delegate_to_agent",
         "WebSearch" | "web_search" => "WebSearch",
+        "WebFetch" | "web_fetch" => "WebFetch",
+        "Skill" | "skill" => "Skill",
+        "AskUser" | "ask_user" => "AskUser",
         _ => return None,
     })
 }
@@ -1487,6 +1711,26 @@ pub(crate) fn full_tool_schema_entries() -> Vec<Value> {
             "args": {"query": "string", "max_results": "number?"},
             "returns": "{results:[{title,url,snippet}]}",
             "notes": "Search the web via DuckDuckGo. Default 5 results, max 10."
+        }),
+        serde_json::json!({
+            "name": "WebFetch",
+            "args": {"url": "string", "max_bytes": "number?"},
+            "returns": "{url,content,content_type,truncated}",
+            "notes": "Fetch a URL and return its content as text. HTML is stripped of tags. Default max 100KB."
+        }),
+        serde_json::json!({
+            "name": "Skill",
+            "args": {"skill": "string", "args": "string?"},
+            "returns": "string",
+            "notes": "Invoke a skill by name. Returns the skill's full instructions. Pass optional args for the skill."
+        }),
+        serde_json::json!({
+            "name": "AskUser",
+            "args": {
+                "questions": "[{question: string, header: string, options: [{label: string, description?: string, preview?: string}], multi_select?: boolean}]"
+            },
+            "returns": "{answers: [{question_index: number, selected: string[], custom_text?: string}]}",
+            "notes": "Ask user 1-4 structured questions with 2-4 options each. User can always type custom text via 'Other'. Blocks until response (5 min timeout). Not available in sub-agents."
         }),
     ]
 }

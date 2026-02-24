@@ -115,7 +115,22 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
         .get("args")
         .or_else(|| obj.get("tool_args"))
         .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
+        .unwrap_or_else(|| {
+            // Models sometimes put tool arguments as top-level fields instead of nesting
+            // under "args". E.g. {"type":"delegate_to_agent","target_agent_id":"x","task":"y"}
+            // Collect all fields except "type", "tool", "name" as an args object.
+            let mut inferred = serde_json::Map::new();
+            for (k, v) in obj {
+                if k != "type" && k != "tool" && k != "name" {
+                    inferred.insert(k.clone(), v.clone());
+                }
+            }
+            if inferred.is_empty() {
+                serde_json::json!({})
+            } else {
+                Value::Object(inferred)
+            }
+        });
 
     // Check "tool" field first, then "name" — models sometimes emit
     // {"name":"Read","args":{...}} instead of {"type":"tool","tool":"Read","args":{...}}.
@@ -170,7 +185,7 @@ fn is_supported_model_tool(_tool: &str) -> bool {
     true
 }
 
-fn extract_first_json_object_span(s: &str) -> Option<(usize, usize)> {
+pub fn extract_first_json_object_span(s: &str) -> Option<(usize, usize)> {
     // Return byte offsets [start,end) for the first JSON object.
     // This is a best-effort extractor for logging. It handles nested braces and quoted strings.
     let bytes = s.as_bytes();
@@ -215,6 +230,19 @@ fn extract_first_json_object_span(s: &str) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+/// Return the trimmed text that appears before the first JSON object in the string.
+/// Returns an empty string if there is no JSON object or no text before it.
+pub fn text_before_first_json(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Some((start, _end)) = extract_first_json_object_span(trimmed) else {
+        return String::new();
+    };
+    trimmed[..start].trim().to_string()
 }
 
 fn truncate_text_chars(s: &str, max_chars: usize) -> String {
@@ -280,7 +308,7 @@ pub fn model_message_log_parts(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_all_actions, parse_first_action, ModelAction};
+    use super::{parse_all_actions, parse_first_action, text_before_first_json, ModelAction};
 
     #[test]
     fn parse_first_action_preserves_generic_types_in_write_content() {
@@ -505,5 +533,61 @@ Now let me also search:
         let actions = parse_all_actions(raw).unwrap();
         assert_eq!(actions.len(), 1);
         assert!(matches!(&actions[0], ModelAction::Done { message } if message.as_deref() == Some("Here is the answer.")));
+    }
+
+    #[test]
+    fn parse_delegate_with_flat_args() {
+        // Models often emit delegate_to_agent with args at top level instead of nested under "args".
+        let raw = r#"{"type":"delegate_to_agent","target_agent_id":"linggen-guide","task":"Introduce Linggen"}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ModelAction::Tool { tool, args } => {
+                assert_eq!(tool, "delegate_to_agent");
+                assert_eq!(args["target_agent_id"], "linggen-guide");
+                assert_eq!(args["task"], "Introduce Linggen");
+            }
+            _ => panic!("expected tool action, got {:?}", actions[0]),
+        }
+    }
+
+    #[test]
+    fn parse_delegate_with_nested_args() {
+        // Proper format with args nested should still work.
+        let raw = r#"{"type":"delegate_to_agent","args":{"target_agent_id":"coder","task":"Fix the bug"}}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ModelAction::Tool { tool, args } => {
+                assert_eq!(tool, "delegate_to_agent");
+                assert_eq!(args["target_agent_id"], "coder");
+                assert_eq!(args["task"], "Fix the bug");
+            }
+            _ => panic!("expected tool action, got {:?}", actions[0]),
+        }
+    }
+
+    #[test]
+    fn text_before_first_json_extracts_prose() {
+        let raw = r#"Let me read the file.
+{"type":"tool","tool":"Read","args":{"path":"src/main.rs"}}"#;
+        assert_eq!(text_before_first_json(raw), "Let me read the file.");
+    }
+
+    #[test]
+    fn text_before_first_json_empty_when_no_json() {
+        assert_eq!(text_before_first_json("No JSON here"), "");
+    }
+
+    #[test]
+    fn text_before_first_json_empty_when_json_at_start() {
+        let raw = r#"{"type":"tool","tool":"Read","args":{"path":"a.rs"}}"#;
+        assert_eq!(text_before_first_json(raw), "");
+    }
+
+    #[test]
+    fn text_before_first_json_trims_whitespace() {
+        let raw = r#"  I'll fix this.  {"type":"done","message":"ok"}"#;
+        assert_eq!(text_before_first_json(raw), "I'll fix this.");
     }
 }

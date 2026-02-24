@@ -5,7 +5,7 @@ import type { SkillInfoFull } from '../types';
 const sourceBadgeCls: Record<string, string> = {
   Global: 'bg-purple-500/10 text-purple-600 dark:text-purple-400',
   Project: 'bg-green-500/10 text-green-600 dark:text-green-400',
-  Compat: 'bg-slate-500/10 text-slate-600 dark:text-slate-400',
+  Compat: 'bg-slate-500/10 text-slate-600 dark:text-slate-400', // fallback for Compat variants
 };
 
 export const SkillsCard: React.FC<{
@@ -24,6 +24,9 @@ export const SkillsCard: React.FC<{
     <div className="flex-1 p-4 overflow-y-auto text-xs space-y-2">
       {skills.map((skill) => {
         const sourceType = skill.source?.type || 'Global';
+        const sourceLabel = sourceType === 'Compat'
+          ? (skill.source as { type: string; label?: string })?.label || 'Compat'
+          : sourceType === 'Global' ? 'Linggen' : sourceType;
         const trigger = skill.trigger || `/${skill.name}`;
         const argHint = skill.argument_hint ? ` ${skill.argument_hint}` : '';
 
@@ -41,10 +44,10 @@ export const SkillsCard: React.FC<{
               </span>
               <span
                 className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full uppercase tracking-wide ${
-                  sourceBadgeCls[sourceType] || sourceBadgeCls.Global
+                  sourceBadgeCls[sourceType] || sourceBadgeCls.Compat
                 }`}
               >
-                {sourceType}
+                {sourceLabel}
               </span>
             </div>
             {skill.description && (

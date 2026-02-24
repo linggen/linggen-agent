@@ -8,6 +8,7 @@
 pub enum DisplayBlock {
     UserMessage {
         text: String,
+        image_count: usize,
     },
     AgentMessage {
         agent_id: String,
@@ -65,12 +66,16 @@ pub struct SubagentEntry {
     pub subagent_id: String,
     pub task: String,
     pub status: SubagentStatus,
+    pub tool_count: usize,
+    pub estimated_tokens: Option<usize>,
+    pub current_activity: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SubagentStatus {
     Running,
     Done,
+    Failed,
 }
 
 #[derive(Debug, Clone)]

@@ -11,11 +11,13 @@ Filesystem layout for all persistent state. No database — everything is files.
 
 ## Root directories
 
+Two-tier layout, aligned with Claude Code's `~/.claude/` + `{repo}/.claude/` convention.
+
 | Directory | Purpose |
 |-----------|---------|
 | `~/.linggen/` | Global home (override with `$LINGGEN_HOME`) |
-| `~/.linggen/projects/{encoded}/` | Per-project state |
-| `{workspace}/.linggen/` | Workspace-local state (future) |
+| `~/.linggen/projects/{encoded}/` | Per-project state (sessions, runs, missions) |
+| `{workspace}/.linggen/` | Workspace-local settings (permissions, future config) |
 
 Project path encoding: `/Users/foo/project` → `-Users-foo-project` (same convention as Claude Code).
 
@@ -34,6 +36,7 @@ Project path encoding: `/Users/foo/project` → `-Users-foo-project` (same conve
 ├── skills/
 │   ├── {name}.md                     # Flat skill files
 │   └── {name}/SKILL.md              # Nested skill directories
+├── credentials.json                  # API keys for model providers (JSON)
 ├── ling.pid                          # Daemon PID
 ├── ling.log                          # Daemon stdout
 ├── ling-mem.pid                      # Memory server PID
@@ -43,7 +46,7 @@ Project path encoding: `/Users/foo/project` → `-Users-foo-project` (same conve
 ## Per-project state (`~/.linggen/projects/{encoded}/`)
 
 ```
-{encoded}/
+~/.linggen/projects/{encoded}/
 ├── project.json                      # Project metadata (JSON)
 ├── sessions/
 │   └── {session_id}/
@@ -59,13 +62,41 @@ Project path encoding: `/Users/foo/project` → `-Users-foo-project` (same conve
     └── ...                           # Agent memory (managed by memory skill)
 ```
 
+## Workspace-local state (`{workspace}/.linggen/`)
+
+```
+{workspace}/.linggen/
+└── permissions.json                  # Tool permission allows (JSON)
+```
+
+Same pattern as Claude Code's `{repo}/.claude/settings.local.json`. Lives in the repo, can be gitignored.
+
 ## Data formats
+
+### Credentials (`credentials.json`)
+
+```json
+{
+  "gemini-flash": { "api_key": "AIza..." },
+  "groq-llama": { "api_key": "gsk_..." }
+}
+```
+
+Stored at `~/.linggen/credentials.json`. Keyed by model `id` from `linggen-agent.toml`. Never committed to git. See `models.md` → Credentials.
 
 ### Project info (`project.json`)
 
 ```json
 { "path": "/abs/path", "name": "project-name", "added_at": 1700000000 }
 ```
+
+### Tool permissions (`permissions.json`)
+
+```json
+{ "tool_allows": ["Write", "Edit"] }
+```
+
+Project-scoped tool permission allows, stored at `{workspace}/.linggen/permissions.json`. Created when user selects "Allow all {tool} for this project". See `tools.md` → Tool permission mode.
 
 ### Session metadata (`session.yaml`)
 

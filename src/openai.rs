@@ -170,14 +170,50 @@ impl OpenAiClient {
 #[derive(Debug, Serialize)]
 struct OaiMessage {
     role: String,
-    content: String,
+    content: OaiContent,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum OaiContent {
+    Text(String),
+    Parts(Vec<OaiContentPart>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum OaiContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: OaiImageUrl },
+}
+
+#[derive(Debug, Serialize)]
+struct OaiImageUrl {
+    url: String,
 }
 
 impl OaiMessage {
     fn from_chat(msg: &crate::ollama::ChatMessage) -> Self {
+        let content = if msg.images.is_empty() {
+            OaiContent::Text(msg.content.clone())
+        } else {
+            let mut parts = vec![OaiContentPart::Text {
+                text: msg.content.clone(),
+            }];
+            for img in &msg.images {
+                parts.push(OaiContentPart::ImageUrl {
+                    image_url: OaiImageUrl {
+                        url: format!("data:image/png;base64,{}", img),
+                    },
+                });
+            }
+            OaiContent::Parts(parts)
+        };
         Self {
             role: msg.role.clone(),
-            content: msg.content.clone(),
+            content,
         }
     }
 }

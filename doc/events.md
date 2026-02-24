@@ -29,6 +29,7 @@ Events are wrapped with increasing `seq` for dedup/recovery.
 | `StateUpdated` | General state refresh |
 | `SettingsUpdated` | Config changed (project_root, mode) |
 | `IdlePromptTriggered` | Idle scheduler fired (agent_id, project_root) |
+| `AskUser` | Agent asking user a question (agent_id, question_id, questions) |
 
 ### Agent status values
 
@@ -59,6 +60,7 @@ This enables the "AI interrupt" pattern — users can redirect, cancel, or query
 - `GET /api/agent-children?run_id=...` — list child runs.
 - `GET /api/agent-context?run_id=...&view=summary|raw` — run context/messages.
 - `POST /api/agent-cancel` with `{ run_id }` — cancel run tree.
+- `POST /api/ask-user-response` with `{ question_id, answers }` — respond to AskUser question.
 
 ### Sessions & projects
 

@@ -6,7 +6,7 @@
       "type": "lldb",
       "request": "launch",
       "program": "${workspaceFolder}/target/debug/ling",
-      "preLaunchTask": "build agent all",
+      "preLaunchTask": "cargo build agent",
       "args": ["--web", "--dev"],
       "cwd": "${workspaceFolder}",
       "env": {

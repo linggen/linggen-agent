@@ -16,17 +16,50 @@ const DEFAULT_SKILLS_REPO: &str = "https://github.com/linggen/skills";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketplaceSkill {
+    #[serde(default)]
     pub skill_id: String,
+    #[serde(alias = "skill")]
     pub name: String,
+    #[serde(default)]
     pub url: String,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
     pub install_count: u64,
-    #[serde(default)]
+    #[serde(default, alias = "ref")]
     pub git_ref: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+impl MarketplaceSkill {
+    /// Extract description from YAML frontmatter in `content` if `description` is None.
+    pub fn fill_description(&mut self) {
+        if self.description.is_some() {
+            return;
+        }
+        let Some(content) = &self.content else { return };
+        let trimmed = content.trim_start();
+        if !trimmed.starts_with("---") {
+            return;
+        }
+        // Find the closing `---`
+        if let Some(end) = trimmed[3..].find("\n---") {
+            let frontmatter = &trimmed[3..3 + end];
+            for line in frontmatter.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("description:") {
+                    let desc = rest.trim().trim_matches('"').trim_matches('\'');
+                    if !desc.is_empty() {
+                        self.description = Some(desc.to_string());
+                    }
+                    return;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,10 +76,21 @@ impl Default for SkillScope {
 }
 
 // ---------------------------------------------------------------------------
+// Registry response envelope
+// ---------------------------------------------------------------------------
+
+/// The registry wraps results in `{"success": true, "skills": [...], "pagination": {...}}`.
+#[derive(Debug, Deserialize)]
+struct RegistryResponse {
+    #[serde(default)]
+    skills: Vec<MarketplaceSkill>,
+}
+
+// ---------------------------------------------------------------------------
 // Registry / search
 // ---------------------------------------------------------------------------
 
-pub(crate) fn http_client() -> Result<reqwest::Client> {
+pub fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent("linggen-agent")
         .timeout(Duration::from_secs(30))
@@ -62,9 +106,14 @@ pub async fn search_marketplace(query: &str) -> Result<Vec<MarketplaceSkill>> {
     let registry_url = format!("{}/skills/search?q={}", REGISTRY_URL, encoded);
     if let Ok(resp) = client.get(&registry_url).send().await {
         if resp.status().is_success() {
-            if let Ok(skills) = resp.json::<Vec<MarketplaceSkill>>().await {
-                if !skills.is_empty() {
-                    return Ok(skills);
+            match resp.json::<RegistryResponse>().await {
+                Ok(mut envelope) if !envelope.skills.is_empty() => {
+                    for s in &mut envelope.skills { s.fill_description(); }
+                    return Ok(envelope.skills);
+                }
+                Ok(_) => {} // empty results, fall through
+                Err(e) => {
+                    tracing::warn!("Failed to parse registry search response: {e}");
                 }
             }
         }
@@ -89,6 +138,7 @@ pub async fn search_marketplace(query: &str) -> Result<Vec<MarketplaceSkill>> {
             install_count: 0,
             git_ref: Some("main".to_string()),
             content: None,
+            updated_at: None,
         })
         .collect();
 
@@ -101,11 +151,20 @@ pub async fn list_marketplace(limit: usize) -> Result<Vec<MarketplaceSkill>> {
 
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
+        tracing::warn!("Registry returned status {}", resp.status());
         return Ok(vec![]);
     }
 
-    let skills: Vec<MarketplaceSkill> = resp.json().await.unwrap_or_default();
-    Ok(skills)
+    match resp.json::<RegistryResponse>().await {
+        Ok(mut envelope) => {
+            for s in &mut envelope.skills { s.fill_description(); }
+            Ok(envelope.skills)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to parse registry list response: {e}");
+            Ok(vec![])
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +788,7 @@ mod tests {
             install_count: 42,
             git_ref: Some("main".into()),
             content: None,
+            updated_at: None,
         };
         let json = serde_json::to_string(&skill).unwrap();
         let parsed: MarketplaceSkill = serde_json::from_str(&json).unwrap();

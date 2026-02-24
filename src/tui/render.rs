@@ -15,7 +15,7 @@ use super::markdown;
 /// Render a single DisplayBlock into terminal lines.
 pub fn render_block(block: &DisplayBlock, _width: u16) -> Vec<Line<'static>> {
     match block {
-        DisplayBlock::UserMessage { text } => render_user_message(text),
+        DisplayBlock::UserMessage { text, image_count } => render_user_message(text, *image_count),
         DisplayBlock::AgentMessage { agent_id, text } => render_agent_message(agent_id, text),
         DisplayBlock::SystemMessage { text } => render_system_message(text),
         DisplayBlock::ToolGroup {
@@ -38,8 +38,8 @@ pub fn render_block(block: &DisplayBlock, _width: u16) -> Vec<Line<'static>> {
     }
 }
 
-fn render_user_message(text: &str) -> Vec<Line<'static>> {
-    vec![Line::from(vec![
+fn render_user_message(text: &str, image_count: usize) -> Vec<Line<'static>> {
+    let mut spans = vec![
         Span::styled(
             "> ",
             Style::default()
@@ -47,7 +47,18 @@ fn render_user_message(text: &str) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(text.to_string(), Style::default().fg(Color::White)),
-    ])]
+    ];
+    if image_count > 0 {
+        spans.push(Span::styled(
+            format!(
+                " [{} image{}]",
+                image_count,
+                plural(image_count)
+            ),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    vec![Line::from(spans)]
 }
 
 fn render_agent_message(agent_id: &str, text: &str) -> Vec<Line<'static>> {
@@ -58,25 +69,29 @@ fn render_agent_message(agent_id: &str, text: &str) -> Vec<Line<'static>> {
         return lines;
     }
 
-    // First line gets the agent tag prefix
-    let tag = Span::styled(
-        format!("[{agent_id}] "),
+    // Claude Code-style: ● bullet prefix with agent name
+    let bullet = Span::styled(
+        "● ",
         Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
     );
 
     if let Some(first) = md_lines.first() {
-        let mut first_spans = vec![tag];
+        let mut first_spans = vec![bullet];
         first_spans.extend(first.spans.iter().cloned());
+        // Append dim agent tag at end of first line
+        first_spans.push(Span::styled(
+            format!("  [{agent_id}]"),
+            Style::default().fg(Color::DarkGray),
+        ));
         lines.push(Line::from(first_spans));
     }
 
-    // Remaining lines get indentation to align with first line's content
-    let indent_len = agent_id.len() + 3; // "[agent] " length
-    let indent = " ".repeat(indent_len);
+    // Remaining lines get indentation to align with first line's content (after "● ")
+    let indent = "  ";
     for md_line in md_lines.iter().skip(1) {
-        let mut spans = vec![Span::raw(indent.clone())];
+        let mut spans = vec![Span::raw(indent.to_string())];
         spans.extend(md_line.spans.iter().cloned());
         lines.push(Line::from(spans));
     }
@@ -89,6 +104,10 @@ fn render_system_message(text: &str) -> Vec<Line<'static>> {
         text.to_string(),
         Style::default().fg(Color::Yellow),
     ))]
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 /// Format a token count as a compact string (e.g. "30.2k").
@@ -119,7 +138,7 @@ pub fn render_tool_group(
         let mut parts = vec![format!(
             "{} tool use{}",
             tool_count,
-            if tool_count == 1 { "" } else { "s" }
+            plural(tool_count)
         )];
         if let Some(tokens) = estimated_tokens {
             parts.push(format!("{} tokens", format_compact_tokens(tokens)));
@@ -238,7 +257,7 @@ pub fn render_tool_group_active(steps: &[ToolStep]) -> Vec<Line<'static>> {
                 format!(
                     "+{} more tool use{}",
                     prev_count,
-                    if prev_count == 1 { "" } else { "s" }
+                    plural(prev_count)
                 ),
                 Style::default()
                     .fg(Color::DarkGray)
@@ -250,71 +269,165 @@ pub fn render_tool_group_active(steps: &[ToolStep]) -> Vec<Line<'static>> {
     lines
 }
 
+/// Build stats string: "· 13 tool uses · 62.7k tokens"
+fn subagent_stats_str(entry: &SubagentEntry) -> String {
+    let mut parts = Vec::new();
+    if entry.tool_count > 0 {
+        parts.push(format!(
+            "{} tool use{}",
+            entry.tool_count,
+            plural(entry.tool_count)
+        ));
+    }
+    if let Some(tokens) = entry.estimated_tokens {
+        if tokens > 0 {
+            parts.push(format!("{} tokens", format_compact_tokens(tokens)));
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", parts.join(" · "))
+    }
+}
+
+/// Render a finalized (done) subagent group — Claude Code style with stats.
 fn render_subagent_group(entries: &[SubagentEntry]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-
-    let done_count = entries.iter().filter(|e| e.status == SubagentStatus::Done).count();
     let total = entries.len();
 
+    let total_tools: usize = entries.iter().map(|e| e.tool_count).sum();
+    let total_tokens: usize = entries.iter().filter_map(|e| e.estimated_tokens).sum();
+
     // Header
-    lines.push(Line::from(vec![
-        Span::styled("  ⏺ ", Style::default().fg(Color::Green)),
+    let mut header_spans = vec![
+        Span::styled("  ● ", Style::default().fg(Color::Green)),
         Span::styled(
             format!(
-                "{} agent{} finished",
-                done_count,
-                if done_count == 1 { "" } else { "s" }
+                "{total} agent{} finished",
+                plural(total)
             ),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
+            Style::default().fg(Color::Green),
         ),
+    ];
+    // Append aggregate stats
+    let mut agg_parts = Vec::new();
+    if total_tools > 0 {
+        agg_parts.push(format!(
+            "{total_tools} tool use{}",
+            plural(total_tools)
+        ));
+    }
+    if total_tokens > 0 {
+        agg_parts.push(format!("{} tokens", format_compact_tokens(total_tokens)));
+    }
+    if !agg_parts.is_empty() {
+        header_spans.push(Span::styled(
+            format!(" ({})", agg_parts.join(" · ")),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    lines.push(Line::from(header_spans));
+
+    // Tree entries
+    for (i, entry) in entries.iter().enumerate() {
+        let is_last = i == total - 1;
+        let branch = if is_last { "└" } else { "├" };
+        let task_preview = truncate_str(&entry.task, 50);
+        let stats = subagent_stats_str(entry);
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("    {branch} "),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                task_preview.to_string(),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(stats, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    lines
+}
+
+/// Render live (in-progress) subagent tree — shows running status + current activity.
+pub(super) fn render_subagent_group_live(entries: &[&SubagentEntry]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let total = entries.len();
+    let running = entries.iter().filter(|e| e.status == SubagentStatus::Running).count();
+    let all_done = running == 0;
+
+    // Header
+    let (dot_color, header_color, header_text) = if all_done {
+        (
+            Color::Green,
+            Color::Green,
+            format!(
+                "{total} agent{} finished",
+                plural(total)
+            ),
+        )
+    } else {
+        (
+            Color::Yellow,
+            Color::Yellow,
+            format!(
+                "Running {running} agent{}…",
+                plural(running)
+            ),
+        )
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("  ● ", Style::default().fg(dot_color)),
+        Span::styled(header_text, Style::default().fg(header_color)),
     ]));
 
     // Tree entries
     for (i, entry) in entries.iter().enumerate() {
         let is_last = i == total - 1;
-        let branch = if is_last { "└─" } else { "├─" };
-        let status_text = match entry.status {
-            SubagentStatus::Running => "Running",
-            SubagentStatus::Done => "Done",
-        };
-        let status_color = match entry.status {
+        let branch = if is_last { "└" } else { "├" };
+        let continuation = if is_last { " " } else { "│" };
+        let is_running = entry.status == SubagentStatus::Running;
+        let entry_color = match entry.status {
             SubagentStatus::Running => Color::Yellow,
+            SubagentStatus::Failed => Color::Red,
             SubagentStatus::Done => Color::Green,
         };
+        let task_preview = truncate_str(&entry.task, 50);
+        let stats = subagent_stats_str(entry);
 
-        // Branch line with task
-        let task_preview = truncate_str(&entry.task, 60);
         lines.push(Line::from(vec![
             Span::styled(
-                format!("     {branch} "),
+                format!("    {branch} "),
                 Style::default().fg(Color::DarkGray),
             ),
+            Span::styled("● ", Style::default().fg(entry_color)),
             Span::styled(
-                entry.subagent_id.clone(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                task_preview.to_string(),
+                Style::default().fg(Color::White),
             ),
-            Span::styled(
-                format!(" · {task_preview}"),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(stats, Style::default().fg(Color::DarkGray)),
         ]));
 
-        // Status line
-        let continuation = if is_last { "   " } else { "│  " };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("     {continuation}⎿  "),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                status_text.to_string(),
-                Style::default().fg(status_color),
-            ),
-        ]));
+        // Current activity sub-line (only when running)
+        if is_running {
+            if let Some(activity) = &entry.current_activity {
+                let activity_preview = truncate_str(activity, 60);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("    {continuation}  └ "),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        activity_preview.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
     }
 
     lines
@@ -390,24 +503,24 @@ fn tool_group_summary(steps: &[ToolStep]) -> String {
     for name in order {
         if let Some(&count) = counts.get(name) {
             let label = match name {
-                "Read" => format!("read {} file{}", count, if count == 1 { "" } else { "s" }),
-                "Write" => format!("wrote {} file{}", count, if count == 1 { "" } else { "s" }),
-                "Edit" => format!("edited {} file{}", count, if count == 1 { "" } else { "s" }),
-                "Bash" => format!("ran {} command{}", count, if count == 1 { "" } else { "s" }),
+                "Read" => format!("read {} file{}", count, plural(count)),
+                "Write" => format!("wrote {} file{}", count, plural(count)),
+                "Edit" => format!("edited {} file{}", count, plural(count)),
+                "Bash" => format!("ran {} command{}", count, plural(count)),
                 "Grep" => format!(
                     "searched {} pattern{}",
                     count,
-                    if count == 1 { "" } else { "s" }
+                    plural(count)
                 ),
                 "Glob" => format!(
                     "listed {} glob{}",
                     count,
-                    if count == 1 { "" } else { "s" }
+                    plural(count)
                 ),
                 "Delegate" => format!(
                     "delegated {} task{}",
                     count,
-                    if count == 1 { "" } else { "s" }
+                    plural(count)
                 ),
                 _ => format!("{} x{}", name, count),
             };

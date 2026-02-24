@@ -139,6 +139,7 @@ pub(crate) async fn run_agent(
                         agent_id.clone(),
                         AgentStatusKind::Working,
                         Some("Running".to_string()),
+                        None,
                     )
                     .await;
                 let mut engine = agent.lock().await;
@@ -215,6 +216,7 @@ pub(crate) async fn run_agent(
                         agent_id.clone(),
                         AgentStatusKind::Idle,
                         Some("Idle".to_string()),
+                        None,
                     )
                     .await;
             });
@@ -231,12 +233,23 @@ pub(crate) async fn cancel_agent_run(
 ) -> impl IntoResponse {
     match state.manager.cancel_run_tree(&req.run_id).await {
         Ok(runs) => {
+            // Cancel any pending AskUser questions for the cancelled agents so
+            // the tool unblocks immediately. Dropping the sender causes the
+            // oneshot receiver to return Err, which is handled gracefully.
+            {
+                let cancelled_agents: std::collections::HashSet<String> =
+                    runs.iter().map(|r| r.agent_id.clone()).collect();
+                let mut pending = state.pending_ask_user.lock().await;
+                pending.retain(|_, entry| !cancelled_agents.contains(&entry.agent_id));
+            }
+
             for run in &runs {
                 state
                     .send_agent_status(
                         run.agent_id.clone(),
                         AgentStatusKind::Idle,
                         Some("Cancelled".to_string()),
+                        None,
                     )
                     .await;
             }

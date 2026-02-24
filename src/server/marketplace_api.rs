@@ -140,7 +140,7 @@ pub(crate) async fn marketplace_uninstall(
 // ---------------------------------------------------------------------------
 
 pub(crate) async fn builtin_skills_list() -> impl IntoResponse {
-    axum::Json(skills::list_builtin_skills())
+    axum::Json(skills::fetch_builtin_skills().await)
 }
 
 #[derive(Deserialize)]

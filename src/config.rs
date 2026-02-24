@@ -31,6 +31,9 @@ pub struct ModelConfig {
     /// does not report context size (e.g. Ollama cloud/remote models).
     #[serde(default)]
     pub context_window: Option<usize>,
+    /// Tags for model capabilities, e.g. ["vision"].
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -176,6 +179,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub write_safety_mode: WriteSafetyMode,
     #[serde(default)]
+    pub tool_permission_mode: ToolPermissionMode,
+    #[serde(default)]
     pub prompt_loop_breaker: Option<String>,
     #[serde(default = "default_max_delegation_depth")]
     pub max_delegation_depth: usize,
@@ -197,6 +202,19 @@ impl Default for WriteSafetyMode {
     fn default() -> Self {
         // User-selected default for this repo: warn (allow write, but emit warnings).
         WriteSafetyMode::Warn
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPermissionMode {
+    Ask,
+    Auto,
+}
+
+impl Default for ToolPermissionMode {
+    fn default() -> Self {
+        ToolPermissionMode::Auto
     }
 }
 
@@ -246,6 +264,10 @@ pub struct RoutingConfig {
     pub default_policy: Option<String>,
     #[serde(default)]
     pub policies: Vec<RoutingPolicy>,
+    /// Ordered list of model IDs selected as defaults by the user.
+    /// The first model in the list is the primary default; others are fallbacks.
+    #[serde(default)]
+    pub default_models: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -332,7 +354,7 @@ impl Config {
                 anyhow::bail!("Duplicate model ID: {}", model.id);
             }
             // Validate provider is known.
-            let known_providers = ["ollama", "openai"];
+            let known_providers = ["ollama", "openai", "gemini", "groq", "deepseek", "openrouter", "github"];
             if !known_providers.contains(&model.provider.as_str()) {
                 anyhow::bail!(
                     "Model '{}' has unknown provider '{}'. Known providers: {}",
@@ -360,6 +382,15 @@ impl Config {
         if self.agent.max_iters > 1000 {
             anyhow::bail!("Agent max_iters must not exceed 1000");
         }
+        // Warn (log) if default_models references non-existent model IDs.
+        for dm in &self.routing.default_models {
+            if !seen_ids.contains(&dm) {
+                tracing::warn!(
+                    "routing.default_models references unknown model ID '{}'; it will be ignored",
+                    dm
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -375,11 +406,13 @@ impl Default for Config {
                 api_key: None,
                 keep_alive: None,
                 context_window: None,
+                tags: Vec::new(),
             }],
             server: ServerConfig { port: 9898 },
             agent: AgentConfig {
                 max_iters: 10,
                 write_safety_mode: WriteSafetyMode::default(),
+                tool_permission_mode: ToolPermissionMode::default(),
                 prompt_loop_breaker: None,
                 max_delegation_depth: default_max_delegation_depth(),
             },

@@ -318,6 +318,24 @@ impl OllamaClient {
 
         Ok(None)
     }
+
+    /// Check if a model supports vision (image input) via /api/show capabilities.
+    pub async fn get_model_has_vision(&self, model: &str) -> Result<bool> {
+        let url = format!("{}/api/show", self.base_url);
+        let req = serde_json::json!({ "name": model });
+        let mut rb = self.http.post(url).json(&req);
+        if let Some(key) = &self.api_key {
+            rb = rb.header("Authorization", format!("Bearer {}", key));
+        }
+        let resp = rb.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("ollama error ({}): {}", status, text);
+        }
+        let payload: OllamaShowResponse = resp.json().await?;
+        Ok(payload.capabilities.iter().any(|c| c == "vision"))
+    }
 }
 
 fn parse_usize_value(value: &serde_json::Value) -> Option<usize> {
@@ -398,6 +416,8 @@ struct OllamaShowResponse {
     model_info: Option<HashMap<String, serde_json::Value>>,
     #[serde(default)]
     details: Option<HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,6 +456,8 @@ pub struct ChatMessage {
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 impl ChatMessage {
@@ -444,7 +466,13 @@ impl ChatMessage {
             role: role.into(),
             content: content.into(),
             thinking: None,
+            images: Vec::new(),
         }
+    }
+
+    pub fn with_images(mut self, images: Vec<String>) -> Self {
+        self.images = images;
+        self
     }
 }
 

@@ -46,6 +46,8 @@ pub struct App {
     pub active_tool_group: Option<ActiveToolGroup>,
     // Subagent tracking
     pub active_subagents: HashMap<String, SubagentEntry>,
+    /// Maps subagent_id → parent_agent_id for routing subagent activity.
+    pub subagent_parent_map: HashMap<String, String>,
     // Dedup own messages echoed back via SSE
     pub pending_user_messages: VecDeque<String>,
     // Verbose/compact display mode
@@ -58,6 +60,10 @@ pub struct App {
     pub run_start_ts: HashMap<String, Instant>,
     // Interactive prompt (e.g., plan approval)
     pub prompt: Option<InteractivePrompt>,
+    /// Base64-encoded images pending to be sent with the next message.
+    pub pending_images: Vec<String>,
+    /// Question ID for a pending AskUser/permission prompt.
+    pub pending_ask_user_id: Option<String>,
 }
 
 /// An interactive prompt shown below the input for user selection.
@@ -139,6 +145,7 @@ impl App {
             is_streaming: false,
             active_tool_group: None,
             active_subagents: HashMap::new(),
+            subagent_parent_map: HashMap::new(),
             pending_user_messages: VecDeque::new(),
             verbose_mode: false,
             scroll_offset: 0,
@@ -146,12 +153,19 @@ impl App {
             last_token_limit: HashMap::new(),
             run_start_ts: HashMap::new(),
             prompt: None,
+            pending_images: Vec::new(),
+            pending_ask_user_id: None,
         }
     }
 
     fn push_user(&mut self, text: &str) {
+        self.push_user_with_images(text, 0);
+    }
+
+    fn push_user_with_images(&mut self, text: &str, image_count: usize) {
         self.blocks.push(DisplayBlock::UserMessage {
             text: text.to_string(),
+            image_count,
         });
     }
 
@@ -183,6 +197,134 @@ impl App {
         self.blocks.push(DisplayBlock::SystemMessage {
             text: text.to_string(),
         });
+    }
+
+    /// Grab a PNG image from the system clipboard and return base64.
+    /// macOS: uses osascript, Linux: tries wl-paste then xclip.
+    fn grab_clipboard_image() -> Result<String> {
+        use base64::Engine;
+        let tmp_path = std::env::temp_dir().join("linggen_clipboard_img.png");
+
+        #[cfg(target_os = "macos")]
+        {
+            let output = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(format!(
+                    "set imgData to the clipboard as «class PNGf»\n\
+                     set fp to open for access POSIX file \"{}\" with write permission\n\
+                     write imgData to fp\n\
+                     close access fp",
+                    tmp_path.display()
+                ))
+                .output()
+                .map_err(|e| anyhow::anyhow!("osascript failed: {}", e))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("clipboard has no image ({})", stderr.trim());
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let wl_ok = std::process::Command::new("wl-paste")
+                .args(["--type", "image/png"])
+                .stdout(std::fs::File::create(&tmp_path)?)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !wl_ok {
+                let xclip_ok = std::process::Command::new("xclip")
+                    .args(["-selection", "clipboard", "-target", "image/png", "-o"])
+                    .stdout(std::fs::File::create(&tmp_path)?)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !xclip_ok {
+                    anyhow::bail!("no image in clipboard (tried wl-paste and xclip)");
+                }
+            }
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            anyhow::bail!("clipboard image paste not supported on this platform");
+        }
+
+        if !tmp_path.exists() {
+            anyhow::bail!("clipboard image file was not created");
+        }
+        let data = std::fs::read(&tmp_path)?;
+        let _ = std::fs::remove_file(&tmp_path);
+        if data.is_empty() {
+            anyhow::bail!("clipboard image is empty");
+        }
+        Ok(base64::engine::general_purpose::STANDARD.encode(&data))
+    }
+
+    /// Try pasting a clipboard image and push a system status message.
+    fn paste_clipboard_image(&mut self) {
+        match Self::grab_clipboard_image() {
+            Ok(base64) => {
+                self.pending_images.push(base64);
+                let count = self.pending_images.len();
+                self.push_system(&format!("Image pasted from clipboard ({count} pending)"));
+            }
+            Err(e) => {
+                self.push_system(&format!("No image in clipboard: {e}"));
+            }
+        }
+    }
+
+    /// Handle /image and /paste commands.
+    fn handle_image_command(&mut self, line: &str) {
+        if line == "/paste" {
+            self.paste_clipboard_image();
+            return;
+        }
+        if line == "/image" {
+            self.push_system("Usage: /image <file_path>  — attach an image file");
+            self.push_system("       Ctrl+V             — paste image from clipboard");
+            self.push_system(&format!("  {} image(s) pending", self.pending_images.len()));
+            return;
+        }
+        if line == "/image clear" {
+            self.pending_images.clear();
+            self.push_system("Cleared all pending images.");
+            return;
+        }
+        // /image <path>
+        let path = line.strip_prefix("/image ").unwrap_or("").trim();
+        if path.is_empty() {
+            self.push_system("Usage: /image <file_path>");
+            return;
+        }
+        match Self::load_image_file(path) {
+            Ok(base64) => {
+                self.pending_images.push(base64);
+                let count = self.pending_images.len();
+                self.push_system(&format!("Image attached: {path} ({count} pending)"));
+            }
+            Err(e) => {
+                self.push_system(&format!("Failed to load image: {e}"));
+            }
+        }
+    }
+
+    /// Load an image file from disk and return its base64-encoded content.
+    fn load_image_file(path: &str) -> Result<String> {
+        use base64::Engine;
+        let expanded = if path.starts_with('~') {
+            if let Some(home) = dirs::home_dir() {
+                home.join(path.strip_prefix("~/").unwrap_or(path))
+            } else {
+                std::path::PathBuf::from(path)
+            }
+        } else {
+            std::path::PathBuf::from(path)
+        };
+        let data = std::fs::read(&expanded)
+            .map_err(|e| anyhow::anyhow!("Cannot read {}: {}", expanded.display(), e))?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(&data))
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -217,6 +359,9 @@ impl App {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(true);
+            }
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.paste_clipboard_image();
             }
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.verbose_mode = !self.verbose_mode;
@@ -265,6 +410,19 @@ impl App {
     }
 
     fn handle_prompt_choice(&mut self, choice: &str) -> Result<bool> {
+        // Handle AskUser/permission prompts.
+        if let Some(question_id) = self.pending_ask_user_id.take() {
+            self.push_system(&format!("Selected: {}", choice));
+            let client = self.client.clone();
+            let selected = choice.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = client.respond_ask_user(&question_id, &selected).await {
+                    tracing::warn!("AskUser response failed: {}", e);
+                }
+            });
+            return Ok(false);
+        }
+
         if choice.starts_with("Start (new session") {
             self.push_system("Clearing context and starting plan execution...");
             let client = self.client.clone();
@@ -326,8 +484,12 @@ impl App {
             self.push_system("  /plan <task>      ask agent to create a plan (read-only)");
             self.push_system("  /plan approve     approve and execute the pending plan");
             self.push_system("  /plan reject      reject the pending plan");
+            self.push_system("  /image <path>     attach an image file");
+            self.push_system("  /image clear      remove all pending images");
+            self.push_system("  /paste            paste image from clipboard");
             self.push_system("  /quit, /exit      exit");
             self.push_system("  <text>            send message to current agent");
+            self.push_system("  Ctrl+V            paste image from clipboard");
             self.push_system("  Ctrl+O            toggle verbose/compact tool display");
             self.push_system("  ↑/↓, scroll       scroll output");
             self.push_system("  PgUp/PgDn         scroll output (fast)");
@@ -385,7 +547,7 @@ impl App {
             let msg = line.clone();
             tokio::spawn(async move {
                 if let Ok(Some(sid)) = client
-                    .send_chat(&project_root, &agent_id, &msg, session_id.as_deref())
+                    .send_chat(&project_root, &agent_id, &msg, session_id.as_deref(), None)
                     .await
                 {
                     let mut guard = slot.lock().unwrap();
@@ -394,6 +556,12 @@ impl App {
                     }
                 }
             });
+            return Ok(false);
+        }
+
+        // Image commands
+        if line == "/image" || line.starts_with("/image ") || line == "/paste" {
+            self.handle_image_command(&line);
             return Ok(false);
         }
 
@@ -418,7 +586,9 @@ impl App {
             (self.agent_id.clone(), line)
         };
 
-        self.push_user(&message);
+        let images = std::mem::take(&mut self.pending_images);
+        let image_count = images.len();
+        self.push_user_with_images(&message, image_count);
         self.pending_user_messages.push_back(message.clone());
         self.status_state = "sending".to_string();
 
@@ -427,6 +597,7 @@ impl App {
         let session_id = self.session_id.clone();
         let slot = self.session_id_slot.clone();
 
+        let send_images = if images.is_empty() { None } else { Some(images) };
         tokio::spawn(async move {
             if let Ok(Some(sid)) = client
                 .send_chat(
@@ -434,6 +605,7 @@ impl App {
                     &target_agent,
                     &message,
                     session_id.as_deref(),
+                    send_images,
                 )
                 .await
             {
@@ -470,6 +642,22 @@ impl App {
                         self.finalize_streaming();
                     }
                 }
+            }
+            "text_segment" => {
+                let agent_id = msg.agent_id.unwrap_or_default();
+                let text = msg.text.unwrap_or_default();
+                if text.is_empty() {
+                    return;
+                }
+                // Skip subagent text segments
+                if self.subagent_parent_map.contains_key(&agent_id.to_lowercase()) {
+                    return;
+                }
+                // Discard any thinking tokens being streamed — text_segment is more reliable
+                self.discard_streaming();
+                // Finalize any active tool group first → creates interleaving
+                self.finalize_tool_group();
+                self.push_agent(&agent_id, &text);
             }
             "message" => {
                 self.discard_streaming();
@@ -521,6 +709,34 @@ impl App {
                     .agent_id
                     .clone()
                     .unwrap_or_else(|| self.status_agent.clone());
+
+                // Route subagent activity to its entry instead of the main tool group
+                let parent_id = msg
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("parent_id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let is_subagent = self.subagent_parent_map.contains_key(&agent)
+                    || parent_id.is_some();
+
+                if is_subagent {
+                    if let Some(pid) = &parent_id {
+                        self.subagent_parent_map.entry(agent.clone()).or_insert_with(|| pid.clone());
+                    }
+                    if let Some(entry) = self.active_subagents.get_mut(&agent) {
+                        // Only count new tool invocations (doing), not completions (done)
+                        if status == "calling_tool" && phase == "doing" {
+                            entry.tool_count += 1;
+                        }
+                        if status == "idle" {
+                            entry.current_activity = None;
+                        } else if !text.is_empty() {
+                            entry.current_activity = Some(text.clone());
+                        }
+                    }
+                    return;
+                }
 
                 // Update status bar
                 self.status_state = status.to_string();
@@ -621,14 +837,23 @@ impl App {
                             .or(msg.agent_id.as_deref())
                             .unwrap_or("")
                             .to_string();
-                        if let Some(tokens) = data.get("estimated_tokens").and_then(|v| v.as_u64())
-                        {
-                            self.last_context_tokens
-                                .insert(agent_key.clone(), tokens as usize);
-                        }
-                        if let Some(limit) = data.get("token_limit").and_then(|v| v.as_u64()) {
-                            self.last_token_limit
-                                .insert(agent_key, limit as usize);
+                        // Route subagent context to its entry
+                        if self.subagent_parent_map.contains_key(&agent_key) {
+                            if let Some(tokens) = data.get("estimated_tokens").and_then(|v| v.as_u64()) {
+                                if let Some(entry) = self.active_subagents.get_mut(&agent_key) {
+                                    entry.estimated_tokens = Some(tokens as usize);
+                                }
+                            }
+                        } else {
+                            if let Some(tokens) = data.get("estimated_tokens").and_then(|v| v.as_u64())
+                            {
+                                self.last_context_tokens
+                                    .insert(agent_key.clone(), tokens as usize);
+                            }
+                            if let Some(limit) = data.get("token_limit").and_then(|v| v.as_u64()) {
+                                self.last_token_limit
+                                    .insert(agent_key, limit as usize);
+                            }
                         }
                     }
                 }
@@ -639,17 +864,27 @@ impl App {
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown")
                             .to_string();
+                        let parent_id = data
+                            .get("parent_id")
+                            .and_then(|v| v.as_str())
+                            .or(msg.agent_id.as_deref())
+                            .unwrap_or("")
+                            .to_string();
                         let task = data
                             .get("task")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
+                        self.subagent_parent_map.insert(subagent_id.clone(), parent_id);
                         self.active_subagents.insert(
                             subagent_id.clone(),
                             SubagentEntry {
                                 subagent_id,
                                 task,
                                 status: SubagentStatus::Running,
+                                tool_count: 0,
+                                estimated_tokens: None,
+                                current_activity: None,
                             },
                         );
                     }
@@ -663,7 +898,9 @@ impl App {
                             .to_string();
                         if let Some(entry) = self.active_subagents.get_mut(&subagent_id) {
                             entry.status = SubagentStatus::Done;
+                            entry.current_activity = None;
                         }
+                        self.subagent_parent_map.remove(&subagent_id);
                         // Check if all subagents are done
                         let all_done = self
                             .active_subagents
@@ -811,6 +1048,52 @@ impl App {
                 if self.session_id.is_none() {
                     if let Some(sid) = msg.session_id {
                         self.session_id = Some(sid);
+                    }
+                }
+            }
+            "ask_user" => {
+                if let Some(data) = &msg.data {
+                    let question_id = data
+                        .get("question_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let questions = data.get("questions").and_then(|v| v.as_array());
+                    if let Some(questions) = questions {
+                        let header = questions
+                            .first()
+                            .and_then(|q| q.get("header"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if header == "Permission" {
+                            // Permission prompt: show question and options as InteractivePrompt.
+                            let question_text = questions
+                                .first()
+                                .and_then(|q| q.get("question"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Permission required");
+                            self.push_system(&format!("Permission: {}", question_text));
+                            let options: Vec<String> = questions
+                                .first()
+                                .and_then(|q| q.get("options"))
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|o| {
+                                            o.get("label").and_then(|v| v.as_str()).map(String::from)
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if !options.is_empty() {
+                                self.pending_ask_user_id = Some(question_id);
+                                self.prompt = Some(InteractivePrompt {
+                                    options,
+                                    selected: 0,
+                                });
+                            }
+                        }
+                        // Non-permission AskUser prompts are not handled in TUI yet.
                     }
                 }
             }
@@ -990,6 +1273,12 @@ impl App {
             all_lines.extend(render::render_tool_group_active(&group.steps));
         }
 
+        // Active (in-progress) subagent tree — rendered live
+        if !self.active_subagents.is_empty() {
+            let entries: Vec<&SubagentEntry> = self.active_subagents.values().collect();
+            all_lines.extend(render::render_subagent_group_live(&entries));
+        }
+
         // Streaming buffer (dim text)
         if self.is_streaming && !self.streaming_buffer.is_empty() {
             for l in self.streaming_buffer.lines() {
@@ -1062,7 +1351,7 @@ impl App {
 
         // ── Fixed input area (always visible at bottom) ─────────────
         let divider = "─".repeat(width as usize);
-        let input_line = Line::from(vec![
+        let mut input_spans = vec![
             Span::styled(
                 "> ",
                 Style::default()
@@ -1070,7 +1359,14 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(self.input.clone()),
-        ]);
+        ];
+        if !self.pending_images.is_empty() {
+            input_spans.push(Span::styled(
+                format!("  [{} image{}]", self.pending_images.len(), if self.pending_images.len() == 1 { "" } else { "s" }),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        let input_line = Line::from(input_spans);
 
         let state_color = match self.status_state.as_str() {
             "thinking" => Color::Blue,

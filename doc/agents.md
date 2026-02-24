@@ -19,6 +19,18 @@ Determined by frontmatter `kind: main` or `kind: subagent`.
 
 **Frontmatter fields**: `name`, `description`, `tools`, `model`, `kind`, `work_globs`, `policy`, `idle_prompt`, `idle_interval_secs`.
 
+### Default agents
+
+| Agent | Role | Key tools |
+|:------|:-----|:----------|
+| `ling` | General-purpose assistant, delegates specialist work | Read, Glob, Grep, Bash, delegate_to_agent, AskUser |
+| `coder` | Implementation — writes and edits code | Read, Write, Edit, Bash, Glob, Grep, AskUser |
+| `explorer` | Read-only codebase exploration | Read, Glob, Grep, Bash |
+| `debugger` | Read-only debugging and log analysis | Read, Glob, Grep, Bash |
+| `linggen-guide` | Linggen docs and usage guide | Read, Glob, Grep, Bash, WebSearch, WebFetch |
+
+`ling` auto-delegates to `linggen-guide` when users ask about Linggen itself.
+
 ## Lifecycle
 
 ```

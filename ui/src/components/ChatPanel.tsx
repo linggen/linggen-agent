@@ -4,15 +4,19 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { cn } from '../lib/cn';
 import DiffView, { diffStats } from './DiffView';
+import { AskUserCard } from './AskUserCard';
+import { ToolPermissionCard } from './ToolPermissionCard';
 import type {
   AgentInfo,
   AgentRunInfo,
   AgentRunContextMessage,
   AgentRunContextResponse,
   ChatMessage,
+  MessageSegment,
   QueuedChatItem,
   SkillInfo,
   SubagentInfo,
+  SubagentTreeEntry,
 } from '../types';
 
 let mermaidInstance: any = null;
@@ -167,6 +171,31 @@ const roleFromSender = (sender: string): ChatMessage['role'] => {
   return 'agent';
 };
 
+/** Strip embedded tool/plan/structured JSON from text using brace-depth counting. */
+const stripStructuredJsonFromText = (text: string): string => {
+  const MARKERS = ['"type":"tool"', '"type":"plan"', '"type":"finalize_task"', '"type": "tool"', '"type": "plan"'];
+  let result = text;
+  for (const marker of MARKERS) {
+    let searchFrom = 0;
+    while (true) {
+      const markerIdx = result.indexOf(marker, searchFrom);
+      if (markerIdx < 0) break;
+      let start = -1;
+      for (let i = markerIdx - 1; i >= 0; i--) {
+        if (result[i] === '{') { start = i; break; }
+      }
+      if (start < 0) { searchFrom = markerIdx + marker.length; continue; }
+      let depth = 0, end = -1;
+      for (let i = start; i < result.length; i++) {
+        if (result[i] === '{') depth++;
+        else if (result[i] === '}') { depth--; if (depth === 0) { end = i + 1; break; } }
+      }
+      if (end < 0) break;
+      result = result.slice(0, start) + result.slice(end);
+    }
+  }
+  return result.trim();
+};
 const TOOL_JSON_EMBEDDED_RE = /\{"type":"tool","tool":"([^"]+)","args":\{[\s\S]*?\}\}/g;
 const TOOL_RESULT_LINE_RE = /^(Tool\s+[A-Za-z0-9_.:-]+\s*:|tool_error:|tool_not_allowed:)/i;
 const START_AUTONOMOUS_LINE_RE = /^Starting autonomous loop for task:/i;
@@ -431,7 +460,7 @@ const sanitizeAgentMessageText = (text: string) => {
   // Optimization: if it's a raw tool result from system, we often want to hide it entirely
   if (text.startsWith('Read:') || text.startsWith('Tool Read:')) return '';
   
-  const withoutEmbedded = text.replace(TOOL_JSON_EMBEDDED_RE, '').trim();
+  const withoutEmbedded = stripStructuredJsonFromText(text);
   const lines = withoutEmbedded.split('\n');
   const readFileRelated = /read:|content omitted in chat/i.test(withoutEmbedded);
   const kept: string[] = [];
@@ -644,6 +673,249 @@ const buildCompactSummary = (msg: ChatMessage, toolCount: number): string => {
     parts.push(formatDurationSec(msg.durationMs));
   }
   return `Done (${parts.join(' \u00b7 ')})`;
+};
+
+/** Parse an activity entry into structured { tool, detail, isDone } for Claude Code-style rendering. */
+const parseActivityEntry = (entry: string): { tool: string; detail: string; isDone: boolean } => {
+  const e = entry.trim();
+  // "Reading file: foo.rs" → { tool: 'Read', detail: 'foo.rs', isDone: false }
+  // "Read file: foo.rs" → { tool: 'Read', detail: 'foo.rs', isDone: true }
+  const patterns: Array<[RegExp, string, boolean]> = [
+    [/^Reading file:\s*(.*)$/i, 'Read', false],
+    [/^Read file:\s*(.*)$/i, 'Read', true],
+    [/^Writing file:\s*(.*)$/i, 'Write', false],
+    [/^Wrote\s+(.*)$/i, 'Write', true],
+    [/^Editing file:\s*(.*)$/i, 'Edit', false],
+    [/^Edited\s+(.*)$/i, 'Edit', true],
+    [/^Running command:\s*(.*)$/i, 'Bash', false],
+    [/^Ran command:\s*(.*)$/i, 'Bash', true],
+    [/^Searching:\s*(.*)$/i, 'Grep', false],
+    [/^Searched(?:\s+for)?:\s*(.*)$/i, 'Grep', true],
+    [/^Listing files:\s*(.*)$/i, 'Glob', false],
+    [/^Listed files:\s*(.*)$/i, 'Glob', true],
+    [/^Delegating to subagent:\s*(.*)$/i, 'Delegate', false],
+    [/^Delegating\.\.\.$/i, 'Delegate', false],
+    [/^Delegated to\s+(.*)$/i, 'Delegate', true],
+    [/^Calling tool:\s*(.*)$/i, 'Tool', false],
+    [/^Used tool:\s*(.*)$/i, 'Tool', true],
+  ];
+  for (const [re, tool, isDone] of patterns) {
+    const m = e.match(re);
+    if (m) return { tool, detail: (m[1] || '').trim(), isDone };
+  }
+  // Fallback: treat generic status lines
+  if (/^Reading file/i.test(e)) return { tool: 'Read', detail: '', isDone: false };
+  if (/^Writing file/i.test(e)) return { tool: 'Write', detail: '', isDone: false };
+  if (/^Running command/i.test(e)) return { tool: 'Bash', detail: '', isDone: false };
+  if (/^Searching/i.test(e)) return { tool: 'Grep', detail: '', isDone: false };
+  if (/^Listing files/i.test(e)) return { tool: 'Glob', detail: '', isDone: false };
+  return { tool: '', detail: e, isDone: false };
+};
+
+/** Render a single tool activity entry in Claude Code style. */
+const ToolActivityEntry: React.FC<{ entry: string; isActive: boolean; isLast: boolean }> = ({ entry, isActive, isLast }) => {
+  const parsed = parseActivityEntry(entry);
+  const dotColor = isActive
+    ? 'text-amber-500'
+    : parsed.isDone
+      ? 'text-emerald-500'
+      : 'text-slate-300 dark:text-slate-600';
+  return (
+    <div className={cn('flex items-start gap-1.5 font-mono', isLast && !parsed.isDone ? '' : 'opacity-70')}>
+      <span className={cn('mt-px text-[10px] leading-none', dotColor)}>●</span>
+      <div className="min-w-0 flex-1">
+        <span className="text-[11px]">
+          <span className="font-semibold text-slate-700 dark:text-slate-200">{parsed.tool || 'Action'}</span>
+          {parsed.detail && (
+            <span className="text-slate-400 dark:text-slate-500">
+              ({parsed.detail.length > 60 ? parsed.detail.slice(0, 57) + '...' : parsed.detail})
+            </span>
+          )}
+        </span>
+        {isActive && (
+          <div className="text-[10px] text-slate-400 dark:text-slate-500 pl-0.5">
+            └ Running…
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+/** Render a tool segment (list of activity entries) in Claude Code style. */
+const ToolSegmentBlock: React.FC<{ entries: string[]; isLast: boolean }> = ({ entries, isLast }) => (
+  <div className="my-1 space-y-0.5 pl-1">
+    {entries.map((entry, idx) => (
+      <ToolActivityEntry
+        key={`${idx}-${entry}`}
+        entry={entry}
+        isActive={isLast && idx === entries.length - 1}
+        isLast={isLast && idx === entries.length - 1}
+      />
+    ))}
+  </div>
+);
+
+/** Render streaming live text with a pulsing cursor. */
+const LiveTextBlock: React.FC<{ text: string }> = ({ text }) => {
+  if (!text.trim()) return null;
+  return (
+    <div className="opacity-60 italic">
+      <MarkdownContent text={text} />
+      <span className="inline-block w-1.5 h-3.5 bg-blue-500 ml-1 animate-pulse align-middle" />
+    </div>
+  );
+};
+
+/** Interleaved text + tool rendering (Claude Code style). */
+const SegmentedMessageView: React.FC<{
+  segments: MessageSegment[];
+  liveText?: string;
+  isGenerating: boolean;
+  isExpanded: boolean;
+  onToggle: () => void;
+  toolCount: number;
+  msg: ChatMessage;
+}> = ({ segments, liveText, isGenerating, isExpanded, onToggle, toolCount, msg }) => {
+  if (!isGenerating && !isExpanded) {
+    // Collapsed: show compact summary + final text only
+    const finalText = [...segments].reverse().find(s => s.type === 'text')?.text || '';
+    return (
+      <>
+        {toolCount > 0 && (
+          <div
+            className="mb-1 text-[11px] cursor-pointer select-none flex items-center gap-1.5"
+            onClick={onToggle}
+          >
+            <span className="text-[9px] text-slate-400 dark:text-slate-500">&#9654;</span>
+            <span className="text-green-600 dark:text-green-400 font-medium">
+              {buildCompactSummary(msg, toolCount)}
+            </span>
+          </div>
+        )}
+        {finalText && renderAgentMessageBody(finalText)}
+      </>
+    );
+  }
+  // Expanded or generating: show all segments interleaved
+  return (
+    <>
+      {segments.map((seg, i) =>
+        seg.type === 'text' ? (
+          <div key={`seg-text-${i}`} className="my-1">
+            {renderAgentMessageBody(seg.text || '')}
+          </div>
+        ) : (
+          <ToolSegmentBlock
+            key={`seg-tools-${i}`}
+            entries={seg.entries || []}
+            isLast={i === segments.length - 1 && isGenerating}
+          />
+        )
+      )}
+      {isGenerating && liveText && <LiveTextBlock text={liveText} />}
+      {isGenerating && !liveText && (
+        <span className="inline-block w-1.5 h-3.5 bg-blue-500 ml-1 animate-pulse align-middle" />
+      )}
+    </>
+  );
+};
+
+const subagentStatsStr = (e: SubagentTreeEntry): string => {
+  const parts: string[] = [];
+  if (e.toolCount > 0) parts.push(`${e.toolCount} tool use${e.toolCount === 1 ? '' : 's'}`);
+  if (e.contextTokens > 0) parts.push(`${formatCompactTokens(e.contextTokens)} tokens`);
+  return parts.length > 0 ? ` \u00b7 ${parts.join(' \u00b7 ')}` : '';
+};
+
+/** Subagent tree view — Claude Code-style inline delegation tree. */
+const SubagentTreeView: React.FC<{
+  entries: SubagentTreeEntry[];
+  isGenerating: boolean;
+  isExpanded: boolean;
+  onToggle: () => void;
+}> = ({ entries, isGenerating, isExpanded, onToggle }) => {
+  const running = entries.filter((e) => e.status === 'running');
+  const allDone = running.length === 0;
+  const totalTools = entries.reduce((s, e) => s + e.toolCount, 0);
+  const totalTokens = entries.reduce((s, e) => s + e.contextTokens, 0);
+
+  // Header text
+  const headerText = allDone
+    ? `${entries.length} agent${entries.length === 1 ? '' : 's'} finished`
+    : `Running ${running.length} agent${running.length === 1 ? '' : 's'}…`;
+
+  const headerColor = allDone
+    ? 'text-emerald-600 dark:text-emerald-400'
+    : 'text-amber-600 dark:text-amber-400';
+
+  const dotColor = allDone ? 'text-emerald-500' : 'text-amber-500';
+
+  // Show expanded when generating, or when user toggled
+  const showEntries = isGenerating || isExpanded;
+
+  if (!showEntries && allDone) {
+    // Collapsed done: single summary line
+    const parts = [`${totalTools} tool use${totalTools === 1 ? '' : 's'}`];
+    if (totalTokens > 0) parts.push(`${formatCompactTokens(totalTokens)} tokens`);
+    return (
+      <div
+        className="mb-1.5 text-[11px] cursor-pointer select-none flex items-center gap-1.5 font-mono"
+        onClick={onToggle}
+      >
+        <span className="text-[9px] text-slate-400 dark:text-slate-500">&#9654;</span>
+        <span className={cn('text-[10px]', dotColor)}>●</span>
+        <span className={headerColor}>
+          {headerText} ({parts.join(' \u00b7 ')})
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mb-1.5 font-mono text-[11px]">
+      {/* Header */}
+      <div
+        className={cn('flex items-center gap-1.5 select-none', !isGenerating && 'cursor-pointer')}
+        onClick={!isGenerating ? onToggle : undefined}
+      >
+        {!isGenerating && (
+          <span className="text-[9px] text-slate-400 dark:text-slate-500">&#9660;</span>
+        )}
+        <span className={cn('text-[10px]', dotColor)}>●</span>
+        <span className={headerColor}>{headerText}</span>
+      </div>
+      {/* Tree entries */}
+      <div className={cn('mt-0.5', isGenerating ? 'pl-3' : 'pl-5')}>
+        {entries.map((entry, idx) => {
+          const isLast = idx === entries.length - 1;
+          const branch = isLast ? '└' : '├';
+          const continuation = isLast ? ' ' : '│';
+          const isRunning = entry.status === 'running';
+          const entryDotColor = isRunning ? 'text-amber-500' : entry.status === 'failed' ? 'text-red-500' : 'text-emerald-500';
+          const taskPreview = entry.task.length > 50 ? entry.task.slice(0, 47) + '…' : entry.task;
+          const statsStr = subagentStatsStr(entry);
+
+          return (
+            <div key={entry.subagentId} className={cn(isRunning ? '' : 'opacity-70')}>
+              <div className="flex items-start gap-0">
+                <span className="text-slate-400 dark:text-slate-600 select-none shrink-0">{branch} </span>
+                <span className={cn('text-[10px] mt-px mr-1', entryDotColor)}>●</span>
+                <span className="text-slate-700 dark:text-slate-200">{taskPreview}</span>
+                <span className="text-slate-400 dark:text-slate-500">{statsStr}</span>
+              </div>
+              {isRunning && entry.currentActivity && (
+                <div className="flex items-start gap-0 text-[10px] text-slate-400 dark:text-slate-500">
+                  <span className="select-none shrink-0">{continuation}  └ </span>
+                  <span>{entry.currentActivity}</span>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 };
 
 /** Strip "Step N: " prefix from plan item title for dedup. */
@@ -994,10 +1266,12 @@ export const ChatPanel: React.FC<{
   subagentRunHistory?: Record<string, AgentRunInfo[]>;
   cancellingRunIds?: Record<string, boolean>;
   onCancelRun?: (runId: string) => void | Promise<void>;
-  onSendMessage: (message: string, targetAgent?: string) => void;
+  onSendMessage: (message: string, targetAgent?: string, images?: string[]) => void;
   pendingPlan?: import('../types').Plan | null;
   onApprovePlan?: () => void;
   onRejectPlan?: () => void;
+  pendingAskUser?: import('../types').PendingAskUser | null;
+  onRespondToAskUser?: (questionId: string, answers: import('../types').AskUserAnswer[]) => void;
   verboseMode?: boolean;
 }> = ({
   chatMessages,
@@ -1022,9 +1296,12 @@ export const ChatPanel: React.FC<{
   pendingPlan,
   onApprovePlan,
   onRejectPlan,
+  pendingAskUser,
+  onRespondToAskUser,
   verboseMode,
 }) => {
   const [chatInput, setChatInput] = useState('');
+  const [pendingImages, setPendingImages] = useState<string[]>([]);
   const [showSkillDropdown, setShowSkillDropdown] = useState(false);
   const [skillFilter, setSkillFilter] = useState('');
   const [showAgentDropdown, setShowAgentDropdown] = useState(false);
@@ -1369,9 +1646,11 @@ export const ChatPanel: React.FC<{
   }, [chatInput]);
 
   const send = () => {
-    if (!chatInput.trim()) return;
+    if (!chatInput.trim() && pendingImages.length === 0) return;
     const userMessage = chatInput;
+    const imagesToSend = pendingImages.length > 0 ? [...pendingImages] : undefined;
     setChatInput('');
+    setPendingImages([]);
     setShowSkillDropdown(false);
     setShowAgentDropdown(false);
 
@@ -1386,8 +1665,55 @@ export const ChatPanel: React.FC<{
     }
 
     const targetAgent = mentionAgent || selectedAgent;
-    onSendMessage(userMessage, targetAgent);
+    onSendMessage(userMessage, targetAgent, imagesToSend);
     window.setTimeout(resizeInput, 0);
+  };
+
+  const readFileAsBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        // Strip "data:image/...;base64," prefix
+        const base64 = result.split(',')[1] || result;
+        resolve(base64);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const handlePaste = async (e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of Array.from(items)) {
+      if (item.type.startsWith('image/')) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (file) {
+          const base64 = await readFileAsBase64(file);
+          setPendingImages(prev => [...prev, base64]);
+        }
+      }
+    }
+  };
+
+  const handleDrop = async (e: React.DragEvent) => {
+    const files = e.dataTransfer?.files;
+    if (!files) return;
+    for (const file of Array.from(files)) {
+      if (file.type.startsWith('image/')) {
+        e.preventDefault();
+        const base64 = await readFileAsBase64(file);
+        setPendingImages(prev => [...prev, base64]);
+      }
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    if (e.dataTransfer?.types?.includes('Files')) {
+      e.preventDefault();
+    }
   };
 
   const buildSkillSuggestions = () => {
@@ -1619,29 +1945,53 @@ export const ChatPanel: React.FC<{
                 messageClass
               )}
             >
-              {hasActivitySummary && (
+              {/* Subagent tree (rendered above regular tool activity) */}
+              {msg.subagentTree && msg.subagentTree.length > 0 && (
+                <SubagentTreeView
+                  entries={msg.subagentTree}
+                  isGenerating={!!msg.isGenerating}
+                  isExpanded={isExpanded}
+                  onToggle={toggleExpand}
+                />
+              )}
+              {/* Segmented interleaved view (text → tools → text → tools → ...) */}
+              {msg.segments && msg.segments.length > 0 ? (
+                <SegmentedMessageView
+                  segments={msg.segments}
+                  liveText={msg.liveText}
+                  isGenerating={!!msg.isGenerating}
+                  isExpanded={isExpanded}
+                  onToggle={toggleExpand}
+                  toolCount={toolCount}
+                  msg={msg}
+                />
+              ) : hasActivitySummary && (
                 msg.isGenerating ? (
-                  /* Active (in-progress): show last tool call + "+N more" */
-                  <div className="mb-1 text-[11px] text-slate-500 dark:text-slate-400">
-                    <div className="flex items-center gap-1.5">
-                      <span className="flex gap-0.5">
-                        <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce [animation-delay:-0.3s]" />
-                        <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce [animation-delay:-0.15s]" />
-                        <span className="w-1 h-1 bg-blue-500 rounded-full animate-bounce" />
-                      </span>
-                      <span>{activityEntries[activityEntries.length - 1] || activityHeadline(msg, activityEntries)}</span>
-                    </div>
-                    {activityEntries.length > 1 && (
-                      <div className="pl-4 text-slate-400 dark:text-slate-500 italic">
-                        +{activityEntries.length - 1} more tool use{activityEntries.length - 1 === 1 ? '' : 's'}
+                  /* Active (in-progress): Claude Code-style live tool log */
+                  <div className="mb-1.5">
+                    {activityEntries.length > 0 ? (
+                      <div className="space-y-0.5">
+                        {activityEntries.map((entry, idx) => (
+                          <ToolActivityEntry
+                            key={`${idx}-${entry}`}
+                            entry={entry}
+                            isActive={idx === activityEntries.length - 1}
+                            isLast={idx === activityEntries.length - 1}
+                          />
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+                        <span className="text-[10px] text-amber-500">●</span>
+                        <span>{activityHeadline(msg, activityEntries)}</span>
                       </div>
                     )}
                   </div>
                 ) : isExpanded && hasActivityDetails ? (
-                  /* Verbose (expanded): show all entries */
-                  <div className="mb-1 text-[11px] text-slate-500 dark:text-slate-400">
+                  /* Expanded: Claude Code-style tool list */
+                  <div className="mb-1.5">
                     <div
-                      className="cursor-pointer select-none flex items-center gap-1.5"
+                      className="cursor-pointer select-none flex items-center gap-1.5 text-[11px]"
                       onClick={toggleExpand}
                     >
                       <span className="text-[9px] text-slate-400 dark:text-slate-500">&#9660;</span>
@@ -1649,11 +1999,14 @@ export const ChatPanel: React.FC<{
                         {buildCompactSummary(msg, toolCount)}
                       </span>
                     </div>
-                    <div className="mt-1 space-y-0.5 pl-4 border-l-2 border-slate-200/80 dark:border-white/10">
+                    <div className="mt-1 space-y-0.5 pl-3">
                       {detailActivityEntries.map((entry, idx) => (
-                        <div key={`${idx}-${entry}`} className="truncate text-slate-400 dark:text-slate-500">
-                          {entry}
-                        </div>
+                        <ToolActivityEntry
+                          key={`${idx}-${entry}`}
+                          entry={entry}
+                          isActive={false}
+                          isLast={idx === detailActivityEntries.length - 1}
+                        />
                       ))}
                     </div>
                   </div>
@@ -1675,7 +2028,27 @@ export const ChatPanel: React.FC<{
                 )
               )}
               {(() => {
-                if (isUser || (isStatusLine && !hasActivity)) return displayText;
+                // When segments mode is active, body text is already rendered by SegmentedMessageView
+                if (msg.segments && msg.segments.length > 0) return null;
+                if (isUser || (isStatusLine && !hasActivity)) {
+                  return (
+                    <>
+                      {displayText}
+                      {isUser && msg.images && msg.images.length > 0 && (
+                        <div className="flex gap-1.5 mt-1.5 flex-wrap">
+                          {msg.images.map((img, imgIdx) => (
+                            <img
+                              key={imgIdx}
+                              src={`data:image/png;base64,${img}`}
+                              alt={`Image ${imgIdx + 1}`}
+                              className="max-w-[200px] max-h-[200px] rounded-md border border-slate-200 dark:border-white/10 object-contain"
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  );
+                }
                 if (hideStatusBodyText) return null;
                 try {
                   const parsed = JSON.parse(displayText);
@@ -1854,10 +2227,17 @@ export const ChatPanel: React.FC<{
                   return renderAgentMessageBody(displayText);
                 }
               })()}
-              {msg.isGenerating && <span className="inline-block w-1.5 h-3.5 bg-blue-500 ml-1 animate-pulse align-middle" />}
+              {msg.isGenerating && !(msg.segments && msg.segments.length > 0) && <span className="inline-block w-1.5 h-3.5 bg-blue-500 ml-1 animate-pulse align-middle" />}
             </div>
           </div>
         )})}
+        {pendingAskUser && onRespondToAskUser && (
+          <div className="px-3 py-2">
+            {pendingAskUser.questions[0]?.header === 'Permission'
+              ? <ToolPermissionCard pending={pendingAskUser} onRespond={onRespondToAskUser} />
+              : <AskUserCard pending={pendingAskUser} onRespond={onRespondToAskUser} />}
+          </div>
+        )}
         <div ref={chatEndRef} />
       </div>
 
@@ -1872,6 +2252,26 @@ export const ChatPanel: React.FC<{
                 </div>
               ))}
             </div>
+          </div>
+        )}
+        {pendingImages.length > 0 && (
+          <div className="flex gap-1.5 px-2 py-1.5 flex-wrap">
+            {pendingImages.map((img, idx) => (
+              <div key={idx} className="relative group">
+                <img
+                  src={`data:image/png;base64,${img}`}
+                  alt={`Pending ${idx + 1}`}
+                  className="w-16 h-16 object-cover rounded-md border border-slate-200 dark:border-white/10"
+                />
+                <button
+                  onClick={() => setPendingImages(prev => prev.filter((_, i) => i !== idx))}
+                  className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-red-500 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                  title="Remove image"
+                >
+                  <X size={10} />
+                </button>
+              </div>
+            ))}
           </div>
         )}
         <div className="flex gap-2 bg-white dark:bg-black/20 p-1.5 rounded-xl border border-slate-300/80 dark:border-white/10 relative items-end">
@@ -1929,6 +2329,9 @@ export const ChatPanel: React.FC<{
           <textarea
             ref={inputRef}
             value={chatInput}
+            onPaste={handlePaste}
+            onDrop={handleDrop}
+            onDragOver={handleDragOver}
             onChange={(e) => {
               const val = e.target.value;
               setChatInput(val);

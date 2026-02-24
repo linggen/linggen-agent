@@ -21,6 +21,7 @@ import type {
   AgentRunSummary,
   AgentWorkInfo,
   ChatMessage,
+  SubagentTreeEntry,
   WorkspaceState,
   ModelInfo,
   OllamaPsResponse,
@@ -170,6 +171,45 @@ const isToolResultMessage = (from?: string, text?: string) => {
   const trimmed = text.trim();
   if (!trimmed) return false;
   return TOOL_RESULT_LINE_RE.test(trimmed) || (from === 'system' && trimmed.startsWith('Tool '));
+};
+
+/** Strip embedded structured JSON (plan, tool calls, finalize_task) from text,
+ *  handling nested braces correctly via depth counting. */
+const stripEmbeddedStructuredJson = (text: string): string => {
+  // Markers for JSON objects we want to strip from visible text
+  const MARKERS = ['"type":"plan"', '"type":"tool"', '"type":"finalize_task"', '"type": "plan"', '"type": "tool"'];
+  let result = text;
+
+  for (const marker of MARKERS) {
+    let searchFrom = 0;
+    while (true) {
+      const markerIdx = result.indexOf(marker, searchFrom);
+      if (markerIdx < 0) break;
+
+      // Find the opening { before the marker
+      let start = -1;
+      for (let i = markerIdx - 1; i >= 0; i--) {
+        if (result[i] === '{') { start = i; break; }
+      }
+      if (start < 0) { searchFrom = markerIdx + marker.length; continue; }
+
+      // Find the matching closing } using brace counting
+      let depth = 0;
+      let end = -1;
+      for (let i = start; i < result.length; i++) {
+        if (result[i] === '{') depth++;
+        else if (result[i] === '}') {
+          depth--;
+          if (depth === 0) { end = i + 1; break; }
+        }
+      }
+      if (end < 0) break; // Unbalanced braces (partial JSON during streaming), stop
+
+      result = result.slice(0, start) + result.slice(end);
+    }
+  }
+
+  return result.trim();
 };
 
 const isStatusLineText = (text: string) =>
@@ -500,6 +540,45 @@ const buildSubagentInfos = (
   return out;
 };
 
+/** Update the subagentTree on a parent agent's generating message. */
+const updateParentSubagentTree = (
+  messages: ChatMessage[],
+  parentId: string,
+  subagentId: string,
+  updater: (entry: SubagentTreeEntry) => SubagentTreeEntry,
+): ChatMessage[] => {
+  // Find the last generating message from the parent agent.
+  let targetIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if ((m.from || '').toLowerCase() === parentId.toLowerCase() && m.isGenerating) {
+      targetIdx = i;
+      break;
+    }
+  }
+  // Fallback: last agent message from parent.
+  if (targetIdx < 0) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if ((m.from || '').toLowerCase() === parentId.toLowerCase() && m.role === 'agent') {
+        targetIdx = i;
+        break;
+      }
+    }
+  }
+  if (targetIdx < 0) return messages;
+
+  const next = [...messages];
+  const msg = next[targetIdx];
+  const tree = msg.subagentTree ? [...msg.subagentTree] : [];
+  const entryIdx = tree.findIndex((e) => e.subagentId === subagentId);
+  if (entryIdx >= 0) {
+    tree[entryIdx] = updater(tree[entryIdx]);
+  }
+  next[targetIdx] = { ...msg, subagentTree: tree };
+  return next;
+};
+
 type Page = 'main' | 'settings' | 'memory' | 'mission';
 
 const App: React.FC = () => {
@@ -548,6 +627,7 @@ const App: React.FC = () => {
   const [idlePromptEvents, setIdlePromptEvents] = useState<IdlePromptEvent[]>([]);
   const [pendingPlan, setPendingPlan] = useState<import('./types').Plan | null>(null);
   const [pendingPlanAgentId, setPendingPlanAgentId] = useState<string | null>(null);
+  const [pendingAskUser, setPendingAskUser] = useState<import('./types').PendingAskUser | null>(null);
   const [activePlan, setActivePlan] = useState<import('./types').Plan | null>(null);
   const [verboseMode, setVerboseMode] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false;
@@ -555,10 +635,15 @@ const App: React.FC = () => {
   });
   const runStartTsRef = useRef<Record<string, number>>({});
   const latestContextTokensRef = useRef<Record<string, number>>({});
-  
+
+  // Subagent tree tracking refs
+  const subagentParentMapRef = useRef<Record<string, string>>({});
+  const subagentStatsRef = useRef<Record<string, { toolCount: number; contextTokens: number }>>({});
+
   const chatEndRef = useRef<HTMLDivElement>(null);
   const lastChatCountRef = useRef(0);
   const lastSseSeqRef = useRef(0);
+  const chatClearTsRef = useRef(0);
   const tokenRateSamplesRef = useRef<Array<{ ts: number; tokens: number }>>([]);
   const lastTokenAtRef = useRef<number>(0);
   const lastAgentCharsRef = useRef<number>(0);
@@ -733,12 +818,15 @@ const App: React.FC = () => {
   }, []);
 
   const isPlanMessage = useCallback((msg: ChatMessage): boolean => {
+    const text = (msg.text || '').trim();
+    // Pure JSON plan message
     try {
-      const parsed = JSON.parse(msg.text);
-      return parsed?.type === 'plan' && !!parsed?.plan;
-    } catch {
-      return false;
-    }
+      const parsed = JSON.parse(text);
+      if (parsed?.type === 'plan' && !!parsed?.plan) return true;
+    } catch { /* not pure JSON */ }
+    // Plan JSON embedded within other text
+    if (text.includes('"type":"plan"') && text.includes('"plan":{')) return true;
+    return false;
   }, []);
 
   const likelySameMessage = useCallback((a: ChatMessage, b: ChatMessage) => {
@@ -755,8 +843,12 @@ const App: React.FC = () => {
   }, [sameMessageContent, isStructuredAgentMessage, isPlanMessage]);
 
   const mergeChatMessages = useCallback((persisted: ChatMessage[], live: ChatMessage[]) => {
-    if (persisted.length === 0) return live;
-    if (live.length === 0) return persisted;
+    if (persisted.length === 0) {
+      // Only keep actively generating messages; discard stale history.
+      const generating = live.filter((m) => m.isGenerating);
+      return generating;
+    }
+    if (live.length === 0) return dedupPlanMessages(persisted);
 
     const persistedWithActivity = persisted.map((msg) => {
       const matchingLive = live.find(
@@ -787,17 +879,21 @@ const App: React.FC = () => {
     );
     const merged = [...persistedWithActivity, ...uniqueExtras];
 
+    return dedupPlanMessages(merged);
+  }, [chatMessageKey, likelySameMessage, isPlanMessage]);
+
+  /** Keep only the last plan message per agent; dedup non-plan by key. */
+  const dedupPlanMessages = useCallback((messages: ChatMessage[]) => {
     // Deduplicate plan messages: keep only the last plan per agent.
     const lastPlanIdx = new Map<string, number>();
-    merged.forEach((m, idx) => {
+    messages.forEach((m, idx) => {
       if (isPlanMessage(m)) {
         lastPlanIdx.set(m.from || m.role || '', idx);
       }
     });
 
     const seen = new Set<string>();
-    return merged.filter((m, idx) => {
-      // For plan messages, only keep the last one per agent.
+    return messages.filter((m, idx) => {
       if (isPlanMessage(m)) {
         const agent = m.from || m.role || '';
         return lastPlanIdx.get(agent) === idx;
@@ -807,7 +903,38 @@ const App: React.FC = () => {
       seen.add(key);
       return true;
     });
-  }, [chatMessageKey, likelySameMessage, isPlanMessage]);
+  }, [chatMessageKey, isPlanMessage]);
+
+  /** Always-deduped + structured-JSON-stripped messages for rendering.
+   *  Plan messages are moved to the bottom and kept as one per agent. */
+  const displayMessages = useMemo(() => {
+    const deduped = dedupPlanMessages(chatMessages);
+    const plans: ChatMessage[] = [];
+    const nonPlans: ChatMessage[] = [];
+    for (const msg of deduped) {
+      if (isPlanMessage(msg)) {
+        plans.push(msg);
+      } else {
+        // Strip embedded structured JSON (plan, tool, finalize) from agent text
+        if ((msg.from || msg.role) !== 'user') {
+          let text = msg.text || '';
+          // Strip complete structured JSON objects
+          text = stripEmbeddedStructuredJson(text);
+          // Strip trailing partial JSON fragments during streaming (e.g. '{ "type' at end)
+          if (msg.isGenerating) {
+            text = text.replace(/\{\s*"type\b[^}]*$/s, '').trim();
+          }
+          if (text !== msg.text && text) {
+            nonPlans.push({ ...msg, text });
+            continue;
+          }
+        }
+        nonPlans.push(msg);
+      }
+    }
+    // Plans go at the bottom, one per agent, in-place updated
+    return [...nonPlans, ...plans];
+  }, [chatMessages, dedupPlanMessages, isPlanMessage]);
 
   useEffect(() => {
     if (chatMessages.length > lastChatCountRef.current) {
@@ -1000,12 +1127,36 @@ const App: React.FC = () => {
       setWorkspaceState(data);
       
       // Update chat messages from state if needed
-      if (data.messages) {
+      // Skip repopulation during clear-chat cooldown (5s) to let server process the clear
+      const inClearCooldown = chatClearTsRef.current > 0 && Date.now() - chatClearTsRef.current < 5000;
+      if (data.messages && !inClearCooldown) {
         const msgs: ChatMessage[] = data.messages
           .filter(([meta, body]: any) => !shouldHideInternalChatMessage(meta.from, body))
           .flatMap(([meta, body]: any) => {
             const isUser = meta.from === 'user';
-            const cleaned = isUser ? body : stripToolPayloadLines(String(body || ''));
+            let bodyStr = String(body || '');
+
+            // If this is a pure plan JSON message, keep it as-is for plan rendering
+            try {
+              const parsed = JSON.parse(bodyStr);
+              if (parsed?.type === 'plan' && parsed?.plan) {
+                return [{
+                  role: 'agent' as const,
+                  from: meta.from,
+                  to: meta.to,
+                  text: bodyStr,
+                  timestamp: new Date(meta.ts * 1000).toLocaleTimeString(),
+                  timestampMs: Number(meta.ts || 0) * 1000,
+                }];
+              }
+            } catch { /* not pure JSON */ }
+
+            // Strip embedded plan JSON from agent text to avoid showing duplicate plan blocks
+            if (!isUser) {
+              bodyStr = stripEmbeddedStructuredJson(bodyStr);
+            }
+
+            const cleaned = isUser ? bodyStr : stripToolPayloadLines(bodyStr);
             if (!isUser && !cleaned) return [];
             return [{
               role:
@@ -1286,9 +1437,12 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (selectedProjectRoot) {
+      // Clear stale chat state before fetching the new session's data.
+      setChatMessages([]);
+      setQueuedMessages([]);
+      setActivePlan(null);
       fetchWorkspaceState();
       fetchAgentRuns();
-      setQueuedMessages([]);
     }
   }, [activeSessionId, selectedProjectRoot, fetchWorkspaceState, fetchAgentRuns]);
 
@@ -1320,6 +1474,11 @@ const App: React.FC = () => {
 
   useEffect(() => {
     const events = new EventSource('/api/events');
+    // Reset seq counter when (re)connecting — after server restart the seq resets to 0
+    // but lastSseSeqRef still holds the old high value, causing all new events to be dropped.
+    events.onopen = () => {
+      lastSseSeqRef.current = 0;
+    };
     events.onmessage = (e) => {
       try {
         const item = JSON.parse(e.data) as UiSseMessage;
@@ -1341,17 +1500,31 @@ const App: React.FC = () => {
             if (agentIdKey) {
               const estTokens = Number(item.data.estimated_tokens || 0);
               latestContextTokensRef.current[agentIdKey] = estTokens;
-              setAgentContext((prev) => ({
-                ...prev,
-                [agentIdKey]: {
-                  tokens: estTokens,
-                  messages: Number(item.data.message_count || 0),
-                  tokenLimit:
-                    typeof item.data.token_limit === 'number'
-                      ? Number(item.data.token_limit)
-                      : prev[agentIdKey]?.tokenLimit,
-                },
-              }));
+
+              // If this agent is a known subagent, update its parent's tree
+              const parentId = subagentParentMapRef.current[agentIdKey];
+              if (parentId) {
+                const stats = subagentStatsRef.current[agentIdKey];
+                if (stats) stats.contextTokens = estTokens;
+                setChatMessages((prev) =>
+                  updateParentSubagentTree(prev, parentId, agentIdKey, (entry) => ({
+                    ...entry,
+                    contextTokens: estTokens,
+                  }))
+                );
+              } else {
+                setAgentContext((prev) => ({
+                  ...prev,
+                  [agentIdKey]: {
+                    tokens: estTokens,
+                    messages: Number(item.data.message_count || 0),
+                    tokenLimit:
+                      typeof item.data.token_limit === 'number'
+                        ? Number(item.data.token_limit)
+                        : prev[agentIdKey]?.tokenLimit,
+                  },
+                }));
+              }
             }
           } else if (item.phase === 'plan_update' && item.data?.plan) {
             const plan = item.data.plan as import('./types').Plan;
@@ -1367,10 +1540,7 @@ const App: React.FC = () => {
             setChatMessages((prev) => {
               const existingIdx = prev.findIndex((m) => {
                 if ((m.from || m.role) !== agentId) return false;
-                try {
-                  const parsed = JSON.parse(m.text);
-                  return parsed?.type === 'plan';
-                } catch { return false; }
+                return isPlanMessage(m);
               });
               if (existingIdx >= 0) {
                 const next = [...prev];
@@ -1391,6 +1561,64 @@ const App: React.FC = () => {
                 timestampMs: Date.now(),
               }];
             });
+          } else if (item.phase === 'subagent_spawned' && item.data) {
+            const parentId = String(item.agent_id || '').toLowerCase();
+            const subagentId = String(item.data.subagent_id || '');
+            const task = String(item.data.task || '');
+            if (subagentId && parentId) {
+              subagentParentMapRef.current[subagentId.toLowerCase()] = parentId;
+              subagentStatsRef.current[subagentId.toLowerCase()] = { toolCount: 0, contextTokens: 0 };
+              const newEntry: SubagentTreeEntry = {
+                subagentId,
+                task,
+                status: 'running',
+                toolCount: 0,
+                contextTokens: 0,
+                currentActivity: null,
+              };
+              setChatMessages((prev) => {
+                // Find parent's generating message and add the entry
+                let targetIdx = -1;
+                for (let i = prev.length - 1; i >= 0; i--) {
+                  const m = prev[i];
+                  if ((m.from || '').toLowerCase() === parentId && m.isGenerating) {
+                    targetIdx = i;
+                    break;
+                  }
+                }
+                if (targetIdx < 0) {
+                  for (let i = prev.length - 1; i >= 0; i--) {
+                    const m = prev[i];
+                    if ((m.from || '').toLowerCase() === parentId && m.role === 'agent') {
+                      targetIdx = i;
+                      break;
+                    }
+                  }
+                }
+                if (targetIdx < 0) return prev;
+                const next = [...prev];
+                const msg = next[targetIdx];
+                const tree = msg.subagentTree ? [...msg.subagentTree] : [];
+                tree.push(newEntry);
+                next[targetIdx] = { ...msg, subagentTree: tree };
+                return next;
+              });
+            }
+          } else if (item.phase === 'subagent_result' && item.data) {
+            const parentId = String(item.agent_id || '').toLowerCase();
+            const subagentId = String(item.data.subagent_id || '');
+            if (subagentId && parentId) {
+              setChatMessages((prev) =>
+                updateParentSubagentTree(prev, parentId, subagentId, (entry) => ({
+                  ...entry,
+                  status: 'done',
+                  currentActivity: null,
+                }))
+              );
+              // Clean up refs
+              delete subagentParentMapRef.current[subagentId.toLowerCase()];
+              delete subagentStatsRef.current[subagentId.toLowerCase()];
+            }
           } else if (item.phase === 'change_report' && item.data) {
             fetchWorkspaceState();
             fetchFiles(currentPath);
@@ -1407,12 +1635,81 @@ const App: React.FC = () => {
           return;
         }
 
+        if (item.kind === 'ask_user') {
+          const { question_id, questions } = item.data || {};
+          if (question_id && questions) {
+            setPendingAskUser({
+              questionId: question_id,
+              agentId: String(item.agent_id || ''),
+              questions,
+            });
+          }
+          return;
+        }
+
+        if (item.kind === 'text_segment') {
+          const agentId = String(item.agent_id || '');
+          if (!agentId) return;
+          // Skip subagent text segments
+          if (subagentParentMapRef.current[agentId.toLowerCase()]) return;
+          const segText = String(item.text || '').trim();
+          if (!segText) return;
+          setChatMessages((prev) => {
+            const idx = findLastGeneratingMessageIndex(prev, agentId);
+            if (idx < 0) return upsertGeneratingAgentMessage(prev, agentId, '');
+            const next = [...prev];
+            const msg = { ...next[idx] };
+            msg.segments = [...(msg.segments || []), { type: 'text' as const, text: segText }];
+            msg.liveText = '';
+            next[idx] = msg;
+            return next;
+          });
+          return;
+        }
+
         if (item.kind === 'activity') {
           const agentId = String(item.agent_id || '');
           if (!agentId) return;
           const statusRaw = String(item.data?.status || '').trim();
           const nextStatus = normalizeAgentStatus(statusRaw);
           const statusText = String(item.text || '').trim();
+
+          // Check if this agent is a known subagent — route activity to parent tree
+          const parentIdFromData = item.data?.parent_id ? String(item.data.parent_id) : null;
+          const parentIdForSubagent =
+            subagentParentMapRef.current[agentId.toLowerCase()] ||
+            (parentIdFromData ? parentIdFromData.toLowerCase() : null);
+
+          if (parentIdForSubagent && statusRaw !== 'idle_prompt_triggered') {
+            // Update tool count and current activity on the parent's subagent tree
+            if (nextStatus === 'calling_tool' && item.phase !== 'done') {
+              const stats = subagentStatsRef.current[agentId.toLowerCase()];
+              if (stats) stats.toolCount += 1;
+              setChatMessages((prev) =>
+                updateParentSubagentTree(prev, parentIdForSubagent, agentId, (entry) => ({
+                  ...entry,
+                  toolCount: (stats?.toolCount ?? entry.toolCount + 1),
+                  currentActivity: statusText || entry.currentActivity,
+                }))
+              );
+            } else if (nextStatus === 'thinking' || nextStatus === 'model_loading') {
+              setChatMessages((prev) =>
+                updateParentSubagentTree(prev, parentIdForSubagent, agentId, (entry) => ({
+                  ...entry,
+                  currentActivity: statusText || (nextStatus === 'thinking' ? 'Thinking...' : 'Model loading...'),
+                }))
+              );
+            } else if (nextStatus === 'idle') {
+              setChatMessages((prev) =>
+                updateParentSubagentTree(prev, parentIdForSubagent, agentId, (entry) => ({
+                  ...entry,
+                  currentActivity: null,
+                }))
+              );
+            }
+            // Don't create separate messages for subagent activity
+            return;
+          }
 
           // Capture idle_prompt_triggered events for Mission activity tab
           if (statusRaw === 'idle_prompt_triggered') {
@@ -1463,22 +1760,48 @@ const App: React.FC = () => {
 
           // Only add tool call status lines as activity entries (not "Thinking"/"Model loading").
           if (statusText.length > 0 && item.phase !== 'done') {
-            setChatMessages((prev) => appendGeneratingActivity(prev, agentId, statusText));
+            setChatMessages((prev) => {
+              const updated = appendGeneratingActivity(prev, agentId, statusText);
+              // Also track in segments for interleaved rendering
+              const idx = findLastGeneratingMessageIndex(updated, agentId);
+              if (idx < 0 || !updated[idx].segments) return updated;
+              const next = [...updated];
+              const msg = { ...next[idx] };
+              const segs = [...(msg.segments || [])];
+              const last = segs[segs.length - 1];
+              if (last?.type === 'tools') {
+                segs[segs.length - 1] = { ...last, entries: [...(last.entries || []), statusText] };
+              } else {
+                segs.push({ type: 'tools', entries: [statusText] });
+              }
+              msg.segments = segs;
+              next[idx] = msg;
+              return next;
+            });
           } else if ((nextStatus === 'model_loading' || nextStatus === 'thinking') && item.phase !== 'done') {
             const placeholder = nextStatus === 'model_loading' ? 'Model loading...' : 'Thinking...';
-            setChatMessages((prev) => upsertGeneratingAgentMessage(prev, agentId, placeholder));
+            setChatMessages((prev) => {
+              // When segments exist, don't overwrite msg.text with placeholder
+              const idx = findLastGeneratingMessageIndex(prev, agentId);
+              if (idx >= 0 && prev[idx].segments) return prev;
+              return upsertGeneratingAgentMessage(prev, agentId, placeholder);
+            });
           }
 
-          if (nextStatus === 'idle' || item.phase === 'done' || item.phase === 'failed') {
+          // Only finalize on true idle (run ended) or explicit failure — NOT on
+          // calling_tool/done which just means one tool finished, not the whole run.
+          if (nextStatus === 'idle' || item.phase === 'failed') {
             const startTs = runStartTsRef.current[agentId];
             const elapsed = startTs ? Date.now() - startTs : undefined;
             const ctxTokens = latestContextTokensRef.current[agentId] || undefined;
-            // Reset run start time for this agent
             delete runStartTsRef.current[agentId];
 
             setChatMessages((prev) => {
               const idx = findLastGeneratingMessageIndex(prev, agentId);
               if (idx < 0) return prev;
+              // Don't finalize if the message has running subagents
+              const tree = prev[idx].subagentTree;
+              if (tree && tree.some((e) => e.status === 'running')) return prev;
               // Only finalize status-only messages here; real token content
               // gets finalized by the 'message' handler to avoid premature cutoff.
               const msgText = prev[idx].text || '';
@@ -1505,13 +1828,20 @@ const App: React.FC = () => {
           const isThinking = item.data?.thinking === true;
           if (!agentId) return;
 
+          // Skip token events from subagents — their output is summarized in the parent tree
+          if (subagentParentMapRef.current[agentId.toLowerCase()]) return;
+
           if (item.phase === 'done') {
             if (isThinking) {
-              // Mark the current generating message as thinking (not final answer).
+              // When segments exist, don't set isThinking — text_segment handles the text
               setChatMessages((prev) => {
                 const idx = findLastGeneratingMessageIndex(prev, agentId);
                 if (idx >= 0) {
                   const next = [...prev];
+                  if (next[idx].segments) {
+                    // Segments mode: discard thinking flag, just keep generating
+                    return next;
+                  }
                   next[idx] = { ...next[idx], isThinking: true };
                   return next;
                 }
@@ -1526,6 +1856,23 @@ const App: React.FC = () => {
             const idx = findLastGeneratingMessageIndex(prev, agentId);
             if (idx >= 0) {
               const next = [...prev];
+              // When segments mode is active, discard thinking tokens entirely.
+              // The text_segment event captures this text more reliably.
+              // Only show a non-thinking final-answer token stream in liveText.
+              if (next[idx].segments) {
+                if (isThinking) {
+                  // Discard thinking tokens — don't accumulate into liveText
+                  return prev;
+                }
+                next[idx] = {
+                  ...next[idx],
+                  liveText: (next[idx].liveText || '') + tokenText,
+                  isGenerating: true,
+                  isThinking: false,
+                  timestampMs: Date.now(),
+                };
+                return next;
+              }
               const isPlaceholder = isStatusLineText(next[idx].text || '');
               next[idx] = {
                 ...next[idx],
@@ -1544,15 +1891,24 @@ const App: React.FC = () => {
         if (item.kind === 'message') {
           const from = String(item.data?.from || item.agent_id || 'assistant');
           const to = String(item.data?.to || '');
-          const content = String(item.text || '');
+          let content = String(item.text || '');
           if (!content) return;
           if (shouldHideInternalChatMessage(from, content)) return;
 
-          // Skip plan JSON messages — handled by plan_update SSE event
+          // Skip message events from subagents — their output is summarized in the parent tree
+          if (subagentParentMapRef.current[from.toLowerCase()]) return;
+
+          // Skip pure plan JSON messages — handled by plan_update SSE event
           try {
             const parsed = JSON.parse(content);
             if (parsed?.type === 'plan' && parsed?.plan) return;
           } catch (_e) { /* not JSON, continue */ }
+
+          // Strip embedded plan JSON from agent text to avoid duplicate plan blocks
+          if (from !== 'user') {
+            content = stripEmbeddedStructuredJson(content);
+            if (!content) return;
+          }
 
           if (from !== 'user' && isStatusLineText(content)) {
             setChatMessages((prev) => appendGeneratingActivity(prev, from, content));
@@ -1573,12 +1929,22 @@ const App: React.FC = () => {
                 ? next[generatingIdx].activityEntries
                 : [];
               const nonTransient = existingEntries.filter((e: string) => !isTransientStatus(e));
+              // Add final text as a text segment (if segments mode is active)
+              let finalSegments = next[generatingIdx].segments;
+              if (finalSegments && content.trim()) {
+                const lastTextSeg = [...finalSegments].reverse().find(s => s.type === 'text');
+                if (!lastTextSeg || lastTextSeg.text !== content.trim()) {
+                  finalSegments = [...finalSegments, { type: 'text' as const, text: content.trim() }];
+                }
+              }
               next[generatingIdx] = {
                 ...next[generatingIdx],
                 text: content,
                 to: to || next[generatingIdx].to || 'user',
                 isGenerating: false,
                 isThinking: false,
+                liveText: undefined,
+                segments: finalSegments,
                 timestamp: new Date(tsMs).toLocaleTimeString(),
                 timestampMs: tsMs,
                 activitySummary:
@@ -1618,6 +1984,29 @@ const App: React.FC = () => {
           });
           fetchWorkspaceState();
         }
+
+        if (item.kind === 'model_fallback') {
+          const agentId = String(item.agent_id || '');
+          const text = String(item.text || 'Model switched');
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              role: 'agent' as const,
+              from: 'system',
+              to: '',
+              text: `\u26A0\uFE0F ${text}`,
+              timestamp: new Date().toLocaleTimeString(),
+              timestampMs: Date.now(),
+              isGenerating: false,
+            },
+          ]);
+          if (agentId) {
+            setAgentStatusText((prev) => ({
+              ...prev,
+              [agentId]: `Fallback: ${item.data?.actual_model || 'alternate model'}`,
+            }));
+          }
+        }
       } catch (err) {
         console.error("SSE parse error", err);
         fetchWorkspaceState();
@@ -1628,8 +2017,9 @@ const App: React.FC = () => {
     return () => events.close();
   }, [currentPath, selectedProjectRoot, activeSessionId, fetchWorkspaceState, fetchFiles, fetchAllAgentTrees, fetchAgentRuns, shouldHideInternalChatMessage]);
 
-  const sendChatMessage = async (userMessage: string, targetAgent?: string) => {
-    if (!userMessage.trim() || !selectedProjectRoot) return;
+  const sendChatMessage = async (userMessage: string, targetAgent?: string, images?: string[]) => {
+    if (!userMessage.trim() && !(images && images.length > 0)) return;
+    if (!selectedProjectRoot) return;
     const agentToUse = targetAgent || selectedAgent;
     if (!agentToUse) return;
     const now = new Date();
@@ -1644,6 +2034,7 @@ const App: React.FC = () => {
         timestamp: now.toLocaleTimeString(),
         timestampMs: now.getTime(),
         isGenerating: false,
+        ...(images && images.length > 0 ? { images } : {}),
       },
     ]);
 
@@ -1666,11 +2057,12 @@ const App: React.FC = () => {
       const resp = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          project_root: selectedProjectRoot, 
+        body: JSON.stringify({
+          project_root: selectedProjectRoot,
           agent_id: agentToUse,
           message: userMessage,
-          session_id: activeSessionId
+          session_id: activeSessionId,
+          ...(images && images.length > 0 ? { images } : {}),
         }),
       });
       const data = await resp.json();
@@ -1680,6 +2072,16 @@ const App: React.FC = () => {
         fetchSessions();
       }
       if (data?.status === 'queued') {
+        // Remove the optimistically-added user message — it will appear in the queue banner instead
+        setChatMessages((prev) => {
+          const idx = prev.findLastIndex(
+            (m) => m.role === 'user' && m.text === userMessage && m.to === agentToUse
+          );
+          if (idx < 0) return prev;
+          const next = [...prev];
+          next.splice(idx, 1);
+          return next;
+        });
         return;
       }
       setAgentStatus((prev) => ({ ...prev, [agentToUse]: 'model_loading' }));
@@ -1694,8 +2096,16 @@ const App: React.FC = () => {
 
   const clearChat = async () => {
     if (!selectedProjectRoot) return;
+    // Clear local state immediately — don't wait for API
+    setChatMessages([]);
+    setQueuedMessages([]);
+    setActivePlan(null);
+    setPendingPlan(null);
+    setPendingPlanAgentId(null);
+    // Suppress fetchWorkspaceState repopulation during cooldown
+    chatClearTsRef.current = Date.now();
     try {
-      await fetch('/api/chat/clear', {
+      const resp = await fetch('/api/chat/clear', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1703,12 +2113,24 @@ const App: React.FC = () => {
           session_id: activeSessionId,
         }),
       });
-      setChatMessages([]);
-      setQueuedMessages([]);
-      setActivePlan(null);
-      fetchWorkspaceState();
+      if (!resp.ok) {
+        addLog(`Clear chat API error: ${resp.status}`);
+      }
     } catch (e) {
       addLog(`Error clearing chat: ${e}`);
+    }
+  };
+
+  const respondToAskUser = async (questionId: string, answers: import('./types').AskUserAnswer[]) => {
+    try {
+      await fetch('/api/ask-user-response', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question_id: questionId, answers }),
+      });
+      setPendingAskUser(null);
+    } catch (e) {
+      addLog(`Error responding to AskUser: ${e}`);
     }
   };
 
@@ -1763,11 +2185,31 @@ const App: React.FC = () => {
         ``,
       ];
 
-      const body = chatMessages
+      const body = displayMessages
         .map((m) => {
           const from = m.from || m.role;
           const to = m.to ? ` → ${m.to}` : '';
-          return `[${m.timestamp}] ${from}${to}\n${m.text}\n`;
+          const lines: string[] = [`[${m.timestamp}] ${from}${to}`];
+          // Include subagent tree entries
+          if (m.subagentTree && m.subagentTree.length > 0) {
+            for (const sa of m.subagentTree) {
+              const stats = [];
+              if (sa.toolCount > 0) stats.push(`${sa.toolCount} tool uses`);
+              if (sa.contextTokens > 0) stats.push(`${(sa.contextTokens / 1000).toFixed(1)}k tokens`);
+              lines.push(`  [subagent:${sa.subagentId}] ${sa.task}${stats.length ? ` (${stats.join(', ')})` : ''} — ${sa.status}`);
+            }
+          }
+          // Include tool activity entries
+          const entries = Array.isArray(m.activityEntries) ? m.activityEntries : [];
+          if (entries.length > 0) {
+            for (const entry of entries) {
+              lines.push(`  > ${entry}`);
+            }
+          } else if (m.activitySummary) {
+            lines.push(`  > ${m.activitySummary}`);
+          }
+          if (m.text) lines.push(m.text);
+          return lines.join('\n') + '\n';
         })
         .join('\n');
 
@@ -1896,7 +2338,7 @@ const App: React.FC = () => {
         <main className="flex-1 flex flex-col overflow-hidden bg-slate-100/40 dark:bg-[#0a0a0a] min-h-0">
           <div className="flex-1 p-2 min-h-0">
             <ChatPanel
-              chatMessages={chatMessages}
+              chatMessages={displayMessages}
               queuedMessages={queuedMessages}
               chatEndRef={chatEndRef}
               projectRoot={selectedProjectRoot}
@@ -1918,6 +2360,8 @@ const App: React.FC = () => {
               pendingPlan={pendingPlan}
               onApprovePlan={approvePlan}
               onRejectPlan={rejectPlan}
+              pendingAskUser={pendingAskUser}
+              onRespondToAskUser={respondToAskUser}
               verboseMode={verboseMode}
             />
           </div>
@@ -1960,7 +2404,7 @@ const App: React.FC = () => {
             icon={<Zap size={12} />}
             iconColor="text-amber-500"
             badge={`${skills.length} loaded`}
-            defaultOpen={skills.length > 0}
+            defaultOpen
           >
             <SkillsCard
               skills={skills}

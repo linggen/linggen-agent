@@ -1,10 +1,20 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Plus, Trash2 } from 'lucide-react';
-import type { AppConfig, ModelConfigUI, OllamaPsResponse } from '../types';
+import { ArrowDown, ArrowUp, Eye, EyeOff, Plus, Star, Trash2 } from 'lucide-react';
+import type { AppConfig, ModelConfigUI, ModelHealthInfo, OllamaPsResponse } from '../types';
 
 const inputCls = 'w-full bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:ring-1 focus:ring-blue-500/50';
 const labelCls = 'text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400';
 const sectionCls = 'bg-white dark:bg-[#141414] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm p-5';
+
+const PROVIDER_PRESETS: Record<string, { url: string; placeholder: string }> = {
+  ollama: { url: 'http://127.0.0.1:11434', placeholder: 'e.g. qwen3:32b' },
+  openai: { url: 'https://api.openai.com/v1', placeholder: 'e.g. gpt-4o' },
+  gemini: { url: 'https://generativelanguage.googleapis.com/v1beta/openai', placeholder: 'e.g. gemini-2.5-flash' },
+  groq: { url: 'https://api.groq.com/openai/v1', placeholder: 'e.g. llama-3.3-70b-versatile' },
+  deepseek: { url: 'https://api.deepseek.com/v1', placeholder: 'e.g. deepseek-chat' },
+  openrouter: { url: 'https://openrouter.ai/api/v1', placeholder: 'e.g. google/gemini-2.5-pro' },
+  github: { url: 'https://models.inference.ai.azure.com', placeholder: 'e.g. gpt-4o-mini' },
+};
 
 const emptyModel = (): ModelConfigUI => ({
   id: '',
@@ -13,21 +23,32 @@ const emptyModel = (): ModelConfigUI => ({
   model: '',
   api_key: null,
   keep_alive: null,
+  tags: [],
 });
 
-const StatusDot: React.FC<{ status: 'connected' | 'disconnected' | 'na' }> = ({ status }) => {
-  const cls =
-    status === 'connected'
-      ? 'bg-green-500'
-      : status === 'disconnected'
-        ? 'bg-red-500'
-        : 'bg-slate-400';
-  const label =
-    status === 'connected'
-      ? 'Connected'
-      : status === 'disconnected'
-        ? 'Disconnected'
-        : 'N/A';
+type CredentialsMap = Record<string, { api_key?: string | null }>;
+
+const HealthDot: React.FC<{ health: ModelHealthInfo | undefined; ollamaStatus: 'connected' | 'disconnected' | 'na' }> = ({ health, ollamaStatus }) => {
+  // Priority: health tracker status > Ollama ps status
+  if (health && health.health !== 'healthy') {
+    const cls = health.health === 'quota_exhausted' ? 'bg-amber-500' : 'bg-red-500';
+    const label = health.health === 'quota_exhausted'
+      ? `Quota exhausted${health.since_secs ? ` (${Math.round(health.since_secs / 60)}m ago)` : ''}`
+      : `Down${health.last_error ? `: ${health.last_error.slice(0, 60)}` : ''}`;
+    return (
+      <span className="inline-flex items-center gap-1.5" title={label}>
+        <span className={`w-2 h-2 rounded-full ${cls}`} />
+        <span className="text-[10px] text-slate-500">
+          {health.health === 'quota_exhausted' ? 'Quota' : 'Down'}
+        </span>
+      </span>
+    );
+  }
+
+  const cls = ollamaStatus === 'connected' ? 'bg-green-500'
+    : ollamaStatus === 'disconnected' ? 'bg-red-500' : 'bg-slate-400';
+  const label = ollamaStatus === 'connected' ? 'Healthy'
+    : ollamaStatus === 'disconnected' ? 'Disconnected' : 'N/A';
   return (
     <span className="inline-flex items-center gap-1.5" title={label}>
       <span className={`w-2 h-2 rounded-full ${cls}`} />
@@ -41,29 +62,64 @@ export const ModelsTab: React.FC<{
   onChange: (config: AppConfig) => void;
 }> = ({ config, onChange }) => {
   const [ollamaStatus, setOllamaStatus] = useState<OllamaPsResponse | null>(null);
+  const [healthMap, setHealthMap] = useState<Record<string, ModelHealthInfo>>({});
+  const [credentials, setCredentials] = useState<CredentialsMap>({});
+  const [localKeys, setLocalKeys] = useState<Record<string, string>>({});
+  const [revealKeys, setRevealKeys] = useState<Record<string, boolean>>({});
+  const [credsDirty, setCredsDirty] = useState(false);
+
+  const defaultModels = config.routing?.default_models ?? [];
 
   const fetchOllamaStatus = useCallback(async () => {
     try {
       const resp = await fetch('/api/utils/ollama-status');
+      if (resp.ok) setOllamaStatus(await resp.json());
+      else setOllamaStatus(null);
+    } catch { setOllamaStatus(null); }
+  }, []);
+
+  const fetchHealth = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/models/health');
       if (resp.ok) {
-        setOllamaStatus(await resp.json());
-      } else {
-        setOllamaStatus(null);
+        const data: ModelHealthInfo[] = await resp.json();
+        const map: Record<string, ModelHealthInfo> = {};
+        for (const h of data) map[h.id] = h;
+        setHealthMap(map);
       }
-    } catch {
-      setOllamaStatus(null);
-    }
+    } catch { /* ignore */ }
+  }, []);
+
+  const fetchCredentials = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/credentials');
+      if (resp.ok) {
+        const data: CredentialsMap = await resp.json();
+        setCredentials(data);
+        const keys: Record<string, string> = {};
+        for (const [id, entry] of Object.entries(data)) {
+          keys[id] = entry.api_key || '';
+        }
+        setLocalKeys(keys);
+      }
+    } catch { /* ignore */ }
   }, []);
 
   useEffect(() => {
     fetchOllamaStatus();
-    const timer = setInterval(fetchOllamaStatus, 5000);
+    fetchHealth();
+    fetchCredentials();
+    const timer = setInterval(() => { fetchOllamaStatus(); fetchHealth(); }, 5000);
     return () => clearInterval(timer);
-  }, [fetchOllamaStatus]);
+  }, [fetchOllamaStatus, fetchHealth, fetchCredentials]);
 
   const updateModel = (index: number, field: keyof ModelConfigUI, value: string | null) => {
     const models = [...config.models];
-    models[index] = { ...models[index], [field]: value };
+    const updated = { ...models[index], [field]: value };
+    if (field === 'provider' && value && PROVIDER_PRESETS[value]) {
+      updated.url = PROVIDER_PRESETS[value].url;
+    }
+    models[index] = updated;
     onChange({ ...config, models });
   };
 
@@ -72,10 +128,43 @@ export const ModelsTab: React.FC<{
   };
 
   const removeModel = (index: number) => {
-    onChange({ ...config, models: config.models.filter((_, i) => i !== index) });
+    const modelId = config.models[index]?.id;
+    const newModels = config.models.filter((_, i) => i !== index);
+    // Also remove from default_models if present
+    const newDefaults = defaultModels.filter((id) => id !== modelId);
+    onChange({
+      ...config,
+      models: newModels,
+      routing: { ...config.routing, default_models: newDefaults },
+    });
   };
 
-  const getModelStatus = (model: ModelConfigUI): 'connected' | 'disconnected' | 'na' => {
+  const updateLocalKey = (modelId: string, value: string) => {
+    setLocalKeys((prev) => ({ ...prev, [modelId]: value }));
+    setCredsDirty(true);
+  };
+
+  const saveCredentials = async () => {
+    const body: CredentialsMap = {};
+    for (const model of config.models) {
+      if (!model.id) continue;
+      const val = localKeys[model.id];
+      if (val !== undefined && val !== '***') {
+        body[model.id] = { api_key: val || null };
+      }
+    }
+    try {
+      await fetch('/api/credentials', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      setCredsDirty(false);
+      fetchCredentials();
+    } catch { /* ignore */ }
+  };
+
+  const getOllamaStatus = (model: ModelConfigUI): 'connected' | 'disconnected' | 'na' => {
     if (model.provider !== 'ollama') return 'na';
     if (!ollamaStatus?.models) return 'disconnected';
     const running = ollamaStatus.models.some(
@@ -84,8 +173,101 @@ export const ModelsTab: React.FC<{
     return running ? 'connected' : 'disconnected';
   };
 
+  const hasKey = (modelId: string) => !!(credentials[modelId]?.api_key);
+
+  // Default model selection helpers
+  const isDefault = (modelId: string) => defaultModels.includes(modelId);
+
+  const toggleDefault = (modelId: string) => {
+    let newDefaults: string[];
+    if (isDefault(modelId)) {
+      newDefaults = defaultModels.filter((id) => id !== modelId);
+    } else {
+      newDefaults = [...defaultModels, modelId];
+    }
+    onChange({
+      ...config,
+      routing: { ...config.routing, default_models: newDefaults },
+    });
+  };
+
+  const moveDefaultUp = (modelId: string) => {
+    const idx = defaultModels.indexOf(modelId);
+    if (idx <= 0) return;
+    const newDefaults = [...defaultModels];
+    [newDefaults[idx - 1], newDefaults[idx]] = [newDefaults[idx], newDefaults[idx - 1]];
+    onChange({ ...config, routing: { ...config.routing, default_models: newDefaults } });
+  };
+
+  const moveDefaultDown = (modelId: string) => {
+    const idx = defaultModels.indexOf(modelId);
+    if (idx < 0 || idx >= defaultModels.length - 1) return;
+    const newDefaults = [...defaultModels];
+    [newDefaults[idx], newDefaults[idx + 1]] = [newDefaults[idx + 1], newDefaults[idx]];
+    onChange({ ...config, routing: { ...config.routing, default_models: newDefaults } });
+  };
+
+  const updateTags = (index: number, tagsStr: string) => {
+    const tags = tagsStr.split(',').map((t) => t.trim()).filter(Boolean);
+    const models = [...config.models];
+    models[index] = { ...models[index], tags };
+    onChange({ ...config, models });
+  };
+
   return (
     <div className="space-y-6">
+      {/* Default Models section */}
+      {defaultModels.length > 0 && (
+        <section className={sectionCls}>
+          <h2 className="text-xs font-bold uppercase tracking-wider text-slate-700 dark:text-slate-300 mb-3">
+            Default Models (Priority Order)
+          </h2>
+          <p className="text-[10px] text-slate-400 mb-3">
+            Models are tried in order. If the first model fails (rate limit, quota), the next one is used automatically.
+          </p>
+          <div className="space-y-1.5">
+            {defaultModels.map((modelId, idx) => {
+              const model = config.models.find((m) => m.id === modelId);
+              const health = healthMap[modelId];
+              return (
+                <div key={modelId} className="flex items-center gap-2 px-3 py-2 bg-slate-50 dark:bg-white/[0.02] rounded-lg border border-slate-100 dark:border-white/5">
+                  <span className="text-[10px] font-bold text-amber-500 w-5">{idx + 1}.</span>
+                  <span className="text-xs font-medium flex-1">
+                    {modelId}
+                    {model && <span className="text-[10px] text-slate-400 ml-1.5">({model.model})</span>}
+                  </span>
+                  <HealthDot health={health} ollamaStatus={model ? getOllamaStatus(model) : 'na'} />
+                  <button
+                    onClick={() => moveDefaultUp(modelId)}
+                    disabled={idx === 0}
+                    className="p-0.5 text-slate-400 hover:text-slate-600 disabled:opacity-30"
+                    title="Move up"
+                  >
+                    <ArrowUp size={12} />
+                  </button>
+                  <button
+                    onClick={() => moveDefaultDown(modelId)}
+                    disabled={idx === defaultModels.length - 1}
+                    className="p-0.5 text-slate-400 hover:text-slate-600 disabled:opacity-30"
+                    title="Move down"
+                  >
+                    <ArrowDown size={12} />
+                  </button>
+                  <button
+                    onClick={() => toggleDefault(modelId)}
+                    className="p-0.5 text-slate-400 hover:text-red-500"
+                    title="Remove from defaults"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {/* Model cards */}
       <section className={sectionCls}>
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-xs font-bold uppercase tracking-wider text-slate-700 dark:text-slate-300">Models</h2>
@@ -94,53 +276,116 @@ export const ModelsTab: React.FC<{
           </button>
         </div>
         <div className="space-y-4">
-          {config.models.map((model, i) => (
-            <div key={model.id || i} className="bg-slate-50 dark:bg-white/[0.02] rounded-lg p-4 border border-slate-100 dark:border-white/5 relative">
-              <div className="absolute top-3 right-3 flex items-center gap-3">
-                <StatusDot status={getModelStatus(model)} />
-                <button
-                  onClick={() => removeModel(i)}
-                  className="p-1 text-slate-400 hover:text-red-500 transition-colors"
-                  title="Remove model"
-                >
-                  <Trash2 size={12} />
-                </button>
+          {config.models.map((model, i) => {
+            const health = healthMap[model.id];
+            const modelIsDefault = model.id ? isDefault(model.id) : false;
+            return (
+              <div key={i} className={`bg-slate-50 dark:bg-white/[0.02] rounded-lg p-4 border relative ${modelIsDefault ? 'border-amber-300 dark:border-amber-700' : 'border-slate-100 dark:border-white/5'}`}>
+                <div className="absolute top-3 right-3 flex items-center gap-3">
+                  <HealthDot health={health} ollamaStatus={getOllamaStatus(model)} />
+                  {model.id && (
+                    <button
+                      onClick={() => toggleDefault(model.id)}
+                      className={`p-1 transition-colors ${modelIsDefault ? 'text-amber-500 hover:text-amber-600' : 'text-slate-300 hover:text-amber-500'}`}
+                      title={modelIsDefault ? 'Remove from defaults' : 'Add to defaults'}
+                    >
+                      <Star size={14} fill={modelIsDefault ? 'currentColor' : 'none'} />
+                    </button>
+                  )}
+                  <button
+                    onClick={() => removeModel(i)}
+                    className="p-1 text-slate-400 hover:text-red-500 transition-colors"
+                    title="Remove model"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className={labelCls}>ID</label>
+                    <input className={inputCls} value={model.id} onChange={(e) => updateModel(i, 'id', e.target.value)} placeholder="e.g. local_ollama" />
+                  </div>
+                  <div>
+                    <label className={labelCls}>Provider</label>
+                    <select className={inputCls} value={model.provider} onChange={(e) => updateModel(i, 'provider', e.target.value)}>
+                      <option value="ollama">Ollama (local)</option>
+                      <option value="gemini">Google Gemini</option>
+                      <option value="openai">OpenAI</option>
+                      <option value="groq">Groq</option>
+                      <option value="deepseek">DeepSeek</option>
+                      <option value="openrouter">OpenRouter</option>
+                      <option value="github">GitHub Models</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className={labelCls}>URL</label>
+                    <input className={inputCls} value={model.url} onChange={(e) => updateModel(i, 'url', e.target.value)} placeholder={PROVIDER_PRESETS[model.provider]?.url || 'http://...'} />
+                  </div>
+                  <div>
+                    <label className={labelCls}>Model</label>
+                    <input className={inputCls} value={model.model} onChange={(e) => updateModel(i, 'model', e.target.value)} placeholder={PROVIDER_PRESETS[model.provider]?.placeholder || 'e.g. model-name'} />
+                  </div>
+                  <div>
+                    <label className={labelCls}>
+                      API Key
+                      {hasKey(model.id) && <span className="ml-1 text-green-500 text-[8px]">(set)</span>}
+                    </label>
+                    <div className="relative">
+                      <input
+                        className={inputCls + ' pr-8'}
+                        type={revealKeys[model.id] ? 'text' : 'password'}
+                        value={localKeys[model.id] ?? ''}
+                        onChange={(e) => updateLocalKey(model.id, e.target.value)}
+                        placeholder={hasKey(model.id) ? '(stored in ~/.linggen/credentials.json)' : '(optional)'}
+                      />
+                      <button
+                        type="button"
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                        onClick={() => setRevealKeys((prev) => ({ ...prev, [model.id]: !prev[model.id] }))}
+                        tabIndex={-1}
+                      >
+                        {revealKeys[model.id] ? <EyeOff size={12} /> : <Eye size={12} />}
+                      </button>
+                    </div>
+                  </div>
+                  <div>
+                    <label className={labelCls}>Keep Alive</label>
+                    <input className={inputCls} value={model.keep_alive || ''} onChange={(e) => updateModel(i, 'keep_alive', e.target.value || null)} placeholder="e.g. 30m" />
+                  </div>
+                  <div className="col-span-2">
+                    <label className={labelCls}>
+                      Tags
+                      <span className="font-normal text-slate-400 ml-1">(comma-separated, e.g. vision)</span>
+                    </label>
+                    <input
+                      className={inputCls}
+                      value={(model.tags ?? []).join(', ')}
+                      onChange={(e) => updateTags(i, e.target.value)}
+                      placeholder="e.g. vision, fast"
+                    />
+                  </div>
+                </div>
               </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className={labelCls}>ID</label>
-                  <input className={inputCls} value={model.id} onChange={(e) => updateModel(i, 'id', e.target.value)} placeholder="e.g. local_ollama" />
-                </div>
-                <div>
-                  <label className={labelCls}>Provider</label>
-                  <select className={inputCls} value={model.provider} onChange={(e) => updateModel(i, 'provider', e.target.value)}>
-                    <option value="ollama">ollama</option>
-                    <option value="openai">openai</option>
-                  </select>
-                </div>
-                <div>
-                  <label className={labelCls}>URL</label>
-                  <input className={inputCls} value={model.url} onChange={(e) => updateModel(i, 'url', e.target.value)} placeholder="http://127.0.0.1:11434" />
-                </div>
-                <div>
-                  <label className={labelCls}>Model</label>
-                  <input className={inputCls} value={model.model} onChange={(e) => updateModel(i, 'model', e.target.value)} placeholder="e.g. qwen3-coder" />
-                </div>
-                <div>
-                  <label className={labelCls}>API Key</label>
-                  <input className={inputCls} type="password" value={model.api_key || ''} onChange={(e) => updateModel(i, 'api_key', e.target.value || null)} placeholder="(optional)" />
-                </div>
-                <div>
-                  <label className={labelCls}>Keep Alive</label>
-                  <input className={inputCls} value={model.keep_alive || ''} onChange={(e) => updateModel(i, 'keep_alive', e.target.value || null)} placeholder="e.g. 30m" />
-                </div>
-              </div>
-            </div>
-          ))}
+            );
+          })}
           {config.models.length === 0 && (
             <p className="text-xs text-slate-400 text-center py-4">No models configured. Add at least one.</p>
           )}
         </div>
+        {credsDirty && (
+          <div className="mt-4 flex justify-end">
+            <button
+              onClick={saveCredentials}
+              className="px-3 py-1.5 text-xs font-medium bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+            >
+              Save API Keys
+            </button>
+          </div>
+        )}
+        <p className="mt-3 text-[10px] text-slate-400">
+          API keys are stored in <code className="text-[10px]">~/.linggen/credentials.json</code>, not in the config file.
+          Click the <Star size={10} className="inline text-amber-500" /> icon on a model to add it to the default fallback chain.
+        </p>
       </section>
     </div>
   );

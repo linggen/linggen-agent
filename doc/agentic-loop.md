@@ -80,8 +80,9 @@ Model can output code blocks for the engine to execute. Model-agnostic — works
 
 ## Guardrails
 
-The loop includes streak detection to prevent infinite loops:
+The loop includes gates and streak detection:
 
+- **Permission gate** — destructive tools (`Write`, `Edit`, `Bash`, `Patch`) require user approval when `tool_permission_mode = "ask"`. See `tools.md`.
 - Empty search results → nudge to broaden query.
 - Redundant tool calls → nudge to try different approach.
 - Invalid JSON parsing → retry hint.

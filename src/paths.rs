@@ -44,10 +44,13 @@ pub fn global_skills_dir() -> PathBuf {
     linggen_home().join("skills")
 }
 
-/// Compat skill dirs: `~/.claude/skills/`, `~/.codex/skills/`
-pub fn compat_skills_dirs() -> Vec<PathBuf> {
+/// Compat skill dirs with labels: `~/.claude/skills/` → "Claude", `~/.codex/skills/` → "Codex"
+pub fn compat_skills_dirs() -> Vec<(PathBuf, &'static str)> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    vec![home.join(".claude/skills"), home.join(".codex/skills")]
+    vec![
+        (home.join(".claude/skills"), "Claude"),
+        (home.join(".codex/skills"), "Codex"),
+    ]
 }
 
 /// `~/.linggen/plans/`

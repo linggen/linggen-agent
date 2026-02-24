@@ -146,8 +146,8 @@ export const SettingsPage: React.FC<{
         )}
 
         {activeTab === 'skills' && (
-          <div className="h-full overflow-y-auto p-6">
-            <div className="max-w-4xl mx-auto">
+          <div className="h-full overflow-y-auto px-6 py-5">
+            <div className="max-w-6xl mx-auto h-full">
               <SkillsTab projectRoot={projectRoot} />
             </div>
           </div>

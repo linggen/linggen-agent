@@ -35,6 +35,7 @@ impl TuiClient {
         agent_id: &str,
         message: &str,
         session_id: Option<&str>,
+        images: Option<Vec<String>>,
     ) -> Result<Option<String>> {
         let mut body = json!({
             "project_root": project_root,
@@ -43,6 +44,11 @@ impl TuiClient {
         });
         if let Some(sid) = session_id {
             body["session_id"] = json!(sid);
+        }
+        if let Some(imgs) = images {
+            if !imgs.is_empty() {
+                body["images"] = json!(imgs);
+            }
         }
         let resp = self
             .client
@@ -114,6 +120,26 @@ impl TuiClient {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("Plan reject failed ({}): {}", status, text);
+        }
+        Ok(())
+    }
+
+    /// Respond to an AskUser prompt (used for both generic AskUser and permission prompts).
+    pub async fn respond_ask_user(&self, question_id: &str, selected: &str) -> Result<()> {
+        let body = json!({
+            "question_id": question_id,
+            "answers": [{ "question_index": 0, "selected": [selected], "custom_text": null }]
+        });
+        let resp = self
+            .client
+            .post(format!("{}/api/ask-user-response", self.base_url))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("AskUser response failed ({}): {}", status, text);
         }
         Ok(())
     }

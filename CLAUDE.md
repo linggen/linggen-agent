@@ -76,7 +76,7 @@ Linggen Agent is a local-first, multi-agent coding assistant. Two entry points: 
 
 - **`main.rs`** — CLI entry point (clap). Parses subcommands `agent` and `serve`, loads config, sets up logging.
 - **`config.rs`** — Config loading from `linggen-agent.toml` (TOML). Defines `Config`, `ModelConfig`, `AgentSpec` (parsed from markdown frontmatter), `AgentPolicy`.
-- **`engine/`** — Core agent execution engine. Prompt loop, tool dispatch, structured/chat mode execution, action parsing, patch application, output rendering. `engine/tools.rs` implements all model-facing tools (`Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `capture_screenshot`, `lock_paths`, `unlock_paths`, `delegate_to_agent`, `get_repo_info`).
+- **`engine/`** — Core agent execution engine. Prompt loop, tool dispatch, structured/chat mode execution, action parsing, patch application, output rendering. `engine/tools.rs` implements all model-facing tools (`Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `capture_screenshot`, `lock_paths`, `unlock_paths`, `delegate_to_agent`, `WebSearch`, `WebFetch`, `Skill`, `AskUser`).
 - **`server/`** — Axum HTTP server. `mod.rs` sets up routes and static asset serving. `chat_api.rs` handles chat/run endpoints and SSE streaming. `chat_helpers.rs` has shared chat logic. `agent_api.rs` has run inspection APIs. `projects_api.rs` handles project/session CRUD. `workspace_api.rs` serves workspace file tree.
 - **`agent_manager/`** — Agent lifecycle management, run records, cancellation, model routing. `models.rs` handles multi-model provider dispatch (Ollama, OpenAI-compatible).
 - **`ollama.rs`** — Ollama API client (streaming and non-streaming chat completions).
@@ -109,7 +109,7 @@ Agent specs are markdown files with YAML frontmatter. Discovered dynamically at 
 
 Frontmatter fields: `name`, `description`, `tools`, `model`, `work_globs`, `policy`.
 
-Current agents: `ling` (general-purpose assistant), `coder` (implementation).
+Current agents: `ling` (general-purpose assistant), `coder` (implementation), `explorer` (read-only codebase analysis), `debugger` (read-only debugging), `linggen-guide` (Linggen docs/usage guide).
 
 ### Configuration (`linggen-agent.toml`)
 

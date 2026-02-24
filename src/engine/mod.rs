@@ -1,9 +1,11 @@
 pub mod actions;
 pub mod patch;
+pub mod permission;
 pub mod render;
 pub mod skill_tool;
 pub mod tool_registry;
 pub mod tools;
+pub mod web_fetch;
 pub mod web_search;
 
 use crate::agent_manager::models::ModelManager;
@@ -24,7 +26,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt as TokioStreamExt;
 use tracing::{info, warn};
 
-pub use actions::{model_message_log_parts, parse_all_actions, ModelAction, PlanItemUpdate};
+pub use actions::{model_message_log_parts, parse_all_actions, text_before_first_json, ModelAction, PlanItemUpdate};
 
 // ---------------------------------------------------------------------------
 // Plan mode data structures
@@ -116,6 +118,7 @@ pub struct EngineConfig {
     pub ws_root: PathBuf,
     pub max_iters: usize,
     pub write_safety_mode: crate::config::WriteSafetyMode,
+    pub tool_permission_mode: crate::config::ToolPermissionMode,
     pub prompt_loop_breaker: Option<String>,
 }
 
@@ -191,6 +194,8 @@ pub struct AgentEngine {
     pub chat_history: Vec<ChatMessage>,
     // Active skill if any
     pub active_skill: Option<Skill>,
+    /// Metadata for skills available to the model via the Skill tool: (name, description).
+    pub available_skills_metadata: Vec<(String, String)>,
     pub parent_agent_id: Option<String>,
     pub run_id: Option<String>,
     pub thinking_tx: Option<mpsc::UnboundedSender<ThinkingEvent>>,
@@ -204,6 +209,12 @@ pub struct AgentEngine {
     pub plan_file: Option<PathBuf>,
     /// Override for plans directory (used in tests for isolation).
     pub plans_dir_override: Option<PathBuf>,
+    /// Base64-encoded images to attach to the next user message.
+    pub pending_images: Vec<String>,
+    /// Tool permission store (session + project scoped allows).
+    pub permission_store: permission::PermissionStore,
+    /// Ordered list of default model IDs from routing config (for fallback chain).
+    pub default_models: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -246,6 +257,12 @@ impl AgentEngine {
     ) -> Result<Self> {
         let builtins = tools::Tools::new(cfg.ws_root.clone())?;
         let tools = ToolRegistry::new(builtins);
+        // Load project-scoped permissions from {workspace}/.linggen/permissions.json
+        // (same pattern as Claude Code's {repo}/.claude/settings.local.json).
+        let perm_store = {
+            let linggen_dir = cfg.ws_root.join(".linggen");
+            permission::PermissionStore::load(&linggen_dir)
+        };
         Ok(Self {
             cfg,
             model_manager,
@@ -261,6 +278,7 @@ impl AgentEngine {
             next_context_id: 1,
             chat_history: Vec::new(),
             active_skill: None,
+            available_skills_metadata: Vec::new(),
             parent_agent_id: None,
             run_id: None,
             thinking_tx: None,
@@ -270,6 +288,9 @@ impl AgentEngine {
             plan: None,
             plan_file: None,
             plans_dir_override: None,
+            pending_images: Vec::new(),
+            permission_store: perm_store,
+            default_models: Vec::new(),
         })
     }
 
@@ -343,6 +364,20 @@ impl AgentEngine {
         }
     }
 
+    /// Populate `available_skills_metadata` with (name, description) pairs
+    /// for all locally-installed skills that are not `disable_model_invocation`.
+    pub async fn load_available_skills_metadata(
+        &mut self,
+        skill_manager: &crate::skills::SkillManager,
+    ) {
+        let all_skills = skill_manager.list_skills().await;
+        self.available_skills_metadata = all_skills
+            .into_iter()
+            .filter(|s| !s.disable_model_invocation)
+            .map(|s| (s.name, s.description))
+            .collect();
+    }
+
     pub async fn manager_db_add_observation(
         &self,
         tool: &str,
@@ -413,6 +448,57 @@ impl AgentEngine {
                 .await;
         }
         Ok(())
+    }
+
+    /// Ask the user for permission to execute a destructive tool via the AskUser bridge.
+    /// Returns `None` if no bridge is available (e.g. CLI mode).
+    async fn ask_permission(
+        &self,
+        tool: &str,
+        question: tools::AskUserQuestion,
+    ) -> Option<permission::PermissionAction> {
+        let bridge = match self.tools.ask_user_bridge() {
+            Some(b) => Arc::clone(b),
+            None => return None,
+        };
+
+        let question_id = uuid::Uuid::new_v4().to_string();
+        let agent_id = self.agent_id.clone().unwrap_or_default();
+
+        // Emit SSE event to push the permission question to the UI.
+        let _ = bridge.events_tx.send(crate::server::ServerEvent::AskUser {
+            agent_id: agent_id.clone(),
+            question_id: question_id.clone(),
+            questions: vec![question],
+        });
+
+        // Create a oneshot channel and register it for the response endpoint.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        bridge.pending.lock().await.insert(
+            question_id.clone(),
+            tools::PendingAskUser {
+                agent_id,
+                sender: tx,
+            },
+        );
+
+        // Block until the user responds or timeout (5 minutes).
+        let response = tokio::time::timeout(std::time::Duration::from_secs(300), rx).await;
+
+        // Cleanup: remove from pending map regardless of outcome.
+        bridge.pending.lock().await.remove(&question_id);
+
+        match response {
+            Ok(Ok(answers)) => {
+                let selected = answers
+                    .first()
+                    .and_then(|a| a.selected.first())
+                    .map(|s| s.as_str())
+                    .unwrap_or("Cancel");
+                Some(permission::parse_permission_answer(selected, tool))
+            }
+            _ => Some(permission::PermissionAction::Deny),
+        }
     }
 
     /// Validate, dispatch, and record a single tool call from the model.
@@ -527,6 +613,30 @@ impl AgentEngine {
             }
         }
 
+        // --- tool permission gate ---
+        if self.cfg.tool_permission_mode == crate::config::ToolPermissionMode::Ask
+            && permission::is_destructive_tool(&canonical_tool)
+            && !self.permission_store.check(&canonical_tool)
+        {
+            let summary =
+                permission::permission_target_summary(&canonical_tool, &args, &self.cfg.ws_root);
+            let question = permission::build_permission_question(&canonical_tool, &summary);
+            match self.ask_permission(&canonical_tool, question).await {
+                Some(permission::PermissionAction::AllowOnce) => { /* proceed */ }
+                Some(permission::PermissionAction::AllowSession) => {
+                    self.permission_store.allow_for_session(&canonical_tool);
+                }
+                Some(permission::PermissionAction::AllowProject) => {
+                    self.permission_store.allow_for_project(&canonical_tool);
+                }
+                Some(permission::PermissionAction::Deny) | None => {
+                    let msg = format!("Permission denied: {} on '{}'", canonical_tool, summary);
+                    messages.push(ChatMessage::new("user", msg));
+                    return LoopControl::Continue;
+                }
+            }
+        }
+
         // --- redundancy / cache gates ---
         let sig = tool_call_signature(&canonical_tool, &args);
         if sig == *last_tool_sig {
@@ -602,6 +712,7 @@ impl AgentEngine {
                     agent_id: from.clone(),
                     status: "calling_tool".to_string(),
                     detail: Some(tool_start_status.clone()),
+                    parent_id: self.parent_agent_id.clone(),
                 })
                 .await;
             if let Some(tx) = &self.repl_events_tx {
@@ -690,6 +801,7 @@ impl AgentEngine {
                             agent_id: agent_id.clone(),
                             status: "calling_tool".to_string(),
                             detail: Some(tool_done_status.clone()),
+                            parent_id: self.parent_agent_id.clone(),
                         })
                         .await;
                     manager
@@ -700,6 +812,7 @@ impl AgentEngine {
                             agent_id,
                             status: "thinking".to_string(),
                             detail: Some("Thinking".to_string()),
+                            parent_id: self.parent_agent_id.clone(),
                         })
                         .await;
                     if let Some(tx) = &self.repl_events_tx {
@@ -788,6 +901,7 @@ impl AgentEngine {
                             agent_id: agent_id.clone(),
                             status: "calling_tool".to_string(),
                             detail: Some(tool_failed_status.clone()),
+                            parent_id: self.parent_agent_id.clone(),
                         })
                         .await;
                     manager
@@ -795,6 +909,7 @@ impl AgentEngine {
                             agent_id,
                             status: "thinking".to_string(),
                             detail: Some("Thinking".to_string()),
+                            parent_id: self.parent_agent_id.clone(),
                         })
                         .await;
                     if let Some(tx) = &self.repl_events_tx {
@@ -1045,7 +1160,7 @@ impl AgentEngine {
         }
 
         // Provide tool schema + workspace info (last user message).
-        messages.push(ChatMessage::new(
+        let task_msg = ChatMessage::new(
             "user",
             format!(
                 "Autonomous agent loop started. Ignore any prior greetings or small talk.\n\nWorkspace root: {}\nPlatform: {}\n\nCurrent Role: {:?}\n\nTask: {}\n\nTool schema (respond with one or more JSON tool call objects per turn):\n{}\n\nWhen the task is fully complete, respond with: {{\"type\":\"done\",\"message\":\"<brief summary>\"}}",
@@ -1055,7 +1170,11 @@ impl AgentEngine {
                 task,
                 self.tools.tool_schema_json(allowed_tools.as_ref())
             ),
-        ));
+        );
+        // Attach any pending images to the task message, then clear them.
+        let images = std::mem::take(&mut self.pending_images);
+        let task_msg = if images.is_empty() { task_msg } else { task_msg.with_images(images) };
+        messages.push(task_msg);
         self.push_context_record(
             ContextType::UserInput,
             Some("structured_bootstrap".to_string()),
@@ -1220,6 +1339,13 @@ impl AgentEngine {
                     .collect();
                 existing.items = new_items;
             }
+            // If we're NOT in plan mode but the existing plan was "Planned" (stale
+            // from a previous /plan run), promote it to "Executing" so the agent
+            // continues working instead of blocking on approval.
+            if !self.plan_mode && existing.status == PlanStatus::Planned {
+                existing.status = PlanStatus::Executing;
+                existing.origin = PlanOrigin::ModelManaged;
+            }
             existing.clone()
         } else {
             // Create new plan.
@@ -1378,10 +1504,14 @@ impl AgentEngine {
     /// so the model can emit prose "thinking" tokens before the JSON action.
     /// Thinking tokens are forwarded via `self.thinking_tx` and the full
     /// accumulated text is returned for action parsing.
-    async fn stream_with_thinking(&self, messages: &[ChatMessage]) -> Result<String> {
+    async fn stream_with_thinking_model(
+        &self,
+        model_id: &str,
+        messages: &[ChatMessage],
+    ) -> Result<String> {
         let mut stream = self
             .model_manager
-            .chat_text_stream(&self.model_id, messages)
+            .chat_text_stream(model_id, messages)
             .await?;
         let mut accumulated = String::new();
         let mut thinking_ended = false;
@@ -1412,6 +1542,99 @@ impl AgentEngine {
         Ok(accumulated)
     }
 
+    /// Build an ordered model chain for fallback attempts.
+    ///
+    /// Order: primary model → `routing.default_models` → remaining configured models.
+    /// Filters out models marked unavailable by the health tracker (keeps at least one).
+    fn build_model_chain(&self) -> Vec<String> {
+        let primary = self.model_id.clone();
+        let all_ids = self.model_manager.model_ids();
+
+        // Start with the primary, then default_models from config, then remaining.
+        let mut chain = vec![primary.clone()];
+        for dm in &self.default_models {
+            if !chain.contains(dm) && all_ids.contains(dm) {
+                chain.push(dm.clone());
+            }
+        }
+        for id in &all_ids {
+            if !chain.contains(id) {
+                chain.push(id.clone());
+            }
+        }
+        chain
+    }
+
+    /// Call the LLM with automatic fallback to other configured models
+    /// when the primary model hits a rate limit (429) or context limit (400).
+    /// Uses the health tracker to skip models known to be down/quota-exhausted.
+    async fn stream_with_fallback(&mut self, messages: &[ChatMessage]) -> Result<String> {
+        use crate::agent_manager::models;
+
+        let chain = self.build_model_chain();
+        let primary = self.model_id.clone();
+        let health = self.model_manager.health.clone();
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for model_id in &chain {
+            // Skip models known to be unavailable (but always try at least the primary).
+            if model_id != &primary && !health.is_available(model_id).await {
+                info!("Skipping model '{}' (health tracker: unavailable)", model_id);
+                continue;
+            }
+
+            match self.stream_with_thinking_model(model_id, messages).await {
+                Ok(text) => {
+                    health.mark_healthy(model_id).await;
+                    if model_id != &primary {
+                        let reason = last_err
+                            .as_ref()
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "unavailable".to_string());
+                        info!(
+                            "Fallback to '{}' succeeded (primary '{}' failed: {})",
+                            model_id, primary, reason
+                        );
+                        self.model_id = model_id.clone();
+                        self.emit_model_fallback_event(&primary, model_id, &reason).await;
+                    }
+                    return Ok(text);
+                }
+                Err(e) if models::is_fallback_worthy_error(&e) => {
+                    warn!(
+                        "Model '{}' returned fallback-worthy error: {}",
+                        model_id, e
+                    );
+                    health.mark_error(model_id, &e.to_string()).await;
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => {
+                    // Non-fallback-worthy error (e.g. network down, bad config) — don't try others.
+                    health.mark_error(model_id, &e.to_string()).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // All models exhausted — return the last error.
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No models available")))
+    }
+
+    /// Emit a ModelFallback event via the agent manager.
+    async fn emit_model_fallback_event(&self, preferred: &str, actual: &str, reason: &str) {
+        let Some(manager) = self.tools.get_manager() else { return };
+        let agent_id = self.agent_id.clone().unwrap_or_else(|| "unknown".to_string());
+        manager
+            .send_event(crate::agent_manager::AgentEvent::ModelFallback {
+                agent_id,
+                preferred_model: preferred.to_string(),
+                actual_model: actual.to_string(),
+                reason: reason.to_string(),
+            })
+            .await;
+    }
+
     fn looks_like_json_action_start(text: &str) -> bool {
         if let Some(brace_idx) = text.rfind('{') {
             text[brace_idx..].contains("\"type\"")
@@ -1435,6 +1658,7 @@ impl AgentEngine {
                     agent_id,
                     status: "working".to_string(),
                     detail: Some("Running".to_string()),
+                    parent_id: self.parent_agent_id.clone(),
                 })
                 .await;
         }
@@ -1555,6 +1779,7 @@ impl AgentEngine {
                         agent_id,
                         status: "thinking".to_string(),
                         detail: Some("Thinking".to_string()),
+                        parent_id: self.parent_agent_id.clone(),
                     })
                     .await;
             }
@@ -1570,7 +1795,8 @@ impl AgentEngine {
                 .await;
 
             // Ask model for the next action, streaming thinking tokens.
-            let raw = self.stream_with_thinking(&messages).await?;
+            // Uses fallback: if primary model hits rate/context limit, tries other models.
+            let raw = self.stream_with_fallback(&messages).await?;
 
             // Debug log: split model output into text + json (truncated).
             let (text_part, json_part) = crate::engine::model_message_log_parts(&raw, 100, 100);
@@ -1583,6 +1809,27 @@ impl AgentEngine {
                 text_part.replace('\n', "\\n"),
                 json_rendered
             );
+
+            // Emit text segment event for text before the first JSON object.
+            // This enables interleaved text+tool rendering in UIs.
+            {
+                let text_before = crate::engine::text_before_first_json(&raw);
+                if !text_before.is_empty() {
+                    if let Some(manager) = self.tools.get_manager() {
+                        let agent_id = self
+                            .agent_id
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        manager
+                            .send_event(crate::agent_manager::AgentEvent::TextSegment {
+                                agent_id,
+                                text: text_before,
+                                parent_id: self.parent_agent_id.clone(),
+                            })
+                            .await;
+                    }
+                }
+            }
 
             // Repetition check
             if let Some(ctrl) = self
@@ -2261,7 +2508,7 @@ impl AgentEngine {
         // precedence — the agent can only use the tools the skill permits.
         if let Some(skill) = &self.active_skill {
             if !skill.allowed_tools.is_empty() {
-                let allowed = skill
+                let mut allowed = skill
                     .allowed_tools
                     .iter()
                     .filter_map(|tool| {
@@ -2274,6 +2521,8 @@ impl AgentEngine {
                         None
                     })
                     .collect::<HashSet<String>>();
+                // Skill tool is always allowed so the model can discover/invoke skills.
+                allowed.insert("Skill".to_string());
                 return Some(allowed);
             }
         }
@@ -2287,7 +2536,7 @@ impl AgentEngine {
             return None;
         }
 
-        let allowed = spec
+        let mut allowed = spec
             .tools
             .iter()
             .filter_map(|tool| {
@@ -2302,6 +2551,9 @@ impl AgentEngine {
                 None
             })
             .collect::<HashSet<String>>();
+
+        // Skill tool is always allowed so the model can discover/invoke skills.
+        allowed.insert("Skill".to_string());
 
         Some(allowed)
     }
@@ -2330,6 +2582,13 @@ impl AgentEngine {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| "You are a helpful AI assistant.".to_string());
+
+        if !self.available_skills_metadata.is_empty() {
+            prompt.push_str("\n\n## Available Skills\n\nUse the `Skill` tool to invoke a skill by name. Available skills:");
+            for (name, description) in &self.available_skills_metadata {
+                prompt.push_str(&format!("\n- **{}**: {}", name, description));
+            }
+        }
 
         if let Some(skill) = &self.active_skill {
             prompt.push_str("\n\n--- ACTIVE SKILL ---");
@@ -2509,11 +2768,15 @@ impl AgentEngine {
             let tb = b.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             tb.cmp(&ta)
         });
-        // Find the most recent non-completed plan.
+        // Find the most recent non-completed, non-planned plan.
+        // Plans with status "Planned" are waiting for explicit user approval
+        // and should not be auto-resumed.
         for entry in entries {
             let path = entry.path();
             if let Some(plan) = Self::parse_plan_file(&path) {
-                if plan.status != PlanStatus::Completed {
+                if plan.status != PlanStatus::Completed
+                    && plan.status != PlanStatus::Planned
+                {
                     self.plan_file = Some(path);
                     return Some(plan);
                 }
@@ -2536,6 +2799,7 @@ mod tests {
                 ws_root: tmp.to_path_buf(),
                 max_iters: 1,
                 write_safety_mode: crate::config::WriteSafetyMode::Off,
+                tool_permission_mode: crate::config::ToolPermissionMode::Auto,
                 prompt_loop_breaker: None,
             },
             model_manager,

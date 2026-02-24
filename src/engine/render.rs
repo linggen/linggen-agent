@@ -67,6 +67,29 @@ pub fn render_tool_result(r: &ToolResult) -> String {
             }
             out
         }
+        ToolResult::WebFetchContent {
+            url,
+            content,
+            content_type,
+            truncated,
+        } => {
+            format!(
+                "WebFetch: {} (type: {}, truncated: {})\n{}",
+                url, content_type, truncated, content
+            )
+        }
+        ToolResult::AskUserResponse { answers } => {
+            let mut out = String::from("User responded:\n");
+            for a in answers {
+                let selected = a.selected.join(", ");
+                if let Some(ref custom) = a.custom_text {
+                    out.push_str(&format!("  Q{}: custom: \"{}\"\n", a.question_index, custom));
+                } else {
+                    out.push_str(&format!("  Q{}: {}\n", a.question_index, selected));
+                }
+            }
+            out
+        }
     }
 }
 
@@ -111,7 +134,21 @@ pub fn render_tool_result_public(r: &ToolResult) -> String {
                 path, truncated, shown_note, preview
             )
         }
+        ToolResult::WebFetchContent {
+            url,
+            content,
+            content_type,
+            truncated,
+        } => {
+            let (preview, preview_truncated) = preview_text(content, 30, 2000);
+            let shown_note = if preview_truncated { " (preview)" } else { "" };
+            format!(
+                "WebFetch: {} (type: {}, truncated: {}){}\n{}",
+                url, content_type, truncated, shown_note, preview
+            )
+        }
         ToolResult::WebSearchResults { .. } => render_tool_result(r),
+        ToolResult::AskUserResponse { .. } => render_tool_result(r),
         other => render_tool_result(other),
     }
 }

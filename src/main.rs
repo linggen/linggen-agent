@@ -2,6 +2,7 @@ mod agent_manager;
 mod check;
 mod cli;
 mod config;
+mod credentials;
 mod engine;
 mod eval;
 mod logging;

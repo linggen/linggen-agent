@@ -25,6 +25,8 @@ pub(crate) struct ChatRequest {
     message: String,
     session_id: Option<String>,
     mode: Option<String>,
+    #[serde(default)]
+    images: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -376,6 +378,7 @@ struct ChatRunCtx {
     session_id: Option<String>,
     clean_msg: String,
     git_baseline: Option<GitChangeSnapshot>,
+    images: Vec<String>,
 }
 
 /// Dispatch a skill (slash command) invocation.
@@ -446,6 +449,7 @@ async fn run_skill_dispatch(
     .await;
 
     let interrupt_key = wire_interrupt_channel(ctx, engine).await;
+    wire_ask_user_bridge(&ctx.state, engine);
 
     let outcome = run_loop_with_tracking(
         &ctx.manager, &ctx.root, engine, &ctx.agent_id,
@@ -529,6 +533,7 @@ async fn run_trigger_dispatch(
     .await;
 
     let interrupt_key = wire_interrupt_channel(ctx, engine).await;
+    wire_ask_user_bridge(&ctx.state, engine);
 
     let outcome = run_loop_with_tracking(
         &ctx.manager, &ctx.root, engine, &ctx.agent_id,
@@ -570,6 +575,7 @@ async fn run_plan_dispatch(
             ctx.agent_id.clone(),
             AgentStatusKind::Thinking,
             Some("Planning".to_string()),
+            None,
         )
         .await;
 
@@ -592,6 +598,7 @@ async fn run_plan_dispatch(
 
     // Wire up the interrupt channel so user messages reach the running loop.
     let interrupt_key = wire_interrupt_channel(ctx, engine).await;
+    wire_ask_user_bridge(&ctx.state, engine);
 
     let events_tx_clone = ctx.events_tx.clone();
     let agent_id_clone = ctx.agent_id.clone();
@@ -647,11 +654,12 @@ async fn run_plan_dispatch(
             }
         }
         Err(err) => {
-            let _ = ctx.events_tx.send(ServerEvent::Message {
-                from: ctx.agent_id.clone(),
-                to: "user".to_string(),
-                content: format!("Error: {}", err),
-            });
+            let error_msg = format!("Error: {}", err);
+            persist_and_emit_message(
+                &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+                &ctx.agent_id, "user", &error_msg, ctx.session_id.as_deref(), false,
+            )
+            .await;
         }
     }
     let _ = ctx.events_tx.send(ServerEvent::StateUpdated);
@@ -689,15 +697,58 @@ async fn unwire_interrupt_channel(
     guard.remove(interrupt_key);
 }
 
+/// Wire the AskUser bridge so the tool can emit SSE events and block on user response.
+fn wire_ask_user_bridge(
+    state: &Arc<ServerState>,
+    engine: &mut crate::engine::AgentEngine,
+) {
+    let bridge = Arc::new(crate::engine::tools::AskUserBridge {
+        events_tx: state.events_tx.clone(),
+        pending: state.pending_ask_user.clone(),
+    });
+    engine.tools.set_ask_user_bridge(bridge);
+}
+
 /// Dispatch the structured (auto) mode agent loop.
 async fn run_structured_loop(
     ctx: &ChatRunCtx,
     engine: &mut crate::engine::AgentEngine,
 ) {
+    // Vision gate: reject images if the model doesn't support vision.
+    if !ctx.images.is_empty() {
+        let has_vision = engine
+            .model_manager
+            .has_vision(&engine.model_id)
+            .await
+            .unwrap_or(false);
+        if !has_vision {
+            let err_msg = format!(
+                "Model `{}` does not support vision/image input. Please use a vision-capable model (e.g. qwen3-vl, llava, llama3.2-vision).",
+                engine.model_id
+            );
+            persist_and_emit_message(
+                &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+                &ctx.agent_id, "user", &err_msg, ctx.session_id.as_deref(), false,
+            )
+            .await;
+            let _ = ctx.events_tx.send(ServerEvent::StateUpdated);
+            return;
+        }
+        engine.pending_images = ctx.images.clone();
+    }
+
     ctx.state
-        .send_agent_status(ctx.agent_id.clone(), AgentStatusKind::Thinking, Some("Thinking".to_string()))
+        .send_agent_status(ctx.agent_id.clone(), AgentStatusKind::Thinking, Some("Thinking".to_string()), None)
         .await;
     engine.observations.clear();
+    // Clear stale "planned" plan from a previous plan-mode run so it doesn't
+    // block execution of the new structured loop.
+    if let Some(p) = &engine.plan {
+        if p.status == crate::engine::PlanStatus::Planned {
+            engine.plan = None;
+            engine.plan_file = None;
+        }
+    }
     let task_for_loop = ctx.clean_msg.trim().to_string();
     engine.task = Some(task_for_loop);
 
@@ -707,6 +758,7 @@ async fn run_structured_loop(
 
     // Wire up the interrupt channel so user messages reach the running loop.
     let interrupt_key = wire_interrupt_channel(ctx, engine).await;
+    wire_ask_user_bridge(&ctx.state, engine);
 
     let events_tx_clone = ctx.events_tx.clone();
     let agent_id_clone = ctx.agent_id.clone();
@@ -774,11 +826,12 @@ async fn run_structured_loop(
         )
         .await;
     } else if let Err(err) = outcome {
-        let _ = ctx.events_tx.send(ServerEvent::Message {
-            from: ctx.agent_id.clone(),
-            to: "user".to_string(),
-            content: format!("Error: {}", err),
-        });
+        let error_msg = format!("Error: {}", err);
+        persist_and_emit_message(
+            &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+            &ctx.agent_id, "user", &error_msg, ctx.session_id.as_deref(), false,
+        )
+        .await;
     }
     let _ = ctx.events_tx.send(ServerEvent::StateUpdated);
 }
@@ -893,6 +946,7 @@ pub(crate) async fn chat_handler(
             let session_id_for_queue = effective_session_id.clone();
             let project_root_for_queue = project_root_str.clone();
             let req_mode = req.mode.clone();
+            let req_images = req.images.clone();
 
             // Persist and emit user message immediately (even when busy) so it
             // appears in the UI chat history right away.
@@ -939,6 +993,7 @@ pub(crate) async fn chat_handler(
                     .send_agent_status(
                         target_id_clone.clone(), AgentStatusKind::ModelLoading,
                         Some("Model loading".to_string()),
+                        None,
                     )
                     .await;
                 let git_baseline = capture_git_snapshot(&root_clone);
@@ -952,6 +1007,7 @@ pub(crate) async fn chat_handler(
                     session_id: session_id.clone(),
                     clean_msg: clean_msg_clone.clone(),
                     git_baseline,
+                    images: req_images,
                 };
 
                 let is_plan_mode = req_mode.as_deref() == Some("plan")
@@ -977,6 +1033,7 @@ pub(crate) async fn chat_handler(
                     .send_agent_status(
                         target_id_clone.clone(), AgentStatusKind::Idle,
                         Some("Idle".to_string()),
+                        None,
                     )
                     .await;
             });
@@ -1051,6 +1108,7 @@ pub(crate) async fn approve_plan_handler(
                 agent_id.clone(),
                 AgentStatusKind::Thinking,
                 Some("Executing plan".to_string()),
+                None,
             )
             .await;
 
@@ -1152,16 +1210,17 @@ pub(crate) async fn approve_plan_handler(
             )
             .await;
         } else if let Err(err) = outcome {
-            let _ = events_tx.send(ServerEvent::Message {
-                from: agent_id.clone(),
-                to: "user".to_string(),
-                content: format!("Error: {}", err),
-            });
+            let error_msg = format!("Error: {}", err);
+            persist_and_emit_message(
+                &manager, &events_tx, &root_clone, &agent_id,
+                &agent_id, "user", &error_msg, session_id.as_deref(), false,
+            )
+            .await;
         }
         let _ = events_tx.send(ServerEvent::StateUpdated);
 
         state_clone
-            .send_agent_status(agent_id.clone(), AgentStatusKind::Idle, Some("Idle".to_string()))
+            .send_agent_status(agent_id.clone(), AgentStatusKind::Idle, Some("Idle".to_string()), None)
             .await;
     });
 
@@ -1202,6 +1261,37 @@ pub(crate) async fn reject_plan_handler(
     .await;
 
     Json(serde_json::json!({ "status": "rejected" })).into_response()
+}
+
+// ── AskUser response endpoint ────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub(crate) struct AskUserResponseRequest {
+    question_id: String,
+    answers: Vec<crate::engine::tools::AskUserAnswer>,
+}
+
+pub(crate) async fn ask_user_response_handler(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<AskUserResponseRequest>,
+) -> impl IntoResponse {
+    let sender = {
+        let mut pending = state.pending_ask_user.lock().await;
+        pending.remove(&req.question_id)
+    };
+
+    match sender {
+        Some(entry) => {
+            if entry.sender.send(req.answers).is_ok() {
+                Json(serde_json::json!({ "status": "ok" })).into_response()
+            } else {
+                (StatusCode::GONE, Json(serde_json::json!({ "error": "Question already expired" }))).into_response()
+            }
+        }
+        None => {
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Unknown question_id" }))).into_response()
+        }
+    }
 }
 
 #[cfg(test)]

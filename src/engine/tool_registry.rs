@@ -99,6 +99,9 @@ impl ToolRegistry {
             "unlock_paths",
             "delegate_to_agent",
             "WebSearch",
+            "WebFetch",
+            "Skill",
+            "AskUser",
         ]
         .into_iter()
         .map(String::from)
@@ -143,5 +146,13 @@ impl ToolRegistry {
 
     pub fn memory_dir(&self) -> Option<&PathBuf> {
         self.builtins.memory_dir()
+    }
+
+    pub fn set_ask_user_bridge(&mut self, bridge: std::sync::Arc<tools::AskUserBridge>) {
+        self.builtins.set_ask_user_bridge(bridge);
+    }
+
+    pub fn ask_user_bridge(&self) -> Option<&std::sync::Arc<tools::AskUserBridge>> {
+        self.builtins.ask_user_bridge()
     }
 }

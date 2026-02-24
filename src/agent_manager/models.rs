@@ -1,13 +1,105 @@
 use crate::config::ModelConfig;
+use crate::credentials::{self, Credentials};
 use crate::ollama::{ChatMessage, OllamaClient};
 use crate::openai::OpenAiClient;
 use anyhow::Result;
 use futures_util::{Stream, StreamExt};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
+use tokio::time::Instant;
+
+// ---------------------------------------------------------------------------
+// Model health tracking (in-memory, resets on restart)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelHealthStatus {
+    Healthy,
+    QuotaExhausted,
+    Down,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelHealthRecord {
+    pub status: ModelHealthStatus,
+    #[serde(skip)]
+    pub since: Instant,
+    pub last_error: Option<String>,
+    /// Seconds since the status changed — populated for API responses.
+    pub since_secs: Option<u64>,
+}
+
+pub struct ModelHealthTracker {
+    records: RwLock<HashMap<String, ModelHealthRecord>>,
+}
+
+impl ModelHealthTracker {
+    pub fn new() -> Self {
+        Self {
+            records: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Check if a model is available for use.
+    /// QuotaExhausted models become available again after 1 hour.
+    /// Down models become available again after 5 minutes.
+    pub async fn is_available(&self, model_id: &str) -> bool {
+        let records = self.records.read().await;
+        let Some(record) = records.get(model_id) else {
+            return true; // No record = healthy
+        };
+        match record.status {
+            ModelHealthStatus::Healthy => true,
+            ModelHealthStatus::QuotaExhausted => record.since.elapsed().as_secs() > 3600,
+            ModelHealthStatus::Down => record.since.elapsed().as_secs() > 300,
+        }
+    }
+
+    pub async fn mark_error(&self, model_id: &str, error_msg: &str) {
+        let status = if is_rate_limit_error_str(error_msg) {
+            ModelHealthStatus::QuotaExhausted
+        } else {
+            ModelHealthStatus::Down
+        };
+        let mut records = self.records.write().await;
+        records.insert(
+            model_id.to_string(),
+            ModelHealthRecord {
+                status,
+                since: Instant::now(),
+                last_error: Some(error_msg.to_string()),
+                since_secs: None,
+            },
+        );
+    }
+
+    pub async fn mark_healthy(&self, model_id: &str) {
+        let mut records = self.records.write().await;
+        records.remove(model_id);
+    }
+
+    pub async fn get_all(&self) -> Vec<(String, ModelHealthRecord)> {
+        let records = self.records.read().await;
+        records
+            .iter()
+            .map(|(id, rec)| {
+                let mut rec = rec.clone();
+                rec.since_secs = Some(rec.since.elapsed().as_secs());
+                (id.clone(), rec)
+            })
+            .collect()
+    }
+}
+
+/// Check if an error message string indicates a rate limit (HTTP 429).
+fn is_rate_limit_error_str(msg: &str) -> bool {
+    msg.contains("(429)") || msg.to_lowercase().contains("rate limit") || msg.to_lowercase().contains("quota")
+}
 
 /// Provider-specific client variant.
 enum ProviderClient {
@@ -17,6 +109,7 @@ enum ProviderClient {
 
 pub struct ModelManager {
     models: HashMap<String, ModelInstance>,
+    pub health: Arc<ModelHealthTracker>,
 }
 
 struct ModelInstance {
@@ -24,18 +117,30 @@ struct ModelInstance {
     client: ProviderClient,
     semaphore: Arc<Semaphore>,
     context_window: OnceCell<Option<usize>>,
+    has_vision: OnceCell<bool>,
 }
 
 impl ModelManager {
     pub fn new(configs: Vec<ModelConfig>) -> Self {
+        let creds = Credentials::load(&credentials::credentials_file());
+        Self::new_with_credentials(configs, &creds)
+    }
+
+    pub fn new_with_credentials(configs: Vec<ModelConfig>, creds: &Credentials) -> Self {
         let mut models = HashMap::new();
-        for cfg in configs {
+        for mut cfg in configs {
+            // Resolve effective API key: TOML > credentials.json > env var
+            let effective_key =
+                credentials::resolve_api_key(&cfg.id, cfg.api_key.as_deref(), creds);
+            cfg.api_key = effective_key;
+
             let client = match cfg.provider.as_str() {
-                "openai" => {
-                    ProviderClient::OpenAi(OpenAiClient::new(cfg.url.clone(), cfg.api_key.clone()))
-                }
-                _ => {
+                "ollama" => {
                     ProviderClient::Ollama(OllamaClient::new(cfg.url.clone(), cfg.api_key.clone()))
+                }
+                // All other providers (openai, gemini, groq, deepseek, etc.) use OpenAI-compatible API.
+                _ => {
+                    ProviderClient::OpenAi(OpenAiClient::new(cfg.url.clone(), cfg.api_key.clone()))
                 }
             };
             let semaphore = Arc::new(Semaphore::new(1));
@@ -46,10 +151,14 @@ impl ModelManager {
                     client,
                     semaphore,
                     context_window: OnceCell::new(),
+                    has_vision: OnceCell::new(),
                 },
             );
         }
-        Self { models }
+        Self {
+            models,
+            health: Arc::new(ModelHealthTracker::new()),
+        }
     }
 
     pub async fn chat_json(&self, model_id: &str, messages: &[ChatMessage]) -> Result<String> {
@@ -225,6 +334,11 @@ impl ModelManager {
         self.models.values().map(|m| &m.config).collect()
     }
 
+    /// Return all registered model IDs (for fallback iteration).
+    pub fn model_ids(&self) -> Vec<String> {
+        self.models.keys().cloned().collect()
+    }
+
     /// Best-effort cached model context window (num_ctx).
     /// Priority: config override > Ollama /api/show > None.
     pub async fn context_window(&self, model_id: &str) -> Result<Option<usize>> {
@@ -254,6 +368,51 @@ impl ModelManager {
         }
     }
 
+    /// Check if a model supports vision (image input).
+    /// Ollama: queries /api/show capabilities, cached in OnceCell.
+    /// OpenAI-compatible: checks `tags` config for "vision" tag; defaults to true.
+    pub async fn has_vision(&self, model_id: &str) -> Result<bool> {
+        let instance = self
+            .models
+            .get(model_id)
+            .ok_or_else(|| anyhow::anyhow!("Model {} not found", model_id))?;
+
+        match &instance.client {
+            ProviderClient::Ollama(client) => {
+                let model_name = instance.config.model.clone();
+                let client = client.clone();
+                let value = instance
+                    .has_vision
+                    .get_or_try_init(|| async move {
+                        client.get_model_has_vision(&model_name).await
+                    })
+                    .await;
+                Ok(*value?)
+            }
+            ProviderClient::OpenAi(_) => {
+                // If tags are configured, use them; otherwise default to true.
+                if instance.config.tags.is_empty() {
+                    Ok(true)
+                } else {
+                    Ok(instance.config.tags.iter().any(|t| t.eq_ignore_ascii_case("vision")))
+                }
+            }
+        }
+    }
+
+    /// Check if a model has a specific tag.
+    pub fn has_tag(&self, model_id: &str, tag: &str) -> bool {
+        self.models
+            .get(model_id)
+            .map(|inst| inst.config.tags.iter().any(|t| t.eq_ignore_ascii_case(tag)))
+            .unwrap_or(false)
+    }
+
+    /// Check if a model ID exists in the configured models.
+    pub fn has_model(&self, model_id: &str) -> bool {
+        self.models.contains_key(model_id)
+    }
+
     /// Return the OllamaClient for a specific model (if it's an Ollama provider).
     /// Used by server status endpoints.
     pub fn ollama_client_for_model(&self, model_id: &str) -> Option<&OllamaClient> {
@@ -273,4 +432,30 @@ impl ModelManager {
         }
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Error classification for fallback routing
+// ---------------------------------------------------------------------------
+
+/// Check if an error indicates a rate limit (HTTP 429).
+pub fn is_rate_limit_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("(429)") || msg.to_lowercase().contains("rate limit")
+}
+
+/// Check if an error indicates a context/token limit exceeded (HTTP 400 + context keywords).
+pub fn is_context_limit_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    (msg.contains("(400)") || msg.contains("(413)"))
+        && (msg.contains("context")
+            || msg.contains("token")
+            || msg.contains("too long")
+            || msg.contains("max_tokens")
+            || msg.contains("content_too_large"))
+}
+
+/// Returns true if the error is a rate limit or context limit that warrants trying another model.
+pub fn is_fallback_worthy_error(err: &anyhow::Error) -> bool {
+    is_rate_limit_error(err) || is_context_limit_error(err)
 }

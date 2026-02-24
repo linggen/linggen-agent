@@ -116,6 +116,7 @@ mod tests {
             api_key: None,
             keep_alive: None,
             context_window: None,
+            tags: Vec::new(),
         }
     }
 
@@ -128,6 +129,7 @@ mod tests {
             api_key: Some("key".to_string()),
             keep_alive: None,
             context_window: None,
+            tags: Vec::new(),
         }
     }
 
@@ -144,7 +146,7 @@ mod tests {
         let models = vec![openai_model("cloud"), ollama_model("local")];
         let routing = RoutingConfig {
             default_policy: Some("local-first".to_string()),
-            policies: vec![],
+            ..Default::default()
         };
         let result = resolve_model(&routing, None, &empty_signal(), &models);
         assert_eq!(result, Some("local".to_string()));
@@ -155,7 +157,7 @@ mod tests {
         let models = vec![ollama_model("local"), openai_model("cloud")];
         let routing = RoutingConfig {
             default_policy: Some("cloud-first".to_string()),
-            policies: vec![],
+            ..Default::default()
         };
         let result = resolve_model(&routing, None, &empty_signal(), &models);
         assert_eq!(result, Some("cloud".to_string()));
@@ -183,6 +185,7 @@ mod tests {
                     },
                 ],
             }],
+            ..Default::default()
         };
 
         // Low complexity -> small

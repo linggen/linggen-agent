@@ -15,7 +15,7 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use rust_embed::RustEmbed;
@@ -36,8 +36,8 @@ use agent_api::{
     cancel_agent_run, clear_mission, get_agent_override, get_mission, list_missions, run_agent,
     set_agent_override, set_mission, set_task,
 };
-use chat_api::{approve_plan_handler, chat_handler, clear_chat_history_api, reject_plan_handler};
-use config_api::{get_config_api, update_config_api};
+use chat_api::{approve_plan_handler, ask_user_response_handler, chat_handler, clear_chat_history_api, reject_plan_handler};
+use config_api::{get_config_api, get_credentials_api, get_models_health, update_config_api, update_credentials_api};
 use projects_api::{
     add_project, create_session, delete_agent_file_api, delete_skill_file_api,
     get_agent_context_api, get_agent_file_api, get_skill_file_api, list_agent_children_api,
@@ -61,6 +61,9 @@ pub struct ServerState {
     /// Senders for interrupt messages keyed by queue_key. Used to inject user
     /// messages into a running agent loop so the model can adapt mid-run.
     pub interrupt_tx: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>,
+    /// Pending AskUser questions waiting for user responses.
+    /// Keyed by unique question_id. The oneshot sender delivers the user's answer.
+    pub pending_ask_user: Arc<Mutex<HashMap<String, crate::engine::tools::PendingAskUser>>>,
     status_seq: AtomicU64,
     active_statuses: Arc<Mutex<HashMap<String, ActiveStatusRecord>>>,
     pub queue_seq: AtomicU64,
@@ -143,6 +146,8 @@ pub enum ServerEvent {
         status_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         lifecycle: Option<String>, // "doing" | "done"
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_agent_id: Option<String>,
     },
     QueueUpdated {
         project_root: String,
@@ -184,6 +189,22 @@ pub enum ServerEvent {
         agent_id: String,
         project_root: String,
     },
+    TextSegment {
+        agent_id: String,
+        text: String,
+        parent_id: Option<String>,
+    },
+    AskUser {
+        agent_id: String,
+        question_id: String,
+        questions: Vec<crate::engine::tools::AskUserQuestion>,
+    },
+    ModelFallback {
+        agent_id: String,
+        preferred_model: String,
+        actual_model: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +237,7 @@ const UI_KIND_ACTIVITY: &str = "activity";
 const UI_KIND_QUEUE: &str = "queue";
 const UI_KIND_RUN: &str = "run";
 const UI_KIND_TOKEN: &str = "token";
+const UI_KIND_TEXT_SEGMENT: &str = "text_segment";
 
 const UI_PHASE_SYNC: &str = "sync";
 const UI_PHASE_OUTCOME: &str = "outcome";
@@ -269,6 +291,7 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
             detail,
             status_id,
             lifecycle,
+            parent_agent_id,
         } => {
             if status.eq_ignore_ascii_case("idle") && lifecycle.is_none() {
                 // Still emit the idle event so the UI can transition agent status.
@@ -283,7 +306,7 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
                     agent_id: Some(agent_id),
                     session_id: None,
                     project_root: None,
-                    data: Some(json!({ "status": "idle" })),
+                    data: Some(json!({ "status": "idle", "parent_id": parent_agent_id })),
                 });
             }
             let phase = lifecycle.or_else(|| {
@@ -314,7 +337,7 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
                 agent_id: Some(agent_id),
                 session_id: None,
                 project_root: None,
-                data: Some(json!({ "status": status })),
+                data: Some(json!({ "status": status, "parent_id": parent_agent_id })),
             })
         }
         ServerEvent::QueueUpdated {
@@ -497,6 +520,68 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
             project_root: Some(project_root),
             data: Some(json!({ "status": "idle_prompt_triggered" })),
         }),
+        ServerEvent::TextSegment {
+            agent_id,
+            text,
+            parent_id,
+        } => Some(UiSseMessage {
+            id: format!("text-seg-{agent_id}-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: UI_KIND_TEXT_SEGMENT.to_string(),
+            phase: None,
+            text: Some(text),
+            agent_id: Some(agent_id),
+            session_id: None,
+            project_root: None,
+            data: Some(json!({ "parent_id": parent_id })),
+        }),
+        ServerEvent::AskUser {
+            agent_id,
+            question_id,
+            questions,
+        } => Some(UiSseMessage {
+            id: format!("ask-user-{question_id}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: "ask_user".to_string(),
+            phase: None,
+            text: None,
+            agent_id: Some(agent_id),
+            session_id: None,
+            project_root: None,
+            data: Some(json!({
+                "question_id": question_id,
+                "questions": questions,
+            })),
+        }),
+        ServerEvent::ModelFallback {
+            agent_id,
+            preferred_model,
+            actual_model,
+            reason,
+        } => Some(UiSseMessage {
+            id: format!("model-fallback-{agent_id}-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: "model_fallback".to_string(),
+            phase: None,
+            text: Some(format!(
+                "Using {} model ({} unavailable: {})",
+                actual_model, preferred_model, reason
+            )),
+            agent_id: Some(agent_id),
+            session_id: None,
+            project_root: None,
+            data: Some(json!({
+                "preferred_model": preferred_model,
+                "actual_model": actual_model,
+                "reason": reason,
+            })),
+        }),
     }
 }
 
@@ -506,6 +591,7 @@ impl ServerState {
         agent_id: String,
         status: AgentStatusKind,
         detail: Option<String>,
+        parent_agent_id: Option<String>,
     ) {
         let mut done_event: Option<ServerEvent> = None;
         let mut status_id: Option<String> = None;
@@ -521,6 +607,7 @@ impl ServerState {
                         detail: prev.detail,
                         status_id: Some(prev.status_id),
                         lifecycle: Some(UI_PHASE_DONE.to_string()),
+                        parent_agent_id: parent_agent_id.clone(),
                     });
                 }
             } else {
@@ -532,6 +619,7 @@ impl ServerState {
                             detail: prev.detail,
                             status_id: Some(prev.status_id),
                             lifecycle: Some(UI_PHASE_DONE.to_string()),
+                            parent_agent_id: parent_agent_id.clone(),
                         });
                         active.remove(&agent_id);
                     } else {
@@ -574,6 +662,7 @@ impl ServerState {
             status: status.as_str().to_string(),
             detail,
             status_id,
+            parent_agent_id,
             lifecycle,
         });
     }
@@ -604,6 +693,7 @@ pub async fn prepare_server(
         skill_manager,
         queued_chats: Arc::new(Mutex::new(HashMap::new())),
         interrupt_tx: Arc::new(Mutex::new(HashMap::new())),
+        pending_ask_user: Arc::new(Mutex::new(HashMap::new())),
         status_seq: AtomicU64::new(1),
         active_statuses: Arc::new(Mutex::new(HashMap::new())),
         queue_seq: AtomicU64::new(1),
@@ -629,9 +719,10 @@ pub async fn prepare_server(
                         agent_id,
                         status,
                         detail,
+                        parent_id,
                     } => {
                         state_clone
-                            .send_agent_status(agent_id, AgentStatusKind::from_str_loose(&status), detail)
+                            .send_agent_status(agent_id, AgentStatusKind::from_str_loose(&status), detail, parent_id)
                             .await;
                     }
                     crate::agent_manager::AgentEvent::SubagentSpawned {
@@ -687,6 +778,30 @@ pub async fn prepare_server(
                             .events_tx
                             .send(ServerEvent::PlanUpdate { agent_id, plan });
                     }
+                    crate::agent_manager::AgentEvent::TextSegment {
+                        agent_id,
+                        text,
+                        parent_id,
+                    } => {
+                        let _ = state_clone.events_tx.send(ServerEvent::TextSegment {
+                            agent_id,
+                            text,
+                            parent_id,
+                        });
+                    }
+                    crate::agent_manager::AgentEvent::ModelFallback {
+                        agent_id,
+                        preferred_model,
+                        actual_model,
+                        reason,
+                    } => {
+                        let _ = state_clone.events_tx.send(ServerEvent::ModelFallback {
+                            agent_id,
+                            preferred_model,
+                            actual_model,
+                            reason,
+                        });
+                    }
                     crate::agent_manager::AgentEvent::TaskUpdate { .. } => {
                         // UI will refresh state from DB
                         let _ = state_clone.events_tx.send(ServerEvent::StateUpdated);
@@ -709,7 +824,9 @@ pub async fn prepare_server(
         .route("/api/agent-children", get(list_agent_children_api))
         .route("/api/agent-context", get(get_agent_context_api))
         .route("/api/models", get(list_models_api))
+        .route("/api/models/health", get(get_models_health))
         .route("/api/config", get(get_config_api).post(update_config_api))
+        .route("/api/credentials", get(get_credentials_api).put(update_credentials_api))
         .route("/api/skills", get(list_skills))
         .route("/api/marketplace/search", get(marketplace_search))
         .route("/api/marketplace/list", get(marketplace_list))
@@ -736,6 +853,7 @@ pub async fn prepare_server(
         .route("/api/chat/clear", post(clear_chat_history_api))
         .route("/api/plan/approve", post(approve_plan_handler))
         .route("/api/plan/reject", post(reject_plan_handler))
+        .route("/api/ask-user-response", post(ask_user_response_handler))
         .route("/api/workspace/tree", get(get_agent_tree))
         .route("/api/files", get(list_files))
         .route("/api/file", get(read_file_api))

@@ -66,6 +66,7 @@ pub enum AgentEvent {
         agent_id: String,
         status: String,
         detail: Option<String>,
+        parent_id: Option<String>,
     },
     SubagentSpawned {
         parent_id: String,
@@ -88,9 +89,20 @@ pub enum AgentEvent {
         compressed: bool,
         summary_count: usize,
     },
+    TextSegment {
+        agent_id: String,
+        text: String,
+        parent_id: Option<String>,
+    },
     PlanUpdate {
         agent_id: String,
         plan: Plan,
+    },
+    ModelFallback {
+        agent_id: String,
+        preferred_model: String,
+        actual_model: String,
+        reason: String,
     },
     StateUpdated,
 }
@@ -145,6 +157,66 @@ impl AgentManager {
                 Some(trimmed.to_string())
             }
         })
+    }
+
+    /// Resolve the model ID for an agent, using the following priority chain:
+    /// 1. Config agent override (if exists in configured models)
+    /// 2. Frontmatter model (if exists in configured models)
+    /// 3. First model in routing.default_models
+    /// 4. Routing policy
+    /// 5. First configured model
+    fn resolve_model_id(
+        config: &Config,
+        models: &ModelManager,
+        agent_id: &str,
+        frontmatter_model: Option<String>,
+    ) -> Result<String> {
+        let model_ids: std::collections::HashSet<&str> =
+            config.models.iter().map(|m| m.id.as_str()).collect();
+
+        // 1. Config agent override
+        if let Some(choice) = Self::normalize_model_choice(Self::model_override_for_agent(config, agent_id)) {
+            if models.has_model(&choice) {
+                return Ok(choice);
+            }
+            warn!("Agent override model '{}' not found in configured models; falling through", choice);
+        }
+
+        // 2. Frontmatter model
+        if let Some(choice) = Self::normalize_model_choice(frontmatter_model) {
+            if models.has_model(&choice) {
+                return Ok(choice);
+            }
+            warn!("Agent frontmatter model '{}' not found in configured models; falling through", choice);
+        }
+
+        // 3. First model in routing.default_models
+        for dm in &config.routing.default_models {
+            if model_ids.contains(dm.as_str()) {
+                return Ok(dm.clone());
+            }
+        }
+
+        // 4. Routing policy
+        if let Some(id) = routing::resolve_model(
+            &config.routing,
+            None,
+            &routing::ComplexitySignal {
+                estimated_tokens: None,
+                tool_depth: None,
+                skill_model_hint: None,
+            },
+            &config.models,
+        ) {
+            return Ok(id);
+        }
+
+        // 5. First configured model
+        config
+            .models
+            .first()
+            .map(|m| m.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("No models configured"))
     }
 
     /// Load agent specs from a single directory.
@@ -418,23 +490,12 @@ impl AgentManager {
         let config = self.config.read().await.clone();
         let models = self.models.read().await.clone();
 
-        let model_id =
-            Self::normalize_model_choice(Self::model_override_for_agent(&config, &normalized_id))
-                .or_else(|| Self::normalize_model_choice(agent_spec.spec.model.clone()))
-                .or_else(|| {
-                    routing::resolve_model(
-                        &config.routing,
-                        None,
-                        &routing::ComplexitySignal {
-                            estimated_tokens: None,
-                            tool_depth: None,
-                            skill_model_hint: None,
-                        },
-                        &config.models,
-                    )
-                })
-                .or_else(|| config.models.first().map(|m| m.id.clone()))
-                .ok_or_else(|| anyhow::anyhow!("No models configured"))?;
+        let model_id = Self::resolve_model_id(
+            &config,
+            &models,
+            &normalized_id,
+            agent_spec.spec.model.clone(),
+        )?;
 
         let role = if agent_spec
             .spec
@@ -452,6 +513,7 @@ impl AgentManager {
                 ws_root: project_root.clone(),
                 max_iters: config.agent.max_iters,
                 write_safety_mode: config.agent.write_safety_mode,
+                tool_permission_mode: config.agent.tool_permission_mode,
                 prompt_loop_breaker: config.agent.prompt_loop_breaker.clone(),
             },
             models,
@@ -459,6 +521,7 @@ impl AgentManager {
             role,
         )?;
 
+        engine.default_models = config.routing.default_models.clone();
         engine.set_spec(
             normalized_id.clone(),
             agent_spec.spec,
@@ -467,6 +530,7 @@ impl AgentManager {
         engine.set_manager_context(self.clone());
         engine.set_delegation_depth(0, config.agent.max_delegation_depth);
         engine.load_skill_tools(&self.skill_manager).await;
+        engine.load_available_skills_metadata(&self.skill_manager).await;
 
         // Set up auto memory directory
         let repo_path_str = project_root.to_string_lossy().to_string();
@@ -504,23 +568,12 @@ impl AgentManager {
         let config = self.config.read().await.clone();
         let models = self.models.read().await.clone();
 
-        let model_id =
-            Self::normalize_model_choice(Self::model_override_for_agent(&config, &normalized_id))
-                .or_else(|| Self::normalize_model_choice(agent_spec.spec.model.clone()))
-                .or_else(|| {
-                    routing::resolve_model(
-                        &config.routing,
-                        None,
-                        &routing::ComplexitySignal {
-                            estimated_tokens: None,
-                            tool_depth: None,
-                            skill_model_hint: None,
-                        },
-                        &config.models,
-                    )
-                })
-                .or_else(|| config.models.first().map(|m| m.id.clone()))
-                .ok_or_else(|| anyhow::anyhow!("No models configured"))?;
+        let model_id = Self::resolve_model_id(
+            &config,
+            &models,
+            &normalized_id,
+            agent_spec.spec.model.clone(),
+        )?;
 
         let role = if agent_spec
             .spec
@@ -538,6 +591,7 @@ impl AgentManager {
                 ws_root: project_root.clone(),
                 max_iters: config.agent.max_iters,
                 write_safety_mode: config.agent.write_safety_mode,
+                tool_permission_mode: config.agent.tool_permission_mode,
                 prompt_loop_breaker: config.agent.prompt_loop_breaker.clone(),
             },
             models,
@@ -545,6 +599,7 @@ impl AgentManager {
             role,
         )?;
 
+        engine.default_models = config.routing.default_models.clone();
         engine.set_spec(
             normalized_id.clone(),
             agent_spec.spec,
@@ -552,6 +607,7 @@ impl AgentManager {
         );
         engine.set_manager_context(self.clone());
         engine.load_skill_tools(&self.skill_manager).await;
+        engine.load_available_skills_metadata(&self.skill_manager).await;
 
         // Set up auto memory directory
         let repo_path_str = project_root.to_string_lossy().to_string();

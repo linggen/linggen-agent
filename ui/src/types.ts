@@ -1,3 +1,18 @@
+export interface SubagentTreeEntry {
+  subagentId: string;
+  task: string;
+  status: 'running' | 'done' | 'failed';
+  toolCount: number;
+  contextTokens: number;
+  currentActivity: string | null;
+}
+
+export interface MessageSegment {
+  type: 'text' | 'tools';
+  text?: string;         // for 'text' segments
+  entries?: string[];    // for 'tools' segments
+}
+
 export interface ChatMessage {
   role: 'user' | 'agent';
   from?: string;
@@ -13,6 +28,10 @@ export interface ChatMessage {
   messageCount?: number;
   toolCount?: number;
   durationMs?: number;
+  images?: string[];
+  subagentTree?: SubagentTreeEntry[];
+  segments?: MessageSegment[];
+  liveText?: string;
 }
 
 export interface UiSseMessage {
@@ -20,7 +39,7 @@ export interface UiSseMessage {
   seq: number;
   rev: number;
   ts_ms: number;
-  kind: 'message' | 'activity' | 'queue' | 'run' | 'token';
+  kind: 'message' | 'activity' | 'queue' | 'run' | 'token' | 'text_segment' | 'ask_user' | 'model_fallback';
   phase?: string;
   text?: string;
   agent_id?: string;
@@ -129,6 +148,16 @@ export interface AppConfig {
   agent: { max_iters: number; write_safety_mode: string; prompt_loop_breaker?: string | null };
   logging: { level?: string | null; directory?: string | null; retention_days?: number | null };
   agents: { id: string; spec_path: string; model?: string | null }[];
+  routing?: { default_models?: string[]; default_policy?: string | null };
+}
+
+export type ModelHealthStatus = 'healthy' | 'quota_exhausted' | 'down' | 'unknown';
+
+export interface ModelHealthInfo {
+  id: string;
+  health: ModelHealthStatus;
+  last_error?: string | null;
+  since_secs?: number | null;
 }
 
 export interface ModelConfigUI {
@@ -138,6 +167,7 @@ export interface ModelConfigUI {
   model: string;
   api_key?: string | null;
   keep_alive?: string | null;
+  tags?: string[];
 }
 
 export interface SessionInfo {
@@ -345,4 +375,31 @@ export interface Plan {
   items: PlanItem[];
   status: PlanStatus;
   origin?: PlanOrigin;
+}
+
+// --- AskUser types ---
+
+export interface AskUserOption {
+  label: string;
+  description?: string | null;
+  preview?: string | null;
+}
+
+export interface AskUserQuestion {
+  question: string;
+  header: string;
+  options: AskUserOption[];
+  multi_select?: boolean;
+}
+
+export interface AskUserAnswer {
+  question_index: number;
+  selected: string[];
+  custom_text?: string | null;
+}
+
+export interface PendingAskUser {
+  questionId: string;
+  agentId: string;
+  questions: AskUserQuestion[];
 }

@@ -223,6 +223,7 @@ async fn dispatch_idle_prompt(
             agent_id.to_string(),
             AgentStatusKind::Working,
             Some("Processing idle prompt".to_string()),
+            None,
         )
         .await;
 
@@ -264,6 +265,7 @@ async fn dispatch_idle_prompt(
             agent_id.to_string(),
             AgentStatusKind::Idle,
             Some("Idle".to_string()),
+            None,
         )
         .await;
 
