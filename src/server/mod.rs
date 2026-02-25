@@ -5,6 +5,7 @@ mod config_api;
 pub(crate) mod idle_scheduler;
 mod marketplace_api;
 mod projects_api;
+mod storage_api;
 mod workspace_api;
 
 use crate::agent_manager::AgentManager;
@@ -46,6 +47,7 @@ use projects_api::{
     rename_session_api, upsert_agent_file_api, upsert_skill_file_api,
 };
 use marketplace_api::{builtin_skills_install, builtin_skills_install_all, builtin_skills_list, marketplace_install, marketplace_list, marketplace_search, marketplace_uninstall};
+use storage_api::{storage_roots, storage_tree, storage_read_file, storage_write_file, storage_delete_file};
 use workspace_api::{get_agent_tree, get_workspace_state, list_files, read_file_api};
 
 #[derive(RustEmbed)]
@@ -163,6 +165,10 @@ pub enum ServerEvent {
         estimated_tokens: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         token_limit: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actual_prompt_tokens: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actual_completion_tokens: Option<usize>,
         compressed: bool,
         summary_count: usize,
     },
@@ -204,6 +210,12 @@ pub enum ServerEvent {
         preferred_model: String,
         actual_model: String,
         reason: String,
+    },
+    ToolProgress {
+        agent_id: String,
+        tool: String,
+        line: String,
+        stream: String, // "stdout" | "stderr"
     },
 }
 
@@ -264,9 +276,6 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
     match event {
         ServerEvent::Message { from, to, content } => {
             let cleaned = crate::server::chat_helpers::sanitize_message_for_ui(&from, &content)?;
-            if from != "user" && crate::server::chat_helpers::is_progress_text_for_ui(&cleaned) {
-                return None;
-            }
             Some(UiSseMessage {
                 id: format!("msg-{seq}"),
                 seq,
@@ -395,6 +404,8 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
             char_count,
             estimated_tokens,
             token_limit,
+            actual_prompt_tokens,
+            actual_completion_tokens,
             compressed,
             summary_count,
         } => Some(UiSseMessage {
@@ -415,6 +426,8 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
                 "char_count": char_count,
                 "estimated_tokens": estimated_tokens,
                 "token_limit": token_limit,
+                "actual_prompt_tokens": actual_prompt_tokens,
+                "actual_completion_tokens": actual_completion_tokens,
                 "compressed": compressed,
                 "summary_count": summary_count,
             })),
@@ -580,6 +593,28 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
                 "preferred_model": preferred_model,
                 "actual_model": actual_model,
                 "reason": reason,
+            })),
+        }),
+        ServerEvent::ToolProgress {
+            agent_id,
+            tool,
+            line,
+            stream,
+        } => Some(UiSseMessage {
+            id: format!("tool-progress-{agent_id}-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: "tool_progress".to_string(),
+            phase: None,
+            text: Some(line.clone()),
+            agent_id: Some(agent_id),
+            session_id: None,
+            project_root: None,
+            data: Some(json!({
+                "tool": tool,
+                "line": line,
+                "stream": stream,
             })),
         }),
     }
@@ -759,6 +794,8 @@ pub async fn prepare_server(
                         char_count,
                         estimated_tokens,
                         token_limit,
+                        actual_prompt_tokens,
+                        actual_completion_tokens,
                         compressed,
                         summary_count,
                     } => {
@@ -769,6 +806,8 @@ pub async fn prepare_server(
                             char_count,
                             estimated_tokens,
                             token_limit,
+                            actual_prompt_tokens,
+                            actual_completion_tokens,
                             compressed,
                             summary_count,
                         });
@@ -800,6 +839,19 @@ pub async fn prepare_server(
                             preferred_model,
                             actual_model,
                             reason,
+                        });
+                    }
+                    crate::agent_manager::AgentEvent::ToolProgress {
+                        agent_id,
+                        tool,
+                        line,
+                        stream,
+                    } => {
+                        let _ = state_clone.events_tx.send(ServerEvent::ToolProgress {
+                            agent_id,
+                            tool,
+                            line,
+                            stream,
                         });
                     }
                     crate::agent_manager::AgentEvent::TaskUpdate { .. } => {
@@ -862,7 +914,9 @@ pub async fn prepare_server(
         .route("/api/health", get(health_handler))
         .route("/api/utils/pick-folder", get(pick_folder))
         .route("/api/utils/ollama-status", get(get_ollama_status))
-        .route("/api/memory/{*rest}", get(memory_proxy).post(memory_proxy).delete(memory_proxy))
+        .route("/api/storage/roots", get(storage_roots))
+        .route("/api/storage/tree", get(storage_tree))
+        .route("/api/storage/file", get(storage_read_file).put(storage_write_file).delete(storage_delete_file))
         .fallback(static_handler)
         .with_state(state.clone());
 
@@ -961,58 +1015,6 @@ async fn events_handler(
 
 async fn health_handler() -> impl IntoResponse {
     axum::Json(json!({ "ok": true }))
-}
-
-/// Proxy /api/memory/* requests to the ling-mem server.
-async fn memory_proxy(
-    State(state): State<Arc<ServerState>>,
-    axum::extract::Path(rest): axum::extract::Path<String>,
-    method: axum::http::Method,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
-    let config = state.manager.get_config_snapshot().await;
-    let base = config.memory.server_url.trim_end_matches('/');
-    let target_url = format!("{}/api/{}", base, rest);
-
-    let client = reqwest::Client::new();
-    let mut req = client.request(method.clone(), &target_url);
-
-    // Forward content-type header
-    if let Some(ct) = headers.get("content-type") {
-        req = req.header("content-type", ct);
-    }
-
-    if !body.is_empty() {
-        req = req.body(body.to_vec());
-    }
-
-    match req.send().await {
-        Ok(resp) => {
-            let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
-                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-            let ct = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/json")
-                .to_string();
-            let bytes = resp.bytes().await.unwrap_or_default();
-            Response::builder()
-                .status(status)
-                .header("content-type", ct)
-                .body(axum::body::Body::from(bytes))
-                .unwrap()
-        }
-        Err(e) => Response::builder()
-            .status(axum::http::StatusCode::BAD_GATEWAY)
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(
-                serde_json::to_vec(&json!({ "error": format!("Memory server unreachable: {}", e) }))
-                    .unwrap_or_default(),
-            ))
-            .unwrap(),
-    }
 }
 
 async fn pick_folder() -> impl IntoResponse {

@@ -185,6 +185,19 @@ fn is_supported_model_tool(_tool: &str) -> bool {
     true
 }
 
+/// Try to parse the first complete JSON action from a buffer.
+/// Returns the action and the byte offset past its end in the buffer.
+/// Used during streaming to detect the first action without waiting for the full response.
+pub fn try_parse_first_action(buf: &str) -> Option<(ModelAction, usize)> {
+    let brace_idx = buf.find('{')?;
+    let candidate = &buf[brace_idx..];
+    let mut de = Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+    let value = de.next()?.ok()?;
+    let consumed = de.byte_offset();
+    let action = value_to_action(value)?;
+    Some((action, brace_idx + consumed))
+}
+
 pub fn extract_first_json_object_span(s: &str) -> Option<(usize, usize)> {
     // Return byte offsets [start,end) for the first JSON object.
     // This is a best-effort extractor for logging. It handles nested braces and quoted strings.

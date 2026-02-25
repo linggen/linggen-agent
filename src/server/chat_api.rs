@@ -989,10 +989,11 @@ pub(crate) async fn chat_handler(
                     .await;
                 }
 
+                let model_label = &engine.model_id;
                 state_clone
                     .send_agent_status(
                         target_id_clone.clone(), AgentStatusKind::ModelLoading,
-                        Some("Model loading".to_string()),
+                        Some(format!("Loading model: {model_label}")),
                         None,
                     )
                     .await;

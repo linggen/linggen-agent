@@ -35,11 +35,8 @@ fn platform_slug() -> &'static str {
     }
 }
 
-/// Install/update ling and/or ling-mem binaries.
-///
-/// - `include_memory`: install/update ling-mem
-/// - `include_agent`: install/update ling itself
-pub async fn run(include_memory: bool, include_agent: bool) -> Result<()> {
+/// Install/update the ling binary.
+pub async fn run() -> Result<()> {
     let current_version = env!("CARGO_PKG_VERSION");
 
     let client = reqwest::Client::builder()
@@ -48,55 +45,17 @@ pub async fn run(include_memory: bool, include_agent: bool) -> Result<()> {
         .build()
         .context("Failed to build HTTP client")?;
 
-    // --- Update ling ---
-    if include_agent {
-        println!("Current ling version: v{}", current_version);
-        update_binary(
-            &client,
-            "ling",
-            "https://github.com/linggen/linggen-agent/releases/latest/download/manifest.json",
-            Some(current_version),
-            None, // install alongside current exe
-        )
-        .await?;
-    }
-
-    // --- Update ling-mem ---
-    if include_memory {
-        let install_dir = install_dir_for_memory();
-        if let Some(dir) = &install_dir {
-            let _ = std::fs::create_dir_all(dir);
-        }
-
-        update_binary(
-            &client,
-            "ling-mem",
-            "https://github.com/linggen/linggen-memory/releases/latest/download/manifest.json",
-            None,
-            install_dir.as_deref(),
-        )
-        .await?;
-    }
+    println!("Current ling version: v{}", current_version);
+    update_binary(
+        &client,
+        "ling",
+        "https://github.com/linggen/linggen-agent/releases/latest/download/manifest.json",
+        Some(current_version),
+        None,
+    )
+    .await?;
 
     Ok(())
-}
-
-/// Install directory for the memory binary.
-fn install_dir_for_memory() -> Option<std::path::PathBuf> {
-    // Prefer alongside the ling binary
-    if let Ok(exe) = std::env::current_exe() {
-        return exe.parent().map(|p| p.to_path_buf());
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = dirs::home_dir() {
-            let dir = home.join("Library/Application Support/Linggen/bin");
-            return Some(dir);
-        }
-    }
-
-    None
 }
 
 async fn update_binary(

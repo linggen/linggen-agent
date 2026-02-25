@@ -9,6 +9,7 @@ mod logging;
 mod ollama;
 mod openai;
 mod paths;
+mod prompts;
 mod project_store;
 mod repl;
 mod server;
@@ -26,7 +27,7 @@ use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "ling", version)]
-#[command(about = "Linggen — AI coding agent with semantic memory", long_about = None)]
+#[command(about = "Linggen — AI coding agent", long_about = None)]
 struct Cli {
     /// Workspace root. If omitted, detects by walking up for .git.
     #[arg(long, global = true)]
@@ -56,7 +57,7 @@ struct Cli {
 enum Command {
     /// Stop background daemon
     Stop,
-    /// Show agent and memory server status
+    /// Show agent server status
     Status,
     /// Diagnose installation health
     Doctor,
@@ -88,71 +89,14 @@ enum Command {
         #[arg(long, default_value_t = false)]
         global: bool,
     },
-    /// Install ling (and optionally ling-mem) binaries
-    Install {
-        /// Also install ling-mem
-        #[arg(long, alias = "mem")]
-        memory: bool,
-
-        /// Install both ling and ling-mem
-        #[arg(long)]
-        all: bool,
-    },
-    /// Update ling (and optionally ling-mem) binaries to latest
-    Update {
-        /// Also update ling-mem
-        #[arg(long, alias = "mem")]
-        memory: bool,
-
-        /// Update both ling and ling-mem
-        #[arg(long)]
-        all: bool,
-    },
+    /// Install/update the ling binary to latest
+    Install,
+    /// Update the ling binary to latest
+    Update,
     /// Manage skills
     Skills {
         #[command(subcommand)]
         action: SkillsAction,
-    },
-    /// Manage memory server
-    #[command(alias = "mem", alias = "m")]
-    Memory {
-        #[command(subcommand)]
-        action: MemoryAction,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum MemoryAction {
-    /// Start the memory server
-    Start,
-    /// Stop the memory server
-    Stop,
-    /// Show memory server status
-    Status,
-    /// Index a local directory
-    Index {
-        /// Path to the directory to index (defaults to current directory)
-        path: Option<std::path::PathBuf>,
-
-        /// Indexing mode: auto, full, or incremental
-        #[arg(long, default_value = "auto")]
-        mode: String,
-
-        /// Override the default source name
-        #[arg(long)]
-        name: Option<String>,
-
-        /// Include patterns (glob patterns)
-        #[arg(long = "include")]
-        include_patterns: Vec<String>,
-
-        /// Exclude patterns (glob patterns)
-        #[arg(long = "exclude")]
-        exclude_patterns: Vec<String>,
-
-        /// Wait for the indexing job to complete (default: true, use --no-wait to disable)
-        #[arg(long, default_value = "true")]
-        wait: bool,
     },
 }
 
@@ -223,11 +167,8 @@ async fn main() -> Result<()> {
             let root = if *global { None } else { global_root.clone() };
             return cli::init::run(*global, root).await;
         }
-        Some(Command::Install { memory, all }) => {
-            return cli::self_update::run(*memory || *all, !*memory || *all).await;
-        }
-        Some(Command::Update { memory, all }) => {
-            return cli::self_update::run(*memory || *all, !*memory || *all).await;
+        Some(Command::Install) | Some(Command::Update) => {
+            return cli::self_update::run().await;
         }
         Some(Command::Skills { action }) => {
             let sa = match action {
@@ -254,9 +195,6 @@ async fn main() -> Result<()> {
                 },
             };
             return cli::skills_cmd::run(sa, &config).await;
-        }
-        Some(Command::Memory { action }) => {
-            return handle_memory(action, &config).await;
         }
         _ => {}
     }
@@ -389,10 +327,9 @@ async fn main() -> Result<()> {
         | Some(Command::Stop)
         | Some(Command::Status)
         | Some(Command::Init { .. })
-        | Some(Command::Install { .. })
-        | Some(Command::Update { .. })
-        | Some(Command::Skills { .. })
-        | Some(Command::Memory { .. }) => unreachable!(),
+        | Some(Command::Install)
+        | Some(Command::Update)
+        | Some(Command::Skills { .. }) => unreachable!(),
     }
 
     Ok(())
@@ -410,29 +347,3 @@ async fn auto_install_builtin_skills() -> Result<()> {
     Ok(())
 }
 
-async fn handle_memory(action: &MemoryAction, config: &Config) -> Result<()> {
-    match action {
-        MemoryAction::Start => cli::daemon::start_memory(config).await,
-        MemoryAction::Stop => cli::daemon::stop_memory().await,
-        MemoryAction::Status => cli::daemon::memory_status(config).await,
-        MemoryAction::Index {
-            path,
-            mode,
-            name,
-            include_patterns,
-            exclude_patterns,
-            wait,
-        } => {
-            cli::index_cmd::run(
-                &config.memory.server_url,
-                path.clone(),
-                mode.clone(),
-                name.clone(),
-                include_patterns.clone(),
-                exclude_patterns.clone(),
-                *wait,
-            )
-            .await
-        }
-    }
-}

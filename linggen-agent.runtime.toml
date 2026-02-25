@@ -2,34 +2,32 @@
 id = "ollama1"
 provider = "ollama"
 url = "http://127.0.0.1:11434"
-#model = "qwen3-coder-next"
 model = "qwen3.5:cloud"
 keep_alive = "20m"
 context_window = 131072
+tags = []
 
-
-# [[models]]
-# id = "cloud_api"
-# provider = "openai"
-# url = "https://api.openai.com/v1"
-# model = "gpt-4o"
-# api_key = "sk-..."
+[[models]]
+id = "gemini-flash"
+provider = "gemini"
+url = "https://generativelanguage.googleapis.com/v1beta/openai"
+model = "gemini-3-flash-preview"
+keep_alive = "20m"
+tags = []
 
 [server]
 port = 9898
 
 [agent]
 max_iters = 100
+write_safety_mode = "warn"
+tool_permission_mode = "auto"
 prompt_loop_breaker = "You are repeatedly calling '{}' with the same arguments and not making progress. Use a different tool/arguments and continue automatically."
+max_delegation_depth = 2
 
 [logging]
 level = "debug"
 retention_days = 7
-
-[memory]
-server_port = 8787
-server_url = "http://127.0.0.1:8787"
-auto_start = true
 
 [[agents]]
 id = "lead"
@@ -50,3 +48,7 @@ model = "ollama1"
 id = "plan"
 spec_path = "agents/plan.md"
 model = "ollama1"
+
+[routing]
+policies = []
+default_models = ["gemini-flash"]

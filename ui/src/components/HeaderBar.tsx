@@ -1,5 +1,5 @@
 import React from 'react';
-import { Copy, Database, Eraser, Maximize2, Minimize2, Settings, Target } from 'lucide-react';
+import { Copy, Eraser, HardDrive, Maximize2, Minimize2, Settings, Target } from 'lucide-react';
 import { cn } from '../lib/cn';
 
 export const HeaderBar: React.FC<{
@@ -10,7 +10,7 @@ export const HeaderBar: React.FC<{
   verboseMode?: boolean;
   onToggleVerbose?: () => void;
   onOpenSettings?: () => void;
-  onOpenMemory?: () => void;
+  onOpenStorage?: () => void;
   onOpenMission?: () => void;
   missionActive?: boolean;
 }> = ({
@@ -21,7 +21,7 @@ export const HeaderBar: React.FC<{
   verboseMode,
   onToggleVerbose,
   onOpenSettings,
-  onOpenMemory,
+  onOpenStorage,
   onOpenMission,
   missionActive,
 }) => {
@@ -90,15 +90,15 @@ export const HeaderBar: React.FC<{
             </button>
           </>
         )}
-        {onOpenMemory && (
+        {onOpenStorage && (
           <>
             <div className="w-px h-3 bg-slate-300 dark:bg-white/10" />
             <button
-              onClick={onOpenMemory}
+              onClick={onOpenStorage}
               className="p-1 hover:text-blue-500 text-slate-500 transition-colors"
-              title="Memory"
+              title="Storage"
             >
-              <Database size={14} />
+              <HardDrive size={14} />
             </button>
           </>
         )}

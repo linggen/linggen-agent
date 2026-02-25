@@ -322,67 +322,73 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
     }
 
     let mut cleaned_lines: Vec<String> = Vec::new();
-    let mut saw_tool = false;
-    let mut last_tool: Option<ToolCallForUi> = None;
-    let mut saw_read_result = false;
-    let mut saw_tool_result_block = false;
-    let mut drop_remainder_as_tool_result = false;
+    let mut in_read_body = false;
 
     for raw_line in content.lines() {
         let line = raw_line.trim();
         if line.is_empty() {
+            in_read_body = false;
             if cleaned_lines.last().map(|v| !v.is_empty()).unwrap_or(false) {
                 cleaned_lines.push(String::new());
             }
             continue;
         }
-        if drop_remainder_as_tool_result {
-            continue;
-        }
 
+        // Tool call JSON — emit a compact status line instead of raw JSON.
         if let Some(tool_call) = parse_tool_call_from_json_line(line) {
-            saw_tool = true;
+            in_read_body = false;
             if !tool_call.name.is_empty() {
-                last_tool = Some(tool_call);
+                cleaned_lines.push(tool_status_line(
+                    &tool_call.name,
+                    tool_call.args.as_ref(),
+                    ToolStatusPhase::Start,
+                ));
             }
             continue;
         }
 
         let lower = line.to_lowercase();
-        if lower.starts_with("tool ")
-            || lower.starts_with("tool_error:")
-            || lower.starts_with("tool_not_allowed:")
-        {
-            saw_tool = true;
-            saw_tool_result_block = true;
-            drop_remainder_as_tool_result = true;
-            if let Some(name) = parse_tool_name_from_result_line(line) {
-                last_tool = Some(ToolCallForUi { name, args: None });
-            }
+
+        // Tool errors and permission denials — always keep.
+        if lower.starts_with("tool_error:") || lower.starts_with("tool_not_allowed:") {
+            in_read_body = false;
+            cleaned_lines.push(raw_line.to_string());
+            continue;
+        }
+
+        // Tool result header lines ("Tool Read: ...", "Tool Bash: ...").
+        // Keep the header as a status line but suppress file content body for Read.
+        if lower.starts_with("tool ") {
             if lower.starts_with("tool read:") {
-                saw_read_result = true;
-                if last_tool.is_none() {
-                    last_tool = Some(ToolCallForUi {
-                        name: "Read".to_string(),
-                        args: None,
-                    });
-                }
+                // Emit a compact status line; suppress the file dump that follows.
+                let path_hint = line
+                    .get(10..)
+                    .and_then(|s| s.split_whitespace().next())
+                    .unwrap_or("");
+                cleaned_lines.push(format!("Read: {}", path_hint));
+                in_read_body = true;
+            } else {
+                // For non-Read tool results, keep the header line.
+                in_read_body = false;
+                cleaned_lines.push(raw_line.to_string());
             }
             continue;
         }
+
+        // Suppress Read file content body lines.
+        if in_read_body {
+            continue;
+        }
+
+        // Internal boilerplate — hide.
         if lower.starts_with("starting autonomous loop for task:") {
             continue;
         }
         if lower == "(content omitted in chat; open the file viewer for full text)" {
             continue;
         }
-        // Never show Read output content in chat UI. After a Read tool result,
-        // many lines are TOML/JSON/etc and don't trip `looks_like_code_line`, which causes
-        // full file dumps to appear in chat. Instead, collapse the entire tool result into
-        // a single progress/status line ("Reading file...").
-        if saw_read_result {
-            continue;
-        }
+
+        // Everything else — keep (model text, delegation messages, errors, etc.)
         cleaned_lines.push(raw_line.to_string());
     }
 
@@ -391,43 +397,10 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
         .replace("\n\n\n", "\n\n")
         .trim()
         .to_string();
-    if saw_tool_result_block {
-        // Tool call status lines are emitted from the call event itself; suppress
-        // tool-result duplicates in chat UI.
-        return None;
-    }
     if cleaned.is_empty() {
-        if saw_tool {
-            return Some(status_line_for_tool_call(last_tool.as_ref()));
-        }
         return None;
     }
     Some(cleaned)
-}
-
-pub(crate) fn is_progress_text_for_ui(text: &str) -> bool {
-    let t = text.trim();
-    if t.is_empty() {
-        return false;
-    }
-    matches!(
-        t,
-        "Thinking..."
-            | "Model loading..."
-            | "Reading file..."
-            | "Writing file..."
-            | "Running command..."
-            | "Searching..."
-            | "Listing files..."
-            | "Delegating..."
-            | "Calling tool..."
-    ) || t.starts_with("Reading file:")
-        || t.starts_with("Writing file:")
-        || t.starts_with("Running command:")
-        || t.starts_with("Searching:")
-        || t.starts_with("Listing files:")
-        || t.starts_with("Delegating to subagent:")
-        || t.starts_with("Calling tool:")
 }
 
 // ---------------------------------------------------------------------------

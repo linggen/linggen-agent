@@ -1,5 +1,6 @@
 export interface SubagentTreeEntry {
   subagentId: string;
+  agentName: string;
   task: string;
   status: 'running' | 'done' | 'failed';
   toolCount: number;
@@ -309,54 +310,20 @@ export interface IdlePromptEvent {
   timestamp: number;
 }
 
-// --- Memory server types ---
+// --- Storage browser types ---
 
-export interface MemorySource {
-  id: string;
-  name: string;
-  resource_type: string;
+export interface StorageRoot {
+  label: string;
   path: string;
-  enabled: boolean;
-  include_patterns: string[];
-  exclude_patterns: string[];
-  latest_job?: MemoryIndexingJob | null;
-  stats?: MemorySourceStats | null;
 }
 
-export interface MemorySourceStats {
-  chunk_count: number;
-  file_count: number;
-  total_size_bytes: number;
-}
-
-export interface MemoryIndexingJob {
-  id: string;
-  source_id: string;
-  source_name: string;
-  source_type: string;
-  status: string;
-  started_at: string;
-  finished_at?: string | null;
-  files_indexed?: number | null;
-  chunks_created?: number | null;
-  total_files?: number | null;
-  error?: string | null;
-}
-
-export interface MemorySearchResult {
-  id: string;
-  content: string;
-  source_id: string;
-  source_name: string;
-  file_path: string;
-  score: number;
-  metadata?: Record<string, any>;
-}
-
-export interface MemoryServerStatus {
-  status: string;
-  message?: string | null;
-  progress?: string | null;
+export interface StorageEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size?: number | null;
+  modified?: number | null;
+  children_count?: number | null;
 }
 
 // Plan mode types

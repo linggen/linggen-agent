@@ -18,19 +18,11 @@ ling --port 8080                  # Custom port
 ling --root /path/to/project      # Custom workspace
 
 ling stop                         # Stop background daemon
-ling status                       # Show agent + memory status
+ling status                       # Show agent status
 ling doctor                       # Full health diagnostics
 
-ling memory start                 # Start memory server (aliases: mem, m)
-ling memory stop                  # Stop memory server
-ling memory status                # Memory server status
-ling m index .                    # Index current directory
-
-ling install                      # Install ling
-ling install --memory             # Install ling-mem
-ling install --all                # Install both
+ling install                      # Install/update ling
 ling update                       # Update ling
-ling update --all                 # Update both
 ling init                         # Bootstrap skills
 ling skills add/remove/list/search
 ling eval                         # Run eval tasks
@@ -42,13 +34,12 @@ ling eval                         # Run eval tasks
 |:--------|:--------|:--------------------|
 | *(none)* | Interactive TUI + embedded server | Yes |
 | `stop` | Stop background daemon | No |
-| `status` | Show agent + memory server status | No |
+| `status` | Show agent server status | No |
 | `doctor` | Diagnose installation health | No |
-| `memory` | Manage memory server (`start/stop/status/index`) | No |
 | `eval` | Run eval tasks against agents | Yes |
 | `init` | Bulk-install skills from `linggen/skills` | No |
-| `install` | Install ling (and optionally ling-mem) | No |
-| `update` | Update ling (and optionally ling-mem) | No |
+| `install` | Install/update the ling binary | No |
+| `update` | Update the ling binary | No |
 | `skills` | Manage skills (add/remove/list/search) | No |
 
 "Needs full runtime" means the command initialises tracing, `AgentManager`, database, and skill loading. Lightweight commands only load `Config`.
@@ -92,13 +83,13 @@ Reads PID from `~/.linggen/ling.pid`, sends `SIGTERM`; if still running after 50
 
 ## status
 
-Show agent and memory server status.
+Show agent server status.
 
 ```
 ling status
 ```
 
-Prints: version, config path, agent server port + running state, memory server port + running state, memory binary location, workspace root, model count, agent count.
+Prints: version, config path, agent server port + running state, workspace root, model count, agent count.
 
 ## doctor
 
@@ -114,67 +105,10 @@ Checks (each prints `[OK]`, `[FAIL]`, or `[INFO]` with ANSI colours):
 2. Config file path
 3. Workspace root detection
 4. Agent server port reachability (TCP probe, 1 s timeout)
-5. Memory server port reachability
-6. Model connectivity (Ollama `/api/tags`, OpenAI `/models`)
+5. Model connectivity (Ollama `/api/tags`, OpenAI `/models`)
 7. Skills directories (global + project)
 8. Agent definition files count
 9. Log directory exists and is writable
-
----
-
-## memory
-
-Manage the ling-mem server. Aliases: `mem`, `m`.
-
-```
-ling memory <SUBCOMMAND>
-ling mem <SUBCOMMAND>
-ling m <SUBCOMMAND>
-```
-
-### memory start
-
-Start the memory server as a background process.
-
-```
-ling memory start
-```
-
-Finds the `ling-mem` binary (checks: macOS Application Support, PATH, alongside `ling`), spawns it with `--port <memory.server_port>`. Writes PID to `~/.linggen/ling-mem.pid`, logs to `~/.linggen/ling-mem.log`.
-
-### memory stop
-
-Stop the memory server.
-
-```
-ling memory stop
-```
-
-### memory status
-
-Show memory server status.
-
-```
-ling memory status
-```
-
-### memory index
-
-Index a local directory via the memory server.
-
-```
-ling memory index [PATH] [OPTIONS]
-ling m index .
-```
-
-| Flag | Description |
-|:-----|:-----------|
-| `PATH` | Directory to index (default: current directory) |
-| `--mode <MODE>` | Indexing mode: `auto`, `full`, or `incremental` (default: `auto`) |
-| `--name <NAME>` | Override the source name |
-| `--include <GLOB>` | Include patterns (repeatable) |
-| `--exclude <GLOB>` | Exclude patterns (repeatable) |
-| `--no-wait` | Don't wait for the indexing job to complete |
 
 ---
 
@@ -214,32 +148,23 @@ Downloads the repository as a ZIP, scans for all `SKILL.md` files, and extracts 
 
 ## install
 
-Install the `ling` binary (default), and optionally `ling-mem`.
+Install or update the `ling` binary.
 
 ```
-ling install              # install ling only (default)
-ling install --memory     # install ling-mem only (alias: --mem)
-ling install --all        # install both
+ling install
 ```
 
-| Flag | Description |
-|:-----|:-----------|
-| `--memory` / `--mem` | Install ling-mem binary |
-| `--all` | Install both ling and ling-mem |
-
-Fetches `manifest.json` from the latest GitHub releases. Downloads platform-specific binaries and installs them. The memory binary is placed alongside the `ling` binary.
+Fetches `manifest.json` from the latest GitHub releases. Downloads the platform-specific binary and installs it.
 
 ## update
 
-Update the `ling` binary (default), and optionally `ling-mem`.
+Update the `ling` binary to latest.
 
 ```
-ling update               # update ling only (default)
-ling update --memory      # update ling-mem only (alias: --mem)
-ling update --all         # update both
+ling update
 ```
 
-Same flags as `install`. Compares versions and skips if already up to date.
+Compares versions and skips if already up to date.
 
 ---
 
@@ -309,20 +234,10 @@ These flags can be used with any command:
 |:-----|:--------|
 | `~/.linggen/ling.pid` | Agent daemon PID (created by `-d`, removed by `stop`) |
 | `~/.linggen/ling.log` | Agent daemon stdout/stderr log |
-| `~/.linggen/ling-mem.pid` | Memory server PID |
-| `~/.linggen/ling-mem.log` | Memory server log |
 
 ## Configuration
 
 All commands load config from `linggen-agent.toml` (see `doc/storage.md` for search order). Lightweight commands only need the config file; they do not initialise the full agent runtime.
-
-### Memory server config
-
-```toml
-[memory]
-server_port = 8787                      # default
-server_url = "http://127.0.0.1:8787"   # default
-```
 
 ### Model context_window override
 

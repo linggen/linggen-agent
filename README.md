@@ -6,6 +6,11 @@
 
 <p align="center">A local-first, skill-driven agent framework. Manage agents, skills, and models from a Web UI or terminal.</p>
 
+<p align="center">
+  <a href="https://linggen.dev">Website</a> &middot;
+  <a href="#documentation">Docs</a>
+</p>
+
 Linggen Agent is the successor of [Linggen](https://github.com/linggen/linggen). It provides a multi-agent runtime where users can add agents and skills by dropping markdown files — no code changes needed.
 
 ## Features
@@ -14,8 +19,8 @@ Linggen Agent is the successor of [Linggen](https://github.com/linggen/linggen).
 - **Multi-agent management** — create, configure, and switch between agents. Each agent has its own context, skill set, and model preference.
 - **Multi-model routing** — connect local models (Ollama), OpenAI API, Claude API, or AWS Bedrock. Define routing policies like `local-first`, `cloud-first`, or custom priority rules.
 - **Skills Marketplace** — search, install, and manage community skills from the built-in marketplace UI or via `/skill` chat command.
+- **Mission system** — agents self-initiate work when a mission is active, or stay reactive without one.
 - **Web UI + TUI** — both interfaces connect to the same backend and share session state in real-time via SSE.
-- **Two interaction modes** — `chat` (human-in-the-loop, Claude Code style) and `auto` (autonomous agent execution).
 - **Workspace safety** — file operations are scoped to the workspace root. Bash commands are validated against an allowlist. Agent actions are policy-gated per agent.
 
 ## Quick Start
@@ -163,6 +168,10 @@ Agents interact with the workspace through a fixed set of Claude Code-style tool
 | `Bash` | Execute shell commands (allowlisted, with timeout) |
 | `Glob` | Find files by pattern |
 | `Grep` | Search file contents by regex |
+| `WebSearch` | Web search via external provider |
+| `WebFetch` | Fetch and extract content from a URL |
+| `Skill` | Invoke a registered skill |
+| `AskUser` | Ask the user a question mid-run |
 | `delegate_to_agent` | Delegate a task to a subagent |
 | `capture_screenshot` | Take a screenshot of a URL |
 
@@ -170,7 +179,7 @@ Agents interact with the workspace through a fixed set of Claude Code-style tool
 
 - **Main agents** are long-lived and can receive user tasks.
 - **Subagents** are ephemeral workers spawned by main agents via `delegate_to_agent`.
-- Delegation depth is fixed at 1: main agent can delegate to subagents, but subagents cannot spawn further subagents.
+- Delegation depth is configurable via `max_delegation_depth` (default 2). Any agent can delegate to any other agent within the depth limit.
 - All actions are policy-gated per agent: `Patch`, `Finalize`, `Delegate` capabilities are declared in frontmatter.
 - Run lifecycle is persisted and cancellation cascades through the run tree.
 
@@ -200,6 +209,29 @@ The server publishes SSE events consumed by both Web UI and TUI:
 | `/api/agent-runs` | GET | List agent runs |
 | `/api/agent-context` | GET | Inspect run context |
 | `/api/agent-cancel` | POST | Cancel an active run |
+| `/api/storage/roots` | GET | List detected config directories (~/.linggen, ~/.claude, etc.) |
+| `/api/storage/tree` | GET | Browse directory tree within a storage root |
+| `/api/storage/file` | GET/PUT/DELETE | Read, write, or delete a file in a storage root |
+
+## Documentation
+
+Detailed design docs live in [`doc/`](doc/):
+
+| Document | Description |
+|----------|-------------|
+| [Product Spec](doc/product-spec.md) | Vision, OS analogy, product goals, UX surface |
+| [Agentic Loop](doc/agentic-loop.md) | Kernel runtime loop — iteration, cancellation, context building, model calls |
+| [Agents](doc/agents.md) | Process management — lifecycle, delegation, scheduling, idle scheduler |
+| [Skills](doc/skills.md) | Dynamic extensions — format, discovery, triggers |
+| [Tools](doc/tools.md) | Syscall interface — built-in tools, safety enforcement |
+| [Events](doc/events.md) | IPC — SSE streaming events, message queue, APIs |
+| [Models](doc/models.md) | Hardware abstraction — providers, routing, credentials, auto-fallback |
+| [Storage](doc/storage.md) | Filesystem layout — persistent state, data formats |
+| [CLI](doc/cli.md) | CLI reference — commands, flags, modes |
+| [Code Style](doc/code-style.md) | Code style rules — flat logic, small files, clean code |
+| [Log Spec](doc/log-spec.md) | Logging — levels, throttling, output targets |
+
+For more information, visit [linggen.dev](https://linggen.dev).
 
 ## License
 

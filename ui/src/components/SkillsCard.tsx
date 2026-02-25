@@ -1,5 +1,5 @@
 import React from 'react';
-import { Settings, Wrench } from 'lucide-react';
+import { Wrench } from 'lucide-react';
 import type { SkillInfoFull } from '../types';
 
 const sourceBadgeCls: Record<string, string> = {
@@ -10,8 +10,7 @@ const sourceBadgeCls: Record<string, string> = {
 
 export const SkillsCard: React.FC<{
   skills: SkillInfoFull[];
-  onManageSkills: () => void;
-}> = ({ skills, onManageSkills }) => {
+}> = ({ skills }) => {
   if (skills.length === 0) {
     return (
       <div className="p-4 text-center text-[11px] text-slate-400 italic">
@@ -65,14 +64,6 @@ export const SkillsCard: React.FC<{
         );
       })}
 
-      <button
-        type="button"
-        onClick={onManageSkills}
-        className="w-full mt-2 inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-[10px] font-semibold text-slate-500 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-slate-50 dark:hover:bg-white/5 rounded-lg transition-colors"
-      >
-        <Settings size={11} />
-        Manage Skills
-      </button>
     </div>
   );
 };

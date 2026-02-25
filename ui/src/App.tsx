@@ -1,5 +1,5 @@
 import React, { useCallback, useMemo, useState, useEffect, useRef } from 'react';
-import { Bot, FilePenLine, Sparkles, Target, Zap } from 'lucide-react';
+import { Bot, FilePenLine, Settings, Sparkles, Target, Zap } from 'lucide-react';
 import { AgentsCard } from './components/AgentsCard';
 import { SessionNav } from './components/SessionNav';
 import { TaskListCard } from './components/TaskListCard';
@@ -10,7 +10,7 @@ import { FilePreview } from './components/FilePreview';
 import { ChatPanel } from './components/ChatPanel';
 import { HeaderBar } from './components/HeaderBar';
 import { SettingsPage } from './components/SettingsPage';
-import { MemoryPage } from './components/MemoryPage';
+import { StoragePage } from './components/StoragePage';
 import { MissionPage } from './components/MissionPage';
 import { MissionSidebarCard } from './components/MissionSidebarCard';
 import { AgentSpecEditorModal } from './components/AgentSpecEditorModal';
@@ -215,7 +215,9 @@ const stripEmbeddedStructuredJson = (text: string): string => {
 const isStatusLineText = (text: string) =>
   text === 'Thinking...' ||
   text === 'Thinking' ||
+  text.startsWith('Thinking (') ||
   text === 'Model loading...' ||
+  text.startsWith('Loading model:') ||
   text === 'Running' ||
   text === 'Reading file...' ||
   text.startsWith('Reading file:') ||
@@ -579,7 +581,7 @@ const updateParentSubagentTree = (
   return next;
 };
 
-type Page = 'main' | 'settings' | 'memory' | 'mission';
+type Page = 'main' | 'settings' | 'storage' | 'mission';
 
 const App: React.FC = () => {
   const [currentPage, setCurrentPage] = useState<Page>('main');
@@ -595,6 +597,7 @@ const App: React.FC = () => {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [ollamaStatus, setOllamaStatus] = useState<OllamaPsResponse | null>(null);
+  const [defaultModels, setDefaultModels] = useState<string[]>([]);
 
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -772,20 +775,11 @@ const App: React.FC = () => {
 
   const [agentContext, setAgentContext] = useState<Record<string, { tokens: number; messages: number; tokenLimit?: number }>>({});
 
-  const shouldHideInternalChatMessage = useCallback((from?: string, text?: string) => {
+  const shouldHideInternalChatMessage = useCallback((_from?: string, text?: string) => {
     if (!text) return false;
-    const stripped = stripToolPayloadLines(text);
-    const hasToolPayload = extractToolNamesFromText(text).length > 0;
-    const isToolResult = isToolResultMessage(from, text);
-    
-    // Hide tool results and tool payloads that have no other text
-    if ((isToolResult || hasToolPayload) && !stripped) return true;
-    
-    // Explicitly hide any message that looks like a raw Read output if it's from 'system'
-    if (from === 'system' && text.includes('Read:')) return true;
-
-    if (from !== 'system') return false;
-    return text.startsWith('Starting autonomous loop for task:');
+    // Only hide internal boilerplate — everything else should be visible.
+    if (text.startsWith('Starting autonomous loop for task:')) return true;
+    return false;
   }, []);
 
   const chatMessageKey = useCallback((msg: ChatMessage) => {
@@ -851,18 +845,30 @@ const App: React.FC = () => {
     if (live.length === 0) return dedupPlanMessages(persisted);
 
     const persistedWithActivity = persisted.map((msg) => {
+      // Find a matching live message that has richer metadata (activity, subagent tree, etc.)
       const matchingLive = live.find(
         (candidate) =>
           !candidate.isGenerating &&
           likelySameMessage(msg, candidate) &&
-          !!candidate.activityEntries &&
-          candidate.activityEntries.length > 0
+          (
+            (candidate.activityEntries && candidate.activityEntries.length > 0) ||
+            candidate.subagentTree ||
+            candidate.segments ||
+            candidate.toolCount ||
+            candidate.durationMs ||
+            candidate.contextTokens
+          )
       );
       if (!matchingLive) return msg;
       return {
         ...msg,
-        activityEntries: matchingLive.activityEntries,
-        activitySummary: matchingLive.activitySummary,
+        activityEntries: matchingLive.activityEntries || msg.activityEntries,
+        activitySummary: matchingLive.activitySummary || msg.activitySummary,
+        subagentTree: matchingLive.subagentTree || msg.subagentTree,
+        segments: matchingLive.segments || msg.segments,
+        toolCount: matchingLive.toolCount || msg.toolCount,
+        durationMs: matchingLive.durationMs || msg.durationMs,
+        contextTokens: matchingLive.contextTokens || msg.contextTokens,
       };
     });
 
@@ -1116,7 +1122,7 @@ const App: React.FC = () => {
   };
 
   const fetchWorkspaceState = useCallback(async () => {
-    if (!selectedProjectRoot) return;
+    if (!selectedProjectRoot || !activeSessionId) return;
     try {
       const url = new URL('/api/workspace/state', window.location.origin);
       url.searchParams.append('project_root', selectedProjectRoot);
@@ -1151,13 +1157,12 @@ const App: React.FC = () => {
               }
             } catch { /* not pure JSON */ }
 
-            // Strip embedded plan JSON from agent text to avoid showing duplicate plan blocks
+            // Strip embedded plan/tool JSON from agent text — backend already sanitized
+            // tool calls/results into status lines, so just remove leftover JSON blocks.
             if (!isUser) {
               bodyStr = stripEmbeddedStructuredJson(bodyStr);
             }
-
-            const cleaned = isUser ? bodyStr : stripToolPayloadLines(bodyStr);
-            if (!isUser && !cleaned) return [];
+            if (!isUser && !bodyStr) return [];
             return [{
               role:
                 meta.from === 'user'
@@ -1165,7 +1170,7 @@ const App: React.FC = () => {
                   : 'agent',
               from: meta.from,
               to: meta.to,
-              text: cleaned,
+              text: bodyStr,
               timestamp: new Date(meta.ts * 1000).toLocaleTimeString(),
               timestampMs: Number(meta.ts || 0) * 1000,
             }];
@@ -1296,6 +1301,37 @@ const App: React.FC = () => {
     }
   }, []);
 
+  const fetchDefaultModels = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/config');
+      if (resp.ok) {
+        const data = await resp.json();
+        setDefaultModels(data.routing?.default_models ?? []);
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  const toggleDefaultModel = useCallback(async (modelId: string) => {
+    try {
+      const resp = await fetch('/api/config');
+      if (!resp.ok) return;
+      const config = await resp.json();
+      const current: string[] = config.routing?.default_models ?? [];
+      const newDefaults = current.includes(modelId)
+        ? current.filter((id: string) => id !== modelId)
+        : [...current, modelId];
+      const updated = { ...config, routing: { ...config.routing, default_models: newDefaults } };
+      const saveResp = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updated),
+      });
+      if (saveResp.ok) {
+        setDefaultModels(newDefaults);
+      }
+    } catch { /* ignore */ }
+  }, []);
+
   const fetchOllamaStatus = useCallback(async () => {
     try {
       const resp = await fetch('/api/utils/ollama-status');
@@ -1407,11 +1443,12 @@ const App: React.FC = () => {
     fetchSkills();
     fetchAgents();
     fetchModels();
-    
+    fetchDefaultModels();
+
     const interval = setInterval(fetchOllamaStatus, 5000);
     fetchOllamaStatus();
     return () => clearInterval(interval);
-  }, [fetchProjects, fetchSkills, fetchAgents, fetchModels, fetchOllamaStatus]);
+  }, [fetchProjects, fetchSkills, fetchAgents, fetchModels, fetchDefaultModels, fetchOllamaStatus]);
 
   useEffect(() => {
     if (selectedProjectRoot) {
@@ -1570,6 +1607,7 @@ const App: React.FC = () => {
               subagentStatsRef.current[subagentId.toLowerCase()] = { toolCount: 0, contextTokens: 0 };
               const newEntry: SubagentTreeEntry = {
                 subagentId,
+                agentName: subagentId,
                 task,
                 status: 'running',
                 toolCount: 0,
@@ -1982,7 +2020,11 @@ const App: React.FC = () => {
               },
             ];
           });
-          fetchWorkspaceState();
+          // Don't call fetchWorkspaceState() here — the SSE message event already
+          // updates the chat state. Fetching workspace state mid-run can clobber
+          // rich metadata (subagentTree, activityEntries) on live messages because
+          // persisted messages lack that metadata.  The outcome/sync events already
+          // trigger fetchWorkspaceState when the run finishes.
         }
 
         if (item.kind === 'model_fallback') {
@@ -2232,14 +2274,15 @@ const App: React.FC = () => {
           setCurrentPage('main');
           setInitialSettingsTab(undefined);
           fetchModels();
+          fetchDefaultModels();
           fetchOllamaStatus();
         }}
         projectRoot={selectedProjectRoot}
         initialTab={initialSettingsTab}
       />
     )}
-    {currentPage === 'memory' && (
-      <MemoryPage
+    {currentPage === 'storage' && (
+      <StoragePage
         onBack={() => setCurrentPage('main')}
       />
     )}
@@ -2269,7 +2312,7 @@ const App: React.FC = () => {
         onToggleVerbose={() => setVerboseMode((v) => !v)}
         onOpenMission={() => setCurrentPage('mission')}
         missionActive={!!mission?.active}
-        onOpenMemory={() => setCurrentPage('memory')}
+        onOpenStorage={() => setCurrentPage('storage')}
         onOpenSettings={() => setCurrentPage('settings')}
       />
 
@@ -2389,6 +2432,15 @@ const App: React.FC = () => {
             iconColor="text-purple-500"
             badge={`${models.length}`}
             defaultOpen
+            headerAction={
+              <button
+                onClick={() => { setInitialSettingsTab('models'); setCurrentPage('settings'); }}
+                className="p-1 hover:bg-slate-100 dark:hover:bg-white/5 rounded transition-colors text-slate-400 hover:text-blue-500"
+                title="Manage Models"
+              >
+                <Settings size={12} />
+              </button>
+            }
           >
             <ModelsCard
               models={models}
@@ -2397,6 +2449,8 @@ const App: React.FC = () => {
               chatMessages={chatMessages}
               tokensPerSec={tokensPerSec}
               agentContext={agentContext}
+              defaultModels={defaultModels}
+              onToggleDefault={toggleDefaultModel}
             />
           </CollapsibleCard>
           <CollapsibleCard
@@ -2405,14 +2459,17 @@ const App: React.FC = () => {
             iconColor="text-amber-500"
             badge={`${skills.length} loaded`}
             defaultOpen
+            headerAction={
+              <button
+                onClick={() => { setInitialSettingsTab('skills'); setCurrentPage('settings'); }}
+                className="p-1 hover:bg-slate-100 dark:hover:bg-white/5 rounded transition-colors text-slate-400 hover:text-blue-500"
+                title="Manage Skills"
+              >
+                <Settings size={12} />
+              </button>
+            }
           >
-            <SkillsCard
-              skills={skills}
-              onManageSkills={() => {
-                setInitialSettingsTab('skills');
-                setCurrentPage('settings');
-              }}
-            />
+            <SkillsCard skills={skills} />
           </CollapsibleCard>
         </aside>
       </div>

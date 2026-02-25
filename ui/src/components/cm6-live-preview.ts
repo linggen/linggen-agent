@@ -7,8 +7,8 @@
  * When cursor is on a line, syntax is shown; when cursor moves away,
  * the markdown is rendered.
  *
- * Ported from linggen-memory's cm6-live-preview.ts with theme
- * adjustments for linggen-agent's Tailwind v4 UI.
+ * CodeMirror 6 live preview extension with theme
+ * adjustments for Tailwind v4 UI.
  */
 
 import {

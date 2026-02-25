@@ -457,12 +457,9 @@ const renderAgentMessageBody = (text: string) => {
 
 const sanitizeAgentMessageText = (text: string) => {
   if (!text) return '';
-  // Optimization: if it's a raw tool result from system, we often want to hide it entirely
-  if (text.startsWith('Read:') || text.startsWith('Tool Read:')) return '';
-  
+
   const withoutEmbedded = stripStructuredJsonFromText(text);
   const lines = withoutEmbedded.split('\n');
-  const readFileRelated = /read:|content omitted in chat/i.test(withoutEmbedded);
   const kept: string[] = [];
   for (const line of lines) {
     const trimmed = line.trim();
@@ -470,23 +467,12 @@ const sanitizeAgentMessageText = (text: string) => {
       if (kept.length > 0 && kept[kept.length - 1] !== '') kept.push('');
       continue;
     }
+    // Strip raw JSON tool call payloads (already converted to status lines by backend)
     if (parseToolNameFromLine(trimmed)) continue;
-    if (/^Tool\s+Bash\s*:\s*Bash output \(exit_code:/i.test(trimmed)) {
-      kept.push(trimmed.replace(/^Tool\s+Bash\s*:\s*/i, ''));
-      continue;
-    }
-    if (TOOL_RESULT_LINE_RE.test(trimmed)) {
-      // Preserve WebSearch results — strip the "Tool WebSearch:" prefix but keep the content
-      const wsToolMatch = /^Tool\s+WebSearch\s*:\s*(.*)$/i.exec(trimmed);
-      if (wsToolMatch) {
-        kept.push(wsToolMatch[1]);
-        continue;
-      }
-      continue;
-    }
+    // Strip internal boilerplate
     if (START_AUTONOMOUS_LINE_RE.test(trimmed)) continue;
     if (CONTENT_OMITTED_LINE_RE.test(trimmed)) continue;
-    if (readFileRelated && looksLikeCodeLine(trimmed)) continue;
+    // Keep everything else: tool results, errors, model text
     kept.push(line);
   }
   return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
@@ -709,6 +695,13 @@ const parseActivityEntry = (entry: string): { tool: string; detail: string; isDo
   if (/^Running command/i.test(e)) return { tool: 'Bash', detail: '', isDone: false };
   if (/^Searching/i.test(e)) return { tool: 'Grep', detail: '', isDone: false };
   if (/^Listing files/i.test(e)) return { tool: 'Glob', detail: '', isDone: false };
+  // Model loading / thinking with model name
+  const loadingMatch = e.match(/^Loading model:\s*(.*)$/i);
+  if (loadingMatch) return { tool: 'Loading', detail: loadingMatch[1].trim(), isDone: false };
+  const thinkingMatch = e.match(/^Thinking\s*\(([^)]+)\)$/i);
+  if (thinkingMatch) return { tool: 'Thinking', detail: thinkingMatch[1].trim(), isDone: false };
+  if (/^Thinking/i.test(e)) return { tool: 'Thinking', detail: '', isDone: false };
+  if (/^Model loading/i.test(e)) return { tool: 'Loading', detail: '', isDone: false };
   return { tool: '', detail: e, isDone: false };
 };
 
@@ -840,10 +833,13 @@ const SubagentTreeView: React.FC<{
   const totalTools = entries.reduce((s, e) => s + e.toolCount, 0);
   const totalTokens = entries.reduce((s, e) => s + e.contextTokens, 0);
 
-  // Header text
+  // Header text — show agent names when possible
+  const agentNames = (allDone ? entries : running).map((e) => e.agentName || e.subagentId).filter(Boolean);
+  const uniqueNames = [...new Set(agentNames)];
+  const namesSuffix = uniqueNames.length > 0 ? ` (${uniqueNames.join(', ')})` : '';
   const headerText = allDone
-    ? `${entries.length} agent${entries.length === 1 ? '' : 's'} finished`
-    : `Running ${running.length} agent${running.length === 1 ? '' : 's'}…`;
+    ? `${entries.length} agent${entries.length === 1 ? '' : 's'} finished${namesSuffix}`
+    : `Running ${running.length} agent${running.length === 1 ? '' : 's'}${namesSuffix}…`;
 
   const headerColor = allDone
     ? 'text-emerald-600 dark:text-emerald-400'
@@ -901,6 +897,7 @@ const SubagentTreeView: React.FC<{
               <div className="flex items-start gap-0">
                 <span className="text-slate-400 dark:text-slate-600 select-none shrink-0">{branch} </span>
                 <span className={cn('text-[10px] mt-px mr-1', entryDotColor)}>●</span>
+                {entry.agentName && <span className="text-blue-600 dark:text-blue-400 mr-1 font-medium">{entry.agentName}</span>}
                 <span className="text-slate-700 dark:text-slate-200">{taskPreview}</span>
                 <span className="text-slate-400 dark:text-slate-500">{statsStr}</span>
               </div>

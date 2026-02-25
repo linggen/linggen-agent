@@ -109,11 +109,13 @@ pub(crate) async fn get_workspace_state(
         let user_stories = ctx.state_fs.read_file("user-stories.md").ok();
         let tasks = ctx.state_fs.list_tasks().unwrap_or_default();
 
-        let session_id = query.session_id.as_deref().unwrap_or("default");
-        let messages = ctx
-            .sessions
-            .get_chat_history(session_id, None)
-            .unwrap_or_default();
+        let messages = match query.session_id.as_deref() {
+            Some(sid) if !sid.is_empty() => ctx
+                .sessions
+                .get_chat_history(sid, None)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
 
         let mapped_messages: Vec<(crate::state_fs::StateFile, String)> = messages
             .into_iter()

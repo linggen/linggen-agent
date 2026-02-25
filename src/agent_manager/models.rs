@@ -4,13 +4,33 @@ use crate::ollama::{ChatMessage, OllamaClient};
 use crate::openai::OpenAiClient;
 use anyhow::Result;
 use futures_util::{Stream, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::Instant;
+
+// ---------------------------------------------------------------------------
+// Token usage tracking from API responses
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: Option<usize>,
+    pub completion_tokens: Option<usize>,
+    pub total_tokens: Option<usize>,
+}
+
+/// Items yielded by the streaming chat API.
+#[derive(Debug, Clone)]
+pub enum StreamChunk {
+    /// A text token (content or thinking).
+    Token(String),
+    /// Final usage stats from the API (emitted at end of stream).
+    Usage(TokenUsage),
+}
 
 // ---------------------------------------------------------------------------
 // Model health tracking (in-memory, resets on restart)
@@ -198,7 +218,7 @@ impl ModelManager {
         &self,
         model_id: &str,
         messages: &[ChatMessage],
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
         let instance = self
             .models
             .get(model_id)
@@ -216,7 +236,7 @@ impl ModelManager {
         model_id: &str,
         messages: &[ChatMessage],
         keep_alive: Option<String>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
         let instance = self
             .models
             .get(model_id)
@@ -230,7 +250,7 @@ impl ModelManager {
                 // Try streaming first; auto-fallback to non-streaming on 503
                 // (e.g. Ollama cloud-proxied models that don't support streaming).
                 // Retry up to 3 times with backoff for 503 errors (model loading).
-                let boxed_stream: Pin<Box<dyn Stream<Item = Result<String>> + Send>> = match client
+                let boxed_stream: Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>> = match client
                     .chat_text_stream_with_keep_alive(
                         &instance.config.model,
                         messages,
@@ -278,7 +298,7 @@ impl ModelManager {
                         }
                         match result {
                             Some(msg) => {
-                                Box::pin(futures_util::stream::once(async move { Ok(msg) }))
+                                Box::pin(futures_util::stream::once(async move { Ok(StreamChunk::Token(msg)) }))
                             }
                             None => return Err(last_err),
                         }
@@ -299,7 +319,7 @@ impl ModelManager {
                 let stream = client
                     .chat_text_stream(&instance.config.model, messages)
                     .await?;
-                let boxed_stream: Pin<Box<dyn Stream<Item = Result<String>> + Send>> =
+                let boxed_stream: Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>> =
                     Box::pin(stream);
                 Ok(Box::pin(futures_util::stream::unfold(
                     (boxed_stream, _permit),

@@ -86,6 +86,10 @@ pub enum AgentEvent {
         estimated_tokens: usize,
         #[serde(default)]
         token_limit: Option<usize>,
+        #[serde(default)]
+        actual_prompt_tokens: Option<usize>,
+        #[serde(default)]
+        actual_completion_tokens: Option<usize>,
         compressed: bool,
         summary_count: usize,
     },
@@ -103,6 +107,12 @@ pub enum AgentEvent {
         preferred_model: String,
         actual_model: String,
         reason: String,
+    },
+    ToolProgress {
+        agent_id: String,
+        tool: String,
+        line: String,
+        stream: String, // "stdout" | "stderr"
     },
     StateUpdated,
 }

@@ -15,8 +15,6 @@ pub struct Config {
     pub agents: Vec<AgentSpecRef>,
     #[serde(default)]
     pub routing: RoutingConfig,
-    #[serde(default)]
-    pub memory: MemoryConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -225,39 +223,6 @@ pub struct LoggingConfig {
     pub retention_days: Option<u64>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct MemoryConfig {
-    #[serde(default = "default_memory_server_port")]
-    pub server_port: u16,
-    #[serde(default = "default_memory_server_url")]
-    pub server_url: String,
-    /// Whether `ling start` should also start the memory server as a sidecar.
-    #[serde(default = "default_true")]
-    pub auto_start: bool,
-}
-
-fn default_memory_server_port() -> u16 {
-    8787
-}
-
-fn default_memory_server_url() -> String {
-    "http://127.0.0.1:8787".to_string()
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            server_port: default_memory_server_port(),
-            server_url: default_memory_server_url(),
-            auto_start: true,
-        }
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct RoutingConfig {
     #[serde(default)]
@@ -353,6 +318,12 @@ impl Config {
             if !seen_ids.insert(&model.id) {
                 anyhow::bail!("Duplicate model ID: {}", model.id);
             }
+            if model.model.trim().is_empty() {
+                anyhow::bail!(
+                    "Model '{}' has an empty model name. Set the 'model' field to the actual model name (e.g. gemini-2.0-flash).",
+                    model.id
+                );
+            }
             // Validate provider is known.
             let known_providers = ["ollama", "openai", "gemini", "groq", "deepseek", "openrouter", "github"];
             if !known_providers.contains(&model.provider.as_str()) {
@@ -423,7 +394,6 @@ impl Default for Config {
             },
             agents: Vec::new(),
             routing: RoutingConfig::default(),
-            memory: MemoryConfig::default(),
         }
     }
 }
@@ -717,16 +687,6 @@ Write code."#;
             let deserialized: WriteSafetyMode = serde_json::from_str(expected).unwrap();
             assert_eq!(&deserialized, mode);
         }
-    }
-
-    // ---- MemoryConfig defaults ----
-
-    #[test]
-    fn test_memory_config_defaults() {
-        let mc = MemoryConfig::default();
-        assert_eq!(mc.server_port, 8787);
-        assert_eq!(mc.server_url, "http://127.0.0.1:8787");
-        assert!(mc.auto_start);
     }
 
     // ---- Config TOML round-trip ----

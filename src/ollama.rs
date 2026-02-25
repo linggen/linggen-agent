@@ -1,3 +1,4 @@
+use crate::agent_manager::models::{StreamChunk, TokenUsage};
 use anyhow::Result;
 use futures_util::Stream;
 use futures_util::StreamExt;
@@ -133,7 +134,7 @@ impl OllamaClient {
         &self,
         model: &str,
         messages: &[ChatMessage],
-    ) -> Result<impl Stream<Item = Result<String>> + Send> {
+    ) -> Result<impl Stream<Item = Result<StreamChunk>> + Send> {
         self.chat_text_stream_with_keep_alive(model, messages, None)
             .await
     }
@@ -143,10 +144,10 @@ impl OllamaClient {
         model: &str,
         messages: &[ChatMessage],
         keep_alive: Option<String>,
-    ) -> Result<impl Stream<Item = Result<String>> + Send> {
+    ) -> Result<impl Stream<Item = Result<StreamChunk>> + Send> {
         let total_len: usize = messages.iter().map(|m| m.content.len()).sum();
         if let Some(last) = messages.last() {
-            tracing::info!("Ollama Request (Stream): model={}, messages={}, total_chars={}\nLast Message ({}): {:.200}...", 
+            tracing::info!("Ollama Request (Stream): model={}, messages={}, total_chars={}\nLast Message ({}): {:.200}...",
                 model, messages.len(), total_len, last.role, last.content);
         } else {
             tracing::info!(
@@ -183,21 +184,44 @@ impl OllamaClient {
         let reader = tokio_util::io::StreamReader::new(stream);
         let lines = FramedRead::new(reader, LinesCodec::new());
 
-        let token_stream = lines.map(|line_result| {
-            let line = line_result.map_err(|e| anyhow::anyhow!("stream error: {}", e))?;
+        let token_stream = lines.filter_map(|line_result| async move {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(e) => return Some(Err(anyhow::anyhow!("stream error: {}", e))),
+            };
             if line.trim().is_empty() {
-                return Ok("".to_string());
+                return None;
             }
             // Ollama sends one JSON object per line
-            let payload: ChatResponse = serde_json::from_str(&line)
-                .map_err(|e| anyhow::anyhow!("json parse error: {} (line: {})", e, line))?;
+            let payload: ChatStreamResponse = match serde_json::from_str(&line) {
+                Ok(p) => p,
+                Err(e) => return Some(Err(anyhow::anyhow!("json parse error: {} (line: {})", e, line))),
+            };
+
+            // When done==true, Ollama includes token usage stats.
+            if payload.done.unwrap_or(false) {
+                let usage = TokenUsage {
+                    prompt_tokens: payload.prompt_eval_count.map(|v| v as usize),
+                    completion_tokens: payload.eval_count.map(|v| v as usize),
+                    total_tokens: match (payload.prompt_eval_count, payload.eval_count) {
+                        (Some(p), Some(c)) => Some((p + c) as usize),
+                        _ => None,
+                    },
+                };
+                return Some(Ok(StreamChunk::Usage(usage)));
+            }
+
             // Emit thinking tokens followed by content tokens
             let mut result = String::new();
             if let Some(thinking) = &payload.message.thinking {
                 result.push_str(thinking);
             }
             result.push_str(&payload.message.content);
-            Ok(result)
+            if result.is_empty() {
+                None
+            } else {
+                Some(Ok(StreamChunk::Token(result)))
+            }
         });
 
         Ok(token_stream)
@@ -458,6 +482,11 @@ pub struct ChatMessage {
     pub thinking: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// Cache control hint for API providers that support prompt caching.
+    /// E.g. `{"type": "ephemeral"}` for Anthropic/OpenAI cache breakpoints.
+    /// Skipped during serialization for providers that don't support it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<serde_json::Value>,
 }
 
 impl ChatMessage {
@@ -467,11 +496,17 @@ impl ChatMessage {
             content: content.into(),
             thinking: None,
             images: Vec::new(),
+            cache_control: None,
         }
     }
 
     pub fn with_images(mut self, images: Vec<String>) -> Self {
         self.images = images;
+        self
+    }
+
+    pub fn with_cache_control(mut self) -> Self {
+        self.cache_control = Some(serde_json::json!({"type": "ephemeral"}));
         self
     }
 }
@@ -491,4 +526,16 @@ struct ChatRequest {
 #[derive(Debug, Clone, Deserialize)]
 struct ChatResponse {
     message: ChatMessage,
+}
+
+/// Extended response type for streaming chunks, includes token usage fields.
+#[derive(Debug, Clone, Deserialize)]
+struct ChatStreamResponse {
+    message: ChatMessage,
+    #[serde(default)]
+    done: Option<bool>,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
 }

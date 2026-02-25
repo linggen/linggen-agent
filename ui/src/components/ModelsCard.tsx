@@ -1,5 +1,5 @@
 import React from 'react';
-import { Bot } from 'lucide-react';
+import { Bot, Star } from 'lucide-react';
 import { cn } from '../lib/cn';
 import type { AgentInfo, ChatMessage, ModelInfo, OllamaPsResponse } from '../types';
 
@@ -18,7 +18,9 @@ export const ModelsCard: React.FC<{
   chatMessages: ChatMessage[];
   tokensPerSec?: number;
   agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
-}> = ({ models, agents, ollamaStatus, tokensPerSec, agentContext }) => {
+  defaultModels?: string[];
+  onToggleDefault?: (modelId: string) => void;
+}> = ({ models, agents, ollamaStatus, tokensPerSec, agentContext, defaultModels = [], onToggleDefault }) => {
   const tps = Number.isFinite(Number(tokensPerSec)) ? Number(tokensPerSec) : 0;
 
   return (
@@ -33,15 +35,33 @@ export const ModelsCard: React.FC<{
           return agentModel === modelId || agentModel === modelName || (!agentModel && models.length === 1);
         });
 
+        const isStarred = defaultModels.includes(m.id);
         return (
-          <div key={m.id} className="rounded-lg border border-slate-100 dark:border-white/5 bg-slate-50/50 dark:bg-white/[0.02] p-2.5 space-y-1.5">
+          <div key={m.id} className={cn(
+            'rounded-lg border bg-slate-50/50 dark:bg-white/[0.02] p-2.5 space-y-1.5',
+            isStarred ? 'border-amber-300/60 dark:border-amber-700/40' : 'border-slate-100 dark:border-white/5'
+          )}>
             {/* Model name + status */}
             <div className="flex items-center justify-between gap-1">
               <div className="flex items-center gap-1.5 min-w-0">
                 <div className={cn('w-1.5 h-1.5 rounded-full shrink-0', isActive ? 'bg-green-500 animate-pulse' : 'bg-slate-300 dark:bg-slate-600')} />
-                <span className="font-mono font-bold text-[11px] truncate">{m.model}</span>
+                <span className="font-mono font-bold text-[11px] truncate">{m.model || m.id}</span>
               </div>
-              <span className="text-[8px] text-slate-400 uppercase tracking-wide shrink-0">{m.provider}</span>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <span className="text-[8px] text-slate-400 uppercase tracking-wide">{m.provider}</span>
+                {onToggleDefault && (
+                  <button
+                    onClick={() => onToggleDefault(m.id)}
+                    className={cn(
+                      'p-0.5 transition-colors',
+                      isStarred ? 'text-amber-500 hover:text-amber-600' : 'text-slate-300 hover:text-amber-500'
+                    )}
+                    title={isStarred ? 'Remove from defaults' : 'Add to defaults'}
+                  >
+                    <Star size={11} fill={isStarred ? 'currentColor' : 'none'} />
+                  </button>
+                )}
+              </div>
             </div>
 
             {/* Model stats when active */}

@@ -46,20 +46,7 @@ pub async fn run(config: &Config, config_path: Option<&Path>) -> Result<()> {
         false => info("Agent server", &format!("port {} not reachable", port)),
     }
 
-    // 5. Memory server
-    let mem_port = config.memory.server_port;
-    match check_tcp_port(mem_port).await {
-        true => ok("Memory server", &format!("port {} is listening", mem_port)),
-        false => info("Memory server", &format!("port {} not reachable", mem_port)),
-    }
-
-    // 5b. Memory binary
-    match crate::cli::daemon::find_memory_binary() {
-        Some(bin) => ok("Memory binary", &bin),
-        None => info("Memory binary", "not found (install with: ling install --memory)"),
-    }
-
-    // 6. Models
+    // 5. Models
     check_models(config).await;
 
     // 7. Skills dirs

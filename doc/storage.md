@@ -38,9 +38,7 @@ Project path encoding: `/Users/foo/project` → `-Users-foo-project` (same conve
 │   └── {name}/SKILL.md              # Nested skill directories
 ├── credentials.json                  # API keys for model providers (JSON)
 ├── ling.pid                          # Daemon PID
-├── ling.log                          # Daemon stdout
-├── ling-mem.pid                      # Memory server PID
-└── ling-mem.log                      # Memory server stdout
+└── ling.log                          # Daemon stdout
 ```
 
 ## Per-project state (`~/.linggen/projects/{encoded}/`)

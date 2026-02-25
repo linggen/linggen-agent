@@ -30,7 +30,7 @@ fn is_rfc1918_172(host: &str) -> bool {
     false
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ToolCall {
     pub tool: String,
     pub args: Value,
@@ -126,6 +126,11 @@ pub struct SearchMatch {
     pub snippet: String,
 }
 
+/// Sender for streaming tool progress lines (tool_name, stream_name, line).
+/// Uses tokio's unbounded channel so the sender works in sync contexts
+/// and the receiver can be held across async .await points.
+pub type ToolProgressSender = tokio::sync::mpsc::UnboundedSender<(String, String, String)>;
+
 pub struct Tools {
     root: PathBuf,
     manager: Option<Arc<AgentManager>>,
@@ -136,6 +141,7 @@ pub struct Tools {
     agent_policy: Option<AgentPolicy>,
     memory_dir: Option<PathBuf>,
     ask_user_bridge: Option<Arc<AskUserBridge>>,
+    progress_tx: Option<ToolProgressSender>,
 }
 
 impl Tools {
@@ -150,6 +156,7 @@ impl Tools {
             agent_policy: None,
             memory_dir: None,
             ask_user_bridge: None,
+            progress_tx: None,
         })
     }
 
@@ -196,6 +203,10 @@ impl Tools {
 
     pub fn set_ask_user_bridge(&mut self, bridge: Arc<AskUserBridge>) {
         self.ask_user_bridge = Some(bridge);
+    }
+
+    pub fn set_progress_tx(&mut self, tx: ToolProgressSender) {
+        self.progress_tx = Some(tx);
     }
 
     pub fn ask_user_bridge(&self) -> Option<&Arc<AskUserBridge>> {
@@ -715,6 +726,8 @@ impl Tools {
     }
 
     fn run_command(&self, args: RunCommandArgs) -> Result<ToolResult> {
+        use std::io::BufRead;
+
         // Hybrid shell mode: support common dev/inspection tools while enforcing
         // an allowlist on every shell segment.
         validate_shell_command(&args.cmd)?;
@@ -737,6 +750,59 @@ impl Tools {
                 .spawn()?
         };
 
+        // Take stdout/stderr handles for line-by-line streaming.
+        let child_stdout = child.stdout.take();
+        let child_stderr = child.stderr.take();
+        let progress_tx = self.progress_tx.clone();
+
+        // Spawn reader threads that accumulate output and optionally send
+        // progress lines through the channel.
+        let stdout_handle = std::thread::spawn({
+            let tx = progress_tx.clone();
+            move || {
+                let mut acc = String::new();
+                if let Some(stdout) = child_stdout {
+                    let reader = std::io::BufReader::new(stdout);
+                    for line in reader.lines() {
+                        match line {
+                            Ok(l) => {
+                                if let Some(tx) = &tx {
+                                    let _ = tx.send(("Bash".to_string(), "stdout".to_string(), l.clone()));
+                                }
+                                acc.push_str(&l);
+                                acc.push('\n');
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                acc
+            }
+        });
+        let stderr_handle = std::thread::spawn({
+            let tx = progress_tx;
+            move || {
+                let mut acc = String::new();
+                if let Some(stderr) = child_stderr {
+                    let reader = std::io::BufReader::new(stderr);
+                    for line in reader.lines() {
+                        match line {
+                            Ok(l) => {
+                                if let Some(tx) = &tx {
+                                    let _ = tx.send(("Bash".to_string(), "stderr".to_string(), l.clone()));
+                                }
+                                acc.push_str(&l);
+                                acc.push('\n');
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                acc
+            }
+        });
+
+        // Wait for the process with timeout.
         let start = Instant::now();
         let mut timed_out = false;
         loop {
@@ -751,8 +817,12 @@ impl Tools {
             std::thread::sleep(Duration::from_millis(25));
         }
 
-        let output = child.wait_with_output()?;
-        let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let exit_status = child.wait()?;
+
+        // Join reader threads and collect accumulated output.
+        let stdout = stdout_handle.join().unwrap_or_default();
+        let mut stderr = stderr_handle.join().unwrap_or_default();
+
         if timed_out {
             if !stderr.is_empty() && !stderr.ends_with('\n') {
                 stderr.push('\n');
@@ -764,8 +834,8 @@ impl Tools {
         }
 
         Ok(ToolResult::CommandOutput {
-            exit_code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            exit_code: exit_status.code(),
+            stdout,
             stderr,
         })
     }

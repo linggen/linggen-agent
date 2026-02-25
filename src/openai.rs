@@ -1,3 +1,4 @@
+use crate::agent_manager::models::{StreamChunk, TokenUsage};
 use anyhow::Result;
 use futures_util::Stream;
 use reqwest::Client;
@@ -80,7 +81,7 @@ impl OpenAiClient {
         &self,
         model: &str,
         messages: &[crate::ollama::ChatMessage],
-    ) -> Result<impl Stream<Item = Result<String>> + Send> {
+    ) -> Result<impl Stream<Item = Result<StreamChunk>> + Send> {
         let total_len: usize = messages.iter().map(|m| m.content.len()).sum();
         if let Some(last) = messages.last() {
             tracing::info!(
@@ -148,6 +149,16 @@ impl OpenAiClient {
                     )));
                 }
             };
+
+            // Check for usage data (some providers include it in the final chunk).
+            if let Some(usage) = chunk.usage {
+                return Some(Ok(StreamChunk::Usage(TokenUsage {
+                    prompt_tokens: usage.prompt_tokens.map(|v| v as usize),
+                    completion_tokens: usage.completion_tokens.map(|v| v as usize),
+                    total_tokens: usage.total_tokens.map(|v| v as usize),
+                })));
+            }
+
             let content = chunk
                 .choices
                 .into_iter()
@@ -157,7 +168,7 @@ impl OpenAiClient {
             if content.is_empty() {
                 None
             } else {
-                Some(Ok(content))
+                Some(Ok(StreamChunk::Token(content)))
             }
         });
 
@@ -250,6 +261,18 @@ struct OaiChoiceMessage {
 #[derive(Debug, Deserialize)]
 struct OaiStreamChunk {
     choices: Vec<OaiStreamChoice>,
+    #[serde(default)]
+    usage: Option<OaiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OaiUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    total_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

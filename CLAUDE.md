@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Please read `.claude/skills/memory/SKILL.md` on load to understand the Linggen Memory skill and context management system.
+Please read `.claude/skills/memory/SKILL.md` on load to understand the Linggen memory system (raw text `.linggen/memory/*.md` files).
 
 ## Doc and Spec
 
@@ -92,14 +92,13 @@ Linggen Agent is a local-first, multi-agent coding assistant. Two entry points: 
 
 React 19 + TypeScript + Tailwind CSS v4 + Vite. Key files:
 
-- **`App.tsx`** — Main app component. Manages projects, sessions, agents, SSE event handling, page routing (`main`, `settings`, `memory`, `mission`).
+- **`App.tsx`** — Main app component. Manages projects, sessions, agents, SSE event handling, page routing (`main`, `settings`, `mission`).
 - **`components/ChatPanel.tsx`** — Chat interface with message rendering, tool activity display, markdown/code rendering.
 - **`components/MissionPage.tsx`** — Dedicated mission management page with 4 tabs: Editor, Agent Config, History, Activity.
-- **`components/MemoryPage.tsx`** — Memory server management (indexed sources, search, jobs).
 - **`components/SettingsPage.tsx`** — Settings management (models, agents, skills, general config).
 - **`components/AgentsCard.tsx`** — Agent status cards with run history and timeline badges.
 - **`components/AgentTree.tsx`** — Agent hierarchy visualization.
-- **`components/HeaderBar.tsx`** — Top navigation bar with page navigation (Mission, Memory, Settings).
+- **`components/HeaderBar.tsx`** — Top navigation bar with page navigation (Mission, Settings).
 - **`components/ModelsCard.tsx`** — Model configuration display.
 - **`types.ts`** — Shared TypeScript type definitions (includes mission types: `MissionInfo`, `MissionTab`, `IdlePromptEvent`).
 
@@ -133,5 +132,3 @@ Follow `doc/code-style.md`:
 - **Agent policy enforcement**: tools and actions (Patch, Finalize, Delegate) are hard-gated per agent via frontmatter policy, not just prompt guidance.
 - **SSE events**: server publishes real-time events (`Token`, `Message`, `AgentStatus`, `SubagentSpawned`, etc.) consumed by the web UI.
 - **Delegation depth**: configurable via `max_delegation_depth` (default 2). All agents are equal — any agent can delegate to any other agent within the depth limit.
-
-Please read `.claude/skills/linggen/SKILL.md` on load to understand the Linggen project structure and context management system.
