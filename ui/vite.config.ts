@@ -10,9 +10,9 @@ function getBackendPort() {
     const tomlPath = path.resolve(__dirname, '../linggen-agent.toml');
     const content = fs.readFileSync(tomlPath, 'utf-8');
     const match = content.match(/\[server\][\s\S]*?port\s*=\s*(\d+)/);
-    return match ? match[1] : '6666';
+    return match ? match[1] : '9898';
   } catch (_e) {
-    return '6666';
+    return '9898';
   }
 }
 

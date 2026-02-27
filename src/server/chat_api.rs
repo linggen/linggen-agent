@@ -38,6 +38,13 @@ pub(crate) struct PlanActionRequest {
 }
 
 #[derive(Deserialize)]
+pub(crate) struct EditPlanRequest {
+    project_root: String,
+    agent_id: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
 pub(crate) struct ClearChatRequest {
     project_root: String,
     session_id: Option<String>,
@@ -368,6 +375,19 @@ pub(crate) async fn clear_chat_history_api(
     }
 }
 
+/// Compute the per-session plan directory from the project store.
+fn compute_session_plan_dir(
+    store: &crate::project_store::ProjectStore,
+    root: &Path,
+    session_id: Option<&str>,
+) -> std::path::PathBuf {
+    let root_str = root.to_string_lossy().to_string();
+    store
+        .project_dir(&root_str)
+        .join("sessions")
+        .join(session_id.unwrap_or("default"))
+}
+
 /// Shared context for the async chat dispatch functions.
 struct ChatRunCtx {
     state: Arc<ServerState>,
@@ -591,6 +611,11 @@ async fn run_plan_dispatch(
     engine.plan = None;
     engine.observations.clear();
     engine.task = Some(task_text.to_string());
+    engine.session_plan_dir = Some(compute_session_plan_dir(
+        &ctx.state.manager.store,
+        &ctx.root,
+        ctx.session_id.as_deref(),
+    ));
 
     // Wire up the thinking channel.
     let (thinking_tx, mut thinking_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -746,11 +771,15 @@ async fn run_structured_loop(
     if let Some(p) = &engine.plan {
         if p.status == crate::engine::PlanStatus::Planned {
             engine.plan = None;
-            engine.plan_file = None;
         }
     }
     let task_for_loop = ctx.clean_msg.trim().to_string();
     engine.task = Some(task_for_loop);
+    engine.session_plan_dir = Some(compute_session_plan_dir(
+        &ctx.state.manager.store,
+        &ctx.root,
+        ctx.session_id.as_deref(),
+    ));
 
     // Wire up the thinking channel so streaming thinking tokens reach the UI.
     let (thinking_tx, mut thinking_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1030,6 +1059,13 @@ pub(crate) async fn chat_handler(
                     run_structured_loop(&ctx, &mut engine).await;
                 }
 
+                // Emit TurnComplete so the Web UI has a single finalizer.
+                let _ = state_clone.events_tx.send(ServerEvent::TurnComplete {
+                    agent_id: target_id_clone.clone(),
+                    duration_ms: None,
+                    context_tokens: None,
+                    parent_id: None,
+                });
                 state_clone
                     .send_agent_status(
                         target_id_clone.clone(), AgentStatusKind::Idle,
@@ -1100,6 +1136,11 @@ pub(crate) async fn approve_plan_handler(
     .await;
 
     let root_clone = root.clone();
+    let plan_dir = compute_session_plan_dir(
+        &state.manager.store,
+        &root,
+        session_id.as_deref(),
+    );
 
     tokio::spawn(async move {
         let mut engine = agent.lock().await;
@@ -1118,6 +1159,7 @@ pub(crate) async fn approve_plan_handler(
         // Set the approved plan on the engine.
         engine.plan = Some(plan);
         engine.plan_mode = false;
+        engine.session_plan_dir = Some(plan_dir);
         if clear_context {
             // Full context clear — plan file is the sole source of truth
             engine.observations.clear();
@@ -1220,6 +1262,13 @@ pub(crate) async fn approve_plan_handler(
         }
         let _ = events_tx.send(ServerEvent::StateUpdated);
 
+        // Emit TurnComplete so the Web UI has a single finalizer.
+        let _ = events_tx.send(ServerEvent::TurnComplete {
+            agent_id: agent_id.clone(),
+            duration_ms: None,
+            context_tokens: None,
+            parent_id: None,
+        });
         state_clone
             .send_agent_status(agent_id.clone(), AgentStatusKind::Idle, Some("Idle".to_string()), None)
             .await;
@@ -1262,6 +1311,31 @@ pub(crate) async fn reject_plan_handler(
     .await;
 
     Json(serde_json::json!({ "status": "rejected" })).into_response()
+}
+
+// ── Edit plan endpoint ──────────────────────────────────────────────────
+
+pub(crate) async fn edit_plan_handler(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<EditPlanRequest>,
+) -> impl IntoResponse {
+    let root = PathBuf::from(&req.project_root);
+    let root_str = root.to_string_lossy().to_string();
+
+    let updated = state
+        .manager
+        .edit_pending_plan(&root_str, &req.agent_id, &req.text)
+        .await;
+
+    if updated {
+        (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "No pending plan"})),
+        )
+            .into_response()
+    }
 }
 
 // ── AskUser response endpoint ────────────────────────────────────────────

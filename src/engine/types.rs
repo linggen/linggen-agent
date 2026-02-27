@@ -40,8 +40,9 @@ pub struct Plan {
     pub summary: String,
     pub items: Vec<PlanItem>,
     pub status: PlanStatus,
-    #[serde(default)]
-    pub origin: PlanOrigin,
+    /// Free-form markdown plan text (from plan mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -53,18 +54,6 @@ pub enum PlanStatus {
     Completed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum PlanOrigin {
-    UserRequested,
-    ModelManaged,
-}
-
-impl Default for PlanOrigin {
-    fn default() -> Self {
-        PlanOrigin::ModelManaged
-    }
-}
 
 #[derive(Debug, Clone)]
 pub enum ThinkingEvent {
@@ -73,6 +62,7 @@ pub enum ThinkingEvent {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum ReplEvent {
     Status { status: String, detail: Option<String> },
     Iteration { current: usize, max: usize },
@@ -102,22 +92,6 @@ pub struct EngineConfig {
     pub write_safety_mode: crate::config::WriteSafetyMode,
     pub tool_permission_mode: crate::config::ToolPermissionMode,
     pub prompt_loop_breaker: Option<String>,
-}
-
-pub(crate) const CHAT_INPUT_LOG_PREVIEW_CHARS: usize = 240;
-
-pub(crate) fn chat_input_log_preview(text: &str) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let char_count = collapsed.chars().count();
-    if char_count <= CHAT_INPUT_LOG_PREVIEW_CHARS {
-        collapsed
-    } else {
-        let prefix = collapsed
-            .chars()
-            .take(CHAT_INPUT_LOG_PREVIEW_CHARS)
-            .collect::<String>();
-        format!("{prefix}... ({char_count} chars)")
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -185,10 +159,8 @@ pub struct AgentEngine {
     // Plan mode
     pub plan_mode: bool,
     pub plan: Option<Plan>,
-    /// Path to the current plan's file in ~/.linggen/plans/
-    pub plan_file: Option<PathBuf>,
-    /// Override for plans directory (used in tests for isolation).
-    pub plans_dir_override: Option<PathBuf>,
+    /// Directory for per-session plan file persistence.
+    pub session_plan_dir: Option<PathBuf>,
     /// Base64-encoded images to attach to the next user message.
     pub pending_images: Vec<String>,
     /// Tool permission store (session + project scoped allows).
@@ -208,6 +180,9 @@ pub struct AgentEngine {
     /// Running token estimate accumulated incrementally during the loop.
     /// Reset after compaction. Avoids re-scanning all messages each iteration.
     pub(crate) accumulated_token_estimate: usize,
+    /// Last assistant message text emitted during the agent loop.
+    /// Set by `Done` dispatch; used by delegation callers to surface the sub-agent's response.
+    pub(crate) last_assistant_text: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -255,6 +230,8 @@ pub(crate) struct ReadyExec {
     pub original_args: JsonValue,
     pub tool_done_status: String,
     pub tool_failed_status: String,
+    /// Unique ID for the content block (used by Web UI content-block events).
+    pub block_id: String,
 }
 
 /// Result of streaming model output, including early-detected first action.
@@ -353,8 +330,7 @@ impl AgentEngine {
             interrupt_rx: None,
             plan_mode: false,
             plan: None,
-            plan_file: None,
-            plans_dir_override: None,
+            session_plan_dir: None,
             pending_images: Vec::new(),
             permission_store: perm_store,
             default_models: Vec::new(),
@@ -363,6 +339,7 @@ impl AgentEngine {
             cached_system_prompt: None,
             message_importance: Vec::new(),
             accumulated_token_estimate: 0,
+            last_assistant_text: None,
         })
     }
 
@@ -380,6 +357,7 @@ impl AgentEngine {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_role(&mut self, role: AgentRole) {
         self.role = role;
         self.observations.clear();

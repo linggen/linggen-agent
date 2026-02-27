@@ -4,7 +4,7 @@ use crate::config::{ComplexityLevel, ModelConfig, RoutingConfig};
 pub struct ComplexitySignal {
     pub estimated_tokens: Option<usize>,
     pub tool_depth: Option<usize>,
-    pub skill_model_hint: Option<String>,
+    pub _skill_model_hint: Option<String>,
 }
 
 impl ComplexitySignal {
@@ -137,7 +137,7 @@ mod tests {
         ComplexitySignal {
             estimated_tokens: None,
             tool_depth: None,
-            skill_model_hint: None,
+            _skill_model_hint: None,
         }
     }
 
@@ -192,7 +192,7 @@ mod tests {
         let low = ComplexitySignal {
             estimated_tokens: Some(100),
             tool_depth: None,
-            skill_model_hint: None,
+            _skill_model_hint: None,
         };
         assert_eq!(resolve_model(&routing, None, &low, &models), Some("small".to_string()));
 
@@ -200,7 +200,7 @@ mod tests {
         let high = ComplexitySignal {
             estimated_tokens: Some(5000),
             tool_depth: None,
-            skill_model_hint: None,
+            _skill_model_hint: None,
         };
         assert_eq!(resolve_model(&routing, None, &high, &models), Some("big".to_string()));
     }

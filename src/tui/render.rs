@@ -414,7 +414,41 @@ pub(super) fn render_subagent_group_live(entries: &[&SubagentEntry]) -> Vec<Line
 
         // Current activity sub-line (only when running)
         if is_running {
-            if let Some(activity) = &entry.current_activity {
+            if !entry.tool_steps.is_empty() {
+                // Show last tool step as structured ⏺ ToolName(args) with +N more
+                let last = &entry.tool_steps[entry.tool_steps.len() - 1];
+                let bullet_color = match last.status {
+                    StepStatus::Done => Color::Green,
+                    StepStatus::Failed => Color::Red,
+                    StepStatus::InProgress => Color::Yellow,
+                };
+                let args_display = if last.args_summary.is_empty() {
+                    String::new()
+                } else {
+                    format!("({})", truncate_str(&last.args_summary, 50))
+                };
+                let prev_count = entry.tool_steps.len() - 1;
+                let more_suffix = if prev_count > 0 {
+                    format!("  +{} more", prev_count)
+                } else {
+                    String::new()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("    {continuation}  └ "),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled("⏺ ", Style::default().fg(bullet_color)),
+                    Span::styled(
+                        last.tool_name.clone(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(args_display, Style::default().fg(Color::White)),
+                    Span::styled(more_suffix, Style::default().fg(Color::DarkGray)),
+                ]));
+            } else if let Some(activity) = &entry.current_activity {
                 let activity_preview = truncate_str(activity, 60);
                 lines.push(Line::from(vec![
                     Span::styled(

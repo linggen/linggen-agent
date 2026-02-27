@@ -152,7 +152,7 @@ impl AgentEngine {
         let mut allowed_tools = self.allowed_tool_names();
         if self.plan_mode {
             let read_only: HashSet<String> = [
-                "Read", "Glob", "Grep", "Bash",
+                "Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUser", "ExitPlanMode",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -185,22 +185,34 @@ impl AgentEngine {
             }
         }
 
-        // If executing an approved plan, inject the plan items into the prompt.
+        // If executing an approved plan, inject the plan into the prompt.
         if let Some(plan) = &self.plan {
             if plan.status == PlanStatus::Approved || plan.status == PlanStatus::Executing {
-                let items_text = plan
-                    .items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, item)| {
-                        let desc = item.description.as_deref().unwrap_or("");
-                        format!("{}. [{}] {} {}", i + 1, serde_json::to_string(&item.status).unwrap_or_default().trim_matches('"'), item.title, desc)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let plan_content = if let Some(text) = &plan.plan_text {
+                    text.clone()
+                } else {
+                    // Fallback for item-based task lists (progress tracking)
+                    plan.items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| {
+                            let desc = item.description.as_deref().unwrap_or("");
+                            format!(
+                                "{}. [{}] {} {}",
+                                i + 1,
+                                serde_json::to_string(&item.status)
+                                    .unwrap_or_default()
+                                    .trim_matches('"'),
+                                item.title,
+                                desc
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
                 if let Some(rendered) = self.prompt_store.render(
                     crate::prompts::PLAN_EXECUTE,
-                    &[("summary", &plan.summary), ("items", &items_text)],
+                    &[("plan_text", &plan_content)],
                 ) {
                     system.push_str("\n\n");
                     system.push_str(&rendered);

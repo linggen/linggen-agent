@@ -224,7 +224,7 @@ Detailed design docs live in [`doc/`](doc/):
 | [Agents](doc/agents.md) | Process management — lifecycle, delegation, scheduling, idle scheduler |
 | [Skills](doc/skills.md) | Dynamic extensions — format, discovery, triggers |
 | [Tools](doc/tools.md) | Syscall interface — built-in tools, safety enforcement |
-| [Events](doc/events.md) | IPC — SSE streaming events, message queue, APIs |
+| [Chat System](doc/chat-spec.md) | Chat system — SSE events, message model, rendering, APIs |
 | [Models](doc/models.md) | Hardware abstraction — providers, routing, credentials, auto-fallback |
 | [Storage](doc/storage.md) | Filesystem layout — persistent state, data formats |
 | [CLI](doc/cli.md) | CLI reference — commands, flags, modes |

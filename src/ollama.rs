@@ -29,10 +29,12 @@ impl OllamaClient {
     }
 
     /// Ask Ollama to return a JSON-formatted assistant message (we set format: "json").
+    #[allow(dead_code)]
     pub async fn chat_json(&self, model: &str, messages: &[ChatMessage]) -> Result<String> {
         self.chat_json_with_keep_alive(model, messages, None).await
     }
 
+    #[allow(dead_code)]
     pub async fn chat_json_with_keep_alive(
         &self,
         model: &str,
@@ -77,6 +79,7 @@ impl OllamaClient {
     }
 
     /// Plain text chat (no structured output enforcement).
+    #[allow(dead_code)]
     pub async fn chat_text(&self, model: &str, messages: &[ChatMessage]) -> Result<String> {
         self.chat_text_with_keep_alive(model, messages, None).await
     }
@@ -130,6 +133,7 @@ impl OllamaClient {
     }
 
     /// Streaming text chat.
+    #[allow(dead_code)]
     pub async fn chat_text_stream(
         &self,
         model: &str,
@@ -228,6 +232,7 @@ impl OllamaClient {
     }
 
     /// Preload a model into memory and keep it there.
+    #[allow(dead_code)]
     pub async fn preload_model(&self, model: &str, keep_alive: &str) -> Result<()> {
         tracing::info!(
             "Preloading Ollama model: {} (keep_alive={})",
@@ -505,6 +510,7 @@ impl ChatMessage {
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_cache_control(mut self) -> Self {
         self.cache_control = Some(serde_json::json!({"type": "ephemeral"}));
         self

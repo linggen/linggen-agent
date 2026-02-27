@@ -86,19 +86,6 @@ Valid statuses: `"pending"`, `"in_progress"`, `"done"`, `"skipped"`
 
 High-quality plan items include file paths and specific changes. Low-quality plans are vague ("update the code"). Skip the plan entirely for simple, single-step tasks.
 
-### 4. Enter Plan Mode — for large tasks needing user approval (optional)
-
-```json
-{"type": "enter_plan_mode", "reason": "<why planning is needed>"}
-```
-
-This enters plan mode where you research with read-only tools, produce a detailed structured plan, and await user approval before making changes. Use this for:
-- Large refactors affecting many files
-- Architectural changes with multiple valid approaches
-- Tasks where the user should review the strategy first
-
-Skip for straightforward tasks where the approach is obvious.
-
 ### Rules
 
 - ALWAYS respond with valid JSON objects. Never plain text without a JSON action.

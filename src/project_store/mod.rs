@@ -62,7 +62,7 @@ impl ProjectStore {
         Self { root }
     }
 
-    fn project_dir(&self, project_path: &str) -> PathBuf {
+    pub fn project_dir(&self, project_path: &str) -> PathBuf {
         self.root.join(encode_project_path(project_path))
     }
 

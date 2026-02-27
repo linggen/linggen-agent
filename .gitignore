@@ -22,3 +22,6 @@ Cargo.lock
 .claude/
 pkg/
 .linggen/
+
+# VS Code
+.vscode/chrome-debug/

@@ -26,6 +26,7 @@ impl OpenAiClient {
     }
 
     /// Non-streaming JSON-mode chat completion.
+    #[allow(dead_code)]
     pub async fn chat_json(
         &self,
         model: &str,
@@ -244,16 +245,19 @@ struct OaiResponseFormat {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OaiChatResponse {
     choices: Vec<OaiChoice>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OaiChoice {
     message: OaiChoiceMessage,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct OaiChoiceMessage {
     content: String,
 }

@@ -1,5 +1,13 @@
 [[models]]
-id = "ollama1"
+id = "qwen3.5:35b"
+provider = "ollama"
+url = "http://127.0.0.1:11434"
+model = "qwen3.5:35b"
+keep_alive = "10m"
+tags = []
+
+[[models]]
+id = "qwen3.5:cloud"
 provider = "ollama"
 url = "http://127.0.0.1:11434"
 model = "qwen3.5:cloud"
@@ -8,11 +16,18 @@ context_window = 131072
 tags = []
 
 [[models]]
-id = "gemini-flash"
+id = "gemini3-flash"
 provider = "gemini"
 url = "https://generativelanguage.googleapis.com/v1beta/openai"
 model = "gemini-3-flash-preview"
 keep_alive = "20m"
+tags = []
+
+[[models]]
+id = "gemini-2.5-flash"
+provider = "gemini"
+url = "https://generativelanguage.googleapis.com/v1beta/openai"
+model = "gemini-2.5-flash"
 tags = []
 
 [server]
@@ -51,4 +66,8 @@ model = "ollama1"
 
 [routing]
 policies = []
-default_models = ["gemini-flash"]
+default_models = [
+    "gemini-flash",
+    "qwen3-coder:latest",
+    "qwen3.5:35b",
+]

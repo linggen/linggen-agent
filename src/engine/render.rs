@@ -51,8 +51,12 @@ pub fn render_tool_result(r: &ToolResult) -> String {
         ToolResult::LockResult { acquired, denied } => {
             format!("lock_result: acquired={:?}, denied={:?}", acquired, denied)
         }
-        ToolResult::AgentOutcome(outcome) => {
-            format!("agent_outcome: {:?}", outcome)
+        ToolResult::AgentOutcome(outcome) => match outcome {
+            crate::engine::AgentOutcome::None => "agent completed (no structured result)".to_string(),
+            crate::engine::AgentOutcome::Task(t) => format!("agent produced task: {}", t.title),
+            crate::engine::AgentOutcome::Patch(diff) => format!("agent produced patch ({} bytes)", diff.len()),
+            crate::engine::AgentOutcome::Plan(p) => format!("agent produced plan: {} items, status={:?}", p.items.len(), p.status),
+            crate::engine::AgentOutcome::PlanModeRequested { reason } => format!("agent requested plan mode: {}", reason.as_deref().unwrap_or("(no reason)")),
         }
         ToolResult::WebSearchResults { query, results } => {
             let mut out = format!("WebSearch: \"{}\" ({} results)\n", query, results.len());
@@ -124,14 +128,12 @@ pub fn render_tool_result_public(r: &ToolResult) -> String {
     match r {
         ToolResult::FileContent {
             path,
-            content,
             truncated,
+            ..
         } => {
-            let (preview, preview_truncated) = preview_text(content, 20, 1200);
-            let shown_note = if preview_truncated { " (preview)" } else { "" };
             format!(
-                "Read: {} (truncated: {}){}\n{}\n\n(content omitted in chat; open the file viewer for full text)",
-                path, truncated, shown_note, preview
+                "Read: {} (truncated: {})\n(content omitted in chat; open the file viewer for full text)",
+                path, truncated
             )
         }
         ToolResult::WebFetchContent {

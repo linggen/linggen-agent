@@ -3,7 +3,6 @@ use crate::config::AgentPolicyCapability;
 use crate::engine::actions::PlanItemUpdate;
 use crate::engine::patch::validate_unified_diff;
 use crate::ollama::ChatMessage;
-use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 impl AgentEngine {
@@ -123,16 +122,15 @@ impl AgentEngine {
             // continues working instead of blocking on approval.
             if !self.plan_mode && existing.status == PlanStatus::Planned {
                 existing.status = PlanStatus::Executing;
-                existing.origin = PlanOrigin::ModelManaged;
             }
             existing.clone()
         } else {
             // Create new plan.
             // User-requested plans (plan_mode) need approval; model task lists execute immediately.
-            let (origin, status) = if self.plan_mode {
-                (PlanOrigin::UserRequested, PlanStatus::Planned)
+            let status = if self.plan_mode {
+                PlanStatus::Planned
             } else {
-                (PlanOrigin::ModelManaged, PlanStatus::Executing)
+                PlanStatus::Executing
             };
             let plan = Plan {
                 summary: summary.unwrap_or_else(|| "Plan".to_string()),
@@ -145,13 +143,13 @@ impl AgentEngine {
                     })
                     .collect(),
                 status,
-                origin,
+                plan_text: None,
             };
             self.plan = Some(plan.clone());
             plan
         };
 
-        // Persist plan to .linggen-agent/plan.md
+        // Persist plan to session dir
         self.write_plan_file(&plan);
 
         // Emit PlanUpdate event via manager
@@ -231,7 +229,7 @@ impl AgentEngine {
                 if item.status == PlanItemStatus::Pending
                     || item.status == PlanItemStatus::InProgress
                 {
-                    item.status = PlanItemStatus::Done;
+                    item.status = PlanItemStatus::Skipped;
                 }
             }
             plan.status = PlanStatus::Completed;
@@ -250,6 +248,51 @@ impl AgentEngine {
                 })
                 .await;
         }
+    }
+
+    /// Called when the model signals plan completion (via ExitPlanMode tool or
+    /// fallback: done in plan_mode). Extracts the plan text, persists it, and
+    /// returns the Plan outcome for user approval.
+    pub(crate) async fn finalize_plan_mode(&mut self, plan_text: String) -> AgentOutcome {
+        let summary = Self::extract_plan_summary(&plan_text);
+        let plan = Plan {
+            summary,
+            items: vec![],
+            status: PlanStatus::Planned,
+            plan_text: Some(plan_text),
+        };
+        self.plan = Some(plan.clone());
+        self.write_plan_file(&plan);
+
+        // Emit PlanUpdate event
+        if let Some(manager) = self.tools.get_manager() {
+            let agent_id = self
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            manager
+                .send_event(crate::agent_manager::AgentEvent::PlanUpdate {
+                    agent_id,
+                    plan: plan.clone(),
+                })
+                .await;
+        }
+
+        AgentOutcome::Plan(plan)
+    }
+
+    /// Extract a summary from the plan text (first heading or first non-empty line).
+    pub(crate) fn extract_plan_summary(text: &str) -> String {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("# ") {
+                return trimmed.strip_prefix("# ").unwrap_or(trimmed).to_string();
+            }
+            if !trimmed.is_empty() {
+                return trimmed.chars().take(80).collect();
+            }
+        }
+        "Plan".to_string()
     }
 
     pub(crate) async fn handle_finalize_action(
@@ -278,185 +321,35 @@ impl AgentEngine {
     }
 
     // -----------------------------------------------------------------------
-    // Plan file persistence (.linggen/plans/<slug>.md)
+    // Per-session plan file persistence
     // -----------------------------------------------------------------------
 
-    pub(crate) fn plans_dir(&self) -> PathBuf {
-        self.plans_dir_override
-            .clone()
-            .unwrap_or_else(|| crate::paths::plans_dir())
-    }
-
-    /// Convert a plan summary into a filesystem-safe slug.
-    /// Takes first few meaningful words, lowercased, joined by hyphens.
-    /// e.g. "Refactor logging module" → "refactor-logging-module"
-    pub(crate) fn slugify_summary(summary: &str) -> String {
-        let slug: String = summary
-            .chars()
-            .map(|c| if c.is_alphanumeric() || c == ' ' { c.to_ascii_lowercase() } else { ' ' })
-            .collect::<String>()
-            .split_whitespace()
-            .take(5) // max 5 words
-            .collect::<Vec<_>>()
-            .join("-");
-        if slug.is_empty() { "plan".to_string() } else { slug }
-    }
-
-    /// Find a unique file path in the plans directory for the given slug.
-    /// Returns `<slug>.md`, or `<slug>-2.md`, `<slug>-3.md`, etc. on collision.
-    fn unique_plan_path(&self, slug: &str) -> PathBuf {
-        let dir = self.plans_dir();
-        let base = dir.join(format!("{}.md", slug));
-        if !base.exists() {
-            return base;
-        }
-        for i in 2.. {
-            let path = dir.join(format!("{}-{}.md", slug, i));
-            if !path.exists() {
-                return path;
-            }
-        }
-        unreachable!()
-    }
-
-    pub(crate) fn write_plan_file(&mut self, plan: &Plan) {
-        let dir = self.plans_dir();
-        let _ = std::fs::create_dir_all(&dir);
-
-        // Determine file path: reuse existing if we already have one, otherwise generate new.
-        let path = if let Some(existing) = &self.plan_file {
-            existing.clone()
+    pub(crate) fn write_plan_file(&self, plan: &Plan) {
+        let Some(dir) = &self.session_plan_dir else { return };
+        let _ = std::fs::create_dir_all(dir);
+        let path = dir.join("plan.md");
+        let md = if let Some(text) = &plan.plan_text {
+            text.clone()
         } else {
-            let slug = Self::slugify_summary(&plan.summary);
-            let p = self.unique_plan_path(&slug);
-            self.plan_file = Some(p.clone());
-            p
-        };
-
-        let status_icon = |s: &PlanItemStatus| match s {
-            PlanItemStatus::Pending => "[ ]",
-            PlanItemStatus::InProgress => "[~]",
-            PlanItemStatus::Done => "[x]",
-            PlanItemStatus::Skipped => "[-]",
-        };
-
-        let origin_str = match plan.origin {
-            PlanOrigin::UserRequested => "user_requested",
-            PlanOrigin::ModelManaged => "model_managed",
-        };
-
-        let mut md = format!("# Plan: {}\n\n", plan.summary);
-        md.push_str(&format!("**Status:** {}\n\n", serde_json::to_string(&plan.status)
-            .unwrap_or_default().trim_matches('"')));
-        md.push_str(&format!("**Origin:** {}\n\n", origin_str));
-        for item in &plan.items {
-            md.push_str(&format!("- {} {}\n", status_icon(&item.status), item.title));
-            if let Some(desc) = &item.description {
-                md.push_str(&format!("  {}\n", desc));
-            }
-        }
-
-        if let Err(e) = std::fs::write(&path, &md) {
-            warn!("Failed to write plan file {}: {}", path.display(), e);
-        }
-    }
-
-    /// Parse a single plan markdown file into a Plan + its path.
-    pub(crate) fn parse_plan_file(path: &Path) -> Option<Plan> {
-        let content = std::fs::read_to_string(path).ok()?;
-
-        let mut summary = String::new();
-        let mut status = PlanStatus::Executing;
-        let mut origin = PlanOrigin::ModelManaged;
-        let mut items = Vec::new();
-
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("# Plan: ") {
-                summary = trimmed.strip_prefix("# Plan: ").unwrap_or("").to_string();
-            } else if trimmed.starts_with("**Status:**") {
-                let s = trimmed
-                    .strip_prefix("**Status:**")
-                    .unwrap_or("")
-                    .trim();
-                status = match s {
-                    "planned" => PlanStatus::Planned,
-                    "approved" => PlanStatus::Approved,
-                    "executing" => PlanStatus::Executing,
-                    "completed" => PlanStatus::Completed,
-                    _ => PlanStatus::Executing,
-                };
-            } else if trimmed.starts_with("**Origin:**") {
-                let o = trimmed
-                    .strip_prefix("**Origin:**")
-                    .unwrap_or("")
-                    .trim();
-                origin = match o {
-                    "user_requested" => PlanOrigin::UserRequested,
-                    _ => PlanOrigin::ModelManaged,
-                };
-            } else if trimmed.starts_with("- [") {
-                let (item_status, title) = if trimmed.starts_with("- [x] ") {
-                    (PlanItemStatus::Done, trimmed.strip_prefix("- [x] ").unwrap_or(""))
-                } else if trimmed.starts_with("- [~] ") {
-                    (PlanItemStatus::InProgress, trimmed.strip_prefix("- [~] ").unwrap_or(""))
-                } else if trimmed.starts_with("- [-] ") {
-                    (PlanItemStatus::Skipped, trimmed.strip_prefix("- [-] ").unwrap_or(""))
-                } else if trimmed.starts_with("- [ ] ") {
-                    (PlanItemStatus::Pending, trimmed.strip_prefix("- [ ] ").unwrap_or(""))
-                } else {
-                    continue;
-                };
-                items.push(PlanItem {
-                    title: title.to_string(),
-                    description: None,
-                    status: item_status,
-                });
-            } else if line.starts_with("  ") && !items.is_empty() {
-                // Description line for the last item (indented with 2+ spaces).
-                if let Some(last) = items.last_mut() {
-                    last.description = Some(line.trim().to_string());
+            // Item-based fallback (for update_plan progress tracking)
+            let status_icon = |s: &PlanItemStatus| match s {
+                PlanItemStatus::Pending => "[ ]",
+                PlanItemStatus::InProgress => "[~]",
+                PlanItemStatus::Done => "[x]",
+                PlanItemStatus::Skipped => "[-]",
+            };
+            let mut out = format!("# {}\n\n", plan.summary);
+            for item in &plan.items {
+                out.push_str(&format!("- {} {}\n", status_icon(&item.status), item.title));
+                if let Some(desc) = &item.description {
+                    for line in desc.lines() {
+                        out.push_str(&format!("  {}\n", line));
+                    }
                 }
             }
-        }
-
-        if summary.is_empty() && items.is_empty() {
-            return None;
-        }
-
-        Some(Plan { summary, items, status, origin })
-    }
-
-    /// Load the most recent non-completed plan from ~/.linggen/plans/.
-    /// Sets `self.plan_file` so subsequent writes update the same file.
-    pub(crate) fn load_latest_plan(&mut self) -> Option<Plan> {
-        let dir = self.plans_dir();
-        let mut entries: Vec<_> = std::fs::read_dir(&dir)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
-            .collect();
-        // Sort by modified time descending (most recent first).
-        entries.sort_by(|a, b| {
-            let ta = a.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            let tb = b.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            tb.cmp(&ta)
-        });
-        // Find the most recent non-completed, non-planned plan.
-        // Plans with status "Planned" are waiting for explicit user approval
-        // and should not be auto-resumed.
-        for entry in entries {
-            let path = entry.path();
-            if let Some(plan) = Self::parse_plan_file(&path) {
-                if plan.status != PlanStatus::Completed
-                    && plan.status != PlanStatus::Planned
-                {
-                    self.plan_file = Some(path);
-                    return Some(plan);
-                }
-            }
-        }
-        None
+            out
+        };
+        let _ = std::fs::write(&path, &md);
     }
 }
 
@@ -469,7 +362,7 @@ mod tests {
         let model_manager = Arc::new(
             crate::agent_manager::models::ModelManager::new(vec![]),
         );
-        let mut engine = AgentEngine::new(
+        AgentEngine::new(
             EngineConfig {
                 ws_root: tmp.to_path_buf(),
                 max_iters: 1,
@@ -481,142 +374,96 @@ mod tests {
             "test".to_string(),
             AgentRole::Coder,
         )
-        .unwrap();
-        engine.plans_dir_override = Some(tmp.join(".linggen").join("plans"));
-        engine
+        .unwrap()
     }
 
     #[test]
-    fn plan_file_round_trip() {
+    fn write_plan_file_per_session() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = make_test_engine(tmp.path());
+        let session_dir = tmp.path().join("sessions").join("s1");
+        engine.session_plan_dir = Some(session_dir.clone());
 
         let plan = Plan {
-            summary: "Refactor logging module".to_string(),
+            summary: "Refactor logging".to_string(),
             items: vec![
                 PlanItem {
-                    title: "Read existing code".to_string(),
-                    description: Some("Understand the current structure".to_string()),
+                    title: "Read code".to_string(),
+                    description: Some("Understand structure".to_string()),
                     status: PlanItemStatus::Done,
-                },
-                PlanItem {
-                    title: "Extract helper function".to_string(),
-                    description: None,
-                    status: PlanItemStatus::InProgress,
                 },
                 PlanItem {
                     title: "Update tests".to_string(),
                     description: None,
                     status: PlanItemStatus::Pending,
                 },
-                PlanItem {
-                    title: "Old migration step".to_string(),
-                    description: None,
-                    status: PlanItemStatus::Skipped,
-                },
             ],
             status: PlanStatus::Executing,
-            origin: PlanOrigin::ModelManaged,
+            plan_text: None,
         };
 
         engine.write_plan_file(&plan);
 
-        // Verify file was written to plans dir as <slug>.md
-        let plan_path = engine.plan_file.as_ref().expect("plan_file should be set");
+        let plan_path = session_dir.join("plan.md");
         assert!(plan_path.exists());
-        assert_eq!(plan_path.file_name().unwrap(), "refactor-logging-module.md");
-        assert!(plan_path.parent().unwrap().ends_with(".linggen/plans"));
-
-        // Load it back via load_latest_plan
-        let mut engine2 = make_test_engine(tmp.path());
-        let loaded = engine2.load_latest_plan().expect("should load plan");
-
-        assert_eq!(loaded.summary, plan.summary);
-        assert_eq!(loaded.status, PlanStatus::Executing);
-        assert_eq!(loaded.origin, PlanOrigin::ModelManaged);
-        assert_eq!(loaded.items.len(), 4);
-        assert_eq!(loaded.items[0].title, "Read existing code");
-        assert_eq!(loaded.items[0].status, PlanItemStatus::Done);
-        assert_eq!(loaded.items[0].description.as_deref(), Some("Understand the current structure"));
-        assert_eq!(loaded.items[1].title, "Extract helper function");
-        assert_eq!(loaded.items[1].status, PlanItemStatus::InProgress);
-        assert_eq!(loaded.items[2].status, PlanItemStatus::Pending);
-        assert_eq!(loaded.items[3].status, PlanItemStatus::Skipped);
+        let content = std::fs::read_to_string(&plan_path).unwrap();
+        assert!(content.contains("# Refactor logging"));
+        assert!(content.contains("[x] Read code"));
+        assert!(content.contains("[ ] Update tests"));
+        assert!(content.contains("  Understand structure"));
     }
 
     #[test]
-    fn plan_file_slug_collision() {
+    fn write_plan_file_free_form() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = make_test_engine(tmp.path());
+        let session_dir = tmp.path().join("sessions").join("s2");
+        engine.session_plan_dir = Some(session_dir.clone());
 
-        let plan1 = Plan {
-            summary: "Fix auth".to_string(),
-            items: vec![PlanItem {
-                title: "Step 1".to_string(),
-                description: None,
-                status: PlanItemStatus::Done,
-            }],
-            status: PlanStatus::Completed,
-            origin: PlanOrigin::ModelManaged,
-        };
-        engine.write_plan_file(&plan1);
-        let path1 = engine.plan_file.clone().unwrap();
-        assert_eq!(path1.file_name().unwrap(), "fix-auth.md");
-
-        // Reset plan_file to force a new file for the second plan.
-        engine.plan_file = None;
-        let plan2 = Plan {
-            summary: "Fix auth".to_string(),
-            items: vec![PlanItem {
-                title: "Step A".to_string(),
-                description: None,
-                status: PlanItemStatus::Pending,
-            }],
-            status: PlanStatus::Executing,
-            origin: PlanOrigin::ModelManaged,
-        };
-        engine.write_plan_file(&plan2);
-        let path2 = engine.plan_file.clone().unwrap();
-        assert_eq!(path2.file_name().unwrap(), "fix-auth-2.md");
-        assert_ne!(path1, path2);
-    }
-
-    #[test]
-    fn slugify_summary_examples() {
-        assert_eq!(AgentEngine::slugify_summary("Refactor logging module"), "refactor-logging-module");
-        assert_eq!(AgentEngine::slugify_summary("Fix the auth bug!"), "fix-the-auth-bug");
-        assert_eq!(AgentEngine::slugify_summary("Add user authentication & session mgmt for v2"), "add-user-authentication-session-mgmt");
-        assert_eq!(AgentEngine::slugify_summary(""), "plan");
-        assert_eq!(AgentEngine::slugify_summary("   "), "plan");
-    }
-
-    #[test]
-    fn load_latest_plan_returns_none_when_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut engine = make_test_engine(tmp.path());
-        assert!(engine.load_latest_plan().is_none());
-    }
-
-    #[test]
-    fn load_latest_plan_skips_completed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut engine = make_test_engine(tmp.path());
-
-        // Write a completed plan.
+        let plan_text = "# Add avatar upload\n\n1. Add endpoint\n2. Add model\n";
         let plan = Plan {
-            summary: "Old task".to_string(),
-            items: vec![PlanItem {
-                title: "Done".to_string(),
-                description: None,
-                status: PlanItemStatus::Done,
-            }],
-            status: PlanStatus::Completed,
-            origin: PlanOrigin::ModelManaged,
+            summary: "Add avatar upload".to_string(),
+            items: vec![],
+            status: PlanStatus::Planned,
+            plan_text: Some(plan_text.to_string()),
         };
+
         engine.write_plan_file(&plan);
 
-        // A fresh engine should NOT load the completed plan.
-        let mut engine2 = make_test_engine(tmp.path());
-        assert!(engine2.load_latest_plan().is_none());
+        let plan_path = session_dir.join("plan.md");
+        assert!(plan_path.exists());
+        let content = std::fs::read_to_string(&plan_path).unwrap();
+        assert_eq!(content, plan_text);
+    }
+
+    #[test]
+    fn write_plan_file_no_dir_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = make_test_engine(tmp.path());
+        // session_plan_dir is None — should not panic or write anything
+
+        let plan = Plan {
+            summary: "Test".to_string(),
+            items: vec![],
+            status: PlanStatus::Executing,
+            plan_text: None,
+        };
+
+        engine.write_plan_file(&plan);
+        // No assertion needed — just verify no panic
+    }
+
+    #[test]
+    fn extract_plan_summary_examples() {
+        assert_eq!(
+            AgentEngine::extract_plan_summary("# My Plan\n\nSome details"),
+            "My Plan"
+        );
+        assert_eq!(
+            AgentEngine::extract_plan_summary("First line without heading"),
+            "First line without heading"
+        );
+        assert_eq!(AgentEngine::extract_plan_summary(""), "Plan");
+        assert_eq!(AgentEngine::extract_plan_summary("   \n  "), "Plan");
     }
 }

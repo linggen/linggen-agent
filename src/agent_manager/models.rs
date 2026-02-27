@@ -181,6 +181,7 @@ impl ModelManager {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn chat_json(&self, model_id: &str, messages: &[ChatMessage]) -> Result<String> {
         let instance = self
             .models
@@ -190,6 +191,7 @@ impl ModelManager {
             .await
     }
 
+    #[allow(dead_code)]
     pub async fn chat_json_with_keep_alive(
         &self,
         model_id: &str,
@@ -334,6 +336,7 @@ impl ModelManager {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn preload_model(&self, model_id: &str, keep_alive: &str) -> Result<()> {
         let instance = self
             .models
@@ -421,6 +424,7 @@ impl ModelManager {
     }
 
     /// Check if a model has a specific tag.
+    #[allow(dead_code)]
     pub fn has_tag(&self, model_id: &str, tag: &str) -> bool {
         self.models
             .get(model_id)
@@ -435,6 +439,7 @@ impl ModelManager {
 
     /// Return the OllamaClient for a specific model (if it's an Ollama provider).
     /// Used by server status endpoints.
+    #[allow(dead_code)]
     pub fn ollama_client_for_model(&self, model_id: &str) -> Option<&OllamaClient> {
         let instance = self.models.get(model_id)?;
         match &instance.client {

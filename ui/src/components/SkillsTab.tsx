@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Book, Check, ChevronDown, ChevronRight, Download, ExternalLink, FilePlus2, Package, Pencil, RefreshCw, Save, Search, Sparkles, Trash2, Wrench, X, Zap } from 'lucide-react';
+import { Book, Check, ChevronRight, Download, ExternalLink, FilePlus2, Package, Pencil, RefreshCw, Save, Search, Sparkles, Trash2, Wrench, X, Zap } from 'lucide-react';
 import type { BuiltInSkillInfo, MarketplaceSkill, SkillInfoFull, SkillFileInfo } from '../types';
 import { CM6Editor } from './CM6Editor';
 
@@ -65,7 +65,6 @@ export const SkillsTab: React.FC<{
   const [mpLoading, setMpLoading] = useState(false);
   const [mpInstalling, setMpInstalling] = useState<Set<string>>(new Set());
   const [mpUninstalling, setMpUninstalling] = useState<Set<string>>(new Set());
-  const [mpCollapsed, setMpCollapsed] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Built-in skills state
@@ -264,7 +263,8 @@ export const SkillsTab: React.FC<{
   const toggleExpanded = (name: string) => {
     setExpandedSkills((prev) => {
       const next = new Set(prev);
-      next.has(name) ? next.delete(name) : next.add(name);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
       return next;
     });
   };
@@ -272,7 +272,8 @@ export const SkillsTab: React.FC<{
   const toggleGroup = (source: string) => {
     setCollapsedGroups((prev) => {
       const next = new Set(prev);
-      next.has(source) ? next.delete(source) : next.add(source);
+      if (next.has(source)) next.delete(source);
+      else next.add(source);
       return next;
     });
   };
@@ -690,7 +691,6 @@ export const SkillsTab: React.FC<{
                   {filteredMpResults.map((skill) => {
                     const isInstalled = installedNames.has(skill.name);
                     const isInstalling = mpInstalling.has(skill.name);
-                    const isUninstalling = mpUninstalling.has(skill.name);
 
                     return (
                       <div

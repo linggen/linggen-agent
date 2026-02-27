@@ -131,7 +131,7 @@ export const ModelsTab: React.FC<{
   };
 
   const addModel = () => {
-    onChange({ ...config, models: [...config.models, emptyModel()] });
+    onChange({ ...config, models: [emptyModel(), ...config.models] });
   };
 
   const removeModel = (index: number) => {

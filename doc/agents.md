@@ -5,7 +5,7 @@ Process management: agent types, lifecycle, delegation, concurrency, and schedul
 ## Related docs
 
 - `agentic-loop.md`: the loop each agent runs.
-- `events.md`: SSE events for agent status.
+- `chat-spec.md`: SSE events for agent status.
 - `product-spec.md`: mission system overview.
 
 ## Agent types

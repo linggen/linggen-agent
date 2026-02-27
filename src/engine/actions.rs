@@ -43,6 +43,7 @@ pub enum ModelAction {
     },
 }
 
+#[allow(dead_code)]
 pub fn parse_first_action(raw: &str) -> Result<ModelAction> {
     let trimmed = raw.trim();
 

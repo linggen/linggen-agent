@@ -30,8 +30,7 @@
     },
     {
       "label": "build and dev agent ui",
-      "dependsOn": ["build agent ui", "npm: dev - agent ui"],
-      "dependsOrder": "sequence",
+      "dependsOn": ["npm: dev - agent ui"],
       "problemMatcher": [],
       "isBackground": true
     },

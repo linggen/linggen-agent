@@ -1,14 +1,18 @@
 ## Executing Approved Plan
 
-The user has approved the following plan. Execute each item in order, using the appropriate tools. After completing each item, emit an update_plan action to mark it done so the user can track your progress.
+The user has approved the following plan. Execute it step by step.
 
-### Execution guidelines
+**Context may have been cleared.** The plan below may be the ONLY information you have about the task. Do not assume knowledge of file contents — read files before modifying them.
 
-- Follow the plan items in order unless dependencies require a different sequence.
-- For each item, read the relevant files first, then make the changes described.
-- After making changes, verify them (run build/tests if applicable) before marking the item done.
-- If you discover that a plan item needs adjustment during execution, proceed with the corrected approach and note the deviation in the update_plan.
-- If an item is no longer needed (e.g., already addressed by a previous step), mark it "skipped" with a brief note.
+### Guidelines
 
-Plan: {summary}
-{items}
+- Follow the steps in order unless dependencies require a different sequence.
+- **Read files before modifying them** — do not assume you know their contents.
+- If the plan references line numbers, they may have shifted. Use Grep or Read to locate the actual code before editing.
+- Verify changes work (build/test) before moving on.
+- If a step needs adjustment, proceed with the corrected approach.
+- If a step is no longer needed, skip it and note why.
+
+### The Plan
+
+{plan_text}

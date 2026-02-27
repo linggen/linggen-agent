@@ -1,3 +1,9 @@
+export interface SubagentToolStep {
+  toolName: string;
+  args: string;
+  status: 'running' | 'done' | 'failed';
+}
+
 export interface SubagentTreeEntry {
   subagentId: string;
   agentName: string;
@@ -6,12 +12,25 @@ export interface SubagentTreeEntry {
   toolCount: number;
   contextTokens: number;
   currentActivity: string | null;
+  toolSteps: SubagentToolStep[];
 }
 
 export interface MessageSegment {
   type: 'text' | 'tools';
   text?: string;         // for 'text' segments
   entries?: string[];    // for 'tools' segments
+}
+
+/** Structured content block — Claude Code-style message model. */
+export interface ContentBlock {
+  type: 'text' | 'tool_use' | 'tool_result' | 'thinking';
+  id?: string;           // unique block ID (for tool_use blocks)
+  text?: string;         // for text/thinking blocks
+  tool?: string;         // for tool_use: "Read", "Edit", "Bash"
+  args?: string;         // for tool_use: compact arg summary
+  summary?: string;      // for tool_result: one-line result summary
+  status?: 'running' | 'done' | 'failed';  // for tool_use lifecycle
+  isError?: boolean;     // for tool_result
 }
 
 export interface ChatMessage {
@@ -33,6 +52,8 @@ export interface ChatMessage {
   subagentTree?: SubagentTreeEntry[];
   segments?: MessageSegment[];
   liveText?: string;
+  /** Structured content blocks (new message model). */
+  content?: ContentBlock[];
 }
 
 export interface UiSseMessage {
@@ -40,7 +61,7 @@ export interface UiSseMessage {
   seq: number;
   rev: number;
   ts_ms: number;
-  kind: 'message' | 'activity' | 'queue' | 'run' | 'token' | 'text_segment' | 'ask_user' | 'model_fallback';
+  kind: 'message' | 'activity' | 'queue' | 'run' | 'token' | 'text_segment' | 'ask_user' | 'model_fallback' | 'content_block' | 'turn_complete';
   phase?: string;
   text?: string;
   agent_id?: string;
@@ -329,8 +350,6 @@ export interface StorageEntry {
 // Plan mode types
 export type PlanItemStatus = 'pending' | 'in_progress' | 'done' | 'skipped';
 export type PlanStatus = 'planned' | 'approved' | 'executing' | 'completed';
-export type PlanOrigin = 'user_requested' | 'model_managed';
-
 export interface PlanItem {
   title: string;
   description?: string | null;
@@ -341,7 +360,7 @@ export interface Plan {
   summary: string;
   items: PlanItem[];
   status: PlanStatus;
-  origin?: PlanOrigin;
+  plan_text?: string | null;
 }
 
 // --- AskUser types ---

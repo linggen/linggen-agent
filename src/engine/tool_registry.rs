@@ -4,7 +4,7 @@ use crate::agent_manager::AgentManager;
 use crate::config::AgentPolicy;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
 
@@ -85,31 +85,6 @@ impl ToolRegistry {
         serde_json::json!({ "tools": tools_arr }).to_string()
     }
 
-    /// All known tool names (builtins + skill tools).
-    pub fn all_tool_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = vec![
-            "Glob",
-            "Read",
-            "Grep",
-            "Write",
-            "Edit",
-            "Bash",
-            "capture_screenshot",
-            "lock_paths",
-            "unlock_paths",
-            "delegate_to_agent",
-            "WebSearch",
-            "WebFetch",
-            "Skill",
-            "AskUser",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-        names.extend(self.skill_tools.keys().cloned());
-        names
-    }
-
     pub fn register_skill_tool(&mut self, tool: SkillToolDef) {
         self.skill_tools.insert(tool.name.clone(), tool);
     }
@@ -134,10 +109,6 @@ impl ToolRegistry {
 
     pub fn get_manager(&self) -> Option<Arc<AgentManager>> {
         self.builtins.get_manager()
-    }
-
-    pub fn workspace_root(&self) -> &Path {
-        self.builtins.workspace_root()
     }
 
     pub fn set_memory_dir(&mut self, dir: PathBuf) {

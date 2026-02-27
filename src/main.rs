@@ -1,4 +1,5 @@
 mod agent_manager;
+#[allow(dead_code)]
 mod check;
 mod cli;
 mod config;
@@ -11,7 +12,6 @@ mod openai;
 mod paths;
 mod prompts;
 mod project_store;
-mod repl;
 mod server;
 mod tui;
 mod skills;
@@ -316,7 +316,7 @@ async fn main() -> Result<()> {
                 let handle =
                     server::prepare_server(manager, skill_manager, port, cli.dev, rx).await?;
                 let result =
-                    repl::run_tui(handle.port, ws_root.to_string_lossy().to_string()).await;
+                    tui::run_tui(handle.port, ws_root.to_string_lossy().to_string()).await;
                 handle.task.abort();
                 result?;
             }

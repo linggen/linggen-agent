@@ -291,6 +291,18 @@ impl AgentEngine {
         session_id: Option<&str>,
     ) -> Option<AgentOutcome> {
         match action {
+            ModelAction::Tool { ref tool, .. } if tool == "ExitPlanMode" => {
+                if self.plan_mode {
+                    info!("ExitPlanMode tool called — submitting plan for review");
+                    let plan_text = state.last_assistant_response.clone();
+                    return Some(self.finalize_plan_mode(plan_text).await);
+                } else {
+                    state.messages.push(ChatMessage::new(
+                        "user",
+                        "ExitPlanMode: not currently in plan mode.",
+                    ));
+                }
+            }
             ModelAction::Tool { tool, args } => {
                 match self
                     .handle_tool_action(
@@ -333,20 +345,22 @@ impl AgentEngine {
             ModelAction::Done { message } => {
                 let msg = message.unwrap_or_else(|| "Task completed.".to_string());
                 info!("Agent signalled done: {}", msg);
-                self.auto_complete_plan().await;
                 self.push_context_record(
                     ContextType::Status, Some("done".to_string()),
                     self.agent_id.clone(), Some("user".to_string()),
                     msg.clone(), serde_json::json!({ "kind": "done" }),
                 );
                 let _ = self.manager_db_add_assistant_message(&msg, session_id).await;
+                self.last_assistant_text = Some(msg.clone());
                 self.active_skill = None;
                 if self.plan_mode {
-                    if let Some(plan) = &mut self.plan {
-                        plan.status = PlanStatus::Planned;
-                        return Some(AgentOutcome::Plan(plan.clone()));
-                    }
+                    // Fallback: model emitted done in plan mode without calling ExitPlanMode.
+                    // Treat the last response as the plan text.
+                    info!("Fallback: done in plan mode — treating as implicit ExitPlanMode");
+                    let plan_text = state.last_assistant_response.clone();
+                    return Some(self.finalize_plan_mode(plan_text).await);
                 }
+                self.auto_complete_plan().await;
                 return Some(AgentOutcome::None);
             }
             ModelAction::EnterPlanMode { reason } => {

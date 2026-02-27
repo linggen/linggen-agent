@@ -13,108 +13,90 @@ Read files under `doc/` and follow them. If you find wrong content in any doc fi
 - `doc/agents.md` — process management: lifecycle, delegation, scheduling
 - `doc/skills.md` — dynamic extensions: format, discovery, triggers
 - `doc/tools.md` — syscall interface: built-in tools, safety
-- `doc/events.md` — IPC: SSE events, message queue, APIs
+- `doc/chat-spec.md` — chat system: SSE events, message model, rendering, APIs
 - `doc/models.md` — hardware abstraction: providers, routing
 - `doc/storage.md` — filesystem layout: all persistent state, data formats
 - `doc/cli.md` — CLI reference
 - `doc/code-style.md` — code style rules (flat logic, small files/functions, clean code)
 - `doc/log-spec.md` — logging levels, throttling, output targets
 
-## Build and Run
+## Build, Test, Run
 
 ### Rust Backend
 
 ```bash
-# Build
-cargo build
-
-# Run CLI interactive mode
-cargo run -- agent
-
-# Run web UI server (default port from linggen-agent.toml)
-cargo run -- serve
-
-# Run server in dev mode (proxies static assets from Vite)
-cargo run -- serve --dev
-
-# Run with specific workspace root
-cargo run -- serve --root /path/to/project
+cargo build                        # Build
+cargo test                         # Run all 161 tests
+cargo test check::tests            # Run tests in a specific module
+cargo test test_name               # Run a single test by name
+cargo run                          # Start TUI + embedded server (default)
+cargo run -- --web                 # Web UI only, no TUI
+cargo run -- --web --dev           # Dev mode (proxy static assets to Vite)
+cargo run -- --root /path/to/proj  # Custom workspace root
 ```
 
-### Web UI (React + Vite + Tailwind v4)
+### Web UI (React 19 + Vite + Tailwind v4)
 
 ```bash
 cd ui
-
-# Install dependencies
-npm install
-
-# Dev server (proxies /api to backend port from linggen-agent.toml)
-npm run dev
-
-# Production build (output to ui/dist/, embedded by Rust via rust-embed)
-npm run build
-
-# Lint
-npm run lint
-npm run lint:fix
+npm install                        # Install dependencies
+npm run dev                        # Dev server (HMR, proxies /api to backend)
+npm run build                      # Production build → ui/dist/ (embedded by Rust)
+npm run lint                       # ESLint check
+npm run lint:fix                   # Auto-fix
 ```
 
-### Development Workflow
+### Full-Stack Dev
 
-For full-stack dev, run both in parallel:
-1. `cargo run -- serve --dev` (backend, serves API only)
-2. `cd ui && npm run dev` (Vite dev server with HMR, proxies API to backend)
+Run both in parallel:
+1. `cargo run -- --web --dev` (backend API only)
+2. `cd ui && npm run dev` (Vite dev server with HMR)
 
-For production: `npm run build` in `ui/`, then `cargo run -- serve` (backend embeds `ui/dist/` via rust-embed).
+For production: `cd ui && npm run build`, then `cargo run` (embeds `ui/dist/` via rust-embed).
 
 ## Architecture
 
-Linggen Agent is a local-first, multi-agent coding assistant. Two entry points: `linggen-agent agent` (interactive CLI/REPL) and `linggen-agent serve` (HTTP API + web UI).
+Linggen Agent is a local-first, multi-agent coding assistant. The binary is `ling`. Default mode starts an HTTP server + TUI; `--web` runs the server only.
 
 ### Rust Backend (`src/`)
 
-- **`main.rs`** — CLI entry point (clap). Parses subcommands `agent` and `serve`, loads config, sets up logging.
+- **`main.rs`** — CLI entry point (clap). Subcommands: `stop`, `status`, `doctor`, `eval`, `init`, `install`, `update`, `skills`. No subcommand → TUI + server.
 - **`config.rs`** — Config loading from `linggen-agent.toml` (TOML). Defines `Config`, `ModelConfig`, `AgentSpec` (parsed from markdown frontmatter), `AgentPolicy`.
-- **`engine/`** — Core agent execution engine. Prompt loop, tool dispatch, structured/chat mode execution, action parsing, patch application, output rendering. `engine/tools.rs` implements all model-facing tools (`Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `capture_screenshot`, `lock_paths`, `unlock_paths`, `delegate_to_agent`, `WebSearch`, `WebFetch`, `Skill`, `AskUser`).
-- **`server/`** — Axum HTTP server. `mod.rs` sets up routes and static asset serving. `chat_api.rs` handles chat/run endpoints and SSE streaming. `chat_helpers.rs` has shared chat logic. `agent_api.rs` has run inspection APIs. `projects_api.rs` handles project/session CRUD. `workspace_api.rs` serves workspace file tree.
-- **`agent_manager/`** — Agent lifecycle management, run records, cancellation, model routing. `models.rs` handles multi-model provider dispatch (Ollama, OpenAI-compatible).
-- **`ollama.rs`** — Ollama API client (streaming and non-streaming chat completions).
-- **`project_store/`** — Persistent state using filesystem JSON files. Projects, missions, agent overrides, run records.
-- **`skills/`** — Skill manager for loading embedded and project-local skill definitions.
-- **`state_fs/`** — Filesystem-backed project state (`.linggen-agent/` directory).
-- **`repl.rs`** — Interactive CLI REPL mode (ratatui TUI).
-- **`check.rs`** — Command safety validation for `Bash` tool (allowlist enforcement).
-- **`workspace.rs`** — Workspace root detection (walks up to find `.git`).
-- **`logging.rs`** — Tracing setup with file rotation and retention.
+- **`engine/`** — Core agent execution engine. `mod.rs` is the main loop. `tools.rs` implements all model-facing tools (Read, Write, Edit, Bash, Glob, Grep, capture_screenshot, lock_paths, unlock_paths, delegate_to_agent, WebSearch, WebFetch, Skill, AskUser). `actions.rs` parses JSON actions from model output. `streaming.rs` handles streaming responses. `context.rs` manages token counting and compaction. `permission.rs` enforces tool permissions. `plan.rs` manages plan mode.
+- **`server/`** — Axum HTTP server. `chat_api.rs` handles chat/run endpoints + SSE streaming. `projects_api.rs` for project/session CRUD. `workspace_api.rs` serves file tree. `config_api.rs` for runtime config. `idle_scheduler.rs` for mission idle prompts.
+- **`agent_manager/`** — Agent lifecycle, run records, cancellation. `models.rs` handles multi-provider dispatch (Ollama, OpenAI-compatible). `routing.rs` implements model selection policies with fallback chains.
+- **`tui/`** — Ratatui terminal UI. `app.rs` is the main TUI state machine. `render.rs` draws the interface. `markdown.rs` renders markdown to terminal spans.
+- **`ollama.rs`** / **`openai.rs`** — Provider API clients (streaming and non-streaming).
+- **`project_store/`** — Persistent state using filesystem JSON files.
+- **`skills/`** — Skill discovery, loading, and marketplace integration.
+- **`state_fs/`** — Filesystem-backed session state (`.linggen/sessions/`).
+- **`check.rs`** — Bash command safety validation (allowlist, not yet wired up).
+- **`eval/`** — Evaluation framework: task runner, grader, report generation.
+- **`cli/`** — Standalone CLI commands: `daemon.rs`, `doctor.rs`, `self_update.rs`, `init.rs`, `skills_cmd.rs`.
 
 ### Web UI (`ui/src/`)
 
-React 19 + TypeScript + Tailwind CSS v4 + Vite. Key files:
+React 19 + TypeScript + Tailwind CSS v4 + Vite.
 
-- **`App.tsx`** — Main app component. Manages projects, sessions, agents, SSE event handling, page routing (`main`, `settings`, `mission`).
-- **`components/ChatPanel.tsx`** — Chat interface with message rendering, tool activity display, markdown/code rendering.
-- **`components/MissionPage.tsx`** — Dedicated mission management page with 4 tabs: Editor, Agent Config, History, Activity.
-- **`components/SettingsPage.tsx`** — Settings management (models, agents, skills, general config).
-- **`components/AgentsCard.tsx`** — Agent status cards with run history and timeline badges.
-- **`components/AgentTree.tsx`** — Agent hierarchy visualization.
-- **`components/HeaderBar.tsx`** — Top navigation bar with page navigation (Mission, Settings).
-- **`components/ModelsCard.tsx`** — Model configuration display.
-- **`types.ts`** — Shared TypeScript type definitions (includes mission types: `MissionInfo`, `MissionTab`, `IdlePromptEvent`).
+- **`App.tsx`** — Root component. Project/session management, SSE event handling, page routing.
+- **`components/ChatPanel.tsx`** — Chat interface, message rendering, tool activity display.
+- **`components/MissionPage.tsx`** — Mission management (editor, agent config, history, activity tabs).
+- **`components/SettingsPage.tsx`** — Settings (models, agents, skills, general).
+- **`types.ts`** — Shared TypeScript type definitions.
 
 ### Agent Definitions (`agents/`)
 
-Agent specs are markdown files with YAML frontmatter. Discovered dynamically at startup — adding a new `.md` file registers a new agent without code changes.
+Agent specs are markdown files with YAML frontmatter. Adding a `.md` file registers a new agent at startup.
 
 Frontmatter fields: `name`, `description`, `tools`, `model`, `work_globs`, `policy`.
 
-Current agents: `ling` (general-purpose assistant), `coder` (implementation), `explorer` (read-only codebase analysis), `debugger` (read-only debugging), `linggen-guide` (Linggen docs/usage guide).
+Current agents: `ling` (lead, delegates), `coder` (writes code), `explorer` (read-only analysis), `debugger` (read-only debugging), `linggen-guide` (docs guide).
 
-### Configuration (`linggen-agent.toml`)
+### Configuration
 
-Config search order: `$LINGGEN_CONFIG` env var → `./linggen-agent.toml` → `~/.config/linggen-agent/` → `~/.local/share/linggen-agent/`.
+Config search: `$LINGGEN_CONFIG` → `./linggen-agent.toml` → `~/.config/linggen-agent/` → `~/.local/share/linggen-agent/`.
 
-Key sections: `[[models]]` (LLM providers), `[server]` (port), `[agent]` (max_iters, safety mode), `[logging]`, `[[agents]]` (agent spec references).
+Key sections: `[[models]]` (LLM providers), `[server]` (port), `[agent]` (max_iters, safety mode, tool_permission_mode), `[logging]`, `[[agents]]` (agent spec references), `[routing]` (model selection policies).
 
 ## Code Style
 
@@ -128,7 +110,10 @@ Follow `doc/code-style.md`:
 
 - **Tool names are Claude Code-style**: `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep` (capitalized).
 - **Workspace-scoped file operations**: all paths are sandboxed to workspace root; parent traversal (`..`) is rejected.
-- **Bash command safety**: commands are validated against an allowlist; shell injection patterns are blocked.
 - **Agent policy enforcement**: tools and actions (Patch, Finalize, Delegate) are hard-gated per agent via frontmatter policy, not just prompt guidance.
-- **SSE events**: server publishes real-time events (`Token`, `Message`, `AgentStatus`, `SubagentSpawned`, etc.) consumed by the web UI.
-- **Delegation depth**: configurable via `max_delegation_depth` (default 2). All agents are equal — any agent can delegate to any other agent within the depth limit.
+- **SSE events**: server publishes real-time events (`Token`, `Message`, `AgentStatus`, `SubagentSpawned`, `ToolStatus`, `PlanUpdate`, etc.) consumed by the web UI.
+- **Delegation depth**: configurable via `max_delegation_depth` (default 2). Any agent can delegate to any other agent.
+- **Model routing**: default model chain with health tracking and auto-fallback on errors/rate limits.
+- **Tool permissions**: three modes — `auto` (always allow), `warn` (log destructive ops), `ask` (prompt user via AskUser bridge).
+
+Please read `.claude/skills/linggen/SKILL.md` on load to understand the Linggen project structure and context management system.

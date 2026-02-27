@@ -6,7 +6,7 @@ Filesystem layout for all persistent state. No database — everything is files.
 
 - `agents.md`: mission system, agent overrides.
 - `agentic-loop.md`: plan persistence, context management.
-- `events.md`: API endpoints that read/write this state.
+- `chat-spec.md`: API endpoints that read/write this state.
 - `skills.md`: skill discovery paths.
 
 ## Root directories

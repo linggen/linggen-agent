@@ -60,14 +60,6 @@ impl AgentEngine {
             });
         }
 
-        // Load plan from file if not already set (session resume).
-        if self.plan.is_none() {
-            if let Some(plan) = self.load_latest_plan() {
-                info!("Loaded plan from file: {} ({} items)", plan.summary, plan.items.len());
-                self.plan = Some(plan);
-            }
-        }
-
         // Sync world state before running the loop if we have a manager
         if let Some(manager) = self.tools.get_manager() {
             let _ = manager.sync_world_state(&self.cfg.ws_root).await;
@@ -247,10 +239,22 @@ impl AgentEngine {
                             .agent_id
                             .clone()
                             .unwrap_or_else(|| "unknown".to_string());
+                        // Keep TextSegment for backward compat (TUI, older clients).
                         manager
                             .send_event(crate::agent_manager::AgentEvent::TextSegment {
+                                agent_id: agent_id.clone(),
+                                text: text_before.clone(),
+                                parent_id: self.parent_agent_id.clone(),
+                            })
+                            .await;
+                        // Also emit structured ContentBlockStart(text) for Web UI.
+                        manager
+                            .send_event(crate::agent_manager::AgentEvent::ContentBlockStart {
                                 agent_id,
-                                text: text_before,
+                                block_id: uuid::Uuid::new_v4().to_string(),
+                                block_type: "text".to_string(),
+                                tool: None,
+                                args: Some(text_before),
                                 parent_id: self.parent_agent_id.clone(),
                             })
                             .await;

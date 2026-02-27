@@ -1,6 +1,7 @@
 use crate::agent_manager::AgentManager;
 use crate::engine::AgentOutcome;
 use crate::server::{ServerEvent, ServerState};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -86,14 +87,6 @@ pub(crate) fn queue_preview(message: &str) -> String {
 // Tool status formatting
 // ---------------------------------------------------------------------------
 
-pub(crate) fn extract_tool_path_arg(args: &serde_json::Value) -> Option<String> {
-    args.get("path")
-        .or_else(|| args.get("file"))
-        .or_else(|| args.get("filepath"))
-        .and_then(|v| v.as_str())
-        .map(|v| v.to_string())
-}
-
 #[derive(Debug, Clone)]
 struct ToolCallForUi {
     name: String,
@@ -129,22 +122,6 @@ fn parse_tool_call_from_json_line(line: &str) -> Option<ToolCallForUi> {
     None
 }
 
-fn parse_tool_name_from_result_line(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if !lower.starts_with("tool ") {
-        return None;
-    }
-    let rest = trimmed.get(5..)?.trim();
-    let (name, _) = rest.split_once(':')?;
-    let clean = name.trim();
-    if clean.is_empty() {
-        None
-    } else {
-        Some(clean.to_string())
-    }
-}
-
 fn preview_value(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         value.to_string()
@@ -175,6 +152,59 @@ fn first_string_arg(args: Option<&serde_json::Value>, keys: &[&str]) -> Option<S
         }
     }
     None
+}
+
+fn parse_read_result_path_from_tool_header(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.len() < 10 || !trimmed[..10].eq_ignore_ascii_case("tool read:") {
+        return None;
+    }
+    let mut rest = trimmed[10..].trim();
+    if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case("read:") {
+        rest = rest[5..].trim();
+    }
+    let path = rest
+        .split(" (truncated:")
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+    if path.is_empty() {
+        None
+    } else {
+        Some(preview_value(&basename(path), 140))
+    }
+}
+
+fn tool_target_line(tool: &str, target: Option<&str>) -> String {
+    match target.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(t) => format!("Used tool: {} · target={}", tool, t),
+        None => format!("Used tool: {}", tool),
+    }
+}
+
+fn parse_grep_target(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed == "(no matches)" {
+        return None;
+    }
+    let path = trimmed.split(':').next().unwrap_or("").trim();
+    if path.is_empty() || path == "(no matches)" {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
+fn summarize_targets(tool: &str, targets: &BTreeSet<String>, empty_label: &str) -> String {
+    if targets.is_empty() {
+        return tool_target_line(tool, Some(empty_label));
+    }
+    let first = targets.iter().next().cloned().unwrap_or_default();
+    if targets.len() == 1 {
+        return tool_target_line(tool, Some(&first));
+    }
+    let more = targets.len() - 1;
+    tool_target_line(tool, Some(&format!("{first} (+{more} more)")))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +306,35 @@ pub(crate) fn tool_status_line(
                 .map(|globs| format!("List files failed: {globs}"))
                 .unwrap_or_else(|| "List files failed".to_string()),
         },
+        "webfetch" => {
+            let url = first_string_arg(args, &["url"]).map(|u| preview_value(&u, 140));
+            match phase {
+                ToolStatusPhase::Start => url
+                    .map(|u| format!("Fetching URL: {u}"))
+                    .unwrap_or_else(|| "Fetching URL...".to_string()),
+                ToolStatusPhase::Done => url
+                    .map(|u| format!("Fetched URL: {u}"))
+                    .unwrap_or_else(|| "Fetched URL".to_string()),
+                ToolStatusPhase::Failed => url
+                    .map(|u| format!("Fetch failed: {u}"))
+                    .unwrap_or_else(|| "Fetch failed".to_string()),
+            }
+        }
+        "websearch" => {
+            let query =
+                first_string_arg(args, &["query", "q"]).map(|q| preview_value(&q, 140));
+            match phase {
+                ToolStatusPhase::Start => query
+                    .map(|q| format!("Searching web: {q}"))
+                    .unwrap_or_else(|| "Searching web...".to_string()),
+                ToolStatusPhase::Done => query
+                    .map(|q| format!("Searched web: {q}"))
+                    .unwrap_or_else(|| "Searched web".to_string()),
+                ToolStatusPhase::Failed => query
+                    .map(|q| format!("Web search failed: {q}"))
+                    .unwrap_or_else(|| "Web search failed".to_string()),
+            }
+        }
         "delegate_to_agent" => match phase {
             ToolStatusPhase::Start => delegate_target
                 .map(|target| format!("Delegating to subagent: {target}"))
@@ -300,18 +359,6 @@ pub(crate) fn tool_status_line(
     }
 }
 
-fn status_line_for_tool_call(tool_call: Option<&ToolCallForUi>) -> String {
-    let Some(tool_call) = tool_call else {
-        return "Calling tool...".to_string();
-    };
-
-    tool_status_line(
-        &tool_call.name,
-        tool_call.args.as_ref(),
-        ToolStatusPhase::Start,
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Message sanitization for UI
 // ---------------------------------------------------------------------------
@@ -321,13 +368,106 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
         return Some(content.to_string());
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SuppressedToolBodyKind {
+        Read,
+        Grep,
+        Glob,
+    }
+
+    #[derive(Debug, Clone)]
+    enum SuppressedToolBody {
+        Read,
+        Grep {
+            summary_idx: usize,
+            targets: BTreeSet<String>,
+            saw_no_matches: bool,
+        },
+        Glob {
+            summary_idx: usize,
+            targets: BTreeSet<String>,
+        },
+    }
+
+    let finalize_mode = |mode: SuppressedToolBody, cleaned_lines: &mut Vec<String>| match mode {
+        SuppressedToolBody::Read => {}
+        SuppressedToolBody::Grep {
+            summary_idx,
+            targets,
+            saw_no_matches,
+        } => {
+            if let Some(entry) = cleaned_lines.get_mut(summary_idx) {
+                *entry = if saw_no_matches {
+                    tool_target_line("Grep", Some("(no matches)"))
+                } else {
+                    summarize_targets("Grep", &targets, "(no matches)")
+                };
+            }
+        }
+        SuppressedToolBody::Glob {
+            summary_idx,
+            targets,
+        } => {
+            if let Some(entry) = cleaned_lines.get_mut(summary_idx) {
+                *entry = summarize_targets("Glob", &targets, "(no files)");
+            }
+        }
+    };
+
+    let mode_kind = |mode: &SuppressedToolBody| match mode {
+        SuppressedToolBody::Read => SuppressedToolBodyKind::Read,
+        SuppressedToolBody::Grep { .. } => SuppressedToolBodyKind::Grep,
+        SuppressedToolBody::Glob { .. } => SuppressedToolBodyKind::Glob,
+    };
+
     let mut cleaned_lines: Vec<String> = Vec::new();
-    let mut in_read_body = false;
+    let mut suppressed_tool_body: Option<SuppressedToolBody> = None;
 
     for raw_line in content.lines() {
         let line = raw_line.trim();
+        let lower = line.to_lowercase();
+
+        // Suppress verbose tool result bodies after compact status lines.
+        if let Some(mut mode) = suppressed_tool_body.take() {
+            let is_boundary = line.starts_with('{')
+                || lower.starts_with("tool ")
+                || lower.starts_with("tool_error:")
+                || lower.starts_with("tool_not_allowed:");
+            let should_suppress = match mode_kind(&mode) {
+                // Read payloads can contain blank lines; only explicit boundaries end suppression.
+                SuppressedToolBodyKind::Read => !is_boundary,
+                // Grep/Glob payloads are line-oriented; an empty line can also end suppression.
+                SuppressedToolBodyKind::Grep | SuppressedToolBodyKind::Glob => {
+                    !is_boundary && !line.is_empty()
+                }
+            };
+            if should_suppress {
+                match &mut mode {
+                    SuppressedToolBody::Read => {}
+                    SuppressedToolBody::Grep {
+                        targets,
+                        saw_no_matches,
+                        ..
+                    } => {
+                        if line.eq_ignore_ascii_case("(no matches)")
+                            || lower.contains("no file candidates found")
+                        {
+                            *saw_no_matches = true;
+                        } else if let Some(target) = parse_grep_target(line) {
+                            targets.insert(target);
+                        }
+                    }
+                    SuppressedToolBody::Glob { targets, .. } => {
+                        targets.insert(line.to_string());
+                    }
+                }
+                suppressed_tool_body = Some(mode);
+                continue;
+            }
+            finalize_mode(mode, &mut cleaned_lines);
+        }
+
         if line.is_empty() {
-            in_read_body = false;
             if cleaned_lines.last().map(|v| !v.is_empty()).unwrap_or(false) {
                 cleaned_lines.push(String::new());
             }
@@ -336,7 +476,7 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
 
         // Tool call JSON — emit a compact status line instead of raw JSON.
         if let Some(tool_call) = parse_tool_call_from_json_line(line) {
-            in_read_body = false;
+            suppressed_tool_body = None;
             if !tool_call.name.is_empty() {
                 cleaned_lines.push(tool_status_line(
                     &tool_call.name,
@@ -347,36 +487,49 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
             continue;
         }
 
-        let lower = line.to_lowercase();
-
         // Tool errors and permission denials — always keep.
         if lower.starts_with("tool_error:") || lower.starts_with("tool_not_allowed:") {
-            in_read_body = false;
+            suppressed_tool_body = None;
             cleaned_lines.push(raw_line.to_string());
             continue;
         }
 
-        // Tool result header lines ("Tool Read: ...", "Tool Bash: ...").
-        // Keep the header as a status line but suppress file content body for Read.
+        // Tool result header lines ("Tool Read: ...", "Tool Grep: ...", "Tool Bash: ...").
+        // Keep compact status lines and suppress verbose bodies for selected tools.
         if lower.starts_with("tool ") {
             if lower.starts_with("tool read:") {
-                // Emit a compact status line; suppress the file dump that follows.
-                let path_hint = line
-                    .get(10..)
-                    .and_then(|s| s.split_whitespace().next())
-                    .unwrap_or("");
-                cleaned_lines.push(format!("Read: {}", path_hint));
-                in_read_body = true;
+                let status = parse_read_result_path_from_tool_header(line)
+                    .map(|path| tool_target_line("Read", Some(&path)))
+                    .unwrap_or_else(|| tool_target_line("Read", None));
+                cleaned_lines.push(status);
+                suppressed_tool_body = Some(SuppressedToolBody::Read);
+            } else if lower.starts_with("tool grep:") {
+                cleaned_lines.push(tool_target_line("Grep", None));
+                let idx = cleaned_lines.len() - 1;
+                suppressed_tool_body = Some(SuppressedToolBody::Grep {
+                    summary_idx: idx,
+                    targets: BTreeSet::new(),
+                    saw_no_matches: false,
+                });
+            } else if lower.starts_with("tool glob:") {
+                cleaned_lines.push(tool_target_line("Glob", None));
+                let idx = cleaned_lines.len() - 1;
+                suppressed_tool_body = Some(SuppressedToolBody::Glob {
+                    summary_idx: idx,
+                    targets: BTreeSet::new(),
+                });
+            } else if lower.starts_with("tool websearch:") {
+                let query = line
+                    .split("WebSearch:")
+                    .nth(1)
+                    .and_then(|s| s.split('(').next())
+                    .map(|s| s.trim().trim_matches('"'))
+                    .filter(|s| !s.is_empty());
+                cleaned_lines.push(tool_target_line("WebSearch", query));
             } else {
-                // For non-Read tool results, keep the header line.
-                in_read_body = false;
+                suppressed_tool_body = None;
                 cleaned_lines.push(raw_line.to_string());
             }
-            continue;
-        }
-
-        // Suppress Read file content body lines.
-        if in_read_body {
             continue;
         }
 
@@ -390,6 +543,10 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
 
         // Everything else — keep (model text, delegation messages, errors, etc.)
         cleaned_lines.push(raw_line.to_string());
+    }
+
+    if let Some(mode) = suppressed_tool_body.take() {
+        finalize_mode(mode, &mut cleaned_lines);
     }
 
     let cleaned = cleaned_lines
@@ -474,5 +631,38 @@ pub(crate) fn emit_outcome_event(
             });
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_message_for_ui;
+
+    #[test]
+    fn sanitize_hides_read_body_and_keeps_file_status() {
+        let input = "Tool Read: Read: doc/storage.md (truncated: false)\n\nFilesystem layout for all persistent state.\nNo database — everything is files.\n\n(content omitted in chat; open the file viewer for full text)";
+        let cleaned = sanitize_message_for_ui("system", input).expect("expected sanitized output");
+        assert_eq!(cleaned, "Used tool: Read · target=storage.md");
+    }
+
+    #[test]
+    fn sanitize_handles_tool_read_header_without_path() {
+        let input = "Tool Read: Read:\n\nsecret content";
+        let cleaned = sanitize_message_for_ui("system", input).expect("expected sanitized output");
+        assert_eq!(cleaned, "Used tool: Read");
+    }
+
+    #[test]
+    fn sanitize_hides_grep_body_and_keeps_compact_status() {
+        let input = "Tool Grep: Grep matches:\nsrc/a.rs:10: fn main() {}\nsrc/b.rs:42: let x = 1;";
+        let cleaned = sanitize_message_for_ui("system", input).expect("expected sanitized output");
+        assert_eq!(cleaned, "Used tool: Grep · target=src/a.rs (+1 more)");
+    }
+
+    #[test]
+    fn sanitize_hides_glob_body_and_keeps_compact_status() {
+        let input = "Tool Glob: files:\nsrc/a.rs\nsrc/b.rs\nsrc/c.rs";
+        let cleaned = sanitize_message_for_ui("system", input).expect("expected sanitized output");
+        assert_eq!(cleaned, "Used tool: Glob · target=src/a.rs (+2 more)");
     }
 }

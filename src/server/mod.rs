@@ -16,7 +16,7 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
-    routing::{delete, get, patch, post, put},
+    routing::{delete, get, patch, post},
     Router,
 };
 use rust_embed::RustEmbed;
@@ -37,7 +37,7 @@ use agent_api::{
     cancel_agent_run, clear_mission, get_agent_override, get_mission, list_missions, run_agent,
     set_agent_override, set_mission, set_task,
 };
-use chat_api::{approve_plan_handler, ask_user_response_handler, chat_handler, clear_chat_history_api, reject_plan_handler};
+use chat_api::{approve_plan_handler, ask_user_response_handler, chat_handler, clear_chat_history_api, edit_plan_handler, reject_plan_handler};
 use config_api::{get_config_api, get_credentials_api, get_models_health, update_config_api, update_credentials_api};
 use projects_api::{
     add_project, create_session, delete_agent_file_api, delete_skill_file_api,
@@ -217,6 +217,35 @@ pub enum ServerEvent {
         line: String,
         stream: String, // "stdout" | "stderr"
     },
+    Resync {
+        reason: String,
+        lagged_count: Option<u64>,
+    },
+    /// A new content block started within the current assistant turn.
+    ContentBlockStart {
+        agent_id: String,
+        block_id: String,
+        block_type: String,
+        tool: Option<String>,
+        args: Option<String>,
+        parent_id: Option<String>,
+    },
+    /// Update an existing content block (status change, result summary).
+    ContentBlockUpdate {
+        agent_id: String,
+        block_id: String,
+        status: Option<String>,
+        summary: Option<String>,
+        is_error: Option<bool>,
+        parent_id: Option<String>,
+    },
+    /// Signal that the assistant turn is complete (single finalizer).
+    TurnComplete {
+        agent_id: String,
+        duration_ms: Option<u64>,
+        context_tokens: Option<usize>,
+        parent_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +279,8 @@ const UI_KIND_QUEUE: &str = "queue";
 const UI_KIND_RUN: &str = "run";
 const UI_KIND_TOKEN: &str = "token";
 const UI_KIND_TEXT_SEGMENT: &str = "text_segment";
+const UI_KIND_CONTENT_BLOCK: &str = "content_block";
+const UI_KIND_TURN_COMPLETE: &str = "turn_complete";
 
 const UI_PHASE_SYNC: &str = "sync";
 const UI_PHASE_OUTCOME: &str = "outcome";
@@ -260,6 +291,7 @@ const UI_PHASE_CHANGE_REPORT: &str = "change_report";
 const UI_PHASE_PLAN_UPDATE: &str = "plan_update";
 const UI_PHASE_DOING: &str = "doing";
 const UI_PHASE_DONE: &str = "done";
+const UI_PHASE_RESYNC: &str = "resync";
 
 fn default_status_text(status: AgentStatusKind) -> String {
     match status {
@@ -617,6 +649,102 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
                 "stream": stream,
             })),
         }),
+        ServerEvent::Resync {
+            reason,
+            lagged_count,
+        } => Some(UiSseMessage {
+            id: format!("run-resync-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: UI_KIND_RUN.to_string(),
+            phase: Some(UI_PHASE_RESYNC.to_string()),
+            text: Some("Resync required".to_string()),
+            agent_id: None,
+            session_id: None,
+            project_root: None,
+            data: Some(json!({
+                "reason": reason,
+                "lagged_count": lagged_count,
+            })),
+        }),
+        ServerEvent::ContentBlockStart {
+            agent_id,
+            block_id,
+            block_type,
+            tool,
+            args,
+            parent_id,
+        } => {
+            let phase = if block_type == "tool_use" { "start" } else { "start" };
+            Some(UiSseMessage {
+                id: format!("cb-start-{block_id}"),
+                seq,
+                rev: seq,
+                ts_ms,
+                kind: UI_KIND_CONTENT_BLOCK.to_string(),
+                phase: Some(phase.to_string()),
+                text: None,
+                agent_id: Some(agent_id),
+                session_id: None,
+                project_root: None,
+                data: Some(json!({
+                    "block_id": block_id,
+                    "block_type": block_type,
+                    "tool": tool,
+                    "args": args,
+                    "parent_id": parent_id,
+                })),
+            })
+        }
+        ServerEvent::ContentBlockUpdate {
+            agent_id,
+            block_id,
+            status,
+            summary,
+            is_error,
+            parent_id,
+        } => Some(UiSseMessage {
+            id: format!("cb-update-{block_id}-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: UI_KIND_CONTENT_BLOCK.to_string(),
+            phase: Some("update".to_string()),
+            text: summary.clone(),
+            agent_id: Some(agent_id),
+            session_id: None,
+            project_root: None,
+            data: Some(json!({
+                "block_id": block_id,
+                "status": status,
+                "summary": summary,
+                "is_error": is_error,
+                "parent_id": parent_id,
+            })),
+        }),
+        ServerEvent::TurnComplete {
+            agent_id,
+            duration_ms,
+            context_tokens,
+            parent_id,
+        } => Some(UiSseMessage {
+            id: format!("turn-complete-{agent_id}-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: UI_KIND_TURN_COMPLETE.to_string(),
+            phase: None,
+            text: None,
+            agent_id: Some(agent_id),
+            session_id: None,
+            project_root: None,
+            data: Some(json!({
+                "duration_ms": duration_ms,
+                "context_tokens": context_tokens,
+                "parent_id": parent_id,
+            })),
+        }),
     }
 }
 
@@ -704,7 +832,6 @@ impl ServerState {
 }
 
 pub struct ServerHandle {
-    pub state: Arc<ServerState>,
     pub task: tokio::task::JoinHandle<anyhow::Result<()>>,
     pub port: u16,
 }
@@ -858,6 +985,53 @@ pub async fn prepare_server(
                         // UI will refresh state from DB
                         let _ = state_clone.events_tx.send(ServerEvent::StateUpdated);
                     }
+                    crate::agent_manager::AgentEvent::ContentBlockStart {
+                        agent_id,
+                        block_id,
+                        block_type,
+                        tool,
+                        args,
+                        parent_id,
+                    } => {
+                        let _ = state_clone.events_tx.send(ServerEvent::ContentBlockStart {
+                            agent_id,
+                            block_id,
+                            block_type,
+                            tool,
+                            args,
+                            parent_id,
+                        });
+                    }
+                    crate::agent_manager::AgentEvent::ContentBlockUpdate {
+                        agent_id,
+                        block_id,
+                        status,
+                        summary,
+                        is_error,
+                        parent_id,
+                    } => {
+                        let _ = state_clone.events_tx.send(ServerEvent::ContentBlockUpdate {
+                            agent_id,
+                            block_id,
+                            status,
+                            summary,
+                            is_error,
+                            parent_id,
+                        });
+                    }
+                    crate::agent_manager::AgentEvent::TurnComplete {
+                        agent_id,
+                        duration_ms,
+                        context_tokens,
+                        parent_id,
+                    } => {
+                        let _ = state_clone.events_tx.send(ServerEvent::TurnComplete {
+                            agent_id,
+                            duration_ms,
+                            context_tokens,
+                            parent_id,
+                        });
+                    }
                 }
             }
         });
@@ -904,6 +1078,7 @@ pub async fn prepare_server(
         .route("/api/chat", post(chat_handler))
         .route("/api/chat/clear", post(clear_chat_history_api))
         .route("/api/plan/approve", post(approve_plan_handler))
+        .route("/api/plan/edit", post(edit_plan_handler))
         .route("/api/plan/reject", post(reject_plan_handler))
         .route("/api/ask-user-response", post(ask_user_response_handler))
         .route("/api/workspace/tree", get(get_agent_tree))
@@ -936,7 +1111,6 @@ pub async fn prepare_server(
     });
 
     Ok(ServerHandle {
-        state,
         task,
         port: actual_port,
     })
@@ -1002,7 +1176,10 @@ async fn events_handler(
     let stream = BroadcastStream::new(rx).filter_map(move |msg| {
         let event = match msg {
             Ok(event) => event,
-            Err(_) => ServerEvent::StateUpdated,
+            Err(_) => ServerEvent::Resync {
+                reason: "broadcast_lag".into(),
+                lagged_count: None,
+            },
         };
         let seq = state.event_seq.fetch_add(1, Ordering::Relaxed);
         let ui_msg = map_server_event_to_ui_message(event, seq)?;
@@ -1036,5 +1213,144 @@ async fn get_ollama_status(State(state): State<Arc<ServerState>>) -> impl IntoRe
             "No Ollama models configured",
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ensure every ServerEvent variant maps without panicking.
+    /// Acts as a documentation checkpoint — if a new variant is added, this test
+    /// will fail to compile until a mapping arm is provided.
+    #[test]
+    fn all_server_events_mapped() {
+        let events: Vec<ServerEvent> = vec![
+            ServerEvent::StateUpdated,
+            ServerEvent::Message {
+                from: "ling".into(),
+                to: "user".into(),
+                content: "hello".into(),
+            },
+            ServerEvent::SubagentSpawned {
+                parent_id: "ling".into(),
+                subagent_id: "coder".into(),
+                task: "fix bug".into(),
+            },
+            ServerEvent::SubagentResult {
+                parent_id: "ling".into(),
+                subagent_id: "coder".into(),
+                outcome: crate::engine::AgentOutcome::None,
+            },
+            ServerEvent::AgentStatus {
+                agent_id: "ling".into(),
+                status: "thinking".into(),
+                detail: Some("Analyzing code".into()),
+                status_id: None,
+                lifecycle: Some("doing".into()),
+                parent_agent_id: None,
+            },
+            ServerEvent::QueueUpdated {
+                project_root: "/tmp".into(),
+                session_id: "s1".into(),
+                agent_id: "ling".into(),
+                items: vec![],
+            },
+            ServerEvent::ContextUsage {
+                agent_id: "ling".into(),
+                stage: "pre".into(),
+                message_count: 10,
+                char_count: 5000,
+                estimated_tokens: 1500,
+                token_limit: Some(200_000),
+                actual_prompt_tokens: None,
+                actual_completion_tokens: None,
+                compressed: false,
+                summary_count: 0,
+            },
+            ServerEvent::Outcome {
+                agent_id: "ling".into(),
+                outcome: crate::engine::AgentOutcome::None,
+            },
+            ServerEvent::Token {
+                agent_id: "ling".into(),
+                token: "Hello".into(),
+                done: false,
+                thinking: false,
+            },
+            ServerEvent::ChangeReport {
+                agent_id: "ling".into(),
+                files: vec![],
+                truncated_count: 0,
+            },
+            ServerEvent::PlanUpdate {
+                agent_id: "ling".into(),
+                plan: crate::engine::Plan {
+                    summary: "Test plan".into(),
+                    items: vec![],
+                    status: crate::engine::PlanStatus::Planned,
+                    plan_text: None,
+                },
+            },
+            ServerEvent::IdlePromptTriggered {
+                agent_id: "ling".into(),
+                project_root: "/tmp".into(),
+            },
+            ServerEvent::TextSegment {
+                agent_id: "ling".into(),
+                text: "some text".into(),
+                parent_id: None,
+            },
+            ServerEvent::AskUser {
+                agent_id: "ling".into(),
+                question_id: "q1".into(),
+                questions: vec![],
+            },
+            ServerEvent::ModelFallback {
+                agent_id: "ling".into(),
+                preferred_model: "gpt-4".into(),
+                actual_model: "gpt-3.5".into(),
+                reason: "rate_limited".into(),
+            },
+            ServerEvent::ToolProgress {
+                agent_id: "ling".into(),
+                tool: "Bash".into(),
+                line: "building...".into(),
+                stream: "stdout".into(),
+            },
+            ServerEvent::Resync {
+                reason: "broadcast_lag".into(),
+                lagged_count: Some(42),
+            },
+            ServerEvent::ContentBlockStart {
+                agent_id: "ling".into(),
+                block_id: "cb-1".into(),
+                block_type: "tool_use".into(),
+                tool: Some("Read".into()),
+                args: Some("foo.rs".into()),
+                parent_id: None,
+            },
+            ServerEvent::ContentBlockUpdate {
+                agent_id: "ling".into(),
+                block_id: "cb-1".into(),
+                status: Some("done".into()),
+                summary: Some("Read 42 lines".into()),
+                is_error: Some(false),
+                parent_id: None,
+            },
+            ServerEvent::TurnComplete {
+                agent_id: "ling".into(),
+                duration_ms: Some(1200),
+                context_tokens: Some(5000),
+                parent_id: None,
+            },
+        ];
+
+        for (i, event) in events.into_iter().enumerate() {
+            let result = map_server_event_to_ui_message(event, i as u64);
+            // All variants should produce Some(...), except Message which may
+            // return None if sanitization strips it. We just verify no panics.
+            let _ = result;
+        }
     }
 }

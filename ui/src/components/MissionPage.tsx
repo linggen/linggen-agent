@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect } from 'react';
 import { ArrowLeft, Target, Bot, Clock, Activity, Save, Trash2, Timer } from 'lucide-react';
 import { cn } from '../lib/cn';
 import type { AgentInfo, AgentRunSummary, IdlePromptEvent, MissionInfo, MissionTab } from '../types';

@@ -18,6 +18,12 @@ const LOGO_1: &str = "╻  ╻┏┓╻┏━╸┏━╸┏━╸┏┓╻";
 const LOGO_2: &str = "┃  ┃┃┗┫┃╺┓┃╺┓┣╸ ┃┗┫";
 const LOGO_3: &str = "┗━╸╹╹ ╹┗━┛┗━┛┗━╸╹ ╹";
 
+/// SSE connection status for the TUI.
+pub enum ConnectionStatus {
+    Connected,
+    Disconnected,
+}
+
 /// In-progress tool group accumulator.
 pub struct ActiveToolGroup {
     pub agent_id: String,
@@ -64,6 +70,10 @@ pub struct App {
     pub pending_images: Vec<String>,
     /// Question ID for a pending AskUser/permission prompt.
     pub pending_ask_user_id: Option<String>,
+    /// SSE connection status (for reconnection indicator).
+    pub connection_status: ConnectionStatus,
+    /// Last seen SSE sequence number for dedup. Reset on reconnection.
+    pub last_seq: u64,
 }
 
 /// An interactive prompt shown below the input for user selection.
@@ -155,6 +165,8 @@ impl App {
             prompt: None,
             pending_images: Vec::new(),
             pending_ask_user_id: None,
+            connection_status: ConnectionStatus::Connected,
+            last_seq: 0,
         }
     }
 
@@ -196,6 +208,28 @@ impl App {
     fn push_system(&mut self, text: &str) {
         self.blocks.push(DisplayBlock::SystemMessage {
             text: text.to_string(),
+        });
+    }
+
+    /// Trigger a full state resync from the server via REST APIs.
+    /// Spawns a fire-and-forget background task; errors are logged.
+    fn trigger_resync(&self) {
+        let client = self.client.clone();
+        let project_root = self.project_root.clone();
+        let session_id = self.session_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client
+                .fetch_workspace_state(&project_root, session_id.as_deref())
+                .await
+            {
+                tracing::debug!("Resync workspace state failed: {}", e);
+            }
+            if let Err(e) = client
+                .fetch_agent_runs(&project_root, session_id.as_deref())
+                .await
+            {
+                tracing::debug!("Resync agent runs failed: {}", e);
+            }
         });
     }
 
@@ -620,6 +654,15 @@ impl App {
     }
 
     pub fn handle_sse(&mut self, msg: UiSseMessage) {
+        // Seq-based dedup: skip events we've already processed.
+        // Connection events (synthetic, seq=0) are always allowed through.
+        if msg.kind != "connection" && msg.seq > 0 && msg.seq <= self.last_seq {
+            return;
+        }
+        if msg.seq > 0 {
+            self.last_seq = msg.seq;
+        }
+
         match msg.kind.as_str() {
             "token" => {
                 let text = msg.text.unwrap_or_default();
@@ -725,13 +768,30 @@ impl App {
                         self.subagent_parent_map.entry(agent.clone()).or_insert_with(|| pid.clone());
                     }
                     if let Some(entry) = self.active_subagents.get_mut(&agent) {
-                        // Only count new tool invocations (doing), not completions (done)
-                        if status == "calling_tool" && phase == "doing" {
-                            entry.tool_count += 1;
+                        if status == "calling_tool" {
+                            if phase == "doing" {
+                                entry.tool_count += 1;
+                                let (tool_name, args_summary) = parse_activity_text(&text);
+                                entry.tool_steps.push(SubagentToolStep {
+                                    tool_name,
+                                    args_summary,
+                                    status: StepStatus::InProgress,
+                                });
+                            } else if phase == "done" {
+                                if let Some(last) = entry.tool_steps.last_mut() {
+                                    let is_failed = text.to_lowercase().contains("failed");
+                                    last.status = if is_failed {
+                                        StepStatus::Failed
+                                    } else {
+                                        StepStatus::Done
+                                    };
+                                }
+                            }
                         }
+                        // Update current_activity for non-tool statuses (thinking, model_loading)
                         if status == "idle" {
                             entry.current_activity = None;
-                        } else if !text.is_empty() {
+                        } else if status != "calling_tool" && !text.is_empty() {
                             entry.current_activity = Some(text.clone());
                         }
                     }
@@ -829,6 +889,13 @@ impl App {
                 }
             }
             "run" => {
+                // Trigger a full state resync on sync, resync, or outcome phases
+                match msg.phase.as_deref() {
+                    Some("sync") | Some("resync") | Some("outcome") => {
+                        self.trigger_resync();
+                    }
+                    _ => {}
+                }
                 if msg.phase.as_deref() == Some("context_usage") {
                     if let Some(data) = &msg.data {
                         let agent_key = data
@@ -885,6 +952,7 @@ impl App {
                                 tool_count: 0,
                                 estimated_tokens: None,
                                 current_activity: None,
+                                tool_steps: Vec::new(),
                             },
                         );
                     }
@@ -1095,6 +1163,36 @@ impl App {
                         }
                         // Non-permission AskUser prompts are not handled in TUI yet.
                     }
+                }
+            }
+            "model_fallback" => {
+                let text = msg.text.unwrap_or_else(|| "Model switched".to_string());
+                self.push_system(&format!("\u{26A0} {text}"));
+            }
+            "tool_progress" => {
+                if let Some(data) = &msg.data {
+                    let line = data
+                        .get("line")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !line.is_empty() {
+                        self.status_tool = Some(line.to_string());
+                    }
+                }
+            }
+            "connection" => {
+                match msg.phase.as_deref() {
+                    Some("connected") => {
+                        self.connection_status = ConnectionStatus::Connected;
+                        self.last_seq = 0;
+                        self.push_system("Reconnected to server");
+                        self.trigger_resync();
+                    }
+                    Some("disconnected") => {
+                        self.connection_status = ConnectionStatus::Disconnected;
+                        self.push_system("Disconnected from server — reconnecting…");
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -1393,6 +1491,13 @@ impl App {
                 Style::default().fg(Color::Yellow),
             ));
         }
+        if let ConnectionStatus::Disconnected = &self.connection_status {
+            status_spans.push(Span::styled("  ", Style::default()));
+            status_spans.push(Span::styled(
+                " DISCONNECTED ",
+                Style::default().fg(Color::White).bg(Color::Red),
+            ));
+        }
 
         let bottom = Paragraph::new(vec![
             Line::from(Span::styled(divider.clone(), Style::default().fg(Color::DarkGray))),
@@ -1438,6 +1543,12 @@ fn parse_activity_text(text: &str) -> (String, String) {
         ("Delegating to subagent: ", "Delegate"),
         ("Delegated to subagent: ", "Delegate"),
         ("Delegation failed: ", "Delegate"),
+        ("Fetching URL: ", "WebFetch"),
+        ("Fetched URL: ", "WebFetch"),
+        ("Fetch failed: ", "WebFetch"),
+        ("Searching web: ", "WebSearch"),
+        ("Searched web: ", "WebSearch"),
+        ("Web search failed: ", "WebSearch"),
         ("Calling tool: ", "Tool"),
         ("Used tool: ", "Tool"),
         ("Tool failed: ", "Tool"),

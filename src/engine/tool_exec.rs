@@ -12,12 +12,14 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 impl AgentEngine {
-    /// Ask the user for permission to execute a destructive tool via the AskUser bridge.
+    /// Ask the user for permission via the AskUser bridge.
+    /// `parser` converts the selected option label into a `PermissionAction`.
     /// Returns `None` if no bridge is available (e.g. CLI mode).
     async fn ask_permission(
         &self,
         tool: &str,
         question: tools::AskUserQuestion,
+        parser: fn(&str, &str) -> permission::PermissionAction,
     ) -> Option<permission::PermissionAction> {
         let bridge = match self.tools.ask_user_bridge() {
             Some(b) => Arc::clone(b),
@@ -57,7 +59,7 @@ impl AgentEngine {
                     .and_then(|a| a.selected.first())
                     .map(|s| s.as_str())
                     .unwrap_or("Cancel");
-                Some(permission::parse_permission_answer(selected, tool))
+                Some(parser(selected, tool))
             }
             _ => Some(permission::PermissionAction::Deny),
         }
@@ -177,25 +179,48 @@ impl AgentEngine {
         }
 
         // --- tool permission gate ---
-        if self.cfg.tool_permission_mode == crate::config::ToolPermissionMode::Ask
-            && permission::is_destructive_tool(&canonical_tool)
+        let needs_permission = self.cfg.tool_permission_mode == crate::config::ToolPermissionMode::Ask
             && !self.permission_store.check(&canonical_tool)
-        {
+            && (permission::is_destructive_tool(&canonical_tool)
+                || permission::is_web_tool(&canonical_tool));
+
+        if needs_permission {
             let summary =
                 permission::permission_target_summary(&canonical_tool, &args, &self.cfg.ws_root);
-            let question = permission::build_permission_question(&canonical_tool, &summary);
-            match self.ask_permission(&canonical_tool, question).await {
-                Some(permission::PermissionAction::AllowOnce) => { /* proceed */ }
-                Some(permission::PermissionAction::AllowSession) => {
-                    self.permission_store.allow_for_session(&canonical_tool);
+
+            if permission::is_web_tool(&canonical_tool) {
+                // Web tools use a simpler 3-option prompt (no project-level persistence).
+                let question =
+                    permission::build_web_permission_question(&canonical_tool, &summary);
+                match self.ask_permission(&canonical_tool, question, permission::parse_web_permission_answer).await {
+                    Some(permission::PermissionAction::AllowOnce) => { /* proceed */ }
+                    Some(permission::PermissionAction::AllowSession) => {
+                        self.permission_store.allow_for_session(&canonical_tool);
+                    }
+                    Some(permission::PermissionAction::Deny) | _ => {
+                        let msg =
+                            format!("Permission denied: {} on '{}'", canonical_tool, summary);
+                        messages.push(ChatMessage::new("user", msg));
+                        return PreExecOutcome::Blocked(LoopControl::Continue);
+                    }
                 }
-                Some(permission::PermissionAction::AllowProject) => {
-                    self.permission_store.allow_for_project(&canonical_tool);
-                }
-                Some(permission::PermissionAction::Deny) | None => {
-                    let msg = format!("Permission denied: {} on '{}'", canonical_tool, summary);
-                    messages.push(ChatMessage::new("user", msg));
-                    return PreExecOutcome::Blocked(LoopControl::Continue);
+            } else {
+                // Destructive tools use the full 4-option prompt.
+                let question = permission::build_permission_question(&canonical_tool, &summary);
+                match self.ask_permission(&canonical_tool, question, permission::parse_permission_answer).await {
+                    Some(permission::PermissionAction::AllowOnce) => { /* proceed */ }
+                    Some(permission::PermissionAction::AllowSession) => {
+                        self.permission_store.allow_for_session(&canonical_tool);
+                    }
+                    Some(permission::PermissionAction::AllowProject) => {
+                        self.permission_store.allow_for_project(&canonical_tool);
+                    }
+                    Some(permission::PermissionAction::Deny) | None => {
+                        let msg =
+                            format!("Permission denied: {} on '{}'", canonical_tool, summary);
+                        messages.push(ChatMessage::new("user", msg));
+                        return PreExecOutcome::Blocked(LoopControl::Continue);
+                    }
                 }
             }
         }
@@ -261,6 +286,7 @@ impl AgentEngine {
         );
 
         // Tell the UI what tool we're about to use.
+        let block_id = uuid::Uuid::new_v4().to_string();
         if let Some(manager) = self.tools.get_manager() {
             let from = self
                 .agent_id
@@ -281,18 +307,20 @@ impl AgentEngine {
                     detail: Some(tool_start_status.clone()),
                 });
             }
+            // Emit structured ContentBlockStart for the Web UI.
+            let compact_args = serde_json::to_string(&safe_args)
+                .unwrap_or_else(|_| "{}".to_string());
             let _ = manager
-                .send_event(crate::agent_manager::AgentEvent::Message {
-                    from: from.clone(),
-                    to: target.clone(),
-                    content: serde_json::json!({
-                        "type": "tool",
-                        "tool": canonical_tool.clone(),
-                        "args": safe_args.clone()
-                    })
-                    .to_string(),
+                .send_event(crate::agent_manager::AgentEvent::ContentBlockStart {
+                    agent_id: from.clone(),
+                    block_id: block_id.clone(),
+                    block_type: "tool_use".to_string(),
+                    tool: Some(canonical_tool.clone()),
+                    args: Some(compact_args),
+                    parent_id: self.parent_agent_id.clone(),
                 })
                 .await;
+            // Persist tool call to session store (no SSE — ContentBlockStart replaces Message).
             let tool_msg = serde_json::json!({
                 "type": "tool",
                 "tool": canonical_tool.clone(),
@@ -327,6 +355,7 @@ impl AgentEngine {
                 original_args: args,
                 tool_done_status,
                 tool_failed_status,
+                block_id,
             },
         )
     }
@@ -349,6 +378,7 @@ impl AgentEngine {
             original_args,
             tool_done_status,
             tool_failed_status,
+            block_id,
         } = exec;
 
         match result {
@@ -392,6 +422,17 @@ impl AgentEngine {
                             agent_id: agent_id.clone(),
                             status: "calling_tool".to_string(),
                             detail: Some(tool_done_status.clone()),
+                            parent_id: self.parent_agent_id.clone(),
+                        })
+                        .await;
+                    // Emit structured ContentBlockUpdate for the Web UI.
+                    manager
+                        .send_event(crate::agent_manager::AgentEvent::ContentBlockUpdate {
+                            agent_id: agent_id.clone(),
+                            block_id: block_id.clone(),
+                            status: Some("done".to_string()),
+                            summary: Some(tool_done_status.clone()),
+                            is_error: Some(false),
                             parent_id: self.parent_agent_id.clone(),
                         })
                         .await;
@@ -507,6 +548,17 @@ impl AgentEngine {
                             agent_id: agent_id.clone(),
                             status: "calling_tool".to_string(),
                             detail: Some(tool_failed_status.clone()),
+                            parent_id: self.parent_agent_id.clone(),
+                        })
+                        .await;
+                    // Emit structured ContentBlockUpdate (failed) for the Web UI.
+                    manager
+                        .send_event(crate::agent_manager::AgentEvent::ContentBlockUpdate {
+                            agent_id: agent_id.clone(),
+                            block_id: block_id.clone(),
+                            status: Some("failed".to_string()),
+                            summary: Some(tool_failed_status.clone()),
+                            is_error: Some(true),
                             parent_id: self.parent_agent_id.clone(),
                         })
                         .await;

@@ -15,13 +15,10 @@ export const MissionSidebarCard: React.FC<MissionSidebarCardProps> = ({
 }) => {
   const [missions, setMissions] = useState<MissionInfo[]>([]);
   const endpointAvailable = useRef<boolean | null>(null);
-  const prevProjectRoot = useRef(projectRoot);
 
-  // Reset endpoint availability when switching projects
-  if (projectRoot !== prevProjectRoot.current) {
+  useEffect(() => {
     endpointAvailable.current = null;
-    prevProjectRoot.current = projectRoot;
-  }
+  }, [projectRoot]);
 
   useEffect(() => {
     if (!projectRoot) return;
@@ -47,16 +44,6 @@ export const MissionSidebarCard: React.FC<MissionSidebarCardProps> = ({
     };
     fetchMissions();
   }, [projectRoot, mission]);
-
-  const formatTime = (ts: number) => {
-    const d = new Date(ts * 1000);
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) +
-      ', ' +
-      d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-  };
-
-  const truncate = (text: string, max: number) =>
-    text.length > max ? text.slice(0, max).trimEnd() + '…' : text;
 
   const activeMission = missions.find((m) => m.active);
 

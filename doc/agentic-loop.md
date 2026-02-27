@@ -7,7 +7,7 @@ The kernel of linggen-agent. Every agent run â€” chat, idle prompt, delegation â
 - `product-spec.md`: vision, OS analogy.
 - `agents.md`: process management, delegation.
 - `tools.md`: syscall interface.
-- `events.md`: IPC, message queue.
+- `chat-spec.md`: IPC, message queue.
 
 ## Loop iteration
 

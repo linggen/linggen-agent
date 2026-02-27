@@ -27,7 +27,7 @@ Users manage agents, skills, and models through WebUI and TUI. Each agent has it
 | `agents.md` | Process management — lifecycle, delegation, scheduling |
 | `skills.md` | Dynamic extensions — format, discovery, triggers |
 | `tools.md` | Syscall interface — built-in tools, safety |
-| `events.md` | IPC — SSE events, message queue, APIs |
+| `chat-spec.md` | Chat system — SSE events, message model, rendering, APIs |
 | `models.md` | Hardware abstraction — providers, routing |
 | `cli.md` | Shell — CLI reference |
 

@@ -5,6 +5,23 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::warn;
 
+/// Percent-encode a query parameter value.
+fn encode_param(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                write!(out, "%{:02X}", b).unwrap();
+            }
+        }
+    }
+    out
+}
+
 pub struct TuiClient {
     base_url: String,
     client: Client,
@@ -144,65 +161,158 @@ impl TuiClient {
         Ok(())
     }
 
+    /// Fetch workspace state from the REST API (used for resync after reconnection or lag).
+    pub async fn fetch_workspace_state(
+        &self,
+        project_root: &str,
+        session_id: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let mut url = format!(
+            "{}/api/workspace/state?project_root={}",
+            self.base_url,
+            encode_param(project_root)
+        );
+        if let Some(sid) = session_id {
+            url.push_str(&format!("&session_id={}", encode_param(sid)));
+        }
+        let resp = self.client.get(&url).send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("workspace state fetch failed: {}", resp.status());
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Fetch agent runs from the REST API (used for resync after reconnection or lag).
+    pub async fn fetch_agent_runs(
+        &self,
+        project_root: &str,
+        session_id: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let mut url = format!(
+            "{}/api/agent-runs?project_root={}",
+            self.base_url,
+            encode_param(project_root)
+        );
+        if let Some(sid) = session_id {
+            url.push_str(&format!("&session_id={}", encode_param(sid)));
+        }
+        let resp = self.client.get(&url).send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("agent runs fetch failed: {}", resp.status());
+        }
+        Ok(resp.json().await?)
+    }
+
     /// Subscribe to SSE events. Returns an unbounded receiver that yields parsed UiSseMessage.
-    /// The SSE connection runs in a background task.
+    /// The SSE connection runs in a background task with automatic reconnection
+    /// using exponential backoff (1s → 2s → 4s → ... capped at 30s).
     pub fn subscribe_sse(&self) -> mpsc::UnboundedReceiver<UiSseMessage> {
         let (tx, rx) = mpsc::unbounded_channel();
         let url = format!("{}/api/events", self.base_url);
         let client = self.client.clone();
 
         tokio::spawn(async move {
-            let resp = match client.get(&url).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("SSE connect failed: {}", e);
-                    return;
-                }
-            };
+            let mut backoff_secs: u64 = 1;
+            const MAX_BACKOFF: u64 = 30;
 
-            let mut stream = resp.bytes_stream();
-            let mut buf = String::new();
-
-            use futures_util::StreamExt;
-            while let Some(chunk) = stream.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
+            loop {
+                let resp = match client.get(&url).send().await {
+                    Ok(r) => {
+                        // Connected — reset backoff and notify
+                        backoff_secs = 1;
+                        let connected_msg = UiSseMessage {
+                            id: String::new(),
+                            seq: 0,
+                            rev: 0,
+                            ts_ms: 0,
+                            kind: "connection".to_string(),
+                            phase: Some("connected".to_string()),
+                            text: None,
+                            agent_id: None,
+                            session_id: None,
+                            project_root: None,
+                            data: None,
+                        };
+                        if tx.send(connected_msg).is_err() {
+                            return; // receiver dropped
+                        }
+                        r
+                    }
                     Err(e) => {
-                        warn!("SSE stream error: {}", e);
-                        break;
+                        warn!("SSE connect failed: {}", e);
+                        Self::send_disconnected(&tx, &format!("Connect failed: {e}"));
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF);
+                        continue;
                     }
                 };
-                buf.push_str(&String::from_utf8_lossy(&chunk));
 
-                // Parse SSE frames: lines starting with "data:" separated by blank lines.
-                while let Some(pos) = buf.find("\n\n") {
-                    let frame = buf[..pos].to_string();
-                    buf = buf[pos + 2..].to_string();
+                let mut stream = resp.bytes_stream();
+                let mut buf = String::new();
 
-                    for line in frame.lines() {
-                        let data = if let Some(d) = line.strip_prefix("data:") {
-                            d.trim()
-                        } else {
-                            continue;
-                        };
-                        if data.is_empty() {
-                            continue;
+                use futures_util::StreamExt;
+                while let Some(chunk) = stream.next().await {
+                    let chunk = match chunk {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("SSE stream error: {}", e);
+                            break;
                         }
-                        match serde_json::from_str::<UiSseMessage>(data) {
-                            Ok(msg) => {
-                                if tx.send(msg).is_err() {
-                                    return; // receiver dropped
-                                }
+                    };
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+
+                    // Parse SSE frames: lines starting with "data:" separated by blank lines.
+                    while let Some(pos) = buf.find("\n\n") {
+                        let frame = buf[..pos].to_string();
+                        buf = buf[pos + 2..].to_string();
+
+                        for line in frame.lines() {
+                            let data = if let Some(d) = line.strip_prefix("data:") {
+                                d.trim()
+                            } else {
+                                continue;
+                            };
+                            if data.is_empty() {
+                                continue;
                             }
-                            Err(_) => {
-                                // Skip malformed frames silently
+                            match serde_json::from_str::<UiSseMessage>(data) {
+                                Ok(msg) => {
+                                    if tx.send(msg).is_err() {
+                                        return; // receiver dropped
+                                    }
+                                }
+                                Err(_) => {
+                                    // Skip malformed frames silently
+                                }
                             }
                         }
                     }
                 }
+
+                // Stream ended — notify disconnected and retry
+                Self::send_disconnected(&tx, "Stream ended");
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF);
             }
         });
 
         rx
+    }
+
+    fn send_disconnected(tx: &mpsc::UnboundedSender<UiSseMessage>, reason: &str) {
+        let msg = UiSseMessage {
+            id: String::new(),
+            seq: 0,
+            rev: 0,
+            ts_ms: 0,
+            kind: "connection".to_string(),
+            phase: Some("disconnected".to_string()),
+            text: Some(reason.to_string()),
+            agent_id: None,
+            session_id: None,
+            project_root: None,
+            data: None,
+        };
+        let _ = tx.send(msg);
     }
 }

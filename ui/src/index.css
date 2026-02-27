@@ -1,5 +1,21 @@
 @import "tailwindcss";
 
+/* Thinking spinner bounce animation */
+@keyframes thinking-bounce {
+  0%, 80%, 100% {
+    transform: scale(0.6);
+    opacity: 0.4;
+  }
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@theme {
+  --animate-thinking-bounce: thinking-bounce 1.4s ease-in-out infinite;
+}
+
 :root {
   color-scheme: light;
 }

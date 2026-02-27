@@ -69,6 +69,7 @@ impl PermissionStore {
     }
 
     /// Create an empty store (no persistence).
+    #[allow(dead_code)]
     pub fn empty() -> Self {
         Self {
             session_allows: HashSet::new(),
@@ -94,6 +95,7 @@ impl PermissionStore {
     }
 
     /// Clear session-scoped permissions (called on session reset).
+    #[allow(dead_code)]
     pub fn clear_session(&mut self) {
         self.session_allows.clear();
     }
@@ -128,6 +130,11 @@ pub fn is_destructive_tool(tool: &str) -> bool {
     matches!(tool, "Write" | "Edit" | "Bash" | "Patch")
 }
 
+/// Returns true for tools that make network requests (WebFetch, WebSearch).
+pub fn is_web_tool(tool: &str) -> bool {
+    matches!(tool, "WebFetch" | "WebSearch")
+}
+
 /// Build a human-readable summary of what the tool is about to do.
 pub fn permission_target_summary(tool: &str, args: &serde_json::Value, ws_root: &Path) -> String {
     match tool {
@@ -159,6 +166,28 @@ pub fn permission_target_summary(tool: &str, args: &serde_json::Value, ws_root: 
                 })
                 .unwrap_or_else(|| "<patch>".to_string())
         }
+        "WebFetch" => args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|url| {
+                if url.len() > 120 {
+                    format!("{}...", &url[..117])
+                } else {
+                    url.to_string()
+                }
+            })
+            .unwrap_or_else(|| "<unknown URL>".to_string()),
+        "WebSearch" => args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|q| {
+                if q.len() > 120 {
+                    format!("{}...", &q[..117])
+                } else {
+                    q.to_string()
+                }
+            })
+            .unwrap_or_else(|| "<unknown query>".to_string()),
         _ => tool.to_string(),
     }
 }
@@ -191,6 +220,44 @@ pub fn build_permission_question(tool: &str, target_summary: &str) -> AskUserQue
             },
         ],
         multi_select: false,
+    }
+}
+
+/// Build the AskUser question for a web tool permission prompt.
+/// Uses a simpler 3-option layout (no project-level persistence for web tools).
+pub fn build_web_permission_question(tool: &str, target_summary: &str) -> AskUserQuestion {
+    AskUserQuestion {
+        question: format!("{} {}", tool, target_summary),
+        header: "Permission".to_string(),
+        options: vec![
+            AskUserOption {
+                label: "Allow this request".to_string(),
+                description: Some("Proceed this one time only".to_string()),
+                preview: None,
+            },
+            AskUserOption {
+                label: format!("Allow all {} for this task", tool),
+                description: Some("Session-scoped; resets on new session".to_string()),
+                preview: None,
+            },
+            AskUserOption {
+                label: "Cancel".to_string(),
+                description: Some("Deny this web request".to_string()),
+                preview: None,
+            },
+        ],
+        multi_select: false,
+    }
+}
+
+/// Parse the selected option from a web permission prompt.
+pub fn parse_web_permission_answer(selected: &str, tool: &str) -> PermissionAction {
+    if selected == "Allow this request" {
+        PermissionAction::AllowOnce
+    } else if selected == format!("Allow all {} for this task", tool) {
+        PermissionAction::AllowSession
+    } else {
+        PermissionAction::Deny
     }
 }
 
@@ -289,5 +356,54 @@ mod tests {
         let args = serde_json::json!({ "path": "src/main.rs", "content": "fn main() {}" });
         let summary = permission_target_summary("Write", &args, Path::new("/tmp"));
         assert_eq!(summary, "src/main.rs");
+    }
+
+    #[test]
+    fn test_is_web_tool() {
+        assert!(is_web_tool("WebFetch"));
+        assert!(is_web_tool("WebSearch"));
+        assert!(!is_web_tool("Read"));
+        assert!(!is_web_tool("Bash"));
+        assert!(!is_web_tool("Write"));
+    }
+
+    #[test]
+    fn test_permission_target_summary_webfetch() {
+        let args = serde_json::json!({ "url": "https://example.com/docs" });
+        let summary = permission_target_summary("WebFetch", &args, Path::new("/tmp"));
+        assert_eq!(summary, "https://example.com/docs");
+    }
+
+    #[test]
+    fn test_permission_target_summary_websearch() {
+        let args = serde_json::json!({ "query": "rust async patterns" });
+        let summary = permission_target_summary("WebSearch", &args, Path::new("/tmp"));
+        assert_eq!(summary, "rust async patterns");
+    }
+
+    #[test]
+    fn test_build_web_permission_question() {
+        let q = build_web_permission_question("WebFetch", "https://example.com");
+        assert_eq!(q.question, "WebFetch https://example.com");
+        assert_eq!(q.options.len(), 3);
+        assert_eq!(q.options[0].label, "Allow this request");
+        assert!(q.options[1].label.contains("WebFetch"));
+        assert_eq!(q.options[2].label, "Cancel");
+    }
+
+    #[test]
+    fn test_parse_web_permission_answer() {
+        assert_eq!(
+            parse_web_permission_answer("Allow this request", "WebFetch"),
+            PermissionAction::AllowOnce
+        );
+        assert_eq!(
+            parse_web_permission_answer("Allow all WebFetch for this task", "WebFetch"),
+            PermissionAction::AllowSession
+        );
+        assert_eq!(
+            parse_web_permission_answer("Cancel", "WebFetch"),
+            PermissionAction::Deny
+        );
     }
 }

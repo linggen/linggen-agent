@@ -35,12 +35,6 @@ pub struct ChatMsg {
 }
 
 impl SessionStore {
-    /// Create a new store rooted at `<project_root>/.linggen/sessions/`.
-    pub fn new(project_root: PathBuf) -> Self {
-        let sessions_dir = project_root.join(".linggen/sessions");
-        Self { sessions_dir }
-    }
-
     /// Create a store with an explicit sessions directory (for ProjectStore).
     pub fn with_sessions_dir(sessions_dir: PathBuf) -> Self {
         Self { sessions_dir }
@@ -213,7 +207,7 @@ mod tests {
 
     fn temp_store() -> (SessionStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(dir.path().to_path_buf());
+        let store = SessionStore::with_sessions_dir(dir.path().join(".linggen/sessions"));
         (store, dir)
     }
 

@@ -114,6 +114,31 @@ pub enum AgentEvent {
         line: String,
         stream: String, // "stdout" | "stderr"
     },
+    /// A new content block started within the current assistant turn.
+    ContentBlockStart {
+        agent_id: String,
+        block_id: String,
+        block_type: String, // "text" | "tool_use" | "tool_result" | "thinking"
+        tool: Option<String>,
+        args: Option<String>,
+        parent_id: Option<String>,
+    },
+    /// Update an existing content block (status change, result summary).
+    ContentBlockUpdate {
+        agent_id: String,
+        block_id: String,
+        status: Option<String>, // "running" | "done" | "failed"
+        summary: Option<String>,
+        is_error: Option<bool>,
+        parent_id: Option<String>,
+    },
+    /// Signal that the assistant turn is complete.
+    TurnComplete {
+        agent_id: String,
+        duration_ms: Option<u64>,
+        context_tokens: Option<usize>,
+        parent_id: Option<String>,
+    },
     StateUpdated,
 }
 
@@ -214,7 +239,7 @@ impl AgentManager {
             &routing::ComplexitySignal {
                 estimated_tokens: None,
                 tool_depth: None,
-                skill_model_hint: None,
+                _skill_model_hint: None,
             },
             &config.models,
         ) {
@@ -985,6 +1010,25 @@ impl AgentManager {
     pub async fn take_pending_plan(&self, project_root: &str, agent_id: &str) -> Option<Plan> {
         let key = format!("{}|{}", project_root, agent_id);
         self.pending_plans.lock().await.remove(&key)
+    }
+
+    /// Edit the plan_text and summary of a pending plan in-place.
+    /// Returns `true` if the plan was found and updated, `false` otherwise.
+    pub async fn edit_pending_plan(
+        &self,
+        project_root: &str,
+        agent_id: &str,
+        text: &str,
+    ) -> bool {
+        let key = format!("{}|{}", project_root, agent_id);
+        let mut plans = self.pending_plans.lock().await;
+        if let Some(plan) = plans.get_mut(&key) {
+            plan.plan_text = Some(text.to_string());
+            plan.summary = crate::engine::AgentEngine::extract_plan_summary(text);
+            true
+        } else {
+            false
+        }
     }
 
     /// Record that an agent performed activity (finished run, received message, etc.)

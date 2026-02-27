@@ -403,11 +403,14 @@ impl Tools {
                     )),
                 }
             }
+            "ExitPlanMode" => Ok(ToolResult::Success(
+                "Plan submitted for review.".to_string(),
+            )),
             _ => anyhow::bail!("unknown tool: {}", call.tool),
         }
     }
 
-    pub fn list_files(&self, args: ListFilesArgs) -> Result<ToolResult> {
+    fn list_files(&self, args: ListFilesArgs) -> Result<ToolResult> {
         let globset = build_globset(args.globs.as_deref())?;
         let max_results = args.max_results.unwrap_or(200);
 
@@ -1333,7 +1336,8 @@ pub(crate) async fn run_delegation(
     engine.set_task(task);
 
     let run_result = engine.run_agent_loop(None).await;
-    // Engine is dropped here — no cleanup of cached state needed.
+    // Capture sub-agent's last response before engine is dropped.
+    let last_text = engine.last_assistant_text.take();
 
     let (outcome, status, detail) = match run_result {
         Ok(outcome) => (outcome, crate::project_store::AgentRunStatus::Completed, None),
@@ -1360,7 +1364,16 @@ pub(crate) async fn run_delegation(
         })
         .await;
 
-    Ok(ToolResult::AgentOutcome(outcome))
+    // When the sub-agent finished normally (AgentOutcome::None), surface its
+    // last response text so the parent agent sees the actual result instead
+    // of "agent_outcome: None".
+    match outcome {
+        crate::engine::AgentOutcome::None => {
+            let text = last_text.unwrap_or_else(|| "Sub-agent completed.".to_string());
+            Ok(ToolResult::Success(text))
+        }
+        other => Ok(ToolResult::AgentOutcome(other)),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1724,6 +1737,7 @@ pub fn canonical_tool_name(tool: &str) -> Option<&'static str> {
         "WebFetch" | "web_fetch" => "WebFetch",
         "Skill" | "skill" => "Skill",
         "AskUser" | "ask_user" => "AskUser",
+        "ExitPlanMode" | "exit_plan_mode" => "ExitPlanMode",
         _ => return None,
     })
 }
@@ -1802,19 +1816,12 @@ pub(crate) fn full_tool_schema_entries() -> Vec<Value> {
             "returns": "{answers: [{question_index: number, selected: string[], custom_text?: string}]}",
             "notes": "Ask user 1-4 structured questions with 2-4 options each. User can always type custom text via 'Other'. Blocks until response (5 min timeout). Not available in sub-agents."
         }),
+        serde_json::json!({
+            "name": "ExitPlanMode",
+            "args": {},
+            "returns": "success",
+            "notes": "Signal that your plan is complete and ready for user review. Call this after researching the codebase and writing your plan in your response text."
+        }),
     ]
 }
 
-pub fn tool_schema_json(allowed_tools: Option<&HashSet<String>>) -> String {
-    let mut tools = full_tool_schema_entries();
-    if let Some(allowed) = allowed_tools {
-        tools.retain(|entry| {
-            entry
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|name| allowed.contains(name))
-                .unwrap_or(false)
-        });
-    }
-    serde_json::json!({ "tools": tools }).to_string()
-}

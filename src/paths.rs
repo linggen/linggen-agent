@@ -24,11 +24,6 @@ pub fn config_dir() -> PathBuf {
     linggen_home().join("config")
 }
 
-/// `~/.linggen/data/`
-pub fn data_dir() -> PathBuf {
-    linggen_home().join("data")
-}
-
 /// `~/.linggen/logs/`
 pub fn logs_dir() -> PathBuf {
     linggen_home().join("logs")
@@ -51,11 +46,6 @@ pub fn compat_skills_dirs() -> Vec<(PathBuf, &'static str)> {
         (home.join(".claude/skills"), "Claude"),
         (home.join(".codex/skills"), "Codex"),
     ]
-}
-
-/// `~/.linggen/plans/`
-pub fn plans_dir() -> PathBuf {
-    linggen_home().join("plans")
 }
 
 /// `~/.linggen/projects/`

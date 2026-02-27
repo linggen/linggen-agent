@@ -12,7 +12,6 @@ import type {
   AgentRunContextMessage,
   AgentRunContextResponse,
   ChatMessage,
-  MessageSegment,
   QueuedChatItem,
   SkillInfo,
   SubagentInfo,
@@ -173,7 +172,22 @@ const roleFromSender = (sender: string): ChatMessage['role'] => {
 
 /** Strip embedded tool/plan/structured JSON from text using brace-depth counting. */
 const stripStructuredJsonFromText = (text: string): string => {
-  const MARKERS = ['"type":"tool"', '"type":"plan"', '"type":"finalize_task"', '"type": "tool"', '"type": "plan"'];
+  const MARKERS = [
+    '"type":"tool"', '"type":"plan"', '"type":"finalize_task"',
+    '"type": "tool"', '"type": "plan"',
+    // Raw model tool call JSON (e.g. { "name": "AskUser", "args": { ... } })
+    '"name":"AskUser"', '"name": "AskUser"',
+    '"name":"Read"', '"name": "Read"',
+    '"name":"Write"', '"name": "Write"',
+    '"name":"Edit"', '"name": "Edit"',
+    '"name":"Bash"', '"name": "Bash"',
+    '"name":"Glob"', '"name": "Glob"',
+    '"name":"Grep"', '"name": "Grep"',
+    '"name":"Skill"', '"name": "Skill"',
+    '"name":"WebFetch"', '"name": "WebFetch"',
+    '"name":"WebSearch"', '"name": "WebSearch"',
+    '"name":"delegate_to_agent"', '"name": "delegate_to_agent"',
+  ];
   let result = text;
   for (const marker of MARKERS) {
     let searchFrom = 0;
@@ -196,8 +210,6 @@ const stripStructuredJsonFromText = (text: string): string => {
   }
   return result.trim();
 };
-const TOOL_JSON_EMBEDDED_RE = /\{"type":"tool","tool":"([^"]+)","args":\{[\s\S]*?\}\}/g;
-const TOOL_RESULT_LINE_RE = /^(Tool\s+[A-Za-z0-9_.:-]+\s*:|tool_error:|tool_not_allowed:)/i;
 const START_AUTONOMOUS_LINE_RE = /^Starting autonomous loop for task:/i;
 const CONTENT_OMITTED_LINE_RE = /^\(content omitted in chat; open the file viewer for full text\)$/i;
 
@@ -207,6 +219,7 @@ const parseToolNameFromLine = (line: string): string | null => {
   try {
     const parsed = JSON.parse(trimmed);
     if (parsed?.type === 'tool' && typeof parsed?.tool === 'string') return parsed.tool;
+    // { "type": "...", "args": { ... } } format
     if (
       typeof parsed?.type === 'string' &&
       parsed.type !== 'finalize_task' &&
@@ -215,244 +228,14 @@ const parseToolNameFromLine = (line: string): string | null => {
     ) {
       return parsed.type;
     }
+    // { "name": "AskUser", "args": { ... } } format (raw model tool calls)
+    if (typeof parsed?.name === 'string' && parsed.args && typeof parsed.args === 'object') {
+      return parsed.name;
+    }
   } catch (_e) {
     // ignore non-json
   }
   return null;
-};
-
-const looksLikeCodeLine = (line: string) =>
-  /^\s*(\/\/|#include|use\s+\w|import\s+\w|fn\s+\w|class\s+\w|def\s+\w|const\s+\w|let\s+\w|pub\s+\w|impl\s+\w|struct\s+\w|enum\s+\w|mod\s+\w|[{}[\]();]|<\/?\w+|[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_])/.test(
-    line
-  );
-
-type WebSearchResultItem = { title: string; url: string; snippet: string };
-type RenderChunk =
-  | { type: 'text'; text: string }
-  | { type: 'bash'; exitCode?: string; stdout: string; stderr: string }
-  | { type: 'websearch'; query: string; results: WebSearchResultItem[] };
-
-const BASH_OUTPUT_HEADER_RE = /^Bash output \(exit_code:\s*([^)]+)\):\s*$/i;
-const TOOL_BASH_OUTPUT_HEADER_RE =
-  /^Tool\s+Bash\s*:\s*Bash output \(exit_code:\s*([^)]+)\):\s*$/i;
-const WEBSEARCH_HEADER_RE = /^(?:Tool\s+WebSearch\s*:\s*)?WebSearch:\s*"([^"]+)"\s*\((\d+)\s*results?\)/i;
-const WEBSEARCH_RESULT_RE = /^\d+\.\s+(.+?)\s+—\s+(\S+)$/;
-
-const trimTrailingEmptyLines = (lines: string[]) => {
-  const out = [...lines];
-  while (out.length > 0 && out[out.length - 1].trim() === '') out.pop();
-  return out;
-};
-
-const normalizeExitCode = (raw?: string) => {
-  const value = String(raw || '').trim();
-  if (!value) return undefined;
-  const someMatch = /^Some\(([-+]?\d+)\)$/.exec(value);
-  if (someMatch?.[1]) return someMatch[1];
-  if (value === 'None') return 'n/a';
-  return value;
-};
-
-const parseBashOutputChunks = (text: string): RenderChunk[] => {
-  const lines = text.replace(/\r\n/g, '\n').split('\n');
-  const chunks: RenderChunk[] = [];
-  let plainBuffer: string[] = [];
-  let i = 0;
-
-  const flushText = () => {
-    if (plainBuffer.length === 0) return;
-    const chunk = plainBuffer.join('\n').trim();
-    if (chunk) chunks.push({ type: 'text', text: chunk });
-    plainBuffer = [];
-  };
-
-  while (i < lines.length) {
-    const line = lines[i] || '';
-    const trimmed = line.trim();
-
-    // Detect WebSearch result blocks
-    const wsMatch = WEBSEARCH_HEADER_RE.exec(trimmed);
-    if (wsMatch) {
-      flushText();
-      const query = wsMatch[1];
-      const results: WebSearchResultItem[] = [];
-      i += 1;
-      while (i < lines.length) {
-        const rl = (lines[i] || '').trim();
-        if (!rl) { i += 1; continue; }
-        const rm = WEBSEARCH_RESULT_RE.exec(rl);
-        if (rm) {
-          const title = rm[1];
-          const url = rm[2];
-          i += 1;
-          // Next line is the snippet (indented)
-          const snippet = (i < lines.length ? (lines[i] || '').trim() : '');
-          if (snippet && !WEBSEARCH_RESULT_RE.test(snippet) && !WEBSEARCH_HEADER_RE.test(snippet)) {
-            results.push({ title, url, snippet });
-            i += 1;
-          } else {
-            results.push({ title, url, snippet: '' });
-          }
-        } else if (/^\d+\.\s/.test(rl)) {
-          // Malformed result line — skip
-          i += 1;
-        } else {
-          break;
-        }
-      }
-      chunks.push({ type: 'websearch', query, results });
-      continue;
-    }
-
-    let exitCode: string | undefined;
-    let atStdout = false;
-
-    const headerMatch = BASH_OUTPUT_HEADER_RE.exec(trimmed) || TOOL_BASH_OUTPUT_HEADER_RE.exec(trimmed);
-    if (headerMatch) {
-      exitCode = normalizeExitCode(headerMatch[1]);
-      if (i + 1 < lines.length && lines[i + 1].trim() === 'STDOUT:') {
-        atStdout = true;
-        i += 1;
-      } else {
-        plainBuffer.push(line);
-        i += 1;
-        continue;
-      }
-    } else if (trimmed === 'STDOUT:') {
-      atStdout = true;
-    }
-
-    if (!atStdout) {
-      plainBuffer.push(line);
-      i += 1;
-      continue;
-    }
-
-    flushText();
-    i += 1; // move after STDOUT:
-
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-    let parsingStderr = false;
-
-    while (i < lines.length) {
-      const current = lines[i] || '';
-      const currentTrimmed = current.trim();
-      if (!parsingStderr && currentTrimmed === 'STDERR:') {
-        parsingStderr = true;
-        i += 1;
-        continue;
-      }
-      // Heuristic boundary for duplicated command output blocks.
-      if (currentTrimmed === 'STDOUT:' && (stdoutLines.length > 0 || stderrLines.length > 0)) {
-        break;
-      }
-      if (BASH_OUTPUT_HEADER_RE.test(currentTrimmed) || TOOL_BASH_OUTPUT_HEADER_RE.test(currentTrimmed)) {
-        const next = lines[i + 1] || '';
-        if (next.trim() === 'STDOUT:') break;
-      }
-      if (parsingStderr) stderrLines.push(current);
-      else stdoutLines.push(current);
-      i += 1;
-    }
-
-    chunks.push({
-      type: 'bash',
-      exitCode,
-      stdout: trimTrailingEmptyLines(stdoutLines).join('\n'),
-      stderr: trimTrailingEmptyLines(stderrLines).join('\n'),
-    });
-  }
-
-  flushText();
-  return chunks.length > 0 ? chunks : [{ type: 'text', text }];
-};
-
-const lineCount = (text: string) => {
-  if (!text) return 0;
-  return text.split('\n').length;
-};
-
-const renderAgentMessageBody = (text: string) => {
-  const chunks = parseBashOutputChunks(text);
-  if (chunks.length === 1 && chunks[0]?.type === 'text') {
-    return <MarkdownContent text={chunks[0].text} />;
-  }
-  return (
-    <div className="space-y-2">
-      {chunks.map((chunk, idx) => {
-        if (chunk.type === 'text') {
-          return <MarkdownContent key={`text-${idx}`} text={chunk.text} />;
-        }
-        if (chunk.type === 'websearch') {
-          return (
-            <details
-              key={`ws-${idx}`}
-              open
-              className="rounded-md border border-blue-200 dark:border-blue-800/40 bg-blue-50/50 dark:bg-blue-950/20 text-[12px]"
-            >
-              <summary className="cursor-pointer px-2 py-1.5 text-slate-600 dark:text-slate-300 select-none flex items-center gap-2">
-                <span className="font-semibold">WebSearch</span>
-                <span className="text-[10px] text-slate-500">&quot;{chunk.query}&quot; &mdash; {chunk.results.length} result{chunk.results.length === 1 ? '' : 's'}</span>
-              </summary>
-              <div className="px-2 pb-2 space-y-1">
-                {chunk.results.map((r, ri) => (
-                  <div key={ri} className="rounded border border-slate-200/60 dark:border-white/10 bg-white dark:bg-black/30 px-2 py-1.5">
-                    <a
-                      href={/^https?:\/\//i.test(r.url) ? r.url : '#'}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-blue-600 dark:text-blue-400 hover:underline font-medium text-[12px] break-all"
-                    >
-                      {r.title || r.url}
-                    </a>
-                    <div className="text-[10px] text-slate-400 dark:text-slate-500 truncate">{r.url}</div>
-                    {r.snippet && <div className="text-[11px] text-slate-600 dark:text-slate-400 mt-0.5 line-clamp-2">{r.snippet}</div>}
-                  </div>
-                ))}
-                {chunk.results.length === 0 && (
-                  <div className="text-[11px] text-slate-400 italic px-1">No results found</div>
-                )}
-              </div>
-            </details>
-          );
-        }
-        const stdoutLines = lineCount(chunk.stdout);
-        const stderrLines = lineCount(chunk.stderr);
-        return (
-          <details
-            key={`bash-${idx}`}
-            className="rounded-md border border-slate-200 dark:border-white/10 bg-slate-50/80 dark:bg-white/[0.03] text-[11px]"
-          >
-            <summary className="cursor-pointer px-2 py-1.5 text-slate-600 dark:text-slate-300 select-none flex flex-wrap items-center gap-2">
-              <span className="font-semibold">Bash output</span>
-              {chunk.exitCode && <span className="font-mono text-[10px]">exit {chunk.exitCode}</span>}
-              <span className="text-[10px]">stdout {stdoutLines} line{stdoutLines === 1 ? '' : 's'}</span>
-              <span className="text-[10px]">stderr {stderrLines} line{stderrLines === 1 ? '' : 's'}</span>
-            </summary>
-            <div className="px-2 pb-2 space-y-1.5">
-              <div className="rounded border border-slate-200/80 dark:border-white/10 bg-white dark:bg-black/30">
-                <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-200/70 dark:border-white/10">
-                  Stdout
-                </div>
-                <pre className="m-0 max-h-80 overflow-auto custom-scrollbar p-2 font-mono text-[11px] leading-5 whitespace-pre-wrap break-words">
-                  {chunk.stdout || '(empty)'}
-                </pre>
-              </div>
-              <div className="rounded border border-slate-200/80 dark:border-white/10 bg-white dark:bg-black/30">
-                <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-200/70 dark:border-white/10">
-                  Stderr
-                </div>
-                <pre className="m-0 max-h-64 overflow-auto custom-scrollbar p-2 font-mono text-[11px] leading-5 whitespace-pre-wrap break-words">
-                  {chunk.stderr || '(empty)'}
-                </pre>
-              </div>
-            </div>
-          </details>
-        );
-      })}
-    </div>
-  );
 };
 
 const sanitizeAgentMessageText = (text: string) => {
@@ -461,14 +244,61 @@ const sanitizeAgentMessageText = (text: string) => {
   const withoutEmbedded = stripStructuredJsonFromText(text);
   const lines = withoutEmbedded.split('\n');
   const kept: string[] = [];
+  let suppressedToolBody: 'read' | 'grep' | 'glob' | null = null;
   for (const line of lines) {
     const trimmed = line.trim();
+    const lower = trimmed.toLowerCase();
+
+    if (suppressedToolBody) {
+      const isBoundary =
+        trimmed.startsWith('{') ||
+        lower.startsWith('tool ') ||
+        lower.startsWith('tool_error:') ||
+        lower.startsWith('tool_not_allowed:');
+      const shouldSuppress =
+        suppressedToolBody === 'read'
+          ? !isBoundary
+          : !isBoundary && trimmed.length > 0;
+      if (shouldSuppress) continue;
+      suppressedToolBody = null;
+    }
+
     if (!trimmed) {
       if (kept.length > 0 && kept[kept.length - 1] !== '') kept.push('');
       continue;
     }
     // Strip raw JSON tool call payloads (already converted to status lines by backend)
     if (parseToolNameFromLine(trimmed)) continue;
+
+    // Redact verbose tool result bodies in case raw context messages leak through.
+    if (lower.startsWith('tool read:')) {
+      const match = /tool\s+read:\s*read:\s*(.+?)(?:\s+\(truncated:|$)/i.exec(trimmed);
+      const target = match?.[1]?.trim();
+      kept.push(target ? `Used tool: Read · target=${target}` : 'Used tool: Read');
+      suppressedToolBody = 'read';
+      continue;
+    }
+    if (lower.startsWith('tool grep:')) {
+      kept.push('Used tool: Grep');
+      suppressedToolBody = 'grep';
+      continue;
+    }
+    if (lower.startsWith('tool glob:')) {
+      kept.push('Used tool: Glob');
+      suppressedToolBody = 'glob';
+      continue;
+    }
+    if (lower.startsWith('tool websearch:')) {
+      const query = trimmed
+        .split('WebSearch:')
+        .pop()
+        ?.split('(')[0]
+        ?.trim()
+        .replace(/^"|"$/g, '');
+      kept.push(query ? `Used tool: WebSearch · target=${query}` : 'Used tool: WebSearch');
+      continue;
+    }
+
     // Strip internal boilerplate
     if (START_AUTONOMOUS_LINE_RE.test(trimmed)) continue;
     if (CONTENT_OMITTED_LINE_RE.test(trimmed)) continue;
@@ -713,21 +543,33 @@ const ToolActivityEntry: React.FC<{ entry: string; isActive: boolean; isLast: bo
     : parsed.isDone
       ? 'text-emerald-500'
       : 'text-slate-300 dark:text-slate-600';
+  // For Loading/Thinking, show detail inline (e.g., "Loading model: qwen3.5:35b")
+  const isTransient = parsed.tool === 'Loading' || parsed.tool === 'Thinking';
+  const displayTool = isTransient && parsed.detail
+    ? `${parsed.tool === 'Loading' ? 'Loading model' : 'Thinking'}: ${parsed.detail}`
+    : parsed.tool || 'Action';
+  const displayDetail = isTransient ? '' : parsed.detail;
+  // Active sub-label: show what's happening, not generic "Running..."
+  const activeLabel = isTransient
+    ? (parsed.tool === 'Loading' ? 'Loading…' : 'Thinking…')
+    : parsed.detail
+      ? `${parsed.tool || 'Running'}…`
+      : 'Running…';
   return (
     <div className={cn('flex items-start gap-1.5 font-mono', isLast && !parsed.isDone ? '' : 'opacity-70')}>
       <span className={cn('mt-px text-[10px] leading-none', dotColor)}>●</span>
       <div className="min-w-0 flex-1">
         <span className="text-[11px]">
-          <span className="font-semibold text-slate-700 dark:text-slate-200">{parsed.tool || 'Action'}</span>
-          {parsed.detail && (
+          <span className="font-semibold text-slate-700 dark:text-slate-200">{displayTool}</span>
+          {displayDetail && (
             <span className="text-slate-400 dark:text-slate-500">
-              ({parsed.detail.length > 60 ? parsed.detail.slice(0, 57) + '...' : parsed.detail})
+              ({displayDetail.length > 60 ? displayDetail.slice(0, 57) + '...' : displayDetail})
             </span>
           )}
         </span>
-        {isActive && (
+        {isActive && !isTransient && (
           <div className="text-[10px] text-slate-400 dark:text-slate-500 pl-0.5">
-            └ Running…
+            └ {activeLabel}
           </div>
         )}
       </div>
@@ -735,82 +577,166 @@ const ToolActivityEntry: React.FC<{ entry: string; isActive: boolean; isLast: bo
   );
 };
 
-/** Render a tool segment (list of activity entries) in Claude Code style. */
-const ToolSegmentBlock: React.FC<{ entries: string[]; isLast: boolean }> = ({ entries, isLast }) => (
-  <div className="my-1 space-y-0.5 pl-1">
-    {entries.map((entry, idx) => (
-      <ToolActivityEntry
-        key={`${idx}-${entry}`}
-        entry={entry}
-        isActive={isLast && idx === entries.length - 1}
-        isLast={isLast && idx === entries.length - 1}
-      />
-    ))}
-  </div>
-);
+// ---------------------------------------------------------------------------
+// Grouped tool display — Claude Code style
+// ---------------------------------------------------------------------------
 
-/** Render streaming live text with a pulsing cursor. */
-const LiveTextBlock: React.FC<{ text: string }> = ({ text }) => {
-  if (!text.trim()) return null;
+interface ToolGroup {
+  tool: string;
+  entries: string[];
+  details: string[];
+  isActive: boolean;
+}
+
+const toolGroupLabel: Record<string, string> = {
+  Read: 'file',
+  Grep: 'pattern',
+  Glob: 'pattern',
+  Write: 'file',
+  Edit: 'file',
+  Bash: 'command',
+  Delegate: 'task',
+  WebFetch: 'URL',
+  WebSearch: 'query',
+  Tool: 'call',
+};
+
+function groupToolEntries(entries: string[], isGenerating: boolean): ToolGroup[] {
+  const groups: ToolGroup[] = [];
+  for (const entry of entries) {
+    const parsed = parseActivityEntry(entry);
+    const tool = parsed.tool || 'Action';
+    // Skip transient entries (Thinking, Loading) — they're not real tool calls
+    if (tool === 'Thinking' || tool === 'Loading') {
+      // Still show them as single-entry groups
+      groups.push({ tool, entries: [entry], details: [parsed.detail], isActive: false });
+      continue;
+    }
+    const last = groups[groups.length - 1];
+    if (last && last.tool === tool) {
+      last.entries.push(entry);
+      if (parsed.detail) last.details.push(parsed.detail);
+    } else {
+      groups.push({
+        tool,
+        entries: [entry],
+        details: parsed.detail ? [parsed.detail] : [],
+        isActive: false,
+      });
+    }
+  }
+  // Mark last group as active during generation
+  if (isGenerating && groups.length > 0) {
+    groups[groups.length - 1].isActive = true;
+  }
+  return groups;
+}
+
+function groupSummaryText(group: ToolGroup): string {
+  const n = group.entries.length;
+  const unit = toolGroupLabel[group.tool] || 'call';
+  const plural = n === 1 ? unit : unit + 's';
+  return `${group.tool} ${n} ${plural}`;
+}
+
+/** Expandable group of same-type tool entries. */
+const ToolGroupBlock: React.FC<{ group: ToolGroup }> = ({ group }) => {
+  const [expanded, setExpanded] = React.useState(false);
+  const n = group.entries.length;
+
+  // Single entry — render as normal ToolActivityEntry
+  if (n === 1) {
+    return (
+      <ToolActivityEntry
+        entry={group.entries[0]}
+        isActive={group.isActive}
+        isLast={group.isActive}
+      />
+    );
+  }
+
+  const dotColor = group.isActive ? 'text-amber-500' : 'text-emerald-500';
+  const latestDetail = group.details[group.details.length - 1] || '';
+
   return (
-    <div className="opacity-60 italic">
-      <MarkdownContent text={text} />
-      <span className="inline-block w-1.5 h-3.5 bg-blue-500 ml-1 animate-pulse align-middle" />
+    <div className="font-mono">
+      <div
+        className="flex items-start gap-1.5 cursor-pointer select-none"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <span className={cn('mt-px text-[10px] leading-none', dotColor)}>
+          {group.isActive ? '●' : '●'}
+        </span>
+        <span className="text-[11px]">
+          <span className="text-[9px] text-slate-400 dark:text-slate-500 mr-0.5">
+            {expanded ? '▾' : '▸'}
+          </span>
+          <span className="font-semibold text-slate-700 dark:text-slate-200">
+            {groupSummaryText(group)}
+          </span>
+        </span>
+      </div>
+      {/* During generation, show latest detail below summary */}
+      {group.isActive && !expanded && latestDetail && (
+        <div className="pl-4 text-[10px] text-slate-400 dark:text-slate-500 truncate">
+          └ {latestDetail}
+        </div>
+      )}
+      {expanded && (
+        <div className="pl-4 mt-0.5 space-y-0.5">
+          {group.entries.map((entry, idx) => (
+            <ToolActivityEntry
+              key={`${idx}-${entry}`}
+              entry={entry}
+              isActive={group.isActive && idx === group.entries.length - 1}
+              isLast={group.isActive && idx === group.entries.length - 1}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 };
 
-/** Interleaved text + tool rendering (Claude Code style). */
-const SegmentedMessageView: React.FC<{
-  segments: MessageSegment[];
-  liveText?: string;
-  isGenerating: boolean;
-  isExpanded: boolean;
-  onToggle: () => void;
-  toolCount: number;
-  msg: ChatMessage;
-}> = ({ segments, liveText, isGenerating, isExpanded, onToggle, toolCount, msg }) => {
-  if (!isGenerating && !isExpanded) {
-    // Collapsed: show compact summary + final text only
-    const finalText = [...segments].reverse().find(s => s.type === 'text')?.text || '';
-    return (
-      <>
-        {toolCount > 0 && (
-          <div
-            className="mb-1 text-[11px] cursor-pointer select-none flex items-center gap-1.5"
-            onClick={onToggle}
-          >
-            <span className="text-[9px] text-slate-400 dark:text-slate-500">&#9654;</span>
-            <span className="text-green-600 dark:text-green-400 font-medium">
-              {buildCompactSummary(msg, toolCount)}
-            </span>
-          </div>
-        )}
-        {finalText && renderAgentMessageBody(finalText)}
-      </>
-    );
-  }
-  // Expanded or generating: show all segments interleaved
+/** Grouped tool activity list — groups consecutive same-type tools into summaries. */
+const GroupedToolActivity: React.FC<{ entries: string[]; isGenerating: boolean }> = ({ entries, isGenerating }) => {
+  const groups = groupToolEntries(entries, isGenerating);
   return (
-    <>
-      {segments.map((seg, i) =>
-        seg.type === 'text' ? (
-          <div key={`seg-text-${i}`} className="my-1">
-            {renderAgentMessageBody(seg.text || '')}
-          </div>
-        ) : (
-          <ToolSegmentBlock
-            key={`seg-tools-${i}`}
-            entries={seg.entries || []}
-            isLast={i === segments.length - 1 && isGenerating}
-          />
-        )
-      )}
-      {isGenerating && liveText && <LiveTextBlock text={liveText} />}
-      {isGenerating && !liveText && (
-        <span className="inline-block w-1.5 h-3.5 bg-blue-500 ml-1 animate-pulse align-middle" />
-      )}
-    </>
+    <div className="space-y-0.5">
+      {groups.map((group, idx) => (
+        <ToolGroupBlock key={`${idx}-${group.tool}-${group.entries.length}`} group={group} />
+      ))}
+    </div>
+  );
+};
+
+/** Claude Code-style thinking/loading spinner indicator. */
+const ThinkingIndicator: React.FC<{ text: string }> = ({ text }) => {
+  // Parse detail from "Thinking (model)" or "Loading model: name"
+  const thinkingMatch = text.match(/^Thinking\s*\(([^)]+)\)$/i);
+  const loadingMatch = text.match(/^(?:Loading model|Model loading)[:\s]*(.*)$/i);
+  const label = thinkingMatch
+    ? 'Thinking'
+    : loadingMatch
+      ? 'Loading model'
+      : text.replace(/\.{2,}$/, '');
+  const detail = thinkingMatch?.[1] || loadingMatch?.[1] || '';
+
+  return (
+    <div className="flex items-center gap-2 py-1">
+      {/* Animated spinner dots */}
+      <span className="flex items-center gap-0.5">
+        <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-[thinking-bounce_1.4s_ease-in-out_0s_infinite]" />
+        <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-[thinking-bounce_1.4s_ease-in-out_0.2s_infinite]" />
+        <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-[thinking-bounce_1.4s_ease-in-out_0.4s_infinite]" />
+      </span>
+      <span className="text-[12px] text-slate-500 dark:text-slate-400 font-medium">
+        {label}
+        {detail && (
+          <span className="font-normal text-slate-400 dark:text-slate-500 ml-1">({detail})</span>
+        )}
+      </span>
+    </div>
   );
 };
 
@@ -878,7 +804,7 @@ const SubagentTreeView: React.FC<{
         {!isGenerating && (
           <span className="text-[9px] text-slate-400 dark:text-slate-500">&#9660;</span>
         )}
-        <span className={cn('text-[10px]', dotColor)}>●</span>
+        <span className={cn('text-[10px]', dotColor, !allDone && 'animate-pulse')}>●</span>
         <span className={headerColor}>{headerText}</span>
       </div>
       {/* Tree entries */}
@@ -896,17 +822,29 @@ const SubagentTreeView: React.FC<{
             <div key={entry.subagentId} className={cn(isRunning ? '' : 'opacity-70')}>
               <div className="flex items-start gap-0">
                 <span className="text-slate-400 dark:text-slate-600 select-none shrink-0">{branch} </span>
-                <span className={cn('text-[10px] mt-px mr-1', entryDotColor)}>●</span>
+                <span className={cn('text-[10px] mt-px mr-1', entryDotColor, isRunning && 'animate-pulse')}>●</span>
                 {entry.agentName && <span className="text-blue-600 dark:text-blue-400 mr-1 font-medium">{entry.agentName}</span>}
                 <span className="text-slate-700 dark:text-slate-200">{taskPreview}</span>
                 <span className="text-slate-400 dark:text-slate-500">{statsStr}</span>
               </div>
-              {isRunning && entry.currentActivity && (
+              {isRunning && entry.toolSteps && entry.toolSteps.length > 0 ? (
+                <div className="flex items-start gap-0 text-[10px]">
+                  <span className="text-slate-400 dark:text-slate-600 select-none shrink-0">{continuation}  └ </span>
+                  <span className={cn('mr-0.5', entry.toolSteps[entry.toolSteps.length - 1].status === 'done' ? 'text-emerald-500' : entry.toolSteps[entry.toolSteps.length - 1].status === 'failed' ? 'text-red-500' : 'text-amber-500')}>⏺</span>
+                  <span className={cn('font-medium', entry.toolSteps[entry.toolSteps.length - 1].status === 'failed' ? 'text-red-600 dark:text-red-400' : 'text-cyan-600 dark:text-cyan-400')}>{entry.toolSteps[entry.toolSteps.length - 1].toolName}</span>
+                  {entry.toolSteps[entry.toolSteps.length - 1].args && (
+                    <span className="text-slate-400 dark:text-slate-500">({entry.toolSteps[entry.toolSteps.length - 1].args.length > 50 ? entry.toolSteps[entry.toolSteps.length - 1].args.slice(0, 47) + '…' : entry.toolSteps[entry.toolSteps.length - 1].args})</span>
+                  )}
+                  {entry.toolSteps.length > 1 && (
+                    <span className="text-slate-400 dark:text-slate-500 ml-1">+{entry.toolSteps.length - 1} more</span>
+                  )}
+                </div>
+              ) : isRunning && entry.currentActivity ? (
                 <div className="flex items-start gap-0 text-[10px] text-slate-400 dark:text-slate-500">
                   <span className="select-none shrink-0">{continuation}  └ </span>
                   <span>{entry.currentActivity}</span>
                 </div>
-              )}
+              ) : null}
             </div>
           );
         })}
@@ -932,6 +870,141 @@ const dedupPlanItems = (items: any[]): any[] => {
   });
 };
 
+/** Renders a plan block with markdown rendering, inline editing, and approval buttons. */
+const PlanBlock: React.FC<{
+  plan: any;
+  statusColor: Record<string, string>;
+  itemIcon: Record<string, string>;
+  itemColor: Record<string, string>;
+  pendingPlanAgentId?: string | null;
+  agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
+  onApprovePlan?: (clearContext: boolean) => void;
+  onRejectPlan?: () => void;
+  onEditPlan?: (text: string) => void;
+  inputRef?: React.RefObject<HTMLTextAreaElement | null>;
+}> = ({ plan, statusColor, itemIcon, itemColor, pendingPlanAgentId, agentContext, onApprovePlan, onRejectPlan, onEditPlan, inputRef }) => {
+  const [editing, setEditing] = useState(false);
+  const [editText, setEditText] = useState('');
+  const editRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const startEditing = () => {
+    setEditText(plan.plan_text || '');
+    setEditing(true);
+    setTimeout(() => editRef.current?.focus(), 50);
+  };
+
+  const saveEdit = () => {
+    if (onEditPlan && editText.trim()) {
+      onEditPlan(editText);
+    }
+    setEditing(false);
+  };
+
+  const cancelEdit = () => {
+    setEditing(false);
+  };
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <span className="font-bold text-blue-500">Plan</span>
+        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${statusColor[plan.status] || statusColor.planned}`}>
+          {plan.status}
+        </span>
+      </div>
+      <div className="text-[12px] opacity-90">{plan.summary}</div>
+      {editing ? (
+        <div className="space-y-2">
+          <textarea
+            ref={editRef}
+            value={editText}
+            onChange={(e) => setEditText(e.target.value)}
+            className="w-full text-[11px] font-mono bg-slate-50 dark:bg-white/5 rounded-md p-3 border border-blue-400 dark:border-blue-500/50 max-h-96 min-h-[120px] overflow-y-auto resize-y focus:outline-none focus:ring-1 focus:ring-blue-400"
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') cancelEdit();
+              if (e.key === 's' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); saveEdit(); }
+            }}
+          />
+          <div className="flex gap-2">
+            <button
+              onClick={saveEdit}
+              className="px-3 py-1 text-[11px] font-semibold rounded-md bg-blue-600 text-white hover:bg-blue-700"
+            >
+              Save
+            </button>
+            <button
+              onClick={cancelEdit}
+              className="px-3 py-1 text-[11px] font-semibold rounded-md border border-slate-300 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/5"
+            >
+              Cancel
+            </button>
+            <span className="text-[10px] text-slate-400 self-center">Cmd/Ctrl+S to save, Esc to cancel</span>
+          </div>
+        </div>
+      ) : plan.plan_text ? (
+        <div className="text-[11px] bg-slate-50 dark:bg-white/5 rounded-md p-3 border border-slate-200 dark:border-white/10 max-h-96 overflow-y-auto">
+          <MarkdownContent text={plan.plan_text} />
+        </div>
+      ) : (
+        <div className="space-y-1">
+          {dedupPlanItems(plan.items || []).map((item: any, idx: number) => (
+            <div key={idx} className="flex items-start gap-1.5 text-[11px]">
+              <span className={`${itemColor[item.status] || 'text-slate-400'} font-mono`}>
+                {itemIcon[item.status] || '○'}
+              </span>
+              <span className={item.status === 'skipped' ? 'line-through opacity-50' : ''}>
+                {item.title}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      {plan.status === 'planned' && onApprovePlan && onRejectPlan && !editing && (() => {
+        const ctx = pendingPlanAgentId ? agentContext?.[pendingPlanAgentId.toLowerCase()] : undefined;
+        const pct = ctx?.tokenLimit && ctx.tokenLimit > 0
+          ? Math.round((ctx.tokens / ctx.tokenLimit) * 100)
+          : null;
+        return (
+          <div className="flex flex-wrap gap-2 pt-1">
+            <button
+              onClick={() => onApprovePlan(true)}
+              className="px-3 py-1 text-[11px] font-semibold rounded-md bg-emerald-600 text-white hover:bg-emerald-700"
+            >
+              Approve, clear context{pct !== null ? ` (${pct}% used)` : ''}
+            </button>
+            <button
+              onClick={() => onApprovePlan(false)}
+              className="px-3 py-1 text-[11px] font-semibold rounded-md bg-blue-600 text-white hover:bg-blue-700"
+            >
+              Approve, keep context
+            </button>
+            {onEditPlan && plan.plan_text && (
+              <button
+                onClick={startEditing}
+                className="px-3 py-1 text-[11px] font-semibold rounded-md border border-blue-300 dark:border-blue-500/30 text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20"
+              >
+                Edit
+              </button>
+            )}
+            <button
+              onClick={() => { inputRef?.current?.focus(); inputRef?.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}
+              className="px-3 py-1 text-[11px] font-semibold rounded-md border border-slate-300 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/5"
+            >
+              Give feedback
+            </button>
+            <button
+              onClick={onRejectPlan}
+              className="px-3 py-1 text-[11px] font-semibold rounded-md border border-red-200 dark:border-red-500/20 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20"
+            >
+              Reject
+            </button>
+          </div>
+        );
+      })()}
+    </div>
+  );
+};
+
 const activityHeadline = (msg: ChatMessage, entries: string[]) => {
   const computed = summarizeCollapsedActivity(entries, msg.isGenerating);
   const summary = msg.isGenerating ? (computed || msg.activitySummary || '') : (msg.activitySummary || computed || '');
@@ -954,6 +1027,340 @@ const activityEntriesForMessage = (msg: ChatMessage): string[] => {
   if (entries.length > 0) return dedupeActivityEntries(entries);
   if (isProgressLineText(msg.text)) return dedupeActivityEntries([msg.text]);
   return [];
+};
+
+// ---------------------------------------------------------------------------
+// Phase-based message rendering (AgentMessage / ActivitySection / MessageBody)
+// ---------------------------------------------------------------------------
+
+type MessagePhase = 'thinking' | 'working' | 'streaming' | 'done';
+
+const isTransientStatus = (entry: string): boolean => {
+  const t = entry.trim();
+  return t === 'Thinking...' || t === 'Thinking' || t === 'Model loading...' || t === 'Model loading' || t === 'Running';
+};
+
+function getMessagePhase(msg: ChatMessage): MessagePhase {
+  if (!msg.isGenerating) return 'done';
+  if (msg.isThinking) return 'thinking';
+  const entries = msg.activityEntries || [];
+  const nonTransient = entries.filter(e => !isTransientStatus(e));
+  if (nonTransient.length > 0) return 'working';
+  return 'streaming';
+}
+
+const CollapsibleSummary: React.FC<{
+  text: string;
+  expanded: boolean;
+  onToggle: () => void;
+}> = ({ text, expanded, onToggle }) => (
+  <div
+    className="cursor-pointer select-none flex items-center gap-1.5 text-[11px]"
+    onClick={onToggle}
+  >
+    <span className="text-[9px] text-slate-400 dark:text-slate-500">
+      {expanded ? '\u25BC' : '\u25B6'}
+    </span>
+    <span className="text-green-600 dark:text-green-400 font-medium">{text}</span>
+  </div>
+);
+
+const PLAN_STATUS_COLOR: Record<string, string> = {
+  planned: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
+  approved: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
+  executing: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
+  completed: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
+};
+
+const PLAN_ITEM_ICON: Record<string, string> = {
+  pending: '\u25CB',
+  in_progress: '\u25D1',
+  done: '\u25CF',
+  skipped: '\u2298',
+};
+
+const PLAN_ITEM_COLOR: Record<string, string> = {
+  pending: 'text-slate-400',
+  in_progress: 'text-blue-500',
+  done: 'text-emerald-500',
+  skipped: 'text-slate-300 dark:text-slate-600',
+};
+
+interface SpecialBlockProps {
+  pendingPlanAgentId?: string | null;
+  agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
+  onApprovePlan?: (clearContext: boolean) => void;
+  onRejectPlan?: () => void;
+  onEditPlan?: (text: string) => void;
+  inputRef?: React.RefObject<HTMLTextAreaElement | null>;
+}
+
+function tryRenderSpecialBlock(
+  text: string,
+  props: SpecialBlockProps,
+): React.ReactNode | null {
+  try {
+    const parsed = JSON.parse(text);
+
+    if (parsed.type === 'plan' && parsed.plan) {
+      return (
+        <PlanBlock
+          plan={parsed.plan}
+          statusColor={PLAN_STATUS_COLOR}
+          itemIcon={PLAN_ITEM_ICON}
+          itemColor={PLAN_ITEM_COLOR}
+          pendingPlanAgentId={props.pendingPlanAgentId}
+          agentContext={props.agentContext}
+          onApprovePlan={props.onApprovePlan}
+          onRejectPlan={props.onRejectPlan}
+          onEditPlan={props.onEditPlan}
+          inputRef={props.inputRef}
+        />
+      );
+    }
+
+    if (parsed.type === 'finalize_task' && parsed.packet) {
+      const packet = parsed.packet;
+      const userStories: string[] = Array.isArray(packet.user_stories) ? packet.user_stories : [];
+      const criteria: string[] = Array.isArray(packet.acceptance_criteria)
+        ? packet.acceptance_criteria
+        : [];
+      return (
+        <div className="space-y-2">
+          <div className="font-bold text-blue-500">Task Finalized: {packet.title}</div>
+          {userStories.length > 0 && (
+            <div className="space-y-1 text-[11px]">
+              <div className="uppercase tracking-wider text-[9px] text-slate-500">User Stories</div>
+              {userStories.map((story: string, idx: number) => (
+                <div key={idx} className="text-[11px] opacity-90">- {story}</div>
+              ))}
+            </div>
+          )}
+          {criteria.length > 0 && (
+            <div className="space-y-1 text-[11px]">
+              <div className="uppercase tracking-wider text-[9px] text-slate-500">Acceptance Criteria</div>
+              {criteria.map((crit: string, idx: number) => (
+                <div key={idx} className="text-[11px] opacity-90">- {crit}</div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    if (parsed.type === 'change_report' && Array.isArray(parsed.files)) {
+      const files = parsed.files
+        .map((item: any) => ({
+          path: typeof item?.path === 'string' ? item.path : '',
+          summary: typeof item?.summary === 'string' ? item.summary : '',
+          diff: typeof item?.diff === 'string' ? item.diff : '',
+        }))
+        .filter((item: any) => item.path);
+      const truncatedCount = Number(parsed.truncated_count || 0);
+      const reviewHint = typeof parsed.review_hint === 'string' ? parsed.review_hint : '';
+      return (
+        <div className="space-y-1">
+          <div className="font-bold text-blue-500">
+            Changed files ({files.length}
+            {truncatedCount > 0 ? ` +${truncatedCount} more` : ''})
+          </div>
+          {files.map((file: any, idx: number) => {
+            const hasDiff = !!file.diff && !file.diff.startsWith('(diff');
+            const stats = hasDiff ? diffStats(file.diff) : null;
+            if (!hasDiff) {
+              return (
+                <div
+                  key={`${file.path}-${idx}`}
+                  className="flex flex-wrap items-center gap-2 rounded-md border border-slate-200 dark:border-white/10 bg-slate-50/80 dark:bg-white/[0.03] px-2 py-1.5 text-[11px]"
+                >
+                  <span className="text-slate-500 dark:text-slate-300">{file.summary || 'Updated'}</span>
+                  <span className="font-mono text-[11px]">{file.path}</span>
+                </div>
+              );
+            }
+            return (
+              <details
+                key={`${file.path}-${idx}`}
+                className="rounded-md border border-slate-200 dark:border-white/10 bg-slate-50/80 dark:bg-white/[0.03] text-[11px]"
+              >
+                <summary className="cursor-pointer px-2 py-1.5 select-none flex flex-wrap items-center gap-2">
+                  <span className="text-slate-500 dark:text-slate-300">{file.summary || 'Updated'}</span>
+                  <span className="font-mono text-[11px]">{file.path}</span>
+                  {stats && (
+                    <span className="ml-auto font-mono text-[10px]">
+                      {stats.added > 0 && <span className="text-green-600 dark:text-green-400">+{stats.added}</span>}
+                      {stats.added > 0 && stats.deleted > 0 && ' '}
+                      {stats.deleted > 0 && <span className="text-red-600 dark:text-red-400">-{stats.deleted}</span>}
+                    </span>
+                  )}
+                </summary>
+                <div className="px-1 pb-1">
+                  <DiffView diff={file.diff} />
+                </div>
+              </details>
+            );
+          })}
+          {reviewHint && (
+            <div className="text-[11px] text-slate-500 dark:text-slate-400">{reviewHint}</div>
+          )}
+        </div>
+      );
+    }
+
+    // JSON with text-like field — extract and render as markdown
+    const textContent =
+      typeof parsed.response === 'string' ? parsed.response
+      : typeof parsed.text === 'string' ? parsed.text
+      : typeof parsed.content === 'string' ? parsed.content
+      : typeof parsed.message === 'string' ? parsed.message
+      : typeof parsed.answer === 'string' ? parsed.answer
+      : null;
+    if (textContent) return <MarkdownContent text={textContent} />;
+  } catch { /* not JSON */ }
+  return null;
+}
+
+/** Activity section — handles all tool display states. */
+const ActivitySection: React.FC<{
+  msg: ChatMessage;
+  phase: MessagePhase;
+  isExpanded: boolean;
+  onToggle: () => void;
+}> = ({ msg, phase, isExpanded, onToggle }) => {
+  if (phase === 'thinking') return null; // ThinkingIndicator handles display
+
+  const entries = activityEntriesForMessage(msg);
+  const detailEntries = activityEntriesForDetails(msg, entries);
+  const toolCount = msg.toolCount || entries.length;
+
+  if (entries.length === 0 && !msg.activitySummary) return null;
+  if (msg.subagentTree && msg.subagentTree.length > 0) return null; // tree handles it
+
+  // Generating (working or streaming): show grouped tool list
+  if (phase === 'working' || phase === 'streaming') {
+    return (
+      <div className="mb-1.5">
+        {entries.length > 0 ? (
+          <GroupedToolActivity entries={entries} isGenerating={true} />
+        ) : (
+          <div className="flex items-center gap-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+            <span className="text-[10px] text-amber-500">{'\u25CF'}</span>
+            <span>{activityHeadline(msg, entries)}</span>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Done + expanded: summary header + detail list
+  if (phase === 'done' && isExpanded && detailEntries.length > 0) {
+    return (
+      <div className="mb-1.5">
+        <CollapsibleSummary
+          text={buildCompactSummary(msg, toolCount)}
+          expanded={true}
+          onToggle={onToggle}
+        />
+        <div className="mt-1 pl-3">
+          <GroupedToolActivity entries={detailEntries} isGenerating={false} />
+        </div>
+      </div>
+    );
+  }
+
+  // Done + collapsed: single summary line
+  if (phase === 'done' && detailEntries.length > 0) {
+    return (
+      <CollapsibleSummary
+        text={buildCompactSummary(msg, toolCount)}
+        expanded={false}
+        onToggle={onToggle}
+      />
+    );
+  }
+
+  // Fallback: text headline for activity without expandable details
+  if (entries.length > 0 || msg.activitySummary) {
+    return (
+      <div className="mb-1 text-[11px] text-slate-500 dark:text-slate-400">
+        {activityHeadline(msg, entries)}
+      </div>
+    );
+  }
+
+  return null;
+};
+
+/** Message body — handles thinking, streaming, and final text. */
+const MessageBody: React.FC<{
+  msg: ChatMessage;
+  phase: MessagePhase;
+  planProps: SpecialBlockProps;
+}> = ({ msg, phase, planProps }) => {
+  if (phase === 'thinking') {
+    return <ThinkingIndicator text={msg.text || 'Thinking...'} />;
+  }
+
+  const displayText = visibleMessageText(msg);
+  if (!displayText && phase !== 'streaming') return null;
+
+  // Hide body when activity section handles the display
+  const entries = activityEntriesForMessage(msg);
+  const hasActivity = entries.length > 0 || !!msg.activitySummary;
+  const hasSubagentTree = !!(msg.subagentTree && msg.subagentTree.length > 0);
+  if (hasActivity && !hasSubagentTree) {
+    if (isProgressLineText(msg.text) || !displayText.trim()) return null;
+    const summaryText = summarizeCollapsedActivity(entries, !!msg.isGenerating);
+    if (displayText.trim() === summaryText) return null;
+  }
+
+  // Try structured JSON rendering
+  const specialBlock = tryRenderSpecialBlock(displayText, planProps);
+  if (specialBlock) return <>{specialBlock}</>;
+
+  return (
+    <>
+      <MarkdownContent text={displayText} />
+      {phase === 'streaming' && (
+        <span className="inline-block w-1.5 h-3.5 bg-blue-500 ml-1 animate-pulse align-middle" />
+      )}
+    </>
+  );
+};
+
+/** Top-level agent message renderer — single component replacing the 380-line rendering loop. */
+const AgentMessage: React.FC<{
+  msg: ChatMessage;
+  isExpanded: boolean;
+  onToggle: () => void;
+  planProps: SpecialBlockProps;
+}> = ({ msg, isExpanded, onToggle, planProps }) => {
+  const phase = getMessagePhase(msg);
+
+  return (
+    <>
+      {/* Delegation tree (if present) */}
+      {msg.subagentTree && msg.subagentTree.length > 0 && (
+        <SubagentTreeView
+          entries={msg.subagentTree}
+          isGenerating={!!msg.isGenerating}
+          isExpanded={isExpanded}
+          onToggle={onToggle}
+        />
+      )}
+
+      {/* Tool activity section */}
+      <ActivitySection
+        msg={msg}
+        phase={phase}
+        isExpanded={isExpanded}
+        onToggle={onToggle}
+      />
+
+      {/* Message body */}
+      <MessageBody msg={msg} phase={phase} planProps={planProps} />
+    </>
+  );
 };
 
 const collapseProgressMessages = (messages: ChatMessage[]): ChatMessage[] => {
@@ -1175,8 +1582,24 @@ const redactFileDumpForReadFile = (text: string) => {
 const visibleMessageText = (msg: ChatMessage) => {
   if (msg.role === 'user') return msg.text;
   const sanitized = sanitizeAgentMessageText(msg.text);
-  if (!hasReadFileActivity(msg.activityEntries)) return sanitized;
-  return redactFileDumpForReadFile(sanitized);
+  // Strip "Used tool:" lines when structured activity data exists (avoids duplicate display)
+  const hasStructuredActivity =
+    (Array.isArray(msg.activityEntries) && msg.activityEntries.length > 0) ||
+    (Array.isArray(msg.content) && msg.content.length > 0);
+  const cleaned = hasStructuredActivity
+    ? sanitized.split('\n')
+        .filter(line => {
+          const t = line.trimStart();
+          return !t.startsWith('Used tool:') &&
+                 !t.startsWith('Tool done:') &&
+                 !t.startsWith('Tool tool_not_allowed:') &&
+                 !t.startsWith('Tool error:') &&
+                 !t.startsWith('tool_not_allowed:');
+        })
+        .join('\n').replace(/\n{3,}/g, '\n\n').trim()
+    : sanitized;
+  if (!hasReadFileActivity(msg.activityEntries)) return cleaned;
+  return redactFileDumpForReadFile(cleaned);
 };
 
 const buildRunTimeline = (
@@ -1265,8 +1688,11 @@ export const ChatPanel: React.FC<{
   onCancelRun?: (runId: string) => void | Promise<void>;
   onSendMessage: (message: string, targetAgent?: string, images?: string[]) => void;
   pendingPlan?: import('../types').Plan | null;
-  onApprovePlan?: () => void;
+  pendingPlanAgentId?: string | null;
+  agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
+  onApprovePlan?: (clearContext: boolean) => void;
   onRejectPlan?: () => void;
+  onEditPlan?: (text: string) => void;
   pendingAskUser?: import('../types').PendingAskUser | null;
   onRespondToAskUser?: (questionId: string, answers: import('../types').AskUserAnswer[]) => void;
   verboseMode?: boolean;
@@ -1290,9 +1716,12 @@ export const ChatPanel: React.FC<{
   cancellingRunIds,
   onCancelRun,
   onSendMessage,
-  pendingPlan,
+  pendingPlan: _pendingPlan,
+  pendingPlanAgentId,
+  agentContext,
   onApprovePlan,
   onRejectPlan,
+  onEditPlan,
   pendingAskUser,
   onRespondToAskUser,
   verboseMode,
@@ -1631,6 +2060,19 @@ export const ChatPanel: React.FC<{
     return () => window.clearInterval(id);
   }, [selectedMainRunningRunId, selectedSubagentRunningRunId, fetchRunContext, fetchRunChildren]);
 
+  // Re-fetch run context when a run transitions from running → stopped,
+  // so the "RUNNING" badge updates to the final status immediately.
+  const prevMainRunningRef = useRef(selectedMainRunningRunId);
+  const prevSubRunningRef = useRef(selectedSubagentRunningRunId);
+  useEffect(() => {
+    const prevMain = prevMainRunningRef.current;
+    const prevSub = prevSubRunningRef.current;
+    prevMainRunningRef.current = selectedMainRunningRunId;
+    prevSubRunningRef.current = selectedSubagentRunningRunId;
+    if (prevMain && !selectedMainRunningRunId) fetchRunContext(prevMain, true);
+    if (prevSub && !selectedSubagentRunningRunId) fetchRunContext(prevSub, true);
+  }, [selectedMainRunningRunId, selectedSubagentRunningRunId, fetchRunContext]);
+
   const resizeInput = () => {
     if (!inputRef.current) return;
     inputRef.current.style.height = '0px';
@@ -1899,29 +2341,14 @@ export const ChatPanel: React.FC<{
         {filteredMainMessages.map((msg, i) => {
           const key = `${msg.timestamp}-${i}-${msg.from || msg.role}-${msg.text.slice(0, 24)}`;
           const isUser = msg.role === 'user';
-          const displayText = visibleMessageText(msg);
-          const activityEntries = activityEntriesForMessage(msg);
-          const hasActivity = !isUser && activityEntries.length > 0;
-          const detailActivityEntries = hasActivity ? activityEntriesForDetails(msg, activityEntries) : [];
-          const hasActivityDetails = !isUser && detailActivityEntries.length > 0;
-          const hasActivitySummary = !isUser && (hasActivity || !!msg.activitySummary);
-          const isStatusLine = isProgressLineText(msg.text);
-          const activitySummaryText = hasActivitySummary
-            ? (hasActivity ? summarizeCollapsedActivity(activityEntries, !!msg.isGenerating) : (msg.activitySummary || ''))
-            : '';
-          const hideStatusBodyText = hasActivitySummary && (
-            isStatusLine ||
-            displayText.trim().length === 0 ||
-            displayText.trim() === activitySummaryText
-          );
+          const phase = isUser ? undefined : getMessagePhase(msg);
           const messageClass = isUser
             ? 'bg-slate-100 dark:bg-white/10 text-slate-900 dark:text-slate-100 rounded-md px-2.5 py-1.5'
-            : msg.isThinking
-              ? 'text-slate-500 dark:text-slate-400 italic opacity-60'
-              : isStatusLine && !hasActivity
-                ? 'text-amber-600/70 dark:text-amber-400/70 italic text-[12px]'
+            : phase === 'thinking'
+              ? '' // ThinkingIndicator handles its own styling
+              : msg.isThinking && !msg.isGenerating
+                ? 'text-slate-500 dark:text-slate-400 italic opacity-60'
                 : 'text-slate-800 dark:text-slate-200';
-          const toolCount = msg.toolCount || activityEntries.length;
           const isExpanded = verboseMode || expandedMessages.has(key);
           const toggleExpand = () => {
             setExpandedMessages((prev) => {
@@ -1932,302 +2359,51 @@ export const ChatPanel: React.FC<{
             });
           };
           return (
-          <div
-            key={key}
-            className={cn('w-full flex', isUser ? 'justify-end' : 'justify-start')}
-          >
             <div
-              className={cn(
-                'max-w-[96%] text-[13px] leading-relaxed',
-                messageClass
-              )}
+              key={key}
+              className={cn('w-full flex', isUser ? 'justify-end' : 'justify-start')}
             >
-              {/* Subagent tree (rendered above regular tool activity) */}
-              {msg.subagentTree && msg.subagentTree.length > 0 && (
-                <SubagentTreeView
-                  entries={msg.subagentTree}
-                  isGenerating={!!msg.isGenerating}
-                  isExpanded={isExpanded}
-                  onToggle={toggleExpand}
-                />
-              )}
-              {/* Segmented interleaved view (text → tools → text → tools → ...) */}
-              {msg.segments && msg.segments.length > 0 ? (
-                <SegmentedMessageView
-                  segments={msg.segments}
-                  liveText={msg.liveText}
-                  isGenerating={!!msg.isGenerating}
-                  isExpanded={isExpanded}
-                  onToggle={toggleExpand}
-                  toolCount={toolCount}
-                  msg={msg}
-                />
-              ) : hasActivitySummary && (
-                msg.isGenerating ? (
-                  /* Active (in-progress): Claude Code-style live tool log */
-                  <div className="mb-1.5">
-                    {activityEntries.length > 0 ? (
-                      <div className="space-y-0.5">
-                        {activityEntries.map((entry, idx) => (
-                          <ToolActivityEntry
-                            key={`${idx}-${entry}`}
-                            entry={entry}
-                            isActive={idx === activityEntries.length - 1}
-                            isLast={idx === activityEntries.length - 1}
+              <div
+                className={cn(
+                  'max-w-[96%] text-[13px] leading-relaxed',
+                  messageClass
+                )}
+              >
+                {isUser ? (
+                  <>
+                    {msg.text}
+                    {msg.images && msg.images.length > 0 && (
+                      <div className="flex gap-1.5 mt-1.5 flex-wrap">
+                        {msg.images.map((img, imgIdx) => (
+                          <img
+                            key={imgIdx}
+                            src={`data:image/png;base64,${img}`}
+                            alt={`Image ${imgIdx + 1}`}
+                            className="max-w-[200px] max-h-[200px] rounded-md border border-slate-200 dark:border-white/10 object-contain"
                           />
                         ))}
                       </div>
-                    ) : (
-                      <div className="flex items-center gap-1.5 text-[11px] text-slate-500 dark:text-slate-400">
-                        <span className="text-[10px] text-amber-500">●</span>
-                        <span>{activityHeadline(msg, activityEntries)}</span>
-                      </div>
                     )}
-                  </div>
-                ) : isExpanded && hasActivityDetails ? (
-                  /* Expanded: Claude Code-style tool list */
-                  <div className="mb-1.5">
-                    <div
-                      className="cursor-pointer select-none flex items-center gap-1.5 text-[11px]"
-                      onClick={toggleExpand}
-                    >
-                      <span className="text-[9px] text-slate-400 dark:text-slate-500">&#9660;</span>
-                      <span className="text-green-600 dark:text-green-400 font-medium">
-                        {buildCompactSummary(msg, toolCount)}
-                      </span>
-                    </div>
-                    <div className="mt-1 space-y-0.5 pl-3">
-                      {detailActivityEntries.map((entry, idx) => (
-                        <ToolActivityEntry
-                          key={`${idx}-${entry}`}
-                          entry={entry}
-                          isActive={false}
-                          isLast={idx === detailActivityEntries.length - 1}
-                        />
-                      ))}
-                    </div>
-                  </div>
-                ) : hasActivityDetails ? (
-                  /* Compact (collapsed): show "Done (N tool uses · Xk tokens · Ys)" */
-                  <div
-                    className="mb-1 text-[11px] cursor-pointer select-none flex items-center gap-1.5"
-                    onClick={toggleExpand}
-                  >
-                    <span className="text-[9px] text-slate-400 dark:text-slate-500">&#9654;</span>
-                    <span className="text-green-600 dark:text-green-400 font-medium">
-                      {buildCompactSummary(msg, toolCount)}
-                    </span>
-                  </div>
+                  </>
                 ) : (
-                  <div className="mb-1 text-[11px] text-slate-500 dark:text-slate-400">
-                    {activityHeadline(msg, activityEntries)}
-                  </div>
-                )
-              )}
-              {(() => {
-                // When segments mode is active, body text is already rendered by SegmentedMessageView
-                if (msg.segments && msg.segments.length > 0) return null;
-                if (isUser || (isStatusLine && !hasActivity)) {
-                  return (
-                    <>
-                      {displayText}
-                      {isUser && msg.images && msg.images.length > 0 && (
-                        <div className="flex gap-1.5 mt-1.5 flex-wrap">
-                          {msg.images.map((img, imgIdx) => (
-                            <img
-                              key={imgIdx}
-                              src={`data:image/png;base64,${img}`}
-                              alt={`Image ${imgIdx + 1}`}
-                              className="max-w-[200px] max-h-[200px] rounded-md border border-slate-200 dark:border-white/10 object-contain"
-                            />
-                          ))}
-                        </div>
-                      )}
-                    </>
-                  );
-                }
-                if (hideStatusBodyText) return null;
-                try {
-                  const parsed = JSON.parse(displayText);
-                  if (parsed.type === 'plan' && parsed.plan) {
-                    const plan = parsed.plan;
-                    const statusColor: Record<string, string> = {
-                      planned: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
-                      approved: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
-                      executing: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
-                      completed: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
-                    };
-                    const itemIcon: Record<string, string> = {
-                      pending: '○',
-                      in_progress: '◑',
-                      done: '●',
-                      skipped: '⊘',
-                    };
-                    const itemColor: Record<string, string> = {
-                      pending: 'text-slate-400',
-                      in_progress: 'text-blue-500',
-                      done: 'text-emerald-500',
-                      skipped: 'text-slate-300 dark:text-slate-600',
-                    };
-                    return (
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2">
-                          <span className="font-bold text-blue-500">
-                            {plan.origin === 'user_requested' ? 'Plan' : 'Tasks'}
-                          </span>
-                          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${statusColor[plan.status] || statusColor.planned}`}>
-                            {plan.status}
-                          </span>
-                        </div>
-                        <div className="text-[12px] opacity-90">{plan.summary}</div>
-                        <div className="space-y-1">
-                          {dedupPlanItems(plan.items || []).map((item: any, idx: number) => (
-                            <div key={idx} className="flex items-start gap-1.5 text-[11px]">
-                              <span className={`${itemColor[item.status] || 'text-slate-400'} font-mono`}>
-                                {itemIcon[item.status] || '○'}
-                              </span>
-                              <span className={item.status === 'skipped' ? 'line-through opacity-50' : ''}>
-                                {item.title}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                        {plan.status === 'planned' && plan.origin === 'user_requested' && onApprovePlan && onRejectPlan && (
-                          <div className="flex gap-2 pt-1">
-                            <button
-                              onClick={onApprovePlan}
-                              className="px-3 py-1 text-[11px] font-semibold rounded-md bg-emerald-600 text-white hover:bg-emerald-700"
-                            >
-                              Approve &amp; Execute
-                            </button>
-                            <button
-                              onClick={onRejectPlan}
-                              className="px-3 py-1 text-[11px] font-semibold rounded-md border border-slate-300 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/5"
-                            >
-                              Reject
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  }
-                  if (parsed.type === 'finalize_task' && parsed.packet) {
-                    const packet = parsed.packet;
-                    const userStories: string[] = Array.isArray(packet.user_stories) ? packet.user_stories : [];
-                    const criteria: string[] = Array.isArray(packet.acceptance_criteria)
-                      ? packet.acceptance_criteria
-                      : [];
-                    return (
-                      <div className="space-y-2">
-                        <div className="font-bold text-blue-500">Task Finalized: {packet.title}</div>
-                        {userStories.length > 0 && (
-                          <div className="space-y-1 text-[11px]">
-                            <div className="uppercase tracking-wider text-[9px] text-slate-500">User Stories</div>
-                            {userStories.map((story: string, idx: number) => (
-                              <div key={idx} className="text-[11px] opacity-90">
-                                - {story}
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                        {criteria.length > 0 && (
-                          <div className="space-y-1 text-[11px]">
-                            <div className="uppercase tracking-wider text-[9px] text-slate-500">Acceptance Criteria</div>
-                            {criteria.map((crit: string, idx: number) => (
-                              <div key={idx} className="text-[11px] opacity-90">
-                                - {crit}
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  }
-                  if (parsed.type === 'change_report' && Array.isArray(parsed.files)) {
-                    const files = parsed.files
-                      .map((item: any) => ({
-                        path: typeof item?.path === 'string' ? item.path : '',
-                        summary: typeof item?.summary === 'string' ? item.summary : '',
-                        diff: typeof item?.diff === 'string' ? item.diff : '',
-                      }))
-                      .filter((item: any) => item.path);
-                    const truncatedCount = Number(parsed.truncated_count || 0);
-                    const reviewHint =
-                      typeof parsed.review_hint === 'string' ? parsed.review_hint : '';
-                    return (
-                      <div className="space-y-1">
-                        <div className="font-bold text-blue-500">
-                          Changed files ({files.length}
-                          {truncatedCount > 0 ? ` +${truncatedCount} more` : ''})
-                        </div>
-                        {files.map((file: any, idx: number) => {
-                          const hasDiff = !!file.diff && !file.diff.startsWith('(diff');
-                          const stats = hasDiff ? diffStats(file.diff) : null;
-                          if (!hasDiff) {
-                            return (
-                              <div
-                                key={`${file.path}-${idx}`}
-                                className="flex flex-wrap items-center gap-2 rounded-md border border-slate-200 dark:border-white/10 bg-slate-50/80 dark:bg-white/[0.03] px-2 py-1.5 text-[11px]"
-                              >
-                                <span className="text-slate-500 dark:text-slate-300">
-                                  {file.summary || 'Updated'}
-                                </span>
-                                <span className="font-mono text-[11px]">{file.path}</span>
-                              </div>
-                            );
-                          }
-                          return (
-                            <details
-                              key={`${file.path}-${idx}`}
-                              className="rounded-md border border-slate-200 dark:border-white/10 bg-slate-50/80 dark:bg-white/[0.03] text-[11px]"
-                            >
-                              <summary className="cursor-pointer px-2 py-1.5 select-none flex flex-wrap items-center gap-2">
-                                <span className="text-slate-500 dark:text-slate-300">
-                                  {file.summary || 'Updated'}
-                                </span>
-                                <span className="font-mono text-[11px]">{file.path}</span>
-                                {stats && (
-                                  <span className="ml-auto font-mono text-[10px]">
-                                    {stats.added > 0 && <span className="text-green-600 dark:text-green-400">+{stats.added}</span>}
-                                    {stats.added > 0 && stats.deleted > 0 && ' '}
-                                    {stats.deleted > 0 && <span className="text-red-600 dark:text-red-400">-{stats.deleted}</span>}
-                                  </span>
-                                )}
-                              </summary>
-                              <div className="px-1 pb-1">
-                                <DiffView diff={file.diff} />
-                              </div>
-                            </details>
-                          );
-                        })}
-                        {reviewHint && (
-                          <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                            {reviewHint}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  }
-                  // JSON object with a text-like field — extract and render as markdown
-                  const textContent =
-                    typeof parsed.response === 'string' ? parsed.response
-                    : typeof parsed.text === 'string' ? parsed.text
-                    : typeof parsed.content === 'string' ? parsed.content
-                    : typeof parsed.message === 'string' ? parsed.message
-                    : typeof parsed.answer === 'string' ? parsed.answer
-                    : null;
-                  if (textContent) {
-                    return renderAgentMessageBody(textContent);
-                  }
-                  return renderAgentMessageBody(displayText);
-                } catch (_e) {
-                  return renderAgentMessageBody(displayText);
-                }
-              })()}
-              {msg.isGenerating && !(msg.segments && msg.segments.length > 0) && <span className="inline-block w-1.5 h-3.5 bg-blue-500 ml-1 animate-pulse align-middle" />}
+                  <AgentMessage
+                    msg={msg}
+                    isExpanded={isExpanded}
+                    onToggle={toggleExpand}
+                    planProps={{
+                      pendingPlanAgentId,
+                      agentContext,
+                      onApprovePlan,
+                      onRejectPlan,
+                      onEditPlan,
+                      inputRef,
+                    }}
+                  />
+                )}
+              </div>
             </div>
-          </div>
-        )})}
+          );
+        })}
         {pendingAskUser && onRespondToAskUser && (
           <div className="px-3 py-2">
             {pendingAskUser.questions[0]?.header === 'Permission'
@@ -2536,7 +2712,7 @@ export const ChatPanel: React.FC<{
                   {(msg.from || msg.role).toUpperCase()} {msg.to ? `→ ${msg.to.toUpperCase()}` : ''}
                 </div>
                 <div className="text-[12px] text-slate-700 dark:text-slate-200 break-words">
-                  {renderAgentMessageBody(visibleMessageText(msg))}
+                  <MarkdownContent text={visibleMessageText(msg)} />
                 </div>
               </div>
             ))}
