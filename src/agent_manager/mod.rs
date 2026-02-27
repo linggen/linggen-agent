@@ -131,6 +131,8 @@ pub enum AgentEvent {
         summary: Option<String>,
         is_error: Option<bool>,
         parent_id: Option<String>,
+        /// Optional extra payload (e.g. diff data for Edit/Write tools).
+        extra: Option<serde_json::Value>,
     },
     /// Signal that the assistant turn is complete.
     TurnComplete {

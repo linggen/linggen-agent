@@ -41,7 +41,8 @@ export type ChatAction =
   | { type: 'FINALIZE_MESSAGE'; agentId: string; content: string; to: string; tsMs: number; elapsed?: number; ctxTokens?: number }
   | { type: 'FINALIZE_ON_IDLE'; agentId: string; elapsed?: number; ctxTokens?: number }
   | { type: 'CONTENT_BLOCK_START'; agentId: string; block: ContentBlock }
-  | { type: 'CONTENT_BLOCK_UPDATE'; agentId: string; blockId: string; status?: string; summary?: string; isError?: boolean }
+  | { type: 'CONTENT_BLOCK_UPDATE'; agentId: string; blockId: string; status?: string; summary?: string; isError?: boolean; diffData?: ContentBlock['diffData'] }
+  | { type: 'TOOL_PROGRESS'; agentId: string; line: string }
   | { type: 'TURN_COMPLETE'; agentId: string; durationMs?: number; contextTokens?: number };
 
 // ---------------------------------------------------------------------------
@@ -244,18 +245,33 @@ function chatReducer(state: ChatMessage[], action: ChatAction): ChatMessage[] {
       const generatingIdx = findLastGeneratingMessageIndex(state, agentId);
       if (generatingIdx >= 0) {
         const next = [...state];
-        const existingEntries = Array.isArray(next[generatingIdx].activityEntries)
-          ? next[generatingIdx].activityEntries
+        const existingMsg = next[generatingIdx];
+        const existingEntries = Array.isArray(existingMsg.activityEntries)
+          ? existingMsg.activityEntries
           : [];
         const nonTransient = existingEntries.filter((e: string) => !isTransientStatus(e));
-        let finalSegments = next[generatingIdx].segments;
+
+        // Don't finalize if subagents are still running — keep isGenerating true
+        // so tokens from the parent agent can still be appended after subagent returns.
+        const hasRunningSubagents = (existingMsg.subagentTree || []).some(
+          (e) => e.status === 'running'
+        );
+        const hasRunningBlocks = (existingMsg.content || []).some(
+          (b) => b.type === 'tool_use' && b.status === 'running'
+        );
+        const keepGenerating = hasRunningSubagents || hasRunningBlocks;
+
+        let finalSegments = existingMsg.segments;
         if (finalSegments && content.trim()) {
-          // Strip "Used tool:" lines from the finalized content — tool info
+          // Strip "Used tool:" and "Delegated task:" lines from the finalized content — tool info
           // is already tracked in tool segments, so including it again would
           // create duplicate entries in the segmented view.
           const strippedContent = content
             .split('\n')
-            .filter((line: string) => !line.trimStart().startsWith('Used tool:'))
+            .filter((line: string) => {
+              const t = line.trimStart();
+              return !t.startsWith('Used tool:') && !t.startsWith('Delegated task:');
+            })
             .join('\n')
             .replace(/\n{3,}/g, '\n\n')
             .trim();
@@ -267,20 +283,20 @@ function chatReducer(state: ChatMessage[], action: ChatAction): ChatMessage[] {
           }
         }
         next[generatingIdx] = {
-          ...next[generatingIdx],
+          ...existingMsg,
           text: content,
-          to: to || next[generatingIdx].to || 'user',
-          isGenerating: false,
+          to: to || existingMsg.to || 'user',
+          isGenerating: keepGenerating,
           isThinking: false,
-          liveText: undefined,
+          liveText: keepGenerating ? existingMsg.liveText : undefined,
           segments: finalSegments,
           timestamp: new Date(tsMs).toLocaleTimeString(),
           timestampMs: tsMs,
           activitySummary:
-            summarizeActivityEntries(existingEntries, false) || next[generatingIdx].activitySummary,
-          toolCount: nonTransient.length || next[generatingIdx].toolCount,
-          durationMs: elapsed || next[generatingIdx].durationMs,
-          contextTokens: ctxTokens || next[generatingIdx].contextTokens,
+            summarizeActivityEntries(existingEntries, keepGenerating) || existingMsg.activitySummary,
+          toolCount: nonTransient.length || existingMsg.toolCount,
+          durationMs: elapsed || existingMsg.durationMs,
+          contextTokens: ctxTokens || existingMsg.contextTokens,
         };
         return next;
       }
@@ -345,6 +361,7 @@ function chatReducer(state: ChatMessage[], action: ChatAction): ChatMessage[] {
         blocks.push(block);
         msg.content = blocks;
         msg.isGenerating = true;
+        msg.isThinking = false; // Clear thinking when any content block arrives
         msg.timestampMs = Date.now();
         // Also add to segments for backward compat rendering
         if (block.type === 'tool_use') {
@@ -388,8 +405,37 @@ function chatReducer(state: ChatMessage[], action: ChatAction): ChatMessage[] {
       return [...state, newMsg];
     }
 
+    case 'TOOL_PROGRESS': {
+      const { agentId, line } = action;
+      const idx = findLastGeneratingMessageIndex(state, agentId);
+      if (idx < 0) return state;
+      const next = [...state];
+      const msg = { ...next[idx] };
+      const blocks = [...(msg.content || [])];
+      // Find the last running tool_use block (the one currently executing)
+      let targetIdx = -1;
+      for (let i = blocks.length - 1; i >= 0; i--) {
+        if (blocks[i].type === 'tool_use' && blocks[i].status === 'running') {
+          targetIdx = i;
+          break;
+        }
+      }
+      if (targetIdx >= 0) {
+        const existingOutput = blocks[targetIdx].output || [];
+        // Cap at 500 lines to prevent memory issues
+        const newOutput = existingOutput.length >= 500
+          ? [...existingOutput.slice(1), line]
+          : [...existingOutput, line];
+        blocks[targetIdx] = { ...blocks[targetIdx], output: newOutput };
+        msg.content = blocks;
+        next[idx] = msg;
+        return next;
+      }
+      return state;
+    }
+
     case 'CONTENT_BLOCK_UPDATE': {
-      const { agentId, blockId, status, summary, isError } = action;
+      const { agentId, blockId, status, summary, isError, diffData } = action;
       const idx = findLastGeneratingMessageIndex(state, agentId);
       if (idx < 0) return state;
       const next = [...state];
@@ -402,6 +448,7 @@ function chatReducer(state: ChatMessage[], action: ChatAction): ChatMessage[] {
           status: (status as ContentBlock['status']) || blocks[blockIdx].status,
           summary: summary || blocks[blockIdx].summary,
           isError: isError ?? blocks[blockIdx].isError,
+          diffData: diffData || blocks[blockIdx].diffData,
         };
         msg.content = blocks;
       }
@@ -436,6 +483,22 @@ function chatReducer(state: ChatMessage[], action: ChatAction): ChatMessage[] {
       if (idx < 0) return state;
       const next = [...state];
       const msg = next[idx];
+
+      // Don't finalize if subagents are still running — the parent will
+      // continue generating after the subagent returns its result.
+      const hasRunningSubagents = (msg.subagentTree || []).some(
+        (e) => e.status === 'running'
+      );
+      if (hasRunningSubagents) {
+        // Just update stats, keep generating
+        next[idx] = {
+          ...msg,
+          durationMs: durationMs || msg.durationMs,
+          contextTokens: contextTokens || msg.contextTokens,
+        };
+        return next;
+      }
+
       const entries = Array.isArray(msg.activityEntries) ? msg.activityEntries : [];
       const nonTransient = entries.filter((e: string) => !isTransientStatus(e));
       const toolBlocks = (msg.content || []).filter((b) => b.type === 'tool_use');

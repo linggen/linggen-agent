@@ -1,3 +1,11 @@
+---
+type: spec
+guide: |
+  Product specification — describe what the system should do and why.
+  Keep it brief. Aim to guide design and implementation, not document code.
+  Avoid implementation details like function signatures, variable types, or code snippets.
+---
+
 # Storage
 
 Filesystem layout for all persistent state. No database — everything is files.

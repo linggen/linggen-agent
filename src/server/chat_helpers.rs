@@ -335,7 +335,7 @@ pub(crate) fn tool_status_line(
                     .unwrap_or_else(|| "Web search failed".to_string()),
             }
         }
-        "delegate_to_agent" => match phase {
+        "task" => match phase {
             ToolStatusPhase::Start => delegate_target
                 .map(|target| format!("Delegating to subagent: {target}"))
                 .unwrap_or_else(|| "Delegating...".to_string()),
@@ -632,6 +632,12 @@ pub(crate) fn emit_outcome_event(
         }
         _ => {}
     }
+    // Always emit an Outcome event so the UI transitions the run from
+    // RUNNING to completed and resets status to idle.
+    let _ = events_tx.send(ServerEvent::Outcome {
+        agent_id: from_id.to_string(),
+        outcome: outcome.clone(),
+    });
 }
 
 #[cfg(test)]

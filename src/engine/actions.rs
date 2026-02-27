@@ -118,7 +118,7 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
         .cloned()
         .unwrap_or_else(|| {
             // Models sometimes put tool arguments as top-level fields instead of nesting
-            // under "args". E.g. {"type":"delegate_to_agent","target_agent_id":"x","task":"y"}
+            // under "args". E.g. {"type":"Task","target_agent_id":"x","task":"y"}
             // Collect all fields except "type", "tool", "name" as an args object.
             let mut inferred = serde_json::Map::new();
             for (k, v) in obj {
@@ -151,7 +151,7 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
 
     let tool_name = match action_type {
         "Read" | "Grep" | "Write" | "Edit" | "Glob" | "Bash" | "capture_screenshot"
-        | "lock_paths" | "unlock_paths" | "delegate_to_agent" => action_type,
+        | "lock_paths" | "unlock_paths" | "Task" | "delegate_to_agent" => action_type,
         // Known non-tool action types that should not be treated as tool shorthands.
         "" | "patch" | "finalize_task" | "update_plan" | "done" | "enter_plan_mode" => {
             // Fallback: if the object has a text-like field but no action type,
@@ -247,14 +247,17 @@ pub fn extract_first_json_object_span(s: &str) -> Option<(usize, usize)> {
 }
 
 /// Return the trimmed text that appears before the first JSON object in the string.
-/// Returns an empty string if there is no JSON object or no text before it.
+/// If there is no JSON object at all, returns the full text (so it can be emitted
+/// as a TextSegment for pure-text model responses).
+/// Returns an empty string only if the input is empty or JSON starts at position 0.
 pub fn text_before_first_json(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return String::new();
     }
     let Some((start, _end)) = extract_first_json_object_span(trimmed) else {
-        return String::new();
+        // No JSON found — the entire response is plain text.
+        return trimmed.to_string();
     };
     trimmed[..start].trim().to_string()
 }
@@ -550,8 +553,40 @@ Now let me also search:
     }
 
     #[test]
-    fn parse_delegate_with_flat_args() {
-        // Models often emit delegate_to_agent with args at top level instead of nested under "args".
+    fn parse_task_with_flat_args() {
+        // Models emit Task with args at top level instead of nested under "args".
+        let raw = r#"{"type":"Task","target_agent_id":"linggen-guide","task":"Introduce Linggen"}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ModelAction::Tool { tool, args } => {
+                assert_eq!(tool, "Task");
+                assert_eq!(args["target_agent_id"], "linggen-guide");
+                assert_eq!(args["task"], "Introduce Linggen");
+            }
+            _ => panic!("expected tool action, got {:?}", actions[0]),
+        }
+    }
+
+    #[test]
+    fn parse_task_with_nested_args() {
+        // Proper format with args nested should still work.
+        let raw = r#"{"type":"Task","args":{"target_agent_id":"coder","task":"Fix the bug"}}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ModelAction::Tool { tool, args } => {
+                assert_eq!(tool, "Task");
+                assert_eq!(args["target_agent_id"], "coder");
+                assert_eq!(args["task"], "Fix the bug");
+            }
+            _ => panic!("expected tool action, got {:?}", actions[0]),
+        }
+    }
+
+    #[test]
+    fn parse_delegate_to_agent_backward_compat_flat() {
+        // Backward compat: old "delegate_to_agent" format still parses.
         let raw = r#"{"type":"delegate_to_agent","target_agent_id":"linggen-guide","task":"Introduce Linggen"}"#;
         let actions = parse_all_actions(raw).unwrap();
         assert_eq!(actions.len(), 1);
@@ -566,8 +601,8 @@ Now let me also search:
     }
 
     #[test]
-    fn parse_delegate_with_nested_args() {
-        // Proper format with args nested should still work.
+    fn parse_delegate_to_agent_backward_compat_nested() {
+        // Backward compat: old "delegate_to_agent" format with nested args still parses.
         let raw = r#"{"type":"delegate_to_agent","args":{"target_agent_id":"coder","task":"Fix the bug"}}"#;
         let actions = parse_all_actions(raw).unwrap();
         assert_eq!(actions.len(), 1);
@@ -589,8 +624,8 @@ Now let me also search:
     }
 
     #[test]
-    fn text_before_first_json_empty_when_no_json() {
-        assert_eq!(text_before_first_json("No JSON here"), "");
+    fn text_before_first_json_returns_full_text_when_no_json() {
+        assert_eq!(text_before_first_json("No JSON here"), "No JSON here");
     }
 
     #[test]

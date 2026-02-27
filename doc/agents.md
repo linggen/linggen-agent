@@ -1,3 +1,11 @@
+---
+type: spec
+guide: |
+  Product specification — describe what the system should do and why.
+  Keep it brief. Aim to guide design and implementation, not document code.
+  Avoid implementation details like function signatures, variable types, or code snippets.
+---
+
 # Agents
 
 Process management: agent types, lifecycle, delegation, concurrency, and scheduling.
@@ -23,7 +31,7 @@ Determined by frontmatter `kind: main` or `kind: subagent`.
 
 | Agent | Role | Key tools |
 |:------|:-----|:----------|
-| `ling` | General-purpose assistant, delegates specialist work | Read, Glob, Grep, Bash, delegate_to_agent, AskUser |
+| `ling` | General-purpose assistant, delegates specialist work | Read, Glob, Grep, Bash, Task, AskUser |
 | `coder` | Implementation — writes and edits code | Read, Write, Edit, Bash, Glob, Grep, AskUser |
 | `explorer` | Read-only codebase exploration | Read, Glob, Grep, Bash |
 | `debugger` | Read-only debugging and log analysis | Read, Glob, Grep, Bash |
@@ -47,7 +55,7 @@ Each execution is an `AgentRunRecord`:
 
 ## Delegation (fork)
 
-`delegate_to_agent` spawns a child agent loop — like `fork()`:
+`Task` spawns a child agent loop — like `fork()`:
 
 - Parent collects consecutive delegations, spawns concurrently via `JoinSet`.
 - Each child gets its own isolated engine and tokio runtime.

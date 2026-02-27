@@ -31,6 +31,15 @@ export interface ContentBlock {
   summary?: string;      // for tool_result: one-line result summary
   status?: 'running' | 'done' | 'failed';  // for tool_use lifecycle
   isError?: boolean;     // for tool_result
+  output?: string[];     // accumulated stdout/stderr lines (Bash)
+  diffData?: {           // Edit/Write diff data
+    diff_type: 'edit' | 'write';
+    path: string;
+    old_string?: string;
+    new_string?: string;
+    start_line?: number;
+    lines_written?: number;
+  };
 }
 
 export interface ChatMessage {
@@ -300,7 +309,7 @@ export interface BuiltInSkillInfo {
   installed: boolean;
 }
 
-export type ManagementTab = 'models' | 'agents' | 'skills' | 'general';
+export type ManagementTab = 'models' | 'agents' | 'skills' | 'tools' | 'general';
 
 // --- Mission types ---
 

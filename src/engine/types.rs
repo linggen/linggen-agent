@@ -61,13 +61,6 @@ pub enum ThinkingEvent {
     Done,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum ReplEvent {
-    Status { status: String, detail: Option<String> },
-    Iteration { current: usize, max: usize },
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentRole {
     #[serde(rename = "lead")]
@@ -153,7 +146,6 @@ pub struct AgentEngine {
     pub parent_agent_id: Option<String>,
     pub run_id: Option<String>,
     pub thinking_tx: Option<mpsc::UnboundedSender<ThinkingEvent>>,
-    pub repl_events_tx: Option<mpsc::UnboundedSender<ReplEvent>>,
     /// Receiver for user interrupt messages injected while the agent loop is running.
     pub interrupt_rx: Option<mpsc::UnboundedReceiver<String>>,
     // Plan mode
@@ -326,7 +318,6 @@ impl AgentEngine {
             parent_agent_id: None,
             run_id: None,
             thinking_tx: None,
-            repl_events_tx: None,
             interrupt_rx: None,
             plan_mode: false,
             plan: None,

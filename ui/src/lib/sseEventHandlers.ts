@@ -73,9 +73,9 @@ const toolPrefixMap: [string, string][] = [
   ['Listing files: ', 'Glob'],
   ['Listed files: ', 'Glob'],
   ['List files failed: ', 'Glob'],
-  ['Delegating to subagent: ', 'Delegate'],
-  ['Delegated to subagent: ', 'Delegate'],
-  ['Delegation failed: ', 'Delegate'],
+  ['Delegating to subagent: ', 'Task'],
+  ['Delegated to subagent: ', 'Task'],
+  ['Delegation failed: ', 'Task'],
   ['Fetching URL: ', 'WebFetch'],
   ['Fetched URL: ', 'WebFetch'],
   ['Fetch failed: ', 'WebFetch'],
@@ -86,6 +86,33 @@ const toolPrefixMap: [string, string][] = [
   ['Used tool: ', 'Tool'],
   ['Tool failed: ', 'Tool'],
 ];
+
+/** Build a user-facing status line for a tool start event (mirrors server tool_status_line). */
+function formatToolStartLine(toolName: string, argsStr: string): string {
+  // Try to extract a meaningful label from the tool name + args JSON.
+  try {
+    const args = JSON.parse(argsStr);
+    switch (toolName) {
+      case 'Read': return `Reading file: ${args.file_path || args.path || argsStr}`;
+      case 'Write': return `Writing file: ${args.file_path || args.path || argsStr}`;
+      case 'Edit': return `Editing file: ${args.file_path || args.path || argsStr}`;
+      case 'Bash': {
+        const cmd = args.command || '';
+        return `Running command: ${cmd.length > 80 ? cmd.slice(0, 77) + '...' : cmd}`;
+      }
+      case 'Grep': return `Searching: ${args.pattern || argsStr}`;
+      case 'Glob': return `Listing files: ${args.pattern || argsStr}`;
+      case 'Task':
+      case 'delegate_to_agent':
+        return `Delegating to subagent: ${args.agent_id || args.agent || argsStr}`;
+      case 'WebFetch': return `Fetching URL: ${args.url || argsStr}`;
+      case 'WebSearch': return `Searching web: ${args.query || argsStr}`;
+      default: return `Calling tool: ${toolName}`;
+    }
+  } catch {
+    return `Calling tool: ${toolName}`;
+  }
+}
 
 function parseToolActivity(text: string): { toolName: string; args: string } | null {
   for (const [prefix, toolName] of toolPrefixMap) {
@@ -119,7 +146,7 @@ export function dispatchSseEvent(item: UiSseMessage, deps: SseHandlerDeps): void
     case 'model_fallback': handleModelFallback(item, deps); return;
     case 'content_block':  handleContentBlock(item, deps); return;
     case 'turn_complete':   handleTurnComplete(item, deps); return;
-    case 'tool_progress': /* no-op for now — TUI handles via status_tool */ return;
+    case 'tool_progress': handleToolProgress(item, deps); return;
   }
 }
 
@@ -490,9 +517,34 @@ function handleContentBlock(item: UiSseMessage, deps: SseHandlerDeps): void {
     };
     deps.chatDispatch({ type: 'CONTENT_BLOCK_START', agentId, block });
 
-    // Activity entries are created by handleActivity (AgentStatus events) — no need
-    // to duplicate them here from ContentBlock events.
+    // Track activity for tool start (segments are already handled by CONTENT_BLOCK_START).
+    if (blockType === 'tool_use') {
+      const toolName = data.tool || 'Tool';
+      const toolArgs = data.args || '';
+      const activityLine = formatToolStartLine(toolName, toolArgs);
+      deps.chatDispatch({ type: 'APPEND_ACTIVITY', agentId, activityLine });
+
+      // Update agent status to calling_tool
+      deps.setAgentStatus((prev) => ({ ...prev, [agentId]: 'calling_tool' as AgentStatusValue }));
+      deps.setAgentStatusText((prev) => ({ ...prev, [agentId]: activityLine }));
+
+      // Track run start time on first tool call
+      if (!deps.runStartTsRef.current[agentId]) {
+        deps.runStartTsRef.current[agentId] = Date.now();
+      }
+    }
   } else if (item.phase === 'update') {
+    // Extract diff data if present (Edit/Write tools send it via extra).
+    const diffData = data.diff_type
+      ? {
+          diff_type: data.diff_type as 'edit' | 'write',
+          path: data.path || '',
+          old_string: data.old_string,
+          new_string: data.new_string,
+          start_line: typeof data.start_line === 'number' ? data.start_line : undefined,
+          lines_written: typeof data.lines_written === 'number' ? data.lines_written : undefined,
+        }
+      : undefined;
     deps.chatDispatch({
       type: 'CONTENT_BLOCK_UPDATE',
       agentId,
@@ -500,9 +552,13 @@ function handleContentBlock(item: UiSseMessage, deps: SseHandlerDeps): void {
       status: data.status || undefined,
       summary: data.summary || undefined,
       isError: data.is_error ?? undefined,
+      diffData,
     });
 
-    // Done-status activity entries come via handleActivity — no duplicate needed here.
+    // Track activity for tool completion (segments are already handled by CONTENT_BLOCK_UPDATE).
+    if (data.summary) {
+      deps.chatDispatch({ type: 'APPEND_ACTIVITY', agentId, activityLine: data.summary });
+    }
   }
 }
 
@@ -524,6 +580,17 @@ function handleTurnComplete(item: UiSseMessage, deps: SseHandlerDeps): void {
   delete deps.runStartTsRef.current[agentId];
 
   deps.chatDispatch({ type: 'TURN_COMPLETE', agentId, durationMs: elapsed, contextTokens: ctxTokens });
+}
+
+function handleToolProgress(item: UiSseMessage, deps: SseHandlerDeps): void {
+  const agentId = String(item.agent_id || '');
+  if (!agentId) return;
+  // Skip subagent tool progress
+  if (deps.subagentParentMapRef.current[agentId.toLowerCase()]) return;
+  const data = item.data || {};
+  const line = String(data.line || item.text || '');
+  if (!line) return;
+  deps.chatDispatch({ type: 'TOOL_PROGRESS', agentId, line });
 }
 
 function handleModelFallback(item: UiSseMessage, deps: SseHandlerDeps): void {

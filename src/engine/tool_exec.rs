@@ -269,11 +269,6 @@ impl AgentEngine {
         }
 
         // --- status lines ---
-        let tool_start_status = crate::server::chat_helpers::tool_status_line(
-            &canonical_tool,
-            Some(&args),
-            crate::server::chat_helpers::ToolStatusPhase::Start,
-        );
         let tool_done_status = crate::server::chat_helpers::tool_status_line(
             &canonical_tool,
             Some(&args),
@@ -293,20 +288,6 @@ impl AgentEngine {
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
             let target = self.outbound_target();
-            let _ = manager
-                .send_event(crate::agent_manager::AgentEvent::AgentStatus {
-                    agent_id: from.clone(),
-                    status: "calling_tool".to_string(),
-                    detail: Some(tool_start_status.clone()),
-                    parent_id: self.parent_agent_id.clone(),
-                })
-                .await;
-            if let Some(tx) = &self.repl_events_tx {
-                let _ = tx.send(ReplEvent::Status {
-                    status: "calling_tool".to_string(),
-                    detail: Some(tool_start_status.clone()),
-                });
-            }
             // Emit structured ContentBlockStart for the Web UI.
             let compact_args = serde_json::to_string(&safe_args)
                 .unwrap_or_else(|_| "{}".to_string());
@@ -417,15 +398,9 @@ impl AgentEngine {
                         .agent_id
                         .clone()
                         .unwrap_or_else(|| "unknown".to_string());
-                    manager
-                        .send_event(crate::agent_manager::AgentEvent::AgentStatus {
-                            agent_id: agent_id.clone(),
-                            status: "calling_tool".to_string(),
-                            detail: Some(tool_done_status.clone()),
-                            parent_id: self.parent_agent_id.clone(),
-                        })
-                        .await;
                     // Emit structured ContentBlockUpdate for the Web UI.
+                    // For Edit/Write, include diff data so the frontend can render inline diffs.
+                    let extra = self.build_tool_extra(&canonical_tool, &original_args);
                     manager
                         .send_event(crate::agent_manager::AgentEvent::ContentBlockUpdate {
                             agent_id: agent_id.clone(),
@@ -434,6 +409,7 @@ impl AgentEngine {
                             summary: Some(tool_done_status.clone()),
                             is_error: Some(false),
                             parent_id: self.parent_agent_id.clone(),
+                            extra,
                         })
                         .await;
                     manager
@@ -447,12 +423,6 @@ impl AgentEngine {
                             parent_id: self.parent_agent_id.clone(),
                         })
                         .await;
-                    if let Some(tx) = &self.repl_events_tx {
-                        let _ = tx.send(ReplEvent::Status {
-                            status: "thinking".to_string(),
-                            detail: Some(format!("Thinking ({})", self.model_id)),
-                        });
-                    }
                 }
 
                 // For file mutations, emit a brief user-visible summary line.
@@ -543,14 +513,6 @@ impl AgentEngine {
                         .agent_id
                         .clone()
                         .unwrap_or_else(|| "unknown".to_string());
-                    manager
-                        .send_event(crate::agent_manager::AgentEvent::AgentStatus {
-                            agent_id: agent_id.clone(),
-                            status: "calling_tool".to_string(),
-                            detail: Some(tool_failed_status.clone()),
-                            parent_id: self.parent_agent_id.clone(),
-                        })
-                        .await;
                     // Emit structured ContentBlockUpdate (failed) for the Web UI.
                     manager
                         .send_event(crate::agent_manager::AgentEvent::ContentBlockUpdate {
@@ -560,6 +522,7 @@ impl AgentEngine {
                             summary: Some(tool_failed_status.clone()),
                             is_error: Some(true),
                             parent_id: self.parent_agent_id.clone(),
+                            extra: None,
                         })
                         .await;
                     manager
@@ -570,12 +533,6 @@ impl AgentEngine {
                             parent_id: self.parent_agent_id.clone(),
                         })
                         .await;
-                    if let Some(tx) = &self.repl_events_tx {
-                        let _ = tx.send(ReplEvent::Status {
-                            status: "thinking".to_string(),
-                            detail: Some(format!("Thinking ({})", self.model_id)),
-                        });
-                    }
                 }
                 let err_msg = ChatMessage::new(
                     "user",
@@ -588,6 +545,87 @@ impl AgentEngine {
             }
         }
         LoopControl::Continue
+    }
+
+    /// Build optional extra payload for ContentBlockUpdate (e.g. diff data for Edit/Write).
+    fn build_tool_extra(
+        &self,
+        canonical_tool: &str,
+        original_args: &JsonValue,
+    ) -> Option<serde_json::Value> {
+        match canonical_tool {
+            "Edit" => {
+                let old_string = original_args
+                    .get("old_string")
+                    .or_else(|| original_args.get("old"))
+                    .or_else(|| original_args.get("old_text"))
+                    .or_else(|| original_args.get("search"))
+                    .or_else(|| original_args.get("from"))
+                    .and_then(|v| v.as_str());
+                let new_string = original_args
+                    .get("new_string")
+                    .or_else(|| original_args.get("new"))
+                    .or_else(|| original_args.get("new_text"))
+                    .or_else(|| original_args.get("replace"))
+                    .or_else(|| original_args.get("to"))
+                    .and_then(|v| v.as_str());
+                let path = original_args
+                    .get("path")
+                    .or_else(|| original_args.get("file"))
+                    .or_else(|| original_args.get("filepath"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let (old_s, new_s) = match (old_string, new_string) {
+                    (Some(o), Some(n)) => (o, n),
+                    _ => return None,
+                };
+
+                // Compute start_line by reading the (post-edit) file and finding new_string.
+                // old_string has already been replaced, so we search for new_string instead.
+                let rel = normalize_tool_path_arg(&self.cfg.ws_root, original_args)
+                    .unwrap_or_else(|| path.to_string());
+                let file_path = self.cfg.ws_root.join(&rel);
+                let start_line = std::fs::read_to_string(&file_path)
+                    .ok()
+                    .and_then(|content| {
+                        content.find(new_s).map(|pos| {
+                            content[..pos].lines().count().max(1)
+                        })
+                    });
+
+                Some(serde_json::json!({
+                    "diff_type": "edit",
+                    "path": rel,
+                    "old_string": old_s,
+                    "new_string": new_s,
+                    "start_line": start_line,
+                }))
+            }
+            "Write" => {
+                let path = original_args
+                    .get("path")
+                    .or_else(|| original_args.get("file"))
+                    .or_else(|| original_args.get("filepath"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let content = original_args
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let rel = normalize_tool_path_arg(&self.cfg.ws_root, original_args)
+                    .unwrap_or_else(|| path.to_string());
+                let line_count = content.lines().count();
+
+                Some(serde_json::json!({
+                    "diff_type": "write",
+                    "path": rel,
+                    "lines_written": line_count,
+                }))
+            }
+            _ => None,
+        }
     }
 
     /// Validate, dispatch, and record a single tool call from the model.

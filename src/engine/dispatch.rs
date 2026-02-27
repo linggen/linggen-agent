@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 impl AgentEngine {
-    /// Handle a batch of consecutive `delegate_to_agent` actions.
+    /// Handle a batch of consecutive `Task` (delegation) actions.
     /// Returns `Some(outcome)` if the loop should exit early.
     pub(crate) async fn handle_delegation_batch(
         &mut self,
@@ -20,17 +20,17 @@ impl AgentEngine {
     ) -> Option<AgentOutcome> {
         use crate::agent_manager::AgentManager;
 
-        // Parse DelegateToAgentArgs from each action.
-        let mut delegation_args: Vec<tools::DelegateToAgentArgs> = Vec::new();
+        // Parse TaskArgs from each action.
+        let mut delegation_args: Vec<tools::TaskArgs> = Vec::new();
         for action in batch {
             if let ModelAction::Tool { tool, args } = action {
                 let normalized = tools::normalize_tool_args(&tool, &args);
-                match serde_json::from_value::<tools::DelegateToAgentArgs>(normalized) {
+                match serde_json::from_value::<tools::TaskArgs>(normalized) {
                     Ok(da) => delegation_args.push(da),
                     Err(e) => {
                         messages.push(ChatMessage::new(
                             "user",
-                            format!("Invalid delegate_to_agent args: {}", e),
+                            format!("Invalid Task args: {}", e),
                         ));
                     }
                 }
@@ -43,12 +43,12 @@ impl AgentEngine {
 
         // Permission check (once for the whole batch).
         if let Some(allowed) = allowed_tools {
-            if !self.is_tool_allowed(allowed, "delegate_to_agent") {
+            if !self.is_tool_allowed(allowed, "Task") {
                 for da in &delegation_args {
                     messages.push(ChatMessage::new(
                         "user",
                         format!(
-                            "Tool 'delegate_to_agent' is not allowed for this agent. Delegation to '{}' blocked.",
+                            "Tool 'Task' is not allowed for this agent. Delegation to '{}' blocked.",
                             da.target_agent_id
                         ),
                     ));
@@ -84,10 +84,10 @@ impl AgentEngine {
                 }
                 Err(e) => {
                     let rendered = format!(
-                        "tool_error: tool=delegate_to_agent target={} error={}",
+                        "tool_error: tool=Task target={} error={}",
                         da.target_agent_id, e
                     );
-                    self.upsert_observation("error", "delegate_to_agent", rendered.clone());
+                    self.upsert_observation("error", "Task", rendered.clone());
                     messages.push(ChatMessage::new(
                         "user",
                         format!("Delegation to '{}' failed validation: {}", da.target_agent_id, e),
@@ -101,22 +101,31 @@ impl AgentEngine {
         }
 
         let ws_root = self.cfg.ws_root.clone();
+        let ask_bridge = self.tools.ask_user_bridge().cloned();
 
         // Spawn each delegation on a blocking thread with its own tokio runtime.
         let mut join_set = tokio::task::JoinSet::new();
         for (spawn_idx, spawn) in spawns.into_iter().enumerate() {
             let ws = ws_root.clone();
+            let bridge = ask_bridge.clone();
             join_set.spawn_blocking(move || {
-                let rt = tokio::runtime::Builder::new_multi_thread()
+                let rt = match tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .worker_threads(1)
                     .build()
-                    .expect("failed to create delegation runtime");
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let target = spawn.target_agent_id.clone();
+                        return (spawn_idx, target, Err(anyhow::anyhow!("failed to create delegation runtime: {}", e)));
+                    }
+                };
                 let target = spawn.target_agent_id.clone();
                 let result = rt.block_on(async move {
                     tools::run_delegation(
                         spawn.manager, ws, spawn.caller_id, spawn.target_agent_id,
                         spawn.task, spawn.parent_run_id, spawn.depth, spawn.max_depth,
+                        bridge,
                     )
                     .await
                 });
@@ -139,26 +148,26 @@ impl AgentEngine {
             match result {
                 Ok(tool_result) => {
                     let rendered = render_tool_result(&tool_result);
-                    self.upsert_observation("tool", "delegate_to_agent", rendered.clone());
+                    self.upsert_observation("tool", "Task", rendered.clone());
                     let _ = self
-                        .manager_db_add_observation("delegate_to_agent", &rendered, session_id)
+                        .manager_db_add_observation("Task", &rendered, session_id)
                         .await;
                     messages.push(ChatMessage::new(
                         "user",
                         Self::observation_text(
                             "tool",
-                            &format!("delegate_to_agent({})", target),
+                            &format!("Task({})", target),
                             &rendered,
                         ),
                     ));
                 }
                 Err(e) => {
                     let rendered = format!(
-                        "tool_error: tool=delegate_to_agent target={} error={}", target, e
+                        "tool_error: tool=Task target={} error={}", target, e
                     );
-                    self.upsert_observation("error", "delegate_to_agent", rendered.clone());
+                    self.upsert_observation("error", "Task", rendered.clone());
                     let _ = self
-                        .manager_db_add_observation("delegate_to_agent", &rendered, session_id)
+                        .manager_db_add_observation("Task", &rendered, session_id)
                         .await;
                     messages.push(ChatMessage::new(
                         "user",
@@ -220,11 +229,9 @@ impl AgentEngine {
                         .into_iter()
                         .map(|(idx, call, exec)| {
                             let handle = scope.spawn(move || {
-                                let rt = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                    .expect("failed to create tool runtime");
-                                let _guard = rt.enter();
+                                // No runtime is set up here — sync tools (Read, Glob, Grep)
+                                // don't need one, and async tools (WebFetch, WebSearch, etc.)
+                                // create their own via block_on_async().
                                 tools_ref.execute(call)
                             });
                             (idx, exec, handle)

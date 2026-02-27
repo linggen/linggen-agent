@@ -27,6 +27,7 @@ pub enum DisplayBlock {
     },
     SubagentGroup {
         entries: Vec<SubagentEntry>,
+        collapsed: bool,
     },
     PlanBlock {
         summary: String,
@@ -36,6 +37,11 @@ pub enum DisplayBlock {
     ChangeReport {
         files: Vec<ChangedFile>,
         truncated_count: usize,
+    },
+    TurnSummary {
+        tool_count: usize,
+        estimated_tokens: Option<usize>,
+        duration_secs: Option<u64>,
     },
 }
 
@@ -73,6 +79,7 @@ pub struct SubagentToolStep {
 #[allow(dead_code)]
 pub struct SubagentEntry {
     pub subagent_id: String,
+    pub agent_name: String,
     pub task: String,
     pub status: SubagentStatus,
     pub tool_count: usize,

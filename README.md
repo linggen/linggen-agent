@@ -172,13 +172,13 @@ Agents interact with the workspace through a fixed set of Claude Code-style tool
 | `WebFetch` | Fetch and extract content from a URL |
 | `Skill` | Invoke a registered skill |
 | `AskUser` | Ask the user a question mid-run |
-| `delegate_to_agent` | Delegate a task to a subagent |
+| `Task` | Delegate a task to a subagent |
 | `capture_screenshot` | Take a screenshot of a URL |
 
 ### Multi-Agent Runtime
 
 - **Main agents** are long-lived and can receive user tasks.
-- **Subagents** are ephemeral workers spawned by main agents via `delegate_to_agent`.
+- **Subagents** are ephemeral workers spawned by main agents via `Task`.
 - Delegation depth is configurable via `max_delegation_depth` (default 2). Any agent can delegate to any other agent within the depth limit.
 - All actions are policy-gated per agent: `Patch`, `Finalize`, `Delegate` capabilities are declared in frontmatter.
 - Run lifecycle is persisted and cancellation cascades through the run tree.

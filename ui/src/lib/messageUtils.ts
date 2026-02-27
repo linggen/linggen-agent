@@ -159,7 +159,8 @@ export const isStatusLineText = (text: string) =>
   text === 'Delegating...' ||
   text.startsWith('Delegating to subagent:') ||
   text === 'Calling tool...' ||
-  text.startsWith('Calling tool:');
+  text.startsWith('Calling tool:') ||
+  text.startsWith('Used tool:');
 
 export const activityKind = (line?: string): string => {
   const t = String(line || '').trim().toLowerCase();
@@ -170,7 +171,7 @@ export const activityKind = (line?: string): string => {
   if (t === 'running command...' || t.startsWith('running command:') || t.startsWith('ran command')) return 'bash';
   if (t === 'searching...' || t.startsWith('searching:') || t.startsWith('searched')) return 'grep';
   if (t === 'listing files...' || t.startsWith('listing files:') || t.startsWith('listed files')) return 'glob';
-  if (t === 'delegating...' || t.startsWith('delegating to subagent:') || t.startsWith('delegated to ')) return 'delegate_to_agent';
+  if (t === 'delegating...' || t.startsWith('delegating to subagent:') || t.startsWith('delegated to ')) return 'task';
   if (t === 'calling tool...' || t.startsWith('calling tool:') || t.startsWith('used tool')) return 'calling_tool';
   return '';
 };
@@ -675,6 +676,7 @@ export const mergeChatMessages = (persisted: ChatMessage[], live: ChatMessage[])
         likelySameMessage(msg, candidate) &&
         (
           (candidate.activityEntries && candidate.activityEntries.length > 0) ||
+          (candidate.content && candidate.content.length > 0) ||
           candidate.subagentTree ||
           candidate.segments ||
           candidate.toolCount ||
@@ -685,6 +687,7 @@ export const mergeChatMessages = (persisted: ChatMessage[], live: ChatMessage[])
     if (!matchingLive) return msg;
     return {
       ...msg,
+      content: matchingLive.content || msg.content,
       activityEntries: matchingLive.activityEntries || msg.activityEntries,
       activitySummary: matchingLive.activitySummary || msg.activitySummary,
       subagentTree: matchingLive.subagentTree || msg.subagentTree,
@@ -713,5 +716,11 @@ export const mergeChatMessages = (persisted: ChatMessage[], live: ChatMessage[])
 export const shouldHideInternalChatMessage = (_from?: string, text?: string): boolean => {
   if (!text) return false;
   if (text.startsWith('Starting autonomous loop for task:')) return true;
+  // Hide raw tool observation messages that leak from context (e.g. "Tool Bash: Bash output...")
+  if (/^Tool\s+\w+:/i.test(text)) return true;
+  // Hide "Used tool: Read · target=..." lines rendered from sanitization
+  if (text.startsWith('Used tool:')) return true;
+  // Hide delegation task text (already shown in SubagentTreeView)
+  if (text.startsWith('Delegated task:')) return true;
   return false;
 };

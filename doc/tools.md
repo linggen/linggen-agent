@@ -1,3 +1,11 @@
+---
+type: spec
+guide: |
+  Product specification — describe what the system should do and why.
+  Keep it brief. Aim to guide design and implementation, not document code.
+  Avoid implementation details like function signatures, variable types, or code snippets.
+---
+
 # Tools
 
 Syscall interface: built-in tools, safety rules, and the two-tier model.
@@ -30,7 +38,7 @@ Built-in tools are the kernel API. Skills are userspace.
 | `capture_screenshot` | `url, delay_ms?` | Web page screenshot |
 | `lock_paths` | `globs, ttl_ms?` | Acquire file locks (multi-agent) |
 | `unlock_paths` | `tokens` | Release file locks |
-| `delegate_to_agent` | `target_agent_id, task` | Spawn subagent |
+| `Task` | `target_agent_id, task` | Spawn subagent |
 | `WebSearch` | `query, max_results?` | Web search (DuckDuckGo) |
 | `WebFetch` | `url, max_bytes?` | Fetch URL content as text |
 | `Skill` | `skill, args?` | Invoke a skill by name |

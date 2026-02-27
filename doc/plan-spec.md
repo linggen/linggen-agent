@@ -1,3 +1,11 @@
+---
+type: spec
+guide: |
+  Product specification — describe what the system should do and why.
+  Keep it brief. Aim to guide design and implementation, not document code.
+  Avoid implementation details like function signatures, variable types, or code snippets.
+---
+
 # Plan Spec
 
 Redesign of the plan feature, aligned with Claude Code. Separates planning (read-only research) from execution, with user approval gates. Multi-model compatible.
@@ -60,7 +68,7 @@ User-initiated only:
 
 Tools available: `Read`, `Glob`, `Grep`, `WebSearch`, `WebFetch`, `AskUser`, `ExitPlanMode`.
 
-Tools blocked (removed from API call): `Write`, `Edit`, `Bash`, `delegate_to_agent`, `lock_paths`, `unlock_paths`, `Skill`.
+Tools blocked (removed from API call): `Write`, `Edit`, `Bash`, `Task`, `lock_paths`, `unlock_paths`, `Skill`.
 
 Model researches the codebase, then writes a self-contained markdown plan and calls `ExitPlanMode`.
 

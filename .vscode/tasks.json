@@ -6,7 +6,10 @@
       "type": "shell",
       "command": "cargo build",
       "options": {
-        "cwd": "${workspaceFolder}"
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PATH": "${env:HOME}/.cargo/bin:${env:PATH}"
+        }
       },
       "group": "build",
       "problemMatcher": ["$rustc"]

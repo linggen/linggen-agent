@@ -833,8 +833,8 @@ async fn run_structured_loop(
     }
 
     // Agent created a plan that needs approval — store as pending.
-    if let Ok(crate::engine::AgentOutcome::Plan(ref plan)) = outcome {
-        emit_outcome_event(outcome.as_ref().unwrap(), &ctx.events_tx, &ctx.agent_id);
+    if let Ok(ref ok_outcome @ crate::engine::AgentOutcome::Plan(ref plan)) = outcome {
+        emit_outcome_event(ok_outcome, &ctx.events_tx, &ctx.agent_id);
         ctx.manager
             .set_pending_plan(
                 &ctx.root.to_string_lossy(),

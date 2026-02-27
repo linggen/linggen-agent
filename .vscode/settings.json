@@ -1,0 +1,11 @@
+{
+  "terminal.integrated.env.osx": {
+    "PATH": "${env:HOME}/.cargo/bin:${env:PATH}"
+  },
+  "lldb.launch.env": {
+    "PATH": "${env:HOME}/.cargo/bin:${env:PATH}"
+  },
+  "lldb.adapterEnv": {
+    "PATH": "${env:HOME}/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+  }
+}

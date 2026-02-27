@@ -36,7 +36,7 @@ port = 9898
 [agent]
 max_iters = 100
 write_safety_mode = "warn"
-tool_permission_mode = "auto"
+tool_permission_mode = "ask"
 prompt_loop_breaker = "You are repeatedly calling '{}' with the same arguments and not making progress. Use a different tool/arguments and continue automatically."
 max_delegation_depth = 2
 

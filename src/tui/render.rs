@@ -25,7 +25,7 @@ pub fn render_block(block: &DisplayBlock, _width: u16) -> Vec<Line<'static>> {
             duration_secs,
             ..
         } => render_tool_group(steps, *collapsed, *estimated_tokens, *duration_secs),
-        DisplayBlock::SubagentGroup { entries } => render_subagent_group(entries),
+        DisplayBlock::SubagentGroup { entries, collapsed } => render_subagent_group(entries, *collapsed),
         DisplayBlock::PlanBlock {
             summary,
             items,
@@ -35,6 +35,11 @@ pub fn render_block(block: &DisplayBlock, _width: u16) -> Vec<Line<'static>> {
             files,
             truncated_count,
         } => render_change_report(files, *truncated_count),
+        DisplayBlock::TurnSummary {
+            tool_count,
+            estimated_tokens,
+            duration_secs,
+        } => render_turn_summary(*tool_count, *estimated_tokens, *duration_secs),
     }
 }
 
@@ -104,6 +109,41 @@ fn render_system_message(text: &str) -> Vec<Line<'static>> {
         text.to_string(),
         Style::default().fg(Color::Yellow),
     ))]
+}
+
+fn render_turn_summary(
+    tool_count: usize,
+    estimated_tokens: Option<usize>,
+    duration_secs: Option<u64>,
+) -> Vec<Line<'static>> {
+    let mut parts = Vec::new();
+    if tool_count > 0 {
+        parts.push(format!(
+            "{} tool use{}",
+            tool_count,
+            plural(tool_count)
+        ));
+    }
+    if let Some(tokens) = estimated_tokens {
+        parts.push(format!("{} tokens", format_compact_tokens(tokens)));
+    }
+    if let Some(secs) = duration_secs {
+        parts.push(format!("{}s", secs));
+    }
+    let summary = if parts.is_empty() {
+        "Done".to_string()
+    } else {
+        format!("Done ({})", parts.join(" · "))
+    };
+    vec![Line::from(vec![
+        Span::styled("  ⎿  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            summary,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ])]
 }
 
 fn plural(n: usize) -> &'static str {
@@ -291,173 +331,214 @@ fn subagent_stats_str(entry: &SubagentEntry) -> String {
     }
 }
 
-/// Render a finalized (done) subagent group — Claude Code style with stats.
-fn render_subagent_group(entries: &[SubagentEntry]) -> Vec<Line<'static>> {
+/// Render a finalized (done) subagent group — Claude Code style per-entry blocks.
+fn render_subagent_group(entries: &[SubagentEntry], collapsed: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let total = entries.len();
 
-    let total_tools: usize = entries.iter().map(|e| e.tool_count).sum();
-    let total_tokens: usize = entries.iter().filter_map(|e| e.estimated_tokens).sum();
-
-    // Header
-    let mut header_spans = vec![
-        Span::styled("  ● ", Style::default().fg(Color::Green)),
-        Span::styled(
-            format!(
-                "{total} agent{} finished",
-                plural(total)
-            ),
-            Style::default().fg(Color::Green),
-        ),
-    ];
-    // Append aggregate stats
-    let mut agg_parts = Vec::new();
-    if total_tools > 0 {
-        agg_parts.push(format!(
-            "{total_tools} tool use{}",
-            plural(total_tools)
-        ));
-    }
-    if total_tokens > 0 {
-        agg_parts.push(format!("{} tokens", format_compact_tokens(total_tokens)));
-    }
-    if !agg_parts.is_empty() {
-        header_spans.push(Span::styled(
-            format!(" ({})", agg_parts.join(" · ")),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    lines.push(Line::from(header_spans));
-
-    // Tree entries
-    for (i, entry) in entries.iter().enumerate() {
-        let is_last = i == total - 1;
-        let branch = if is_last { "└" } else { "├" };
-        let task_preview = truncate_str(&entry.task, 50);
-        let stats = subagent_stats_str(entry);
-
+    for entry in entries {
+        let task_preview = truncate_str(&entry.task, 60);
+        let label = if entry.agent_name.is_empty() { "Task" } else { &entry.agent_name };
+        // Header: ⏺ agent_name(task_preview)
         lines.push(Line::from(vec![
+            Span::styled("  ⏺ ", Style::default().fg(Color::Green)),
             Span::styled(
-                format!("    {branch} "),
-                Style::default().fg(Color::DarkGray),
+                label.to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                task_preview.to_string(),
+                format!("({})", task_preview),
                 Style::default().fg(Color::White),
             ),
-            Span::styled(stats, Style::default().fg(Color::DarkGray)),
-        ]));
-    }
-
-    lines
-}
-
-/// Render live (in-progress) subagent tree — shows running status + current activity.
-pub(super) fn render_subagent_group_live(entries: &[&SubagentEntry]) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let total = entries.len();
-    let running = entries.iter().filter(|e| e.status == SubagentStatus::Running).count();
-    let all_done = running == 0;
-
-    // Header
-    let (dot_color, header_color, header_text) = if all_done {
-        (
-            Color::Green,
-            Color::Green,
-            format!(
-                "{total} agent{} finished",
-                plural(total)
-            ),
-        )
-    } else {
-        (
-            Color::Yellow,
-            Color::Yellow,
-            format!(
-                "Running {running} agent{}…",
-                plural(running)
-            ),
-        )
-    };
-
-    lines.push(Line::from(vec![
-        Span::styled("  ● ", Style::default().fg(dot_color)),
-        Span::styled(header_text, Style::default().fg(header_color)),
-    ]));
-
-    // Tree entries
-    for (i, entry) in entries.iter().enumerate() {
-        let is_last = i == total - 1;
-        let branch = if is_last { "└" } else { "├" };
-        let continuation = if is_last { " " } else { "│" };
-        let is_running = entry.status == SubagentStatus::Running;
-        let entry_color = match entry.status {
-            SubagentStatus::Running => Color::Yellow,
-            SubagentStatus::Failed => Color::Red,
-            SubagentStatus::Done => Color::Green,
-        };
-        let task_preview = truncate_str(&entry.task, 50);
-        let stats = subagent_stats_str(entry);
-
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("    {branch} "),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled("● ", Style::default().fg(entry_color)),
-            Span::styled(
-                task_preview.to_string(),
-                Style::default().fg(Color::White),
-            ),
-            Span::styled(stats, Style::default().fg(Color::DarkGray)),
         ]));
 
-        // Current activity sub-line (only when running)
-        if is_running {
-            if !entry.tool_steps.is_empty() {
-                // Show last tool step as structured ⏺ ToolName(args) with +N more
-                let last = &entry.tool_steps[entry.tool_steps.len() - 1];
-                let bullet_color = match last.status {
+        if collapsed {
+            // Collapsed: ⎿  Done (stats)
+            let mut parts = vec![format!(
+                "{} tool use{}",
+                entry.tool_count,
+                plural(entry.tool_count)
+            )];
+            if let Some(tokens) = entry.estimated_tokens {
+                if tokens > 0 {
+                    parts.push(format!("{} tokens", format_compact_tokens(tokens)));
+                }
+            }
+            lines.push(Line::from(vec![
+                Span::styled("    ⎿  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("Done ({})", parts.join(" · ")),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        } else {
+            // Expanded: show each tool step
+            for (i, step) in entry.tool_steps.iter().enumerate() {
+                let is_last = i == entry.tool_steps.len() - 1;
+                let connector = if is_last { "⎿" } else { "│" };
+                let bullet_color = match step.status {
                     StepStatus::Done => Color::Green,
                     StepStatus::Failed => Color::Red,
                     StepStatus::InProgress => Color::Yellow,
                 };
-                let args_display = if last.args_summary.is_empty() {
+                let args_display = if step.args_summary.is_empty() {
                     String::new()
                 } else {
-                    format!("({})", truncate_str(&last.args_summary, 50))
-                };
-                let prev_count = entry.tool_steps.len() - 1;
-                let more_suffix = if prev_count > 0 {
-                    format!("  +{} more", prev_count)
-                } else {
-                    String::new()
+                    format!("({})", truncate_str(&step.args_summary, 60))
                 };
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("    {continuation}  └ "),
+                        format!("    {connector}  "),
                         Style::default().fg(Color::DarkGray),
                     ),
                     Span::styled("⏺ ", Style::default().fg(bullet_color)),
                     Span::styled(
-                        last.tool_name.clone(),
+                        step.tool_name.clone(),
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(args_display, Style::default().fg(Color::White)),
-                    Span::styled(more_suffix, Style::default().fg(Color::DarkGray)),
                 ]));
+            }
+            // If no tool steps recorded, show Done summary
+            if entry.tool_steps.is_empty() {
+                let mut parts = vec![format!(
+                    "{} tool use{}",
+                    entry.tool_count,
+                    plural(entry.tool_count)
+                )];
+                if let Some(tokens) = entry.estimated_tokens {
+                    if tokens > 0 {
+                        parts.push(format!("{} tokens", format_compact_tokens(tokens)));
+                    }
+                }
+                lines.push(Line::from(vec![
+                    Span::styled("    ⎿  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("Done ({})", parts.join(" · ")),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+            }
+        }
+    }
+
+    lines
+}
+
+/// Render live (in-progress) subagent — Claude Code style per-entry blocks.
+pub(super) fn render_subagent_group_live(entries: &[&SubagentEntry]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    for entry in entries {
+        let is_running = entry.status == SubagentStatus::Running;
+        let bullet_color = match entry.status {
+            SubagentStatus::Running => Color::Yellow,
+            SubagentStatus::Failed => Color::Red,
+            SubagentStatus::Done => Color::Green,
+        };
+        let task_preview = truncate_str(&entry.task, 60);
+        let label = if entry.agent_name.is_empty() { "Task" } else { &entry.agent_name };
+
+        // Header: ⏺ agent_name(task_preview)
+        lines.push(Line::from(vec![
+            Span::styled("  ⏺ ", Style::default().fg(bullet_color)),
+            Span::styled(
+                label.to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("({})", task_preview),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+
+        // Current activity sub-lines (only when running) — show last 3
+        if is_running {
+            if !entry.tool_steps.is_empty() {
+                let total = entry.tool_steps.len();
+                let start = total.saturating_sub(3);
+                let visible = &entry.tool_steps[start..];
+                for (i, step) in visible.iter().enumerate() {
+                    let is_last = start + i == total - 1;
+                    let connector = if is_last { "⎿" } else { "│" };
+                    let step_bullet_color = match step.status {
+                        StepStatus::Done => Color::Green,
+                        StepStatus::Failed => Color::Red,
+                        StepStatus::InProgress => Color::Yellow,
+                    };
+                    let args_display = if step.args_summary.is_empty() {
+                        String::new()
+                    } else {
+                        format!("({})", truncate_str(&step.args_summary, 50))
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("    {connector}  "),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled("⏺ ", Style::default().fg(step_bullet_color)),
+                        Span::styled(
+                            step.tool_name.clone(),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(args_display, Style::default().fg(Color::White)),
+                    ]));
+                }
+                if start > 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled("       ", Style::default()),
+                        Span::styled(
+                            format!("+{} more", start),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        ),
+                    ]));
+                }
             } else if let Some(activity) = &entry.current_activity {
                 let activity_preview = truncate_str(activity, 60);
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("    {continuation}  └ "),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled("    ⎿  ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         activity_preview.to_string(),
                         Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        } else {
+            // Done entry in live view — show stats
+            let stats = subagent_stats_str(entry);
+            if !stats.is_empty() {
+                // stats starts with " · ", strip leading " · " for Done(...)
+                let stats_inner = stats.trim_start_matches(" · ");
+                lines.push(Line::from(vec![
+                    Span::styled("    ⎿  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("Done ({})", stats_inner),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("    ⎿  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        "Done".to_string(),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
                     ),
                 ]));
             }
@@ -533,7 +614,7 @@ fn tool_group_summary(steps: &[ToolStep]) -> String {
     }
 
     let mut parts = Vec::new();
-    let order = ["Read", "Write", "Edit", "Bash", "Grep", "Glob", "Delegate"];
+    let order = ["Read", "Write", "Edit", "Bash", "Grep", "Glob", "Task"];
     for name in order {
         if let Some(&count) = counts.get(name) {
             let label = match name {
@@ -551,7 +632,7 @@ fn tool_group_summary(steps: &[ToolStep]) -> String {
                     count,
                     plural(count)
                 ),
-                "Delegate" => format!(
+                "Task" => format!(
                     "delegated {} task{}",
                     count,
                     plural(count)

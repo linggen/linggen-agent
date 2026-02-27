@@ -1,6 +1,14 @@
+---
+type: spec
+guide: |
+  Product specification — describe what the system should do and why.
+  Keep it brief. Aim to guide design and implementation, not document code.
+  Avoid implementation details like function signatures, variable types, or code snippets.
+---
+
 # Chat System
 
-Message system design: SSE event bus, chat message model, rendering pipeline, message queue, and API contract.
+Real-time messaging between users and agents, with streaming output, live activity tracking, and task-oriented conversation structure.
 
 ## Related docs
 
@@ -10,275 +18,141 @@ Message system design: SSE event bus, chat message model, rendering pipeline, me
 
 ## Architecture overview
 
+The backend engine emits events as agents think and act. Events stream to clients via SSE. The UI consumes events, builds message state, and renders an organized conversation.
+
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  Rust Backend (src/server/)                                      │
-│                                                                  │
-│  Engine loop → ServerEvent enum → map_server_event_to_ui_message │
-│                                    ↓                             │
-│                              UiSseMessage (JSON)                 │
-│                                    ↓                             │
-│                           GET /api/events (SSE)                  │
-└──────────────────────────────┬───────────────────────────────────┘
-                               │
-                    EventSource connection
-                               │
-┌──────────────────────────────▼───────────────────────────────────┐
-│  Web UI (ui/src/)                                                │
-│                                                                  │
-│  useSseConnection → sseEventHandlers → chatReducer → ChatPanel   │
-│                     (dispatch by kind)   (state)     (render)    │
-└──────────────────────────────────────────────────────────────────┘
+Backend engine → SSE event stream → UI event dispatcher → chat state → renderer
 ```
 
-## SSE event bus
+Both the Web UI and TUI consume the same event stream.
 
-`GET /api/events` streams real-time events to all connected clients (WebUI + TUI).
+## Event categories
 
-Events are wrapped with increasing `seq` for dedup/recovery.
+Events fall into these categories:
 
-### ServerEvent types
+| Category | What it conveys |
+|:---------|:----------------|
+| Token streaming | Model output tokens, including thinking tokens |
+| Messages | Chat messages between user and agent |
+| Agent status | High-level state transitions: thinking, working, idle |
+| Tool lifecycle | Structured content blocks: tool start, progress, completion |
+| Delegation | Subagent spawned, subagent finished |
+| Context | Token usage, compression, context window stats |
+| Plan | Plan created, updated, approved |
+| Queue | User message queued while agent is busy |
+| Run outcome | Agent turn finished, files changed |
 
-| ServerEvent | Purpose |
-|:------|:--------|
-| `Token` | Streaming token from model (agent_id, token, done, thinking) |
-| `Message` | Chat message (from, to, content) |
-| `AgentStatus` | Status change (agent_id, status, detail, lifecycle) |
-| `SubagentSpawned` | Child agent created (parent_id, subagent_id, task) |
-| `SubagentResult` | Child agent finished (parent_id, subagent_id, outcome) |
-| `QueueUpdated` | Message queue changed (project_root, session_id, agent_id, items) |
-| `Outcome` | Agent run outcome (agent_id, outcome) |
-| `ContextUsage` | Context window stats (message_count, estimated_tokens, compressed) |
-| `ChangeReport` | Files changed (agent_id, files, truncated_count) |
-| `StateUpdated` | General state refresh |
-| `PlanUpdate` | Plan created/updated (agent_id, plan) |
-| `IdlePromptTriggered` | Idle scheduler fired (agent_id, project_root) |
-| `TextSegment` | Finalized text segment from agent (agent_id, text) |
-| `AskUser` | Agent asking user a question (agent_id, question_id, questions) |
-| `ModelFallback` | Model switched due to error/rate-limit (agent_id, preferred, actual, reason) |
-| `ToolProgress` | Streaming tool output line (agent_id, tool, line, stream) |
-| `Resync` | Broadcast lag recovery signal (reason, lagged_count) |
-
-### Wire format: UiSseMessage
-
-All events are serialized to a common wire format:
-
-```typescript
-interface UiSseMessage {
-  id: string;       // event ID
-  seq: number;      // monotonic sequence for dedup
-  rev: number;      // revision
-  ts_ms: number;    // timestamp millis
-  kind: string;     // event category (see mapping below)
-  phase?: string;   // sub-category within kind
-  text?: string;    // text payload
-  agent_id?: string;
-  session_id?: string;
-  project_root?: string;
-  data?: any;       // structured payload
-}
-```
-
-### Kind/phase mapping
-
-`ServerEvent` → `UiSseMessage` mapping used by both Web UI and TUI:
-
-| ServerEvent | kind | phase | Web UI handler | TUI handler |
-|:---|:---|:---|:---|:---|
-| `StateUpdated` | `run` | `sync` | `handleRun` → full refetch | `trigger_resync()` |
-| `Outcome` | `run` | `outcome` | `handleRun` → full refetch | `trigger_resync()` + finalize |
-| `Resync` | `run` | `resync` | `handleRun` → full refetch | `trigger_resync()` |
-| `ContextUsage` | `run` | `context_usage` | `handleRun` → update context | update `last_context_tokens` |
-| `SubagentSpawned` | `run` | `subagent_spawned` | `handleRun` → add tree entry | add to `active_subagents` |
-| `SubagentResult` | `run` | `subagent_result` | `handleRun` → mark done | mark done, finalize group |
-| `PlanUpdate` | `run` | `plan_update` | `handleRun` → set plan | render plan block |
-| `ChangeReport` | `run` | `change_report` | `handleRun` → refetch files | render change report |
-| `Message` | `message` | — | `handleMessage` | dedup + display |
-| `AgentStatus` | `activity` | `doing`/`done` | `handleActivity` | update status bar / tool groups |
-| `IdlePromptTriggered` | `activity` | `doing` | `handleActivity` | — |
-| `QueueUpdated` | `queue` | — | `handleQueue` | — |
-| `Token` | `token` | —/`done` | `handleToken` | streaming buffer |
-| `TextSegment` | `text_segment` | — | `handleTextSegment` | push agent message |
-| `AskUser` | `ask_user` | — | `handleAskUser` | interactive prompt |
-| `ModelFallback` | `model_fallback` | — | `handleModelFallback` | system message |
-| `ToolProgress` | `tool_progress` | — | no-op | update `status_tool` |
-
-### Agent status lifecycle
+## Agent status lifecycle
 
 `model_loading` → `thinking` → `calling_tool` → `working` → `idle`
 
-## ChatMessage model
+Status events convey high-level transitions. Tool-level detail (which tool, what arguments, success/failure) is conveyed by structured content block events, not status text.
 
-The frontend `ChatMessage` is the core data structure for rendered messages:
+## Message model
 
-```typescript
-interface ChatMessage {
-  role: 'user' | 'agent';
-  from?: string;              // agent ID
-  to?: string;                // target agent ID
-  text: string;               // primary text content
-  timestamp: string;
-  timestampMs?: number;
+Each message carries:
 
-  // Lifecycle
-  isGenerating?: boolean;     // true while agent is producing this message
-  isThinking?: boolean;       // true during thinking phase
-
-  // Activity (tool use)
-  activitySummary?: string;   // headline: "Reading file.ts"
-  activityEntries?: string[]; // tool call entries: "Read file.ts", "Edit main.rs"
-  toolCount?: number;         // total tool calls in this turn
-
-  // Context
-  contextTokens?: number;
-  messageCount?: number;
-  durationMs?: number;
-
-  // Rich content
-  images?: string[];
-  subagentTree?: SubagentTreeEntry[];
-  content?: ContentBlock[];   // structured content blocks (target model)
-
-  // Legacy (being phased out)
-  segments?: MessageSegment[];
-  liveText?: string;
-}
-```
+- **Role**: user or agent.
+- **Text**: the primary content, rendered as Markdown.
+- **Lifecycle state**: whether the message is still being generated (streaming, thinking) or finalized.
+- **Activity**: tool calls made during this turn — names, arguments, status, grouped by type.
+- **Context stats**: token count, elapsed time, tool call count.
+- **Rich content**: subagent delegation tree, structured content blocks, images.
 
 ### Message phases
 
-The frontend derives a rendering phase from ChatMessage state:
+Each agent message progresses through rendering phases:
 
-```
-getMessagePhase(msg) → 'thinking' | 'working' | 'streaming' | 'done'
-```
+| Phase | What the user sees |
+|:------|:-------------------|
+| Thinking | Animated indicator while the model reasons |
+| Working | Live activity tree showing tool calls in progress |
+| Streaming | Text appearing in real time with a cursor |
+| Done | Final message with collapsible activity summary and footer stats |
 
-| Phase | Condition | Rendering |
-|:------|:----------|:----------|
-| `thinking` | `isGenerating && isThinking` | Animated ThinkingIndicator |
-| `working` | `isGenerating && has non-transient activity` | GroupedToolActivity (live) |
-| `streaming` | `isGenerating && no activity` | Markdown text + cursor |
-| `done` | `!isGenerating` | Collapsible summary + final text |
+## Rendering principles
 
-Transient statuses filtered out: "Thinking...", "Model loading...", "Running".
+Each chat conversation represents a **task journey** — from the user's question through the agent's reasoning and actions to a final answer. The UI should make this journey clear, organized, and visually rich.
+Align WebUI and TUI to Claude Code is the target. 
+
+### 1. Rich, well-ordered messages
+
+Agent messages render as full Markdown: tables, lists, headings, code blocks with syntax highlighting, inline formatting. Content should be concise enough to scan, detailed enough to be useful. No raw JSON, internal status strings, or unformatted tool output in visible messages.
+
+### 2. Live activity tree
+
+While the agent is working, show a tree-structured view of current activity:
+
+- **Primary agent**: tool calls displayed as a grouped, collapsible list (e.g., "Read config.toml", "Edit main.rs") with status indicators (in-progress / done / failed).
+- **Subagents** nested under the parent: each delegated agent shown as a branch with its own tool steps, token count, and current status.
+- Updates in real time — new tool calls append, completed ones transition from active to done.
+
+### 3. Turn completion summary
+
+When a turn finishes, display a compact summary footer:
+
+- Total tool calls.
+- Context tokens used.
+- Elapsed time.
+- Files changed (if any).
+
+This gives the user an at-a-glance overview of what the agent did.
+
+### 4. Task-oriented conversation structure
+
+Each chat session tells the story of solving a task:
+
+1. **User request** — the question or instruction.
+2. **Reasoning** — the agent's thinking and analysis (streaming text, collapsible thinking blocks).
+3. **Actions** — tool calls and their results (activity tree, expandable details).
+4. **Conclusion** — the final answer, rendered as rich Markdown with clear structure.
+
+The UI should make it easy to follow this narrative: see what the agent explored, understand how it reached its conclusion, and review the final output.
 
 ## Rendering pipeline
 
 ```
-ChatMessage
-  → AgentMessage component
-    → SubagentTreeView (if delegation)
-    → ActivitySection (tool calls: grouped, collapsible)
-    → MessageBody (text: thinking indicator, special blocks, markdown)
+AgentMessage
+  ├─ SubagentTreeView (if delegation)
+  ├─ ActivitySection (tool calls: grouped, collapsible)
+  ├─ TurnSummaryFooter (tool count, tokens, duration)
+  └─ MessageBody (thinking indicator, special blocks, markdown)
 ```
 
 ### Special block types
 
-MessageBody checks for JSON-structured content and renders specialized widgets:
+Certain structured payloads render as dedicated widgets:
 
-| JSON `type` | Component | Purpose |
-|:------------|:----------|:--------|
-| `plan` | PlanBlock | Interactive plan approval UI |
-| `finalize_task` | FinalizeTaskBlock | Task completion summary |
-| `change_report` | ChangeReportBlock | File changes summary |
-| `ask_user` | AskUserCard | Agent question with options |
+| Type | Widget | Purpose |
+|:-----|:-------|:--------|
+| Plan | PlanBlock | Interactive plan approval |
+| Finalize | FinalizeBlock | Task completion summary |
+| Change report | ChangeReportBlock | File diff summary |
+| Ask user | AskUserCard | Agent question with options |
 
-Non-JSON text renders as Markdown via `MarkdownContent`.
-
-## Chat reducer
-
-`useChatMessages` hook manages message state via a reducer with these action categories:
-
-### Token streaming
-- `APPEND_TOKEN` — append streaming token to current message
-- `SET_THINKING` — toggle thinking state
-
-### Message lifecycle
-- `PUSH_MESSAGE` — add new message (user or agent)
-- `FINALIZE_MESSAGE` — mark current message as done (isGenerating=false)
-- `CLEAR_MESSAGES` — reset all messages
-
-### Activity (tool calls)
-- `SET_ACTIVITY` — update activity summary/entries on current message
-- `ACTIVITY_DONE` — mark activity complete
-
-### Run events
-- `SET_CONTEXT_USAGE` — update token/message counts
-- `ADD_SUBAGENT` — add entry to subagent tree
-- `MARK_SUBAGENT_DONE` — mark subagent complete
-- `SET_PLAN` — set plan data on message
-
-### Special
-- `SET_ASK_USER` — store pending AskUser question
-- `SET_MODEL_FALLBACK` — record model fallback event
-- `PUSH_TEXT_SEGMENT` — append finalized text segment
+All other content renders as Markdown.
 
 ## Message queue
 
-When a user sends a message to a busy agent:
-
-1. Message is added to per-agent queue (`queued_chats` HashMap).
-2. `QueueUpdated` SSE event emitted so UI can show queued state.
-3. At next loop iteration, engine checks queue and injects into context.
-4. Model sees the message and decides how to respond.
-
-This enables the "AI interrupt" pattern — users can redirect, cancel, or query a running agent without waiting for it to finish.
-
-**Implementation**: `server/chat_api.rs` → `queued_chats`
+When a user sends a message to a busy agent, it queues. The agent picks it up at the next loop iteration and can react mid-run. This enables the "AI interrupt" pattern — users can redirect, cancel, or query a running agent without waiting.
 
 ## Event flow: single agent turn
 
-```
-User sends message via POST /api/chat
-  ↓
-1. Server → Message event (kind: "message")
-   UI: PUSH_MESSAGE (user msg) + PUSH_MESSAGE (empty agent msg, isGenerating=true)
+1. User sends a message.
+2. Agent begins thinking — thinking tokens stream to the UI.
+3. Agent decides to use a tool — content block events show tool name and arguments.
+4. Tool runs — progress events stream output if applicable.
+5. Tool completes — content block update marks it done/failed.
+6. Agent continues thinking or calls more tools (repeat 3-5).
+7. Agent produces a text response — tokens stream as Markdown.
+8. Turn completes — summary footer appears with stats.
 
-2. Server → Token events (kind: "token", thinking=true)
-   UI: SET_THINKING + APPEND_TOKEN → phase: "thinking"
+## API surface
 
-3. Server → AgentStatus (kind: "activity", phase: "doing", detail: "Reading file.ts")
-   UI: SET_ACTIVITY → phase: "working"
-
-4. Server → Token events (kind: "token", thinking=false)
-   UI: APPEND_TOKEN → phase: "streaming"
-
-5. Server → TextSegment (kind: "text_segment")
-   UI: PUSH_TEXT_SEGMENT (finalized text chunk)
-
-6. Server → Outcome (kind: "run", phase: "outcome")
-   UI: FINALIZE_MESSAGE → phase: "done"
-```
-
-## API contract
-
-### Chat
-
-- `POST /api/chat` — send message to agent (queues if busy).
-
-### Agent runs
-
-- `GET /api/agent-runs?project_root=...&session_id=...` — list runs.
-- `GET /api/agent-children?run_id=...` — list child runs.
-- `GET /api/agent-context?run_id=...&view=summary|raw` — run context/messages.
-- `POST /api/agent-cancel` with `{ run_id }` — cancel run tree.
-- `POST /api/ask-user-response` with `{ question_id, answers }` — respond to AskUser question.
-
-### Sessions & projects
-
-- `GET/POST /api/settings` — configuration.
-- `GET /api/workspace/tree` — file tree.
-
-### Missions
-
-- `GET /api/mission?project_root=...` — active mission.
-- `GET /api/missions?project_root=...` — mission history.
-- `POST /api/mission` — set mission.
-- `DELETE /api/mission` — clear mission.
-- `GET /api/agent-override?project_root=...&agent_id=...` — agent override.
-- `POST /api/agent-override` — set agent override.
-
-### Events
-
-- `GET /api/events` — SSE stream.
-- `GET /api/health` — health check (`{"ok": true}`).
+- `POST /api/chat` — send message (queues if busy).
+- `GET /api/events` — SSE event stream.
+- `GET /api/agent-runs` — list runs for a project/session.
+- `GET /api/agent-children` — list child runs (delegation).
+- `GET /api/agent-context` — run context and messages.
+- `POST /api/agent-cancel` — cancel a run tree.
+- `POST /api/ask-user-response` — respond to an AskUser question.

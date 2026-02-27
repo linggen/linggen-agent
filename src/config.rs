@@ -67,7 +67,7 @@ pub enum AgentPolicyCapability {
     Patch,
     #[serde(alias = "finalize", alias = "FINALIZE", alias = "FinalizeTask")]
     Finalize,
-    #[serde(alias = "delegate", alias = "DELEGATE")]
+    #[serde(alias = "delegate", alias = "DELEGATE", alias = "Task")]
     Delegate,
 }
 
@@ -212,7 +212,7 @@ pub enum ToolPermissionMode {
 
 impl Default for ToolPermissionMode {
     fn default() -> Self {
-        ToolPermissionMode::Auto
+        ToolPermissionMode::Ask
     }
 }
 

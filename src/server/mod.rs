@@ -238,6 +238,8 @@ pub enum ServerEvent {
         summary: Option<String>,
         is_error: Option<bool>,
         parent_id: Option<String>,
+        /// Optional extra payload (e.g. diff data for Edit/Write tools).
+        extra: Option<serde_json::Value>,
     },
     /// Signal that the assistant turn is complete (single finalizer).
     TurnComplete {
@@ -246,6 +248,61 @@ pub enum ServerEvent {
         context_tokens: Option<usize>,
         parent_id: Option<String>,
     },
+}
+
+impl ServerEvent {
+    /// Convert a 1:1 `AgentEvent` variant into the corresponding `ServerEvent`.
+    /// Returns `None` for variants that require special handling (AgentStatus, TaskUpdate).
+    fn from_agent_event(event: crate::agent_manager::AgentEvent) -> Option<Self> {
+        use crate::agent_manager::AgentEvent;
+        match event {
+            AgentEvent::StateUpdated => Some(Self::StateUpdated),
+            AgentEvent::Message { from, to, content } => {
+                Some(Self::Message { from, to, content })
+            }
+            AgentEvent::SubagentSpawned { parent_id, subagent_id, task } => {
+                Some(Self::SubagentSpawned { parent_id, subagent_id, task })
+            }
+            AgentEvent::SubagentResult { parent_id, subagent_id, outcome } => {
+                Some(Self::SubagentResult { parent_id, subagent_id, outcome })
+            }
+            AgentEvent::Outcome { agent_id, outcome } => {
+                Some(Self::Outcome { agent_id, outcome })
+            }
+            AgentEvent::ContextUsage {
+                agent_id, stage, message_count, char_count, estimated_tokens,
+                token_limit, actual_prompt_tokens, actual_completion_tokens,
+                compressed, summary_count,
+            } => Some(Self::ContextUsage {
+                agent_id, stage, message_count, char_count, estimated_tokens,
+                token_limit, actual_prompt_tokens, actual_completion_tokens,
+                compressed, summary_count,
+            }),
+            AgentEvent::PlanUpdate { agent_id, plan } => {
+                Some(Self::PlanUpdate { agent_id, plan })
+            }
+            AgentEvent::TextSegment { agent_id, text, parent_id } => {
+                Some(Self::TextSegment { agent_id, text, parent_id })
+            }
+            AgentEvent::ModelFallback { agent_id, preferred_model, actual_model, reason } => {
+                Some(Self::ModelFallback { agent_id, preferred_model, actual_model, reason })
+            }
+            AgentEvent::ToolProgress { agent_id, tool, line, stream } => {
+                Some(Self::ToolProgress { agent_id, tool, line, stream })
+            }
+            AgentEvent::ContentBlockStart { agent_id, block_id, block_type, tool, args, parent_id } => {
+                Some(Self::ContentBlockStart { agent_id, block_id, block_type, tool, args, parent_id })
+            }
+            AgentEvent::ContentBlockUpdate { agent_id, block_id, status, summary, is_error, parent_id, extra } => {
+                Some(Self::ContentBlockUpdate { agent_id, block_id, status, summary, is_error, parent_id, extra })
+            }
+            AgentEvent::TurnComplete { agent_id, duration_ms, context_tokens, parent_id } => {
+                Some(Self::TurnComplete { agent_id, duration_ms, context_tokens, parent_id })
+            }
+            // AgentStatus and TaskUpdate need special handling — return None.
+            AgentEvent::AgentStatus { .. } | AgentEvent::TaskUpdate { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -704,25 +761,37 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
             summary,
             is_error,
             parent_id,
-        } => Some(UiSseMessage {
-            id: format!("cb-update-{block_id}-{seq}"),
-            seq,
-            rev: seq,
-            ts_ms,
-            kind: UI_KIND_CONTENT_BLOCK.to_string(),
-            phase: Some("update".to_string()),
-            text: summary.clone(),
-            agent_id: Some(agent_id),
-            session_id: None,
-            project_root: None,
-            data: Some(json!({
+            extra,
+        } => {
+            let mut data_obj = json!({
                 "block_id": block_id,
                 "status": status,
                 "summary": summary,
                 "is_error": is_error,
                 "parent_id": parent_id,
-            })),
-        }),
+            });
+            // Merge extra fields into the data object so the frontend receives them flat.
+            if let Some(extra_val) = &extra {
+                if let (Some(base), Some(ext)) = (data_obj.as_object_mut(), extra_val.as_object()) {
+                    for (k, v) in ext {
+                        base.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            Some(UiSseMessage {
+                id: format!("cb-update-{block_id}-{seq}"),
+                seq,
+                rev: seq,
+                ts_ms,
+                kind: UI_KIND_CONTENT_BLOCK.to_string(),
+                phase: Some("update".to_string()),
+                text: summary.clone(),
+                agent_id: Some(agent_id),
+                session_id: None,
+                project_root: None,
+                data: Some(data_obj),
+            })
+        }
         ServerEvent::TurnComplete {
             agent_id,
             duration_ms,
@@ -868,169 +937,22 @@ pub async fn prepare_server(
         tokio::spawn(async move {
             while let Some(event) = agent_events_rx.recv().await {
                 match event {
-                    crate::agent_manager::AgentEvent::StateUpdated => {
-                        let _ = state_clone.events_tx.send(ServerEvent::StateUpdated);
-                    }
-                    crate::agent_manager::AgentEvent::Message { from, to, content } => {
-                        let _ =
-                            state_clone
-                                .events_tx
-                                .send(ServerEvent::Message { from, to, content });
-                    }
+                    // Special cases that need extra logic beyond a 1:1 mapping.
                     crate::agent_manager::AgentEvent::AgentStatus {
-                        agent_id,
-                        status,
-                        detail,
-                        parent_id,
+                        agent_id, status, detail, parent_id,
                     } => {
                         state_clone
                             .send_agent_status(agent_id, AgentStatusKind::from_str_loose(&status), detail, parent_id)
                             .await;
                     }
-                    crate::agent_manager::AgentEvent::SubagentSpawned {
-                        parent_id,
-                        subagent_id,
-                        task,
-                    } => {
-                        let _ = state_clone.events_tx.send(ServerEvent::SubagentSpawned {
-                            parent_id,
-                            subagent_id,
-                            task,
-                        });
-                    }
-                    crate::agent_manager::AgentEvent::SubagentResult {
-                        parent_id,
-                        subagent_id,
-                        outcome,
-                    } => {
-                        let _ = state_clone.events_tx.send(ServerEvent::SubagentResult {
-                            parent_id,
-                            subagent_id,
-                            outcome,
-                        });
-                    }
-                    crate::agent_manager::AgentEvent::Outcome { agent_id, outcome } => {
-                        let _ = state_clone
-                            .events_tx
-                            .send(ServerEvent::Outcome { agent_id, outcome });
-                    }
-                    crate::agent_manager::AgentEvent::ContextUsage {
-                        agent_id,
-                        stage,
-                        message_count,
-                        char_count,
-                        estimated_tokens,
-                        token_limit,
-                        actual_prompt_tokens,
-                        actual_completion_tokens,
-                        compressed,
-                        summary_count,
-                    } => {
-                        let _ = state_clone.events_tx.send(ServerEvent::ContextUsage {
-                            agent_id,
-                            stage,
-                            message_count,
-                            char_count,
-                            estimated_tokens,
-                            token_limit,
-                            actual_prompt_tokens,
-                            actual_completion_tokens,
-                            compressed,
-                            summary_count,
-                        });
-                    }
-                    crate::agent_manager::AgentEvent::PlanUpdate { agent_id, plan } => {
-                        let _ = state_clone
-                            .events_tx
-                            .send(ServerEvent::PlanUpdate { agent_id, plan });
-                    }
-                    crate::agent_manager::AgentEvent::TextSegment {
-                        agent_id,
-                        text,
-                        parent_id,
-                    } => {
-                        let _ = state_clone.events_tx.send(ServerEvent::TextSegment {
-                            agent_id,
-                            text,
-                            parent_id,
-                        });
-                    }
-                    crate::agent_manager::AgentEvent::ModelFallback {
-                        agent_id,
-                        preferred_model,
-                        actual_model,
-                        reason,
-                    } => {
-                        let _ = state_clone.events_tx.send(ServerEvent::ModelFallback {
-                            agent_id,
-                            preferred_model,
-                            actual_model,
-                            reason,
-                        });
-                    }
-                    crate::agent_manager::AgentEvent::ToolProgress {
-                        agent_id,
-                        tool,
-                        line,
-                        stream,
-                    } => {
-                        let _ = state_clone.events_tx.send(ServerEvent::ToolProgress {
-                            agent_id,
-                            tool,
-                            line,
-                            stream,
-                        });
-                    }
                     crate::agent_manager::AgentEvent::TaskUpdate { .. } => {
-                        // UI will refresh state from DB
                         let _ = state_clone.events_tx.send(ServerEvent::StateUpdated);
                     }
-                    crate::agent_manager::AgentEvent::ContentBlockStart {
-                        agent_id,
-                        block_id,
-                        block_type,
-                        tool,
-                        args,
-                        parent_id,
-                    } => {
-                        let _ = state_clone.events_tx.send(ServerEvent::ContentBlockStart {
-                            agent_id,
-                            block_id,
-                            block_type,
-                            tool,
-                            args,
-                            parent_id,
-                        });
-                    }
-                    crate::agent_manager::AgentEvent::ContentBlockUpdate {
-                        agent_id,
-                        block_id,
-                        status,
-                        summary,
-                        is_error,
-                        parent_id,
-                    } => {
-                        let _ = state_clone.events_tx.send(ServerEvent::ContentBlockUpdate {
-                            agent_id,
-                            block_id,
-                            status,
-                            summary,
-                            is_error,
-                            parent_id,
-                        });
-                    }
-                    crate::agent_manager::AgentEvent::TurnComplete {
-                        agent_id,
-                        duration_ms,
-                        context_tokens,
-                        parent_id,
-                    } => {
-                        let _ = state_clone.events_tx.send(ServerEvent::TurnComplete {
-                            agent_id,
-                            duration_ms,
-                            context_tokens,
-                            parent_id,
-                        });
+                    // All other variants have a 1:1 ServerEvent equivalent.
+                    other => {
+                        if let Some(se) = ServerEvent::from_agent_event(other) {
+                            let _ = state_clone.events_tx.send(se);
+                        }
                     }
                 }
             }
@@ -1131,16 +1053,21 @@ pub async fn start_server(
 async fn static_handler(State(state): State<Arc<ServerState>>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
 
+    let build_response = |builder: axum::http::response::Builder, body: axum::body::Body| -> Response {
+        builder.body(body).unwrap_or_else(|_| {
+            Response::new(axum::body::Body::from("internal server error"))
+        })
+    };
+
     if state.dev_mode {
         // In dev mode, static assets are served by the Vite dev server.
         // Return 404 so the user knows to use the Vite proxy.
-        return Response::builder()
-            .status(404)
-            .header("Content-Type", "text/plain")
-            .body(axum::body::Body::from(
+        return build_response(
+            Response::builder().status(404).header("Content-Type", "text/plain"),
+            axum::body::Body::from(
                 "Dev mode: static assets are served by Vite. Use the Vite dev server URL instead.",
-            ))
-            .unwrap();
+            ),
+        );
     }
 
     let path = if path.is_empty() { "index.html" } else { path };
@@ -1148,22 +1075,22 @@ async fn static_handler(State(state): State<Arc<ServerState>>, uri: Uri) -> Resp
     match Assets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
-            Response::builder()
-                .header("Content-Type", mime.as_ref())
-                .body(axum::body::Body::from(content.data))
-                .unwrap()
+            build_response(
+                Response::builder().header("Content-Type", mime.as_ref()),
+                axum::body::Body::from(content.data),
+            )
         }
         None => {
             // Fallback to index.html for SPA routing
             match Assets::get("index.html") {
-                Some(index) => Response::builder()
-                    .header("Content-Type", "text/html")
-                    .body(axum::body::Body::from(index.data))
-                    .unwrap(),
-                None => Response::builder()
-                    .status(404)
-                    .body(axum::body::Body::from("Not found"))
-                    .unwrap(),
+                Some(index) => build_response(
+                    Response::builder().header("Content-Type", "text/html"),
+                    axum::body::Body::from(index.data),
+                ),
+                None => build_response(
+                    Response::builder().status(404),
+                    axum::body::Body::from("Not found"),
+                ),
             }
         }
     }
@@ -1337,6 +1264,7 @@ mod tests {
                 summary: Some("Read 42 lines".into()),
                 is_error: Some(false),
                 parent_id: None,
+                extra: None,
             },
             ServerEvent::TurnComplete {
                 agent_id: "ling".into(),

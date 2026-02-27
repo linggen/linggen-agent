@@ -18,7 +18,7 @@ pub mod web_search;
 // Re-export public API types
 pub use types::{
     AgentEngine, AgentOutcome, AgentRole, ContextRecord, ContextType, EngineConfig,
-    Plan, PlanItemStatus, PlanStatus, ReplEvent, TaskPacket, ThinkingEvent,
+    Plan, PlanItemStatus, PlanStatus, TaskPacket, ThinkingEvent,
 };
 
 pub use actions::{model_message_log_parts, parse_all_actions, text_before_first_json, ModelAction};
@@ -52,12 +52,6 @@ impl AgentEngine {
                     parent_id: self.parent_agent_id.clone(),
                 })
                 .await;
-        }
-        if let Some(tx) = &self.repl_events_tx {
-            let _ = tx.send(ReplEvent::Status {
-                status: "working".to_string(),
-                detail: Some("Running".to_string()),
-            });
         }
 
         // Sync world state before running the loop if we have a manager
@@ -155,14 +149,7 @@ impl AgentEngine {
             progress_rx,
         };
 
-        for iter_num in 0..self.cfg.max_iters {
-            if let Some(tx) = &self.repl_events_tx {
-                let _ = tx.send(ReplEvent::Iteration {
-                    current: iter_num + 1,
-                    max: self.cfg.max_iters,
-                });
-            }
-
+        for _ in 0..self.cfg.max_iters {
             if self.is_cancelled().await {
                 anyhow::bail!("run cancelled");
             }
@@ -201,12 +188,6 @@ impl AgentEngine {
                         parent_id: self.parent_agent_id.clone(),
                     })
                     .await;
-            }
-            if let Some(tx) = &self.repl_events_tx {
-                let _ = tx.send(ReplEvent::Status {
-                    status: "thinking".to_string(),
-                    detail: Some(format!("Thinking ({})", self.model_id)),
-                });
             }
 
             let summary_count = self.maybe_compact_model_messages(&mut state.messages, "loop_iter");
@@ -332,13 +313,13 @@ impl AgentEngine {
             let mut actions = actions;
 
             while !actions.is_empty() && early_return.is_none() {
-                // Check if the front action is a delegate_to_agent tool call.
+                // Check if the front action is a Task (delegation) tool call.
                 let front_is_delegation = match &actions[0] {
                     ModelAction::Tool { tool, .. } => {
                         self.tools
                             .canonical_tool_name(tool)
                             .unwrap_or(tool.as_str())
-                            == "delegate_to_agent"
+                            == "Task"
                     }
                     _ => false,
                 };
@@ -383,7 +364,7 @@ impl AgentEngine {
                 };
 
                 if front_is_delegation {
-                    // Collect a run of consecutive delegate_to_agent actions.
+                    // Collect a run of consecutive Task (delegation) actions.
                     let batch_size = actions
                         .iter()
                         .take_while(|a| match a {
@@ -391,7 +372,7 @@ impl AgentEngine {
                                 self.tools
                                     .canonical_tool_name(tool)
                                     .unwrap_or(tool.as_str())
-                                    == "delegate_to_agent"
+                                    == "Task"
                             }
                             _ => false,
                         })

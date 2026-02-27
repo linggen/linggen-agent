@@ -4,12 +4,14 @@ import type { AppConfig, ManagementTab } from '../types';
 import { ModelsTab } from './ModelsTab';
 import { AgentsTab } from './AgentsTab';
 import { SkillsTab } from './SkillsTab';
+import { ToolsTab } from './ToolsTab';
 import { GeneralTab } from './GeneralTab';
 
 const tabs: { key: ManagementTab; label: string }[] = [
   { key: 'models', label: 'Models' },
   { key: 'agents', label: 'Agents' },
   { key: 'skills', label: 'Skills' },
+  { key: 'tools', label: 'Tools' },
   { key: 'general', label: 'General' },
 ];
 
@@ -149,6 +151,14 @@ export const SettingsPage: React.FC<{
           <div className="h-full overflow-y-auto px-6 py-5">
             <div className="max-w-6xl mx-auto h-full">
               <SkillsTab projectRoot={projectRoot} />
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'tools' && (
+          <div className="h-full overflow-y-auto p-6">
+            <div className="max-w-4xl mx-auto">
+              <ToolsTab />
             </div>
           </div>
         )}
