@@ -7,7 +7,7 @@ import { ModelsCard } from './components/ModelsCard';
 import { CollapsibleCard } from './components/CollapsibleCard';
 import { SkillsCard } from './components/SkillsCard';
 import { FilePreview } from './components/FilePreview';
-import { ChatPanel } from './components/ChatPanel';
+import { ChatPanel } from './components/chat';
 import { HeaderBar } from './components/HeaderBar';
 import { SettingsPage } from './components/SettingsPage';
 import { StoragePage } from './components/StoragePage';
