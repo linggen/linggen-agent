@@ -68,8 +68,6 @@ export const SkillsTab: React.FC<{
   // Built-in skills state
   const [builtInSkills, setBuiltInSkills] = useState<BuiltInSkillInfo[]>([]);
   const [biInstalling, setBiInstalling] = useState<Set<string>>(new Set());
-  const [biInstallingAll, setBiInstallingAll] = useState(false);
-
   const fetchBuiltInSkills = useCallback(async () => {
     try {
       const resp = await fetch('/api/builtin-skills');
@@ -99,22 +97,6 @@ export const SkillsTab: React.FC<{
       next.delete(name);
       return next;
     });
-  };
-
-  const installAllBuiltInSkills = async () => {
-    setBiInstallingAll(true);
-    setError(null);
-    try {
-      const resp = await fetch('/api/builtin-skills/install-all', { method: 'POST' });
-      if (!resp.ok) {
-        setError(await resp.text());
-      } else {
-        await Promise.all([fetchSkills(), fetchSkillFiles(), fetchBuiltInSkills()]);
-      }
-    } catch (e) {
-      setError(String(e));
-    }
-    setBiInstallingAll(false);
   };
 
   const fetchSkills = useCallback(async () => {
@@ -439,7 +421,7 @@ export const SkillsTab: React.FC<{
               <Zap size={14} className="text-white" />
             </div>
             <div>
-              <h3 className="text-[13px] font-bold text-slate-800 dark:text-slate-100 leading-none">Skills</h3>
+              <h3 className="text-xs font-bold text-slate-800 dark:text-slate-100 leading-none">Skills</h3>
               <p className="text-[10px] text-slate-400 mt-0.5">{totalInstalled} installed</p>
             </div>
           </div>
@@ -455,7 +437,7 @@ export const SkillsTab: React.FC<{
           </button>
           <button
             onClick={createSkillFile}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-semibold rounded-lg bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-700 dark:text-slate-200 hover:border-blue-300 dark:hover:border-blue-500/30 hover:text-blue-600 dark:hover:text-blue-400 shadow-sm transition-all"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-700 dark:text-slate-200 hover:border-blue-300 dark:hover:border-blue-500/30 hover:text-blue-600 dark:hover:text-blue-400 shadow-sm transition-all"
           >
             <FilePlus2 size={12} /> New Skill
           </button>
@@ -506,12 +488,12 @@ export const SkillsTab: React.FC<{
                           <div className="text-slate-300 dark:text-slate-600 transition-transform duration-200" style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)' }}>
                             <ChevronRight size={11} />
                           </div>
-                          <span className="text-[11px] font-semibold text-slate-700 dark:text-slate-200 flex-1">{skill.name}</span>
-                          <span className={`text-[8px] font-semibold px-1.5 py-0.5 rounded-md border ${sourceBadgeCls[skill.source?.type] || sourceBadgeCls.Compat}`}>
+                          <span className="text-xs font-semibold text-slate-700 dark:text-slate-200 flex-1">{skill.name}</span>
+                          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-md border ${sourceBadgeCls[skill.source?.type] || sourceBadgeCls.Compat}`}>
                             {subLabel}
                           </span>
                           {skill.tool_defs && skill.tool_defs.length > 0 && (
-                            <span className="inline-flex items-center gap-1 text-[9px] text-slate-400 bg-slate-100/80 dark:bg-white/5 px-1.5 py-0.5 rounded-md">
+                            <span className="inline-flex items-center gap-1 text-[10px] text-slate-400 bg-slate-100/80 dark:bg-white/5 px-1.5 py-0.5 rounded-md">
                               <Wrench size={8} /> {skill.tool_defs.length}
                             </span>
                           )}
@@ -519,7 +501,7 @@ export const SkillsTab: React.FC<{
                             <button
                               onClick={() => uninstallMarketplaceSkill(skill.name, 'global')}
                               disabled={mpUninstalling.has(skill.name)}
-                              className="px-1.5 py-0.5 rounded text-[9px] font-medium text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 border border-transparent hover:border-red-200 dark:hover:border-red-500/20 transition-all disabled:opacity-50"
+                              className="px-1.5 py-0.5 rounded text-[10px] font-medium text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 border border-transparent hover:border-red-200 dark:hover:border-red-500/20 transition-all disabled:opacity-50"
                               title="Remove"
                             >
                               {mpUninstalling.has(skill.name) ? <RefreshCw size={10} className="animate-spin" /> : <span className="flex items-center gap-1"><Trash2 size={9} /> Remove</span>}
@@ -529,7 +511,7 @@ export const SkillsTab: React.FC<{
 
                         {expanded && (
                           <div className="px-4 pb-3 pl-9 space-y-2">
-                            <p className="text-[10px] text-slate-500 dark:text-slate-400 leading-relaxed">{skill.description}</p>
+                            <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">{skill.description}</p>
                             {skill.tool_defs && skill.tool_defs.length > 0 && (
                               <div className="overflow-x-auto rounded-lg border border-slate-100 dark:border-white/5">
                                 <table className="w-full text-[10px]">
@@ -600,9 +582,9 @@ export const SkillsTab: React.FC<{
                           <div className="text-slate-300 dark:text-slate-600 transition-transform duration-200" style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)' }}>
                             <ChevronRight size={11} />
                           </div>
-                          <span className="text-[11px] font-semibold text-slate-700 dark:text-slate-200 flex-1">{skill.name}</span>
+                          <span className="text-xs font-semibold text-slate-700 dark:text-slate-200 flex-1">{skill.name}</span>
                           {skill.tool_defs && skill.tool_defs.length > 0 && (
-                            <span className="inline-flex items-center gap-1 text-[9px] text-slate-400 bg-slate-100/80 dark:bg-white/5 px-1.5 py-0.5 rounded-md">
+                            <span className="inline-flex items-center gap-1 text-[10px] text-slate-400 bg-slate-100/80 dark:bg-white/5 px-1.5 py-0.5 rounded-md">
                               <Wrench size={8} /> {skill.tool_defs.length}
                             </span>
                           )}
@@ -615,7 +597,7 @@ export const SkillsTab: React.FC<{
                             <button
                               onClick={() => handleMoveToGlobal(skill.name)}
                               disabled={mpMoving.has(skill.name)}
-                              className="px-1.5 py-0.5 rounded text-[9px] font-medium text-slate-400 hover:text-indigo-500 hover:bg-indigo-50 dark:hover:bg-indigo-500/10 border border-transparent hover:border-indigo-200 dark:hover:border-indigo-500/20 transition-all disabled:opacity-50"
+                              className="px-1.5 py-0.5 rounded text-[10px] font-medium text-slate-400 hover:text-indigo-500 hover:bg-indigo-50 dark:hover:bg-indigo-500/10 border border-transparent hover:border-indigo-200 dark:hover:border-indigo-500/20 transition-all disabled:opacity-50"
                               title="Move to Global"
                             >
                               {mpMoving.has(skill.name) ? <RefreshCw size={10} className="animate-spin" /> : <span className="flex items-center gap-1"><ArrowUpRight size={9} /> Global</span>}
@@ -623,7 +605,7 @@ export const SkillsTab: React.FC<{
                             <button
                               onClick={() => uninstallMarketplaceSkill(skill.name, 'project')}
                               disabled={mpUninstalling.has(skill.name)}
-                              className="px-1.5 py-0.5 rounded text-[9px] font-medium text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 border border-transparent hover:border-red-200 dark:hover:border-red-500/20 transition-all disabled:opacity-50"
+                              className="px-1.5 py-0.5 rounded text-[10px] font-medium text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 border border-transparent hover:border-red-200 dark:hover:border-red-500/20 transition-all disabled:opacity-50"
                               title="Remove"
                             >
                               {mpUninstalling.has(skill.name) ? <RefreshCw size={10} className="animate-spin" /> : <span className="flex items-center gap-1"><Trash2 size={9} /> Remove</span>}
@@ -633,7 +615,7 @@ export const SkillsTab: React.FC<{
 
                         {expanded && (
                           <div className="px-4 pb-3 pl-9 space-y-2">
-                            <p className="text-[10px] text-slate-500 dark:text-slate-400 leading-relaxed">{skill.description}</p>
+                            <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">{skill.description}</p>
                             {skill.tool_defs && skill.tool_defs.length > 0 && (
                               <div className="overflow-x-auto rounded-lg border border-slate-100 dark:border-white/5">
                                 <table className="w-full text-[10px]">
@@ -694,16 +676,7 @@ export const SkillsTab: React.FC<{
                 <div className="w-5 h-5 rounded-md bg-blue-500/10 flex items-center justify-center">
                   <Book size={11} className="text-blue-500" />
                 </div>
-                <span className="text-[11px] font-bold text-slate-700 dark:text-slate-200 tracking-wide uppercase">Library</span>
-                {builtInSkills.some((bi) => !bi.installed) && (
-                  <button
-                    onClick={installAllBuiltInSkills}
-                    disabled={biInstallingAll}
-                    className="ml-auto px-2.5 py-1 text-[10px] font-semibold rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 shadow-sm shadow-blue-600/20 transition-colors"
-                  >
-                    {biInstallingAll ? 'Installing...' : 'Install All'}
-                  </button>
-                )}
+                <span className="text-xs font-bold text-slate-700 dark:text-slate-200 tracking-wide uppercase">Library</span>
               </div>
               <div className="px-3 py-2 border-b border-slate-100 dark:border-white/5">
                 <div className="flex items-center gap-2 bg-slate-50/80 dark:bg-white/[0.03] rounded-lg px-3 py-2 border border-slate-200/50 dark:border-white/5 focus-within:border-blue-300 dark:focus-within:border-blue-500/30 focus-within:ring-2 focus-within:ring-blue-500/10 transition-all">
@@ -713,7 +686,7 @@ export const SkillsTab: React.FC<{
                     value={mpQuery}
                     onChange={(e) => handleMpQueryChange(e.target.value)}
                     placeholder="Search skills..."
-                    className="flex-1 text-[11px] bg-transparent outline-none placeholder:text-slate-400"
+                    className="flex-1 text-xs bg-transparent outline-none placeholder:text-slate-400"
                   />
                   {mpQuery && (
                     <button onClick={() => { setMpQuery(''); fetchMarketplaceList(); }} className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-300">
@@ -745,17 +718,17 @@ export const SkillsTab: React.FC<{
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center gap-1.5">
                             <Sparkles size={10} className="text-blue-500 shrink-0" />
-                            <span className="text-[11px] font-bold text-slate-700 dark:text-slate-200">{bi.name}</span>
-                            <span className="text-[8px] font-semibold text-blue-500 bg-blue-500/10 px-1.5 py-0.5 rounded uppercase">Linggen</span>
+                            <span className="text-xs font-bold text-slate-700 dark:text-slate-200">{bi.name}</span>
+                            <span className="text-[10px] font-semibold text-blue-500 bg-blue-500/10 px-1.5 py-0.5 rounded uppercase">Linggen</span>
                           </div>
-                          <p className="text-[10px] text-slate-500 dark:text-slate-400 mt-0.5 line-clamp-2 leading-relaxed">{bi.description}</p>
+                          <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 line-clamp-2 leading-relaxed">{bi.description}</p>
                         </div>
                         <div className="shrink-0 pt-0.5">
                           {bi.installed ? (
                             <button
                               onClick={() => installBuiltInSkill(bi.name)}
                               disabled={biInstalling.has(bi.name)}
-                              className="px-2 py-1 text-[9px] font-semibold rounded-md border border-slate-200 dark:border-white/10 text-slate-500 hover:text-blue-600 hover:border-blue-200 dark:hover:border-blue-500/30 hover:bg-blue-50/50 dark:hover:bg-blue-500/5 disabled:opacity-50 transition-all"
+                              className="px-2 py-1 text-[10px] font-semibold rounded-md border border-slate-200 dark:border-white/10 text-slate-500 hover:text-blue-600 hover:border-blue-200 dark:hover:border-blue-500/30 hover:bg-blue-50/50 dark:hover:bg-blue-500/5 disabled:opacity-50 transition-all"
                             >
                               {biInstalling.has(bi.name) ? '...' : 'Update'}
                             </button>
@@ -782,7 +755,7 @@ export const SkillsTab: React.FC<{
                   {filteredBuiltIn.length > 0 && filteredMpResults.length > 0 && (
                     <div className="flex items-center gap-2 py-1.5 px-1">
                       <div className="flex-1 border-t border-slate-200/60 dark:border-white/5" />
-                      <span className="text-[9px] font-semibold text-slate-400 uppercase tracking-wider">Community</span>
+                      <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Community</span>
                       <div className="flex-1 border-t border-slate-200/60 dark:border-white/5" />
                     </div>
                   )}
@@ -804,23 +777,23 @@ export const SkillsTab: React.FC<{
                         <div className="flex items-start gap-2.5">
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-1.5">
-                              <span className="text-[11px] font-bold text-slate-700 dark:text-slate-200">{skill.name}</span>
+                              <span className="text-xs font-bold text-slate-700 dark:text-slate-200">{skill.name}</span>
                               {skill.install_count > 0 && (
-                                <span className="inline-flex items-center gap-0.5 text-[9px] text-slate-400">
+                                <span className="inline-flex items-center gap-0.5 text-[10px] text-slate-400">
                                   <Download size={8} />
                                   {skill.install_count}
                                 </span>
                               )}
                             </div>
                             {skill.description && (
-                              <p className="text-[10px] text-slate-500 dark:text-slate-400 mt-0.5 line-clamp-2 leading-relaxed">{skill.description}</p>
+                              <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 line-clamp-2 leading-relaxed">{skill.description}</p>
                             )}
                             {skill.url && (
                               <a
                                 href={skill.url}
                                 target="_blank"
                                 rel="noopener noreferrer"
-                                className="inline-flex items-center gap-0.5 text-[9px] text-slate-400 hover:text-blue-500 mt-1 transition-colors"
+                                className="inline-flex items-center gap-0.5 text-[10px] text-slate-400 hover:text-blue-500 mt-1 transition-colors"
                                 onClick={(e) => e.stopPropagation()}
                               >
                                 <ExternalLink size={8} />
@@ -830,7 +803,7 @@ export const SkillsTab: React.FC<{
                           </div>
                           <div className="shrink-0 pt-0.5">
                             {isInstalled ? (
-                              <span className="inline-flex items-center gap-1 px-2 py-1 text-[9px] font-semibold rounded-md text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 border border-emerald-200/50 dark:border-emerald-500/20">
+                              <span className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold rounded-md text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 border border-emerald-200/50 dark:border-emerald-500/20">
                                 <Check size={9} /> Installed
                               </span>
                             ) : (

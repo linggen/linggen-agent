@@ -87,9 +87,6 @@ impl SkillToolDef {
 
         info!("Skill tool '{}' rendered command: {}", self.name, rendered);
 
-        // Validate the rendered command through the existing allowlist.
-        super::tools::validate_shell_command(&rendered)?;
-
         // Execute via sh -c.
         let timeout = Duration::from_millis(self.timeout_ms);
         let mut child = Command::new("sh")

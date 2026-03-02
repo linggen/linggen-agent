@@ -1,4 +1,4 @@
-use super::tool_helpers::{build_globset, to_rel_string, validate_shell_command};
+use super::tool_helpers::{build_globset, to_rel_string};
 use super::{SearchMatch, ToolResult, Tools};
 use anyhow::Result;
 use grep::regex::RegexMatcher;
@@ -88,9 +88,6 @@ impl Tools {
     pub(super) fn run_command(&self, args: RunCommandArgs) -> Result<ToolResult> {
         use std::io::BufRead;
 
-        // Hybrid shell mode: support common dev/inspection tools while enforcing
-        // an allowlist on every shell segment.
-        validate_shell_command(&args.cmd)?;
         let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(30000));
 
         let mut child = if cfg!(target_os = "windows") {

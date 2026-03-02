@@ -6,7 +6,7 @@ mod tool_helpers;
 
 pub use tool_helpers::canonical_tool_name;
 pub(crate) use tool_helpers::full_tool_schema_entries;
-pub(crate) use tool_helpers::{normalize_tool_args, summarize_tool_args, validate_shell_command};
+pub(crate) use tool_helpers::{normalize_tool_args, summarize_tool_args};
 pub(crate) use delegation::{run_delegation, TaskArgs};
 
 use crate::agent_manager::AgentManager;

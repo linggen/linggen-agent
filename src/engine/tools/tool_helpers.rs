@@ -1,7 +1,6 @@
 use anyhow::Result;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde_json::Value;
-use std::collections::HashSet;
 use std::path::{Component, Path};
 
 pub(super) fn build_globset(globs: Option<&[String]>) -> Result<Option<GlobSet>> {
@@ -183,69 +182,6 @@ pub(crate) fn normalize_tool_args(tool: &str, args: &Value) -> Value {
     normalized
 }
 
-pub(crate) fn validate_shell_command(cmd: &str) -> Result<()> {
-    let trimmed = cmd.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("empty command");
-    }
-
-    // Disallow common shell injection patterns.
-    for banned in ["$(", "`", "\n", "\r", "<(", ">("] {
-        if trimmed.contains(banned) {
-            anyhow::bail!("command contains disallowed shell construct: {}", banned);
-        }
-    }
-    // Block output redirection (but allow `>` inside grep patterns etc. via `--`).
-    // We only block bare `>` or `>>` that appear as shell operators.
-    for op in [" > ", " >> ", "\t>\t", "\t>>\t", " >|"] {
-        if trimmed.contains(op) {
-            anyhow::bail!("command contains disallowed shell redirection");
-        }
-    }
-    // Block input redirection `< file`.
-    if trimmed.contains(" < ") {
-        anyhow::bail!("command contains disallowed shell redirection");
-    }
-
-    let allowed: HashSet<&str> = [
-        "ls", "pwd", "cat", "head", "tail", "wc", "cut", "sort", "uniq", "tr", "sed", "awk",
-        "find", "fd", "rg", "grep", "git", "cargo", "rustc", "npm", "pnpm", "yarn", "node",
-        "python", "python3", "pip", "pip3", "pytest", "go", "make", "just",
-        "bash", "sh", "curl", "jq",
-    ]
-    .into_iter()
-    .collect();
-
-    for segment in split_shell_segments(trimmed) {
-        let token = first_segment_token(segment)
-            .ok_or_else(|| anyhow::anyhow!("invalid command segment: '{}'", segment))?;
-        if !allowed.contains(token) {
-            anyhow::bail!(
-                "Command not allowed: {} (allowed tools are code/search/build/test commands)",
-                token
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn split_shell_segments(cmd: &str) -> Vec<&str> {
-    cmd.split(|c| c == '|' || c == ';')
-        .flat_map(|part| part.split("&&"))
-        .flat_map(|part| part.split("||"))
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect()
-}
-
-fn first_segment_token(segment: &str) -> Option<&str> {
-    segment
-        .split_whitespace()
-        .next()
-        .map(|token| token.trim_start_matches('('))
-}
-
 pub fn canonical_tool_name(tool: &str) -> Option<&'static str> {
     Some(match tool {
         "Glob" => "Glob",
@@ -302,7 +238,7 @@ pub(crate) fn full_tool_schema_entries() -> Vec<Value> {
             "name": "Bash",
             "args": {"cmd": "string", "timeout_ms": "number?"},
             "returns": "{exit_code,stdout,stderr}",
-            "notes": "Runs allowlisted dev/search/build shell commands with per-segment validation. Command alias accepted: command."
+            "notes": "Runs shell commands via sh -c. Permission required in ask mode. Command alias accepted: command."
         }),
         serde_json::json!({
             "name": "capture_screenshot",

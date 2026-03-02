@@ -13,11 +13,11 @@ function isGlobalOrCompat(skill: SkillInfoFull): boolean {
   return t === 'Global' || t === 'Compat';
 }
 
-function SkillRow({ skill }: { skill: SkillInfoFull }) {
+function SkillRow({ skill, projectName }: { skill: SkillInfoFull; projectName?: string }) {
   const sourceType = skill.source?.type || 'Global';
   const sourceLabel = sourceType === 'Compat'
     ? (skill.source as { type: string; label?: string })?.label || 'Compat'
-    : sourceType === 'Global' ? 'Linggen' : sourceType;
+    : sourceType === 'Global' ? 'Linggen' : (projectName || 'Project');
   const trigger = skill.trigger || `/${skill.name}`;
   const argHint = skill.argument_hint ? ` ${skill.argument_hint}` : '';
 
@@ -55,7 +55,8 @@ function SkillRow({ skill }: { skill: SkillInfoFull }) {
 
 export const SkillsCard: React.FC<{
   skills: SkillInfoFull[];
-}> = ({ skills }) => {
+  projectRoot?: string;
+}> = ({ skills, projectRoot }) => {
   if (skills.length === 0) {
     return (
       <div className="p-4 text-center text-[11px] text-slate-400 italic">
@@ -66,6 +67,7 @@ export const SkillsCard: React.FC<{
 
   const globalSkills = skills.filter(isGlobalOrCompat);
   const projectSkills = skills.filter((s) => !isGlobalOrCompat(s));
+  const projectName = projectRoot ? projectRoot.split('/').filter(Boolean).pop() || 'Project' : 'Project';
 
   return (
     <div className="flex-1 p-4 overflow-y-auto text-xs space-y-2">
@@ -79,9 +81,9 @@ export const SkillsCard: React.FC<{
       )}
       {projectSkills.length > 0 && (
         <>
-          <div className={`text-[9px] font-bold text-slate-400 uppercase tracking-wider px-1 ${globalSkills.length > 0 ? 'mt-3' : ''}`}>Project</div>
+          <div className={`text-[9px] font-bold text-slate-400 uppercase tracking-wider px-1 ${globalSkills.length > 0 ? 'mt-3' : ''}`}>{projectName}</div>
           {projectSkills.map((skill) => (
-            <SkillRow key={skill.name} skill={skill} />
+            <SkillRow key={skill.name} skill={skill} projectName={projectName} />
           ))}
         </>
       )}

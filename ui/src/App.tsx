@@ -1149,7 +1149,7 @@ const App: React.FC = () => {
               </button>
             }
           >
-            <SkillsCard skills={skills} />
+            <SkillsCard skills={skills} projectRoot={selectedProjectRoot} />
           </CollapsibleCard>
         </aside>
       </div>

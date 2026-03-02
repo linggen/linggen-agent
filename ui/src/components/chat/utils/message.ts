@@ -303,7 +303,8 @@ export const collapseProgressMessages = (messages: ChatMessage[]): ChatMessage[]
     const agentId = normalizeAgentKey(msg.from || msg.role);
     const entries = activityEntriesForMsg(msg);
     const body = String(msg.text || '').trim();
-    const onlyProgress = !body || isProgressLineText(body);
+    const hasContentBlocks = msg.content && msg.content.length > 0;
+    const onlyProgress = !hasContentBlocks && (!body || isProgressLineText(body));
 
     if (onlyProgress) {
       if (entries.length > 0) {
