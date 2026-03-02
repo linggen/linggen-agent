@@ -101,24 +101,23 @@ impl App {
             }
         }
 
-        // Sticky plan: show the active executing plan at the bottom of content
-        // (like Claude Code's todo list). Skip "planned" (shown inline) and "completed".
-        let active_plan = self.blocks.iter().rev().find_map(|b| {
+        // Sticky plan: show the active executing plan at the bottom of content.
+        // Skip "planned" (shown inline) and "completed".
+        let active_plan_summary = self.blocks.iter().rev().find_map(|b| {
             if let DisplayBlock::PlanBlock {
                 summary,
-                items,
                 status,
             } = b
             {
                 if status != "completed" && status != "planned" {
-                    return Some((summary.clone(), items.clone()));
+                    return Some(summary.clone());
                 }
             }
             None
         });
-        if let Some((summary, items)) = active_plan {
+        if let Some(summary) = active_plan_summary {
             all_lines.push(Line::from(""));
-            all_lines.extend(render::render_plan_sticky(&summary, &items));
+            all_lines.extend(render::render_plan_sticky(&summary));
         }
 
         // Compute total wrapped rows (accounts for line wrapping)

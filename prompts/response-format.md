@@ -68,28 +68,9 @@ Bad done messages (too vague):
 - `"Done."`
 - `"Task completed successfully."`
 
-### 3. Task List — track progress on multi-step work (optional)
-
-For complex tasks with 3+ steps, emit an update_plan to track progress visually. This is metadata only — it does NOT execute anything. You MUST also emit tool calls to actually do the work.
-
-Create a plan:
-```json
-{"type": "update_plan", "summary": "Migrate database schema", "items": [{"title": "Add new columns to users table", "status": "pending"}, {"title": "Write migration script", "status": "pending"}, {"title": "Update ORM models", "status": "pending"}, {"title": "Run tests", "status": "pending"}]}
-```
-
-Update progress:
-```json
-{"type": "update_plan", "items": [{"title": "Add new columns to users table", "status": "done"}]}
-```
-
-Valid statuses: `"pending"`, `"in_progress"`, `"done"`, `"skipped"`
-
-High-quality plan items include file paths and specific changes. Low-quality plans are vague ("update the code"). Skip the plan entirely for simple, single-step tasks.
-
 ### Rules
 
 - ALWAYS respond with valid JSON objects. Never plain text without a JSON action.
-- An update_plan alone does NOT count as progress. You MUST emit tool calls alongside or after it.
 - When delegating, use the Task tool with a concrete task description — do not just plan to delegate.
 - When finished, ALWAYS emit a done action. Never stop without signaling completion.
 - Keep going until the task is fully resolved. Only emit done when you are confident the work is complete.

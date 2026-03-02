@@ -3,9 +3,11 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{fmt::time::ChronoUtc, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::reload::Handle;
+use tracing_subscriber::{fmt::time::ChronoUtc, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry};
 
 static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+static FILTER_HANDLE: OnceLock<Handle<EnvFilter, Registry>> = OnceLock::new();
 
 const DEFAULT_RETENTION_DAYS: u64 = 7;
 const LOG_FILE_PREFIX: &str = "linggen-agent";
@@ -16,6 +18,16 @@ pub struct LoggingSettings<'a> {
     pub retention_days: Option<u64>,
     /// When true, suppress stdout logging (TUI mode owns the terminal).
     pub suppress_stdout: bool,
+}
+
+/// Build an `EnvFilter` for the given application log level.
+fn build_filter(level: &str) -> EnvFilter {
+    EnvFilter::try_new(format!(
+        "ling={level},linggen_agent={level},linggen-agent={level},linggen={level},\
+         axum=warn,tower_http=warn,hyper=warn,hyper_util=warn,reqwest=warn,\
+         mio=warn,reqwest_retry=warn"
+    ))
+    .unwrap_or_else(|_| EnvFilter::new("info"))
 }
 
 pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Result<PathBuf> {
@@ -64,39 +76,39 @@ pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Result<Path
         .compact()
         .with_timer(time_format);
 
-    let default_filter = || {
-        let base = settings.level.unwrap_or("info");
-        EnvFilter::new(format!(
-            "ling={level},linggen_agent={level},linggen-agent={level},linggen={level},\
-             axum=warn,tower_http=warn,hyper=warn,hyper_util=warn,reqwest=warn,\
-             mio=warn,reqwest_retry=warn",
-            level = base
-        ))
-    };
-
     // When level is explicitly set, override RUST_LOG; otherwise, use RUST_LOG first, then default
     let filter = if let Some(level) = settings.level {
-        EnvFilter::try_new(format!(
-            "ling={level},linggen_agent={level},linggen-agent={level},linggen={level},\
-             axum=warn,tower_http=warn,hyper=warn,hyper_util=warn,reqwest=warn,\
-             mio=warn,reqwest_retry=warn"
-        ))
-        .unwrap_or_else(|_| default_filter())
+        build_filter(level)
     } else {
-        // When no explicit level, try RUST_LOG env var first, then default
         match EnvFilter::try_from_default_env() {
             Ok(env_filter) => env_filter,
-            Err(_) => default_filter(),
+            Err(_) => build_filter("info"),
         }
     };
 
+    // Wrap the filter in a reload layer so we can change log level at runtime.
+    let (reload_filter, handle) = tracing_subscriber::reload::Layer::new(filter);
+    let _ = FILTER_HANDLE.set(handle);
+
     let _ = tracing_subscriber::registry()
-        .with(filter)
+        .with(reload_filter)
         .with(stdout_layer)
         .with(file_layer)
         .try_init();
 
     Ok(log_dir)
+}
+
+/// Update the log level at runtime. Called when the user changes the level via settings.
+pub fn set_log_level(level: &str) {
+    let Some(handle) = FILTER_HANDLE.get() else {
+        eprintln!("Cannot set log level: logging not initialized");
+        return;
+    };
+    let new_filter = build_filter(level);
+    if let Err(e) = handle.reload(new_filter) {
+        eprintln!("Failed to reload log filter: {e}");
+    }
 }
 
 fn resolve_log_dir(configured: Option<&str>) -> Result<PathBuf> {

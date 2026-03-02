@@ -423,15 +423,18 @@ struct SkillFileResponse {
     error: Option<String>,
 }
 
+const PROJECT_SKILL_PREFIXES: &[&str] = &[".linggen/skills/", ".claude/skills/", ".codex/skills/"];
+
 fn normalize_skill_md_path(path: &str) -> Result<String, String> {
     let raw = path.trim().replace('\\', "/");
     if raw.is_empty() {
         return Err("path is required".to_string());
     }
     if raw.starts_with('/') || raw.contains("..") {
-        return Err("path must be a relative markdown path under .linggen/skills/".to_string());
+        return Err("path must be a relative markdown path under a skills/ directory".to_string());
     }
-    let rel = if raw.starts_with(".linggen/skills/") {
+    // Accept paths already under any of the 3 project skill dirs
+    let rel = if PROJECT_SKILL_PREFIXES.iter().any(|p| raw.starts_with(p)) {
         raw
     } else {
         format!(".linggen/skills/{}", raw)
@@ -445,7 +448,11 @@ fn normalize_skill_md_path(path: &str) -> Result<String, String> {
     {
         return Err("path contains unsupported characters".to_string());
     }
-    let suffix = rel.strip_prefix(".linggen/skills/").unwrap_or("");
+    // Extract suffix after the matched prefix
+    let suffix = PROJECT_SKILL_PREFIXES
+        .iter()
+        .find_map(|p| rel.strip_prefix(p))
+        .unwrap_or("");
     if suffix.is_empty() || suffix.split('/').any(|seg| seg.is_empty()) {
         return Err("invalid skill markdown path".to_string());
     }
@@ -456,35 +463,39 @@ pub(crate) async fn list_skill_files_api(
     Query(query): Query<ProjectQuery>,
 ) -> impl IntoResponse {
     let root = canonical_project_root(&query.project_root);
-    let skills_dir = root.join(".linggen/skills");
-    if !skills_dir.exists() {
-        return Json(Vec::<SkillFileListItem>::new()).into_response();
-    }
-    let entries = match std::fs::read_dir(&skills_dir) {
-        Ok(entries) => entries,
-        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
-    };
     let mut items: Vec<SkillFileListItem> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "md") {
-            let rel = path
-                .strip_prefix(&root)
-                .unwrap_or(path.as_path())
-                .to_string_lossy()
-                .to_string();
-            let name = path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            items.push(SkillFileListItem {
-                name,
-                path: rel,
-                source: "project".to_string(),
-            });
+
+    for prefix in PROJECT_SKILL_PREFIXES {
+        let skills_dir = root.join(prefix);
+        if !skills_dir.exists() {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&skills_dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "md") {
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap_or(path.as_path())
+                    .to_string_lossy()
+                    .to_string();
+                let name = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                items.push(SkillFileListItem {
+                    name,
+                    path: rel,
+                    source: "project".to_string(),
+                });
+            }
         }
     }
+
     items.sort_by(|a, b| a.name.cmp(&b.name));
     Json(items).into_response()
 }

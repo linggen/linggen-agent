@@ -1,37 +1,18 @@
 import React, { useRef, useState } from 'react';
 import { MarkdownContent } from './MarkdownContent';
 
-/** Strip "Step N: " prefix from plan item title for dedup. */
-const stripStepPrefix = (s: string): string => {
-  const m = s.match(/^Step \d+: (.+)$/);
-  return m ? m[1] : s;
-};
-
-/** Deduplicate plan items: normalize by stripping "Step N: " prefixes, keep first. */
-const dedupPlanItems = (items: any[]): any[] => {
-  const seen = new Set<string>();
-  return items.filter((item) => {
-    const normalized = stripStepPrefix(item.title || '');
-    if (seen.has(normalized)) return false;
-    seen.add(normalized);
-    return true;
-  });
-};
-
 
 /** Renders a plan block with markdown rendering, inline editing, and approval buttons. */
 export const PlanBlock: React.FC<{
   plan: any;
   statusColor: Record<string, string>;
-  itemIcon: Record<string, string>;
-  itemColor: Record<string, string>;
   pendingPlanAgentId?: string | null;
   agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
   onApprovePlan?: (clearContext: boolean) => void;
   onRejectPlan?: () => void;
   onEditPlan?: (text: string) => void;
   inputRef?: React.RefObject<HTMLTextAreaElement | null>;
-}> = ({ plan, statusColor, itemIcon, itemColor, pendingPlanAgentId, agentContext, onApprovePlan, onRejectPlan, onEditPlan, inputRef }) => {
+}> = ({ plan, statusColor, pendingPlanAgentId, agentContext, onApprovePlan, onRejectPlan, onEditPlan, inputRef }) => {
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState('');
   const editRef = useRef<HTMLTextAreaElement | null>(null);
@@ -90,22 +71,9 @@ export const PlanBlock: React.FC<{
             <span className="text-[10px] text-slate-400 self-center">Cmd/Ctrl+S to save, Esc to cancel</span>
           </div>
         </div>
-      ) : plan.plan_text ? (
-        <div className="text-[11px] bg-slate-50 dark:bg-white/5 rounded-md p-3 border border-slate-200 dark:border-white/10 max-h-96 overflow-y-auto">
-          <MarkdownContent text={plan.plan_text} />
-        </div>
       ) : (
-        <div className="space-y-1">
-          {dedupPlanItems(plan.items || []).map((item: any, idx: number) => (
-            <div key={idx} className="flex items-start gap-1.5 text-[11px]">
-              <span className={`${itemColor[item.status] || 'text-slate-400'} font-mono`}>
-                {itemIcon[item.status] || '○'}
-              </span>
-              <span className={item.status === 'skipped' ? 'line-through opacity-50' : ''}>
-                {item.title}
-              </span>
-            </div>
-          ))}
+        <div className="text-[11px] bg-slate-50 dark:bg-white/5 rounded-md p-3 border border-slate-200 dark:border-white/10 max-h-96 overflow-y-auto">
+          <MarkdownContent text={plan.plan_text || ''} />
         </div>
       )}
       {plan.status === 'planned' && onApprovePlan && onRejectPlan && !editing && (() => {
@@ -127,7 +95,7 @@ export const PlanBlock: React.FC<{
             >
               Approve, keep context
             </button>
-            {onEditPlan && plan.plan_text && (
+            {onEditPlan && (
               <button
                 onClick={startEditing}
                 className="px-3 py-1 text-[11px] font-semibold rounded-md border border-blue-300 dark:border-blue-500/30 text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20"

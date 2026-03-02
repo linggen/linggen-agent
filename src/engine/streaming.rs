@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::path::Path;
 use tokio_stream::StreamExt as TokioStreamExt;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Free functions for parallel tool execution
@@ -177,7 +177,7 @@ impl AgentEngine {
         for model_id in &chain {
             // Skip models known to be unavailable (but always try at least the primary).
             if model_id != &primary && !health.is_available(model_id).await {
-                info!("Skipping model '{}' (health tracker: unavailable)", model_id);
+                debug!("Skipping model '{}': unavailable", model_id);
                 continue;
             }
 
@@ -190,20 +190,14 @@ impl AgentEngine {
                             .as_ref()
                             .map(|e| e.to_string())
                             .unwrap_or_else(|| "unavailable".to_string());
-                        info!(
-                            "Fallback to '{}' succeeded (primary '{}' failed: {})",
-                            model_id, primary, reason
-                        );
+                        info!("Model fallback: {} → {} ({})", primary, model_id, reason);
                         self.model_id = model_id.clone();
                         self.emit_model_fallback_event(&primary, model_id, &reason).await;
                     }
                     return Ok(result);
                 }
                 Err(e) if models::is_fallback_worthy_error(&e) => {
-                    warn!(
-                        "Model '{}' returned fallback-worthy error: {}",
-                        model_id, e
-                    );
+                    warn!("Model '{}' error (will fallback): {}", model_id, e);
                     health.mark_error(model_id, &e.to_string()).await;
                     last_err = Some(e);
                     continue;

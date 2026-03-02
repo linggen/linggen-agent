@@ -31,25 +31,13 @@ pub enum DisplayBlock {
     },
     PlanBlock {
         summary: String,
-        items: Vec<PlanDisplayItem>,
         status: String,
-    },
-    ChangeReport {
-        files: Vec<ChangedFile>,
-        truncated_count: usize,
     },
     TurnSummary {
         tool_count: usize,
         estimated_tokens: Option<usize>,
         duration_secs: Option<u64>,
     },
-}
-
-#[derive(Debug, Clone)]
-pub struct ChangedFile {
-    pub path: String,
-    pub summary: String,
-    pub diff: String,
 }
 
 #[derive(Debug, Clone)]
@@ -96,8 +84,3 @@ pub enum SubagentStatus {
     Failed,
 }
 
-#[derive(Debug, Clone)]
-pub struct PlanDisplayItem {
-    pub title: String,
-    pub status: String,
-}

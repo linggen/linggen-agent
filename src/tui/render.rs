@@ -28,13 +28,8 @@ pub fn render_block(block: &DisplayBlock, _width: u16) -> Vec<Line<'static>> {
         DisplayBlock::SubagentGroup { entries, collapsed } => render_subagent_group(entries, *collapsed),
         DisplayBlock::PlanBlock {
             summary,
-            items,
             status,
-        } => render_plan_block(summary, items, status),
-        DisplayBlock::ChangeReport {
-            files,
-            truncated_count,
-        } => render_change_report(files, *truncated_count),
+        } => render_plan_block(summary, status),
         DisplayBlock::TurnSummary {
             tool_count,
             estimated_tokens,
@@ -548,16 +543,13 @@ pub(super) fn render_subagent_group_live(entries: &[&SubagentEntry]) -> Vec<Line
     lines
 }
 
-pub(super) fn render_plan_block(summary: &str, items: &[PlanDisplayItem], status: &str) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-
-    // Header with status indicator (Claude Code style)
+pub(super) fn render_plan_block(summary: &str, status: &str) -> Vec<Line<'static>> {
     let (header_icon, header_color) = match status {
         "planned" => ("◇", Color::Cyan),
         "completed" => ("✓", Color::Green),
         _ => ("✻", Color::Yellow), // executing/approved
     };
-    lines.push(Line::from(vec![
+    vec![Line::from(vec![
         Span::styled(
             format!("{header_icon} "),
             Style::default().fg(header_color),
@@ -568,42 +560,7 @@ pub(super) fn render_plan_block(summary: &str, items: &[PlanDisplayItem], status
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-    ]));
-
-    // Items with tree connectors (Claude Code style)
-    let total = items.len();
-    for (i, item) in items.iter().enumerate() {
-        let is_last = i == total - 1;
-        let branch = if is_last { "└ " } else { "├ " };
-
-        let (icon, icon_color) = match item.status.as_str() {
-            "done" => ("✓", Color::Green),
-            "in_progress" => ("■", Color::Yellow),
-            "skipped" => ("-", Color::DarkGray),
-            _ => ("□", Color::White),
-        };
-
-        let text_style = match item.status.as_str() {
-            "done" => Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::CROSSED_OUT),
-            "in_progress" => Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            _ => Style::default().fg(Color::White),
-        };
-
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {branch}"),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
-            Span::styled(item.title.clone(), text_style),
-        ]));
-    }
-
-    lines
+    ])]
 }
 
 /// Generate a summary string for a tool group, e.g. "Read 2 files, ran 1 command".
@@ -656,21 +613,8 @@ fn tool_group_summary(steps: &[ToolStep]) -> String {
 }
 
 /// Render a compact sticky plan progress view for the bottom of scrollable content.
-/// Uses Claude Code-style tree connectors and strikethrough for completed items.
-pub fn render_plan_sticky(summary: &str, items: &[PlanDisplayItem]) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-
-    let done = items.iter().filter(|i| i.status == "done").count();
-    let in_progress = items.iter().filter(|i| i.status == "in_progress").count();
-    let total = items.len();
-
-    // Header with spinner and progress stats
-    let stats = if in_progress > 0 {
-        format!(" ({}/{} done, {} running)", done, total, in_progress)
-    } else {
-        format!(" ({}/{} done)", done, total)
-    };
-    lines.push(Line::from(vec![
+pub fn render_plan_sticky(summary: &str) -> Vec<Line<'static>> {
+    vec![Line::from(vec![
         Span::styled("✻ ", Style::default().fg(Color::Yellow)),
         Span::styled(
             summary.to_string(),
@@ -678,119 +622,7 @@ pub fn render_plan_sticky(summary: &str, items: &[PlanDisplayItem]) -> Vec<Line<
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(stats, Style::default().fg(Color::DarkGray)),
-    ]));
-
-    // Items with tree connectors
-    for (i, item) in items.iter().enumerate() {
-        let is_last = i == total - 1;
-        let branch = if is_last { "└ " } else { "├ " };
-
-        let (icon, icon_color) = match item.status.as_str() {
-            "done" => ("✓", Color::Green),
-            "in_progress" => ("■", Color::Yellow),
-            "skipped" => ("-", Color::DarkGray),
-            _ => ("□", Color::White),
-        };
-
-        let text_style = match item.status.as_str() {
-            "done" => Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::CROSSED_OUT),
-            "in_progress" => Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            _ => Style::default().fg(Color::White),
-        };
-
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {branch}"),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
-            Span::styled(item.title.clone(), text_style),
-        ]));
-    }
-
-    lines
-}
-
-fn render_change_report(files: &[ChangedFile], truncated_count: usize) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-
-    // Header: "Changed files (N)" in blue, matching the web UI style
-    let count_label = if truncated_count > 0 {
-        format!("Changed files ({} +{} more)", files.len(), truncated_count)
-    } else {
-        format!("Changed files ({})", files.len())
-    };
-    lines.push(Line::from(Span::styled(
-        count_label,
-        Style::default()
-            .fg(Color::Blue)
-            .add_modifier(Modifier::BOLD),
-    )));
-
-    for file in files {
-        let summary_color = if file.summary.contains("Added") {
-            Color::Green
-        } else if file.summary.contains("Deleted") {
-            Color::Red
-        } else {
-            Color::Yellow
-        };
-
-        // Count +/- lines from diff text
-        let (added, deleted) = diff_line_counts(&file.diff);
-        let stat_str = match (added > 0, deleted > 0) {
-            (true, true) => format!("  +{added} -{deleted}"),
-            (true, false) => format!("  +{added}"),
-            (false, true) => format!("  -{deleted}"),
-            _ => String::new(),
-        };
-
-        let mut spans = vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                format!("{:<20}", truncate_str(&file.summary, 20)),
-                Style::default().fg(summary_color),
-            ),
-            Span::styled(
-                file.path.clone(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ];
-        if !stat_str.is_empty() {
-            spans.push(Span::styled(stat_str, Style::default().fg(Color::DarkGray)));
-        }
-        lines.push(Line::from(spans));
-    }
-
-    lines.push(Line::from(Span::styled(
-        "  Review these diffs in the UI and rollback any file you don't want.",
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC),
-    )));
-
-    lines
-}
-
-/// Count added (+) and deleted (-) lines in a unified diff string.
-fn diff_line_counts(diff: &str) -> (usize, usize) {
-    let mut added = 0usize;
-    let mut deleted = 0usize;
-    for line in diff.lines() {
-        if line.starts_with('+') && !line.starts_with("+++") {
-            added += 1;
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            deleted += 1;
-        }
-    }
-    (added, deleted)
+    ])]
 }
 
 fn truncate_str(s: &str, max: usize) -> String {

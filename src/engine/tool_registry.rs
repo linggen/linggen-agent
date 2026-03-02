@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
+use tracing::debug;
 
 pub struct ToolRegistry {
     pub builtins: Tools,
@@ -29,11 +29,7 @@ impl ToolRegistry {
 
         // Skill tools are dispatched via SkillToolDef.
         if let Some(skill_tool) = self.skill_tools.get(&call.tool) {
-            info!(
-                "Executing skill tool: {} with args: {}",
-                call.tool,
-                tools::summarize_tool_args(&call.tool, &call.args)
-            );
+            debug!("Skill tool: {} args={}", call.tool, tools::summarize_tool_args(&call.tool, &call.args));
             return skill_tool.execute(&call.args, self.builtins.workspace_root());
         }
 

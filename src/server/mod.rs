@@ -46,7 +46,7 @@ use projects_api::{
     list_sessions, list_skill_files_api, list_skills, remove_project, remove_session_api,
     rename_session_api, upsert_agent_file_api, upsert_skill_file_api,
 };
-use marketplace_api::{builtin_skills_install, builtin_skills_install_all, builtin_skills_list, marketplace_install, marketplace_list, marketplace_search, marketplace_uninstall};
+use marketplace_api::{builtin_skills_install, builtin_skills_install_all, builtin_skills_list, marketplace_install, marketplace_list, marketplace_move_to_global, marketplace_search, marketplace_uninstall};
 use storage_api::{storage_roots, storage_tree, storage_read_file, storage_write_file, storage_delete_file};
 use workspace_api::{get_agent_tree, get_workspace_state, list_files, read_file_api};
 
@@ -181,11 +181,6 @@ pub enum ServerEvent {
         token: String,
         done: bool,
         thinking: bool,
-    },
-    ChangeReport {
-        agent_id: String,
-        files: Vec<serde_json::Value>,
-        truncated_count: usize,
     },
     PlanUpdate {
         agent_id: String,
@@ -344,7 +339,6 @@ const UI_PHASE_OUTCOME: &str = "outcome";
 const UI_PHASE_CONTEXT_USAGE: &str = "context_usage";
 const UI_PHASE_SUBAGENT_SPAWNED: &str = "subagent_spawned";
 const UI_PHASE_SUBAGENT_RESULT: &str = "subagent_result";
-const UI_PHASE_CHANGE_REPORT: &str = "change_report";
 const UI_PHASE_PLAN_UPDATE: &str = "plan_update";
 const UI_PHASE_DOING: &str = "doing";
 const UI_PHASE_DONE: &str = "done";
@@ -572,26 +566,6 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
             session_id: None,
             project_root: None,
             data: if thinking { Some(json!({ "thinking": true })) } else { None },
-        }),
-        ServerEvent::ChangeReport {
-            agent_id,
-            files,
-            truncated_count,
-        } => Some(UiSseMessage {
-            id: format!("run-change-report-{agent_id}-{seq}"),
-            seq,
-            rev: seq,
-            ts_ms,
-            kind: UI_KIND_RUN.to_string(),
-            phase: Some(UI_PHASE_CHANGE_REPORT.to_string()),
-            text: Some("Change report".to_string()),
-            agent_id: Some(agent_id),
-            session_id: None,
-            project_root: None,
-            data: Some(json!({
-                "files": files,
-                "truncated_count": truncated_count,
-            })),
         }),
         ServerEvent::PlanUpdate { agent_id, plan } => Some(UiSseMessage {
             id: format!("run-plan-{agent_id}-{seq}"),
@@ -980,6 +954,7 @@ pub async fn prepare_server(
         .route("/api/marketplace/list", get(marketplace_list))
         .route("/api/marketplace/install", post(marketplace_install))
         .route("/api/marketplace/uninstall", delete(marketplace_uninstall))
+        .route("/api/marketplace/move-to-global", post(marketplace_move_to_global))
         .route("/api/builtin-skills", get(builtin_skills_list))
         .route("/api/builtin-skills/install", post(builtin_skills_install))
         .route("/api/builtin-skills/install-all", post(builtin_skills_install_all))
@@ -1205,18 +1180,12 @@ mod tests {
                 done: false,
                 thinking: false,
             },
-            ServerEvent::ChangeReport {
-                agent_id: "ling".into(),
-                files: vec![],
-                truncated_count: 0,
-            },
             ServerEvent::PlanUpdate {
                 agent_id: "ling".into(),
                 plan: crate::engine::Plan {
                     summary: "Test plan".into(),
-                    items: vec![],
                     status: crate::engine::PlanStatus::Planned,
-                    plan_text: None,
+                    plan_text: String::new(),
                 },
             },
             ServerEvent::IdlePromptTriggered {

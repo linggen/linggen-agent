@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Book, Check, ChevronRight, Download, ExternalLink, FilePlus2, Package, Pencil, RefreshCw, Save, Search, Sparkles, Trash2, Wrench, X, Zap } from 'lucide-react';
+import { ArrowUpRight, Book, Check, ChevronRight, Download, ExternalLink, FilePlus2, Package, Pencil, RefreshCw, Save, Search, Sparkles, Trash2, Wrench, X, Zap } from 'lucide-react';
 import type { BuiltInSkillInfo, MarketplaceSkill, SkillInfoFull, SkillFileInfo } from '../types';
 import { CM6Editor } from './CM6Editor';
 
@@ -17,17 +17,21 @@ const sourceAccentCls: Record<string, string> = {
   Compat: 'border-l-slate-300 dark:border-l-slate-500',
 };
 
-const sourceLabels: Record<string, string> = {
-  Global: 'Linggen',
-};
-
-function sourceKey(skill: SkillInfoFull): { key: string; label: string } {
+/** Get a short subfolder badge label for a skill based on its source. */
+function skillSubfolderLabel(skill: SkillInfoFull): string {
   const t = skill.source?.type || 'Global';
   if (t === 'Compat') {
-    const lbl = (skill.source as { type: string; label?: string })?.label || 'Compat';
-    return { key: `Compat:${lbl}`, label: lbl };
+    return (skill.source as { type: string; label?: string })?.label || 'Compat';
   }
-  return { key: t, label: sourceLabels[t] || t };
+  if (t === 'Global') return 'Linggen';
+  // Project skills — we don't know the exact subfolder from the source alone,
+  // so just show "Project"
+  return 'Project';
+}
+
+function isGlobalOrCompat(skill: SkillInfoFull): boolean {
+  const t = skill.source?.type || 'Global';
+  return t === 'Global' || t === 'Compat';
 }
 
 const defaultSkillTemplate = (name: string) => `---
@@ -38,12 +42,6 @@ tools: []
 
 Skill instructions go here.
 `;
-
-interface SkillGroup {
-  label: string;
-  source: string;
-  skills: SkillInfoFull[];
-}
 
 export const SkillsTab: React.FC<{
   projectRoot: string;
@@ -230,24 +228,37 @@ export const SkillsTab: React.FC<{
     });
   };
 
+  const [mpMoving, setMpMoving] = useState<Set<string>>(new Set());
+
+  const handleMoveToGlobal = async (skillName: string) => {
+    setMpMoving((prev) => new Set(prev).add(skillName));
+    setError(null);
+    try {
+      const resp = await fetch('/api/marketplace/move-to-global', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: skillName, project_root: projectRoot }),
+      });
+      if (!resp.ok) {
+        setError(await resp.text());
+      } else {
+        await Promise.all([fetchSkills(), fetchSkillFiles()]);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+    setMpMoving((prev) => {
+      const next = new Set(prev);
+      next.delete(skillName);
+      return next;
+    });
+  };
+
   const builtInNames = new Set(builtInSkills.map((bi) => bi.name));
 
-  // Derive project name from projectRoot path (last segment)
-  const projectName = projectRoot ? projectRoot.split('/').filter(Boolean).pop() || 'Project' : 'Project';
-
-  const groups: SkillGroup[] = (() => {
-    const bySource: Record<string, { label: string; skills: SkillInfoFull[] }> = {};
-    bySource['Global'] = { label: 'Linggen', skills: [] };
-    bySource['Project'] = { label: projectName, skills: [] };
-    for (const skill of allSkills) {
-      const { key, label } = sourceKey(skill);
-      if (!bySource[key]) bySource[key] = { label, skills: [] };
-      bySource[key].skills.push(skill);
-    }
-    return Object.entries(bySource)
-      .map(([key, { label, skills }]) => ({ label, source: key, skills }))
-      .filter((g) => g.skills.length > 0);
-  })();
+  // Split into Global (includes Compat) and Project sections
+  const globalSkills = allSkills.filter(isGlobalOrCompat);
+  const projectSkills = allSkills.filter((s) => !isGlobalOrCompat(s));
 
   // Library: built-in skills filtered by search query, shown on top
   const filteredBuiltIn = mpQuery.trim()
@@ -369,7 +380,6 @@ export const SkillsTab: React.FC<{
     }
   };
 
-  const isProjectSkill = (skill: SkillInfoFull) => skill.source?.type === 'Project';
   const editDirty = editContent !== savedEditContent;
 
   const refreshAll = async () => {
@@ -466,115 +476,205 @@ export const SkillsTab: React.FC<{
         {/* ═══════ LEFT PANEL: Installed skills ═══════ */}
         <div className="flex-[3] min-w-0 overflow-y-auto space-y-3 pr-1">
 
-          {/* Source groups */}
-          {groups.map((group) => {
-            const collapsed = collapsedGroups.has(group.source);
-            const accentCls = sourceAccentCls[group.source] || sourceAccentCls.Compat || '';
-            return (
-              <div key={group.source} className={`bg-white dark:bg-[#141414] rounded-xl border border-slate-200/80 dark:border-white/5 shadow-sm overflow-hidden border-l-[3px] ${accentCls}`}>
-                <button
-                  onClick={() => toggleGroup(group.source)}
-                  className="w-full flex items-center gap-2.5 px-4 py-2.5 text-left hover:bg-slate-50/50 dark:hover:bg-white/[0.02] transition-colors"
-                >
-                  <div className="text-slate-400 transition-transform duration-200" style={{ transform: collapsed ? 'rotate(0deg)' : 'rotate(90deg)' }}>
-                    <ChevronRight size={12} />
-                  </div>
-                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md border ${sourceBadgeCls[group.source] || sourceBadgeCls.Compat || ''}`}>
-                    {group.label}
-                  </span>
-                  <span className="text-[10px] text-slate-400 tabular-nums">{group.skills.length} skill{group.skills.length !== 1 ? 's' : ''}</span>
-                </button>
+          {/* ── Global Skills Section ── */}
+          {globalSkills.length > 0 && (
+            <div className={`bg-white dark:bg-[#141414] rounded-xl border border-slate-200/80 dark:border-white/5 shadow-sm overflow-hidden border-l-[3px] ${sourceAccentCls.Global}`}>
+              <button
+                onClick={() => toggleGroup('_global')}
+                className="w-full flex items-center gap-2.5 px-4 py-2.5 text-left hover:bg-slate-50/50 dark:hover:bg-white/[0.02] transition-colors"
+              >
+                <div className="text-slate-400 transition-transform duration-200" style={{ transform: collapsedGroups.has('_global') ? 'rotate(0deg)' : 'rotate(90deg)' }}>
+                  <ChevronRight size={12} />
+                </div>
+                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md border ${sourceBadgeCls.Global}`}>
+                  Global Skills
+                </span>
+                <span className="text-[10px] text-slate-400 tabular-nums">{globalSkills.length} skill{globalSkills.length !== 1 ? 's' : ''}</span>
+              </button>
 
-                {!collapsed && (
-                  <div className="border-t border-slate-100/80 dark:border-white/[0.03]">
-                    {group.skills.map((skill, idx) => {
-                      const expanded = expandedSkills.has(skill.name);
-                      const isProject = isProjectSkill(skill);
-                      const file = skillFiles.find((f) => f.name === skill.name);
-                      return (
-                        <div key={skill.name} className={idx < group.skills.length - 1 ? 'border-b border-slate-100/60 dark:border-white/[0.03]' : ''}>
-                          <div
-                            className="flex items-center gap-2.5 px-4 py-2.5 cursor-pointer hover:bg-slate-50/80 dark:hover:bg-white/[0.02] transition-colors group"
-                            onClick={() => toggleExpanded(skill.name)}
-                          >
-                            <div className="text-slate-300 dark:text-slate-600 transition-transform duration-200" style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)' }}>
-                              <ChevronRight size={11} />
-                            </div>
-                            <span className="text-[11px] font-semibold text-slate-700 dark:text-slate-200 flex-1">{skill.name}</span>
-                            {skill.tool_defs && skill.tool_defs.length > 0 && (
-                              <span className="inline-flex items-center gap-1 text-[9px] text-slate-400 bg-slate-100/80 dark:bg-white/5 px-1.5 py-0.5 rounded-md">
-                                <Wrench size={8} /> {skill.tool_defs.length}
-                              </span>
-                            )}
-                            <div className="flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
-                              {isProject && file && (
-                                <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                                  <button onClick={() => startEditing(skill)} className="p-1 rounded text-slate-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-blue-500/10 transition-all" title="Edit"><Pencil size={10} /></button>
-                                  <button onClick={() => file && deleteSkillFile(file.path)} className="p-1 rounded text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 transition-all" title="Delete"><Trash2 size={10} /></button>
-                                </div>
-                              )}
-                              {/* Remove button: show for global/compat skills, and for project skills without a local file (marketplace-installed) */}
-                              {(!isProject || (isProject && !file)) && (
-                                <button
-                                  onClick={() => {
-                                    const scope = skill.source?.type === 'Project' ? 'project' : 'global';
-                                    uninstallMarketplaceSkill(skill.name, scope);
-                                  }}
-                                  disabled={mpUninstalling.has(skill.name)}
-                                  className="px-1.5 py-0.5 rounded text-[9px] font-medium text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 border border-transparent hover:border-red-200 dark:hover:border-red-500/20 transition-all disabled:opacity-50"
-                                  title="Remove"
-                                >
-                                  {mpUninstalling.has(skill.name) ? <RefreshCw size={10} className="animate-spin" /> : <span className="flex items-center gap-1"><Trash2 size={9} /> Remove</span>}
-                                </button>
-                              )}
-                            </div>
+              {!collapsedGroups.has('_global') && (
+                <div className="border-t border-slate-100/80 dark:border-white/[0.03]">
+                  {globalSkills.map((skill, idx) => {
+                    const expanded = expandedSkills.has(skill.name);
+                    const subLabel = skillSubfolderLabel(skill);
+                    return (
+                      <div key={skill.name} className={idx < globalSkills.length - 1 ? 'border-b border-slate-100/60 dark:border-white/[0.03]' : ''}>
+                        <div
+                          className="flex items-center gap-2.5 px-4 py-2.5 cursor-pointer hover:bg-slate-50/80 dark:hover:bg-white/[0.02] transition-colors group"
+                          onClick={() => toggleExpanded(skill.name)}
+                        >
+                          <div className="text-slate-300 dark:text-slate-600 transition-transform duration-200" style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)' }}>
+                            <ChevronRight size={11} />
                           </div>
-
-                          {expanded && (
-                            <div className="px-4 pb-3 pl-9 space-y-2">
-                              <p className="text-[10px] text-slate-500 dark:text-slate-400 leading-relaxed">{skill.description}</p>
-                              {skill.tool_defs && skill.tool_defs.length > 0 && (
-                                <div className="overflow-x-auto rounded-lg border border-slate-100 dark:border-white/5">
-                                  <table className="w-full text-[10px]">
-                                    <thead>
-                                      <tr className="text-left text-slate-400 bg-slate-50/80 dark:bg-white/[0.02]">
-                                        <th className="py-1.5 px-2.5 font-bold">Tool</th>
-                                        <th className="py-1.5 px-2.5 font-bold">Description</th>
-                                        <th className="py-1.5 px-2.5 font-bold">Cmd</th>
-                                      </tr>
-                                    </thead>
-                                    <tbody>
-                                      {skill.tool_defs.map((tool) => (
-                                        <tr key={tool.name} className="border-t border-slate-100/60 dark:border-white/[0.03]">
-                                          <td className="py-1 px-2.5 font-mono font-semibold text-slate-600 dark:text-slate-300">{tool.name}</td>
-                                          <td className="py-1 px-2.5 text-slate-500 max-w-40 truncate">{tool.description}</td>
-                                          <td className="py-1 px-2.5 font-mono text-slate-400 max-w-40 truncate">{tool.cmd}</td>
-                                        </tr>
-                                      ))}
-                                    </tbody>
-                                  </table>
-                                </div>
-                              )}
-                              {skill.content && (
-                                <details className="text-[10px] group/details">
-                                  <summary className="text-slate-400 cursor-pointer hover:text-slate-600 dark:hover:text-slate-300 font-medium transition-colors">Content preview</summary>
-                                  <pre className="mt-1.5 p-2.5 bg-slate-50 dark:bg-black/20 border border-slate-100 dark:border-white/5 rounded-lg text-[9px] overflow-x-auto max-h-32 whitespace-pre-wrap text-slate-600 dark:text-slate-400">
-                                    {skill.content.slice(0, 400)}{skill.content.length > 400 ? '...' : ''}
-                                  </pre>
-                                </details>
-                              )}
-                            </div>
+                          <span className="text-[11px] font-semibold text-slate-700 dark:text-slate-200 flex-1">{skill.name}</span>
+                          <span className={`text-[8px] font-semibold px-1.5 py-0.5 rounded-md border ${sourceBadgeCls[skill.source?.type] || sourceBadgeCls.Compat}`}>
+                            {subLabel}
+                          </span>
+                          {skill.tool_defs && skill.tool_defs.length > 0 && (
+                            <span className="inline-flex items-center gap-1 text-[9px] text-slate-400 bg-slate-100/80 dark:bg-white/5 px-1.5 py-0.5 rounded-md">
+                              <Wrench size={8} /> {skill.tool_defs.length}
+                            </span>
                           )}
+                          <div className="flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
+                            <button
+                              onClick={() => uninstallMarketplaceSkill(skill.name, 'global')}
+                              disabled={mpUninstalling.has(skill.name)}
+                              className="px-1.5 py-0.5 rounded text-[9px] font-medium text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 border border-transparent hover:border-red-200 dark:hover:border-red-500/20 transition-all disabled:opacity-50"
+                              title="Remove"
+                            >
+                              {mpUninstalling.has(skill.name) ? <RefreshCw size={10} className="animate-spin" /> : <span className="flex items-center gap-1"><Trash2 size={9} /> Remove</span>}
+                            </button>
+                          </div>
                         </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            );
-          })}
 
-          {groups.length === 0 && (
+                        {expanded && (
+                          <div className="px-4 pb-3 pl-9 space-y-2">
+                            <p className="text-[10px] text-slate-500 dark:text-slate-400 leading-relaxed">{skill.description}</p>
+                            {skill.tool_defs && skill.tool_defs.length > 0 && (
+                              <div className="overflow-x-auto rounded-lg border border-slate-100 dark:border-white/5">
+                                <table className="w-full text-[10px]">
+                                  <thead>
+                                    <tr className="text-left text-slate-400 bg-slate-50/80 dark:bg-white/[0.02]">
+                                      <th className="py-1.5 px-2.5 font-bold">Tool</th>
+                                      <th className="py-1.5 px-2.5 font-bold">Description</th>
+                                      <th className="py-1.5 px-2.5 font-bold">Cmd</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {skill.tool_defs.map((tool) => (
+                                      <tr key={tool.name} className="border-t border-slate-100/60 dark:border-white/[0.03]">
+                                        <td className="py-1 px-2.5 font-mono font-semibold text-slate-600 dark:text-slate-300">{tool.name}</td>
+                                        <td className="py-1 px-2.5 text-slate-500 max-w-40 truncate">{tool.description}</td>
+                                        <td className="py-1 px-2.5 font-mono text-slate-400 max-w-40 truncate">{tool.cmd}</td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                            {skill.content && (
+                              <details className="text-[10px] group/details">
+                                <summary className="text-slate-400 cursor-pointer hover:text-slate-600 dark:hover:text-slate-300 font-medium transition-colors">Content preview</summary>
+                                <pre className="mt-1.5 p-2.5 bg-slate-50 dark:bg-black/20 border border-slate-100 dark:border-white/5 rounded-lg text-[9px] overflow-x-auto max-h-32 whitespace-pre-wrap text-slate-600 dark:text-slate-400">
+                                  {skill.content.slice(0, 400)}{skill.content.length > 400 ? '...' : ''}
+                                </pre>
+                              </details>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Project Skills Section ── */}
+          {projectSkills.length > 0 && (
+            <div className={`bg-white dark:bg-[#141414] rounded-xl border border-slate-200/80 dark:border-white/5 shadow-sm overflow-hidden border-l-[3px] ${sourceAccentCls.Project}`}>
+              <button
+                onClick={() => toggleGroup('_project')}
+                className="w-full flex items-center gap-2.5 px-4 py-2.5 text-left hover:bg-slate-50/50 dark:hover:bg-white/[0.02] transition-colors"
+              >
+                <div className="text-slate-400 transition-transform duration-200" style={{ transform: collapsedGroups.has('_project') ? 'rotate(0deg)' : 'rotate(90deg)' }}>
+                  <ChevronRight size={12} />
+                </div>
+                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md border ${sourceBadgeCls.Project}`}>
+                  Project Skills
+                </span>
+                <span className="text-[10px] text-slate-400 tabular-nums">{projectSkills.length} skill{projectSkills.length !== 1 ? 's' : ''}</span>
+              </button>
+
+              {!collapsedGroups.has('_project') && (
+                <div className="border-t border-slate-100/80 dark:border-white/[0.03]">
+                  {projectSkills.map((skill, idx) => {
+                    const expanded = expandedSkills.has(skill.name);
+                    const file = skillFiles.find((f) => f.name === skill.name);
+                    return (
+                      <div key={skill.name} className={idx < projectSkills.length - 1 ? 'border-b border-slate-100/60 dark:border-white/[0.03]' : ''}>
+                        <div
+                          className="flex items-center gap-2.5 px-4 py-2.5 cursor-pointer hover:bg-slate-50/80 dark:hover:bg-white/[0.02] transition-colors group"
+                          onClick={() => toggleExpanded(skill.name)}
+                        >
+                          <div className="text-slate-300 dark:text-slate-600 transition-transform duration-200" style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)' }}>
+                            <ChevronRight size={11} />
+                          </div>
+                          <span className="text-[11px] font-semibold text-slate-700 dark:text-slate-200 flex-1">{skill.name}</span>
+                          {skill.tool_defs && skill.tool_defs.length > 0 && (
+                            <span className="inline-flex items-center gap-1 text-[9px] text-slate-400 bg-slate-100/80 dark:bg-white/5 px-1.5 py-0.5 rounded-md">
+                              <Wrench size={8} /> {skill.tool_defs.length}
+                            </span>
+                          )}
+                          <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+                            {file && (
+                              <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <button onClick={() => startEditing(skill)} className="p-1 rounded text-slate-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-blue-500/10 transition-all" title="Edit"><Pencil size={10} /></button>
+                              </div>
+                            )}
+                            <button
+                              onClick={() => handleMoveToGlobal(skill.name)}
+                              disabled={mpMoving.has(skill.name)}
+                              className="px-1.5 py-0.5 rounded text-[9px] font-medium text-slate-400 hover:text-indigo-500 hover:bg-indigo-50 dark:hover:bg-indigo-500/10 border border-transparent hover:border-indigo-200 dark:hover:border-indigo-500/20 transition-all disabled:opacity-50"
+                              title="Move to Global"
+                            >
+                              {mpMoving.has(skill.name) ? <RefreshCw size={10} className="animate-spin" /> : <span className="flex items-center gap-1"><ArrowUpRight size={9} /> Global</span>}
+                            </button>
+                            <button
+                              onClick={() => uninstallMarketplaceSkill(skill.name, 'project')}
+                              disabled={mpUninstalling.has(skill.name)}
+                              className="px-1.5 py-0.5 rounded text-[9px] font-medium text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 border border-transparent hover:border-red-200 dark:hover:border-red-500/20 transition-all disabled:opacity-50"
+                              title="Remove"
+                            >
+                              {mpUninstalling.has(skill.name) ? <RefreshCw size={10} className="animate-spin" /> : <span className="flex items-center gap-1"><Trash2 size={9} /> Remove</span>}
+                            </button>
+                          </div>
+                        </div>
+
+                        {expanded && (
+                          <div className="px-4 pb-3 pl-9 space-y-2">
+                            <p className="text-[10px] text-slate-500 dark:text-slate-400 leading-relaxed">{skill.description}</p>
+                            {skill.tool_defs && skill.tool_defs.length > 0 && (
+                              <div className="overflow-x-auto rounded-lg border border-slate-100 dark:border-white/5">
+                                <table className="w-full text-[10px]">
+                                  <thead>
+                                    <tr className="text-left text-slate-400 bg-slate-50/80 dark:bg-white/[0.02]">
+                                      <th className="py-1.5 px-2.5 font-bold">Tool</th>
+                                      <th className="py-1.5 px-2.5 font-bold">Description</th>
+                                      <th className="py-1.5 px-2.5 font-bold">Cmd</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {skill.tool_defs.map((tool) => (
+                                      <tr key={tool.name} className="border-t border-slate-100/60 dark:border-white/[0.03]">
+                                        <td className="py-1 px-2.5 font-mono font-semibold text-slate-600 dark:text-slate-300">{tool.name}</td>
+                                        <td className="py-1 px-2.5 text-slate-500 max-w-40 truncate">{tool.description}</td>
+                                        <td className="py-1 px-2.5 font-mono text-slate-400 max-w-40 truncate">{tool.cmd}</td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                            {skill.content && (
+                              <details className="text-[10px] group/details">
+                                <summary className="text-slate-400 cursor-pointer hover:text-slate-600 dark:hover:text-slate-300 font-medium transition-colors">Content preview</summary>
+                                <pre className="mt-1.5 p-2.5 bg-slate-50 dark:bg-black/20 border border-slate-100 dark:border-white/5 rounded-lg text-[9px] overflow-x-auto max-h-32 whitespace-pre-wrap text-slate-600 dark:text-slate-400">
+                                  {skill.content.slice(0, 400)}{skill.content.length > 400 ? '...' : ''}
+                                </pre>
+                              </details>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {globalSkills.length === 0 && projectSkills.length === 0 && (
             <div className="bg-white dark:bg-[#141414] rounded-xl border border-dashed border-slate-200 dark:border-white/10 p-8 text-center">
               <div className="w-10 h-10 rounded-xl bg-slate-100 dark:bg-white/5 flex items-center justify-center mx-auto mb-3">
                 <Package size={18} className="text-slate-300 dark:text-slate-600" />

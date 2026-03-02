@@ -25,58 +25,6 @@ impl OpenAiClient {
         }
     }
 
-    /// Non-streaming JSON-mode chat completion.
-    #[allow(dead_code)]
-    pub async fn chat_json(
-        &self,
-        model: &str,
-        messages: &[crate::ollama::ChatMessage],
-    ) -> Result<String> {
-        let total_len: usize = messages.iter().map(|m| m.content.len()).sum();
-        if let Some(last) = messages.last() {
-            tracing::info!(
-                "OpenAI Request (JSON): model={}, messages={}, total_chars={}\nLast Message ({}): {:.200}...",
-                model, messages.len(), total_len, last.role, last.content
-            );
-        } else {
-            tracing::info!(
-                "OpenAI Request (JSON): model={}, messages={}, total_chars={}",
-                model, messages.len(), total_len
-            );
-        }
-
-        let url = format!("{}/chat/completions", self.base_url);
-        let oai_messages: Vec<OaiMessage> = messages.iter().map(OaiMessage::from_chat).collect();
-        let req = OaiRequest {
-            model: model.to_string(),
-            messages: oai_messages,
-            stream: false,
-            response_format: Some(OaiResponseFormat {
-                r#type: "json_object".to_string(),
-            }),
-        };
-
-        let mut rb = self.http.post(url).json(&req);
-        if let Some(key) = &self.api_key {
-            rb = rb.header("Authorization", format!("Bearer {}", key));
-        }
-        let resp = rb.send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("openai error ({}): {}", status, text);
-        }
-
-        let payload: OaiChatResponse = resp.json().await?;
-        let content = payload
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .unwrap_or_default();
-        Ok(content)
-    }
-
     /// Streaming text chat completion (SSE format).
     pub async fn chat_text_stream(
         &self,
@@ -84,16 +32,9 @@ impl OpenAiClient {
         messages: &[crate::ollama::ChatMessage],
     ) -> Result<impl Stream<Item = Result<StreamChunk>> + Send> {
         let total_len: usize = messages.iter().map(|m| m.content.len()).sum();
+        tracing::info!("OpenAI stream: model={} msgs={} chars={}", model, messages.len(), total_len);
         if let Some(last) = messages.last() {
-            tracing::info!(
-                "OpenAI Request (Stream): model={}, messages={}, total_chars={}\nLast Message ({}): {:.200}...",
-                model, messages.len(), total_len, last.role, last.content
-            );
-        } else {
-            tracing::info!(
-                "OpenAI Request (Stream): model={}, messages={}, total_chars={}",
-                model, messages.len(), total_len
-            );
+            tracing::debug!("Last msg ({}): {:.200}", last.role, last.content);
         }
 
         let url = format!("{}/chat/completions", self.base_url);
@@ -242,24 +183,6 @@ struct OaiRequest {
 #[derive(Debug, Serialize)]
 struct OaiResponseFormat {
     r#type: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct OaiChatResponse {
-    choices: Vec<OaiChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct OaiChoice {
-    message: OaiChoiceMessage,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct OaiChoiceMessage {
-    content: String,
 }
 
 #[derive(Debug, Deserialize)]

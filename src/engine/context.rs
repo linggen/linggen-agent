@@ -1,11 +1,22 @@
 use super::types::*;
 use crate::ollama::ChatMessage;
 
+/// Maximum number of messages to retain in chat_history across turns.
+const CHAT_HISTORY_MAX_MESSAGES: usize = 120;
+
 // ---------------------------------------------------------------------------
 // Adaptive context window thresholds
 // ---------------------------------------------------------------------------
 
 impl AgentEngine {
+    /// Trim chat_history to the most recent `CHAT_HISTORY_MAX_MESSAGES` entries.
+    pub(crate) fn truncate_chat_history(&mut self) {
+        if self.chat_history.len() > CHAT_HISTORY_MAX_MESSAGES {
+            let excess = self.chat_history.len() - CHAT_HISTORY_MAX_MESSAGES;
+            self.chat_history.drain(..excess);
+        }
+    }
+
     pub(crate) fn context_soft_token_limit(&self) -> usize {
         self.context_window_tokens
             .map(|cw| (cw as f64 * 0.75) as usize)

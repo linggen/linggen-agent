@@ -131,17 +131,9 @@ export const ChatPanel: React.FC<{
 
   const visibleMessages = useMemo(() => {
     const selected = normalizeAgentKey(selectedAgent);
-    const queuedPreviews = new Set(
-      queuedMessages
-        .filter((q) => normalizeAgentKey(q.agent_id) === selected)
-        .map((q) => q.preview.trim())
-    );
     const filtered = chatMessages.filter((msg) => {
       const from = normalizeAgentKey(msg.from || msg.role);
       const to = normalizeAgentKey(msg.to || '');
-      if (msg.role === 'user' && queuedPreviews.has(msg.text.trim())) {
-        return false;
-      }
       if (msg.role === 'user') {
         return !to || to === selected;
       }
@@ -150,7 +142,7 @@ export const ChatPanel: React.FC<{
       return false;
     });
     return sortMessagesByTime(filtered);
-  }, [chatMessages, selectedAgent, queuedMessages]);
+  }, [chatMessages, selectedAgent]);
 
   const visibleQueued = useMemo(
     () => queuedMessages.filter((item) => normalizeAgentKey(item.agent_id) === normalizeAgentKey(selectedAgent)),

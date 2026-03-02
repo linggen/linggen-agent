@@ -357,19 +357,12 @@ export interface StorageEntry {
 }
 
 // Plan mode types
-export type PlanItemStatus = 'pending' | 'in_progress' | 'done' | 'skipped';
 export type PlanStatus = 'planned' | 'approved' | 'executing' | 'completed';
-export interface PlanItem {
-  title: string;
-  description?: string | null;
-  status: PlanItemStatus;
-}
 
 export interface Plan {
   summary: string;
-  items: PlanItem[];
   status: PlanStatus;
-  plan_text?: string | null;
+  plan_text: string;
 }
 
 // --- AskUser types ---

@@ -246,10 +246,6 @@ function handleRun(item: UiSseMessage, deps: SseHandlerDeps): void {
     return;
   }
 
-  if (item.phase === 'change_report' && item.data) {
-    deps.fetchWorkspaceState();
-    deps.fetchFiles(deps.currentPath);
-  }
 }
 
 function handleQueue(item: UiSseMessage, deps: SseHandlerDeps): void {
@@ -553,6 +549,7 @@ function handleContentBlock(item: UiSseMessage, deps: SseHandlerDeps): void {
       summary: data.summary || undefined,
       isError: data.is_error ?? undefined,
       diffData,
+      bashOutput: Array.isArray(data.bash_output) ? data.bash_output as string[] : undefined,
     });
 
     // Track activity for tool completion (segments are already handled by CONTENT_BLOCK_UPDATE).

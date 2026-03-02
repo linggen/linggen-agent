@@ -5,8 +5,53 @@ import type { SkillInfoFull } from '../types';
 const sourceBadgeCls: Record<string, string> = {
   Global: 'bg-purple-500/10 text-purple-600 dark:text-purple-400',
   Project: 'bg-green-500/10 text-green-600 dark:text-green-400',
-  Compat: 'bg-slate-500/10 text-slate-600 dark:text-slate-400', // fallback for Compat variants
+  Compat: 'bg-slate-500/10 text-slate-600 dark:text-slate-400',
 };
+
+function isGlobalOrCompat(skill: SkillInfoFull): boolean {
+  const t = skill.source?.type || 'Global';
+  return t === 'Global' || t === 'Compat';
+}
+
+function SkillRow({ skill }: { skill: SkillInfoFull }) {
+  const sourceType = skill.source?.type || 'Global';
+  const sourceLabel = sourceType === 'Compat'
+    ? (skill.source as { type: string; label?: string })?.label || 'Compat'
+    : sourceType === 'Global' ? 'Linggen' : sourceType;
+  const trigger = skill.trigger || `/${skill.name}`;
+  const argHint = skill.argument_hint ? ` ${skill.argument_hint}` : '';
+
+  return (
+    <div className="bg-slate-50 dark:bg-black/20 px-3 py-2.5 rounded-xl border border-slate-200 dark:border-white/5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-mono font-bold text-blue-600 dark:text-blue-400 text-[11px]">
+          {trigger}
+          {argHint && (
+            <span className="text-slate-400 dark:text-slate-500 font-normal">{argHint}</span>
+          )}
+        </span>
+        <span
+          className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full uppercase tracking-wide ${
+            sourceBadgeCls[sourceType] || sourceBadgeCls.Compat
+          }`}
+        >
+          {sourceLabel}
+        </span>
+      </div>
+      {skill.description && (
+        <div className="mt-1 text-[10px] text-slate-500 dark:text-slate-400 truncate leading-relaxed">
+          {skill.description}
+        </div>
+      )}
+      {skill.tool_defs.length > 0 && (
+        <div className="mt-1 text-[10px] text-slate-400 dark:text-slate-500 flex items-center gap-1">
+          <Wrench size={9} />
+          {skill.tool_defs.length} tool{skill.tool_defs.length !== 1 ? 's' : ''}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export const SkillsCard: React.FC<{
   skills: SkillInfoFull[];
@@ -19,51 +64,27 @@ export const SkillsCard: React.FC<{
     );
   }
 
+  const globalSkills = skills.filter(isGlobalOrCompat);
+  const projectSkills = skills.filter((s) => !isGlobalOrCompat(s));
+
   return (
     <div className="flex-1 p-4 overflow-y-auto text-xs space-y-2">
-      {skills.map((skill) => {
-        const sourceType = skill.source?.type || 'Global';
-        const sourceLabel = sourceType === 'Compat'
-          ? (skill.source as { type: string; label?: string })?.label || 'Compat'
-          : sourceType === 'Global' ? 'Linggen' : sourceType;
-        const trigger = skill.trigger || `/${skill.name}`;
-        const argHint = skill.argument_hint ? ` ${skill.argument_hint}` : '';
-
-        return (
-          <div
-            key={skill.name}
-            className="bg-slate-50 dark:bg-black/20 px-3 py-2.5 rounded-xl border border-slate-200 dark:border-white/5"
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="font-mono font-bold text-blue-600 dark:text-blue-400 text-[11px]">
-                {trigger}
-                {argHint && (
-                  <span className="text-slate-400 dark:text-slate-500 font-normal">{argHint}</span>
-                )}
-              </span>
-              <span
-                className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full uppercase tracking-wide ${
-                  sourceBadgeCls[sourceType] || sourceBadgeCls.Compat
-                }`}
-              >
-                {sourceLabel}
-              </span>
-            </div>
-            {skill.description && (
-              <div className="mt-1 text-[10px] text-slate-500 dark:text-slate-400 truncate leading-relaxed">
-                {skill.description}
-              </div>
-            )}
-            {skill.tool_defs.length > 0 && (
-              <div className="mt-1 text-[10px] text-slate-400 dark:text-slate-500 flex items-center gap-1">
-                <Wrench size={9} />
-                {skill.tool_defs.length} tool{skill.tool_defs.length !== 1 ? 's' : ''}
-              </div>
-            )}
-          </div>
-        );
-      })}
-
+      {globalSkills.length > 0 && (
+        <>
+          <div className="text-[9px] font-bold text-slate-400 uppercase tracking-wider px-1">Global</div>
+          {globalSkills.map((skill) => (
+            <SkillRow key={skill.name} skill={skill} />
+          ))}
+        </>
+      )}
+      {projectSkills.length > 0 && (
+        <>
+          <div className={`text-[9px] font-bold text-slate-400 uppercase tracking-wider px-1 ${globalSkills.length > 0 ? 'mt-3' : ''}`}>Project</div>
+          {projectSkills.map((skill) => (
+            <SkillRow key={skill.name} skill={skill} />
+          ))}
+        </>
+      )}
     </div>
   );
 };

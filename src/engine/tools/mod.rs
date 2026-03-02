@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
-use tracing::info;
+use tracing::debug;
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -253,8 +253,8 @@ impl Tools {
 
     pub fn execute(&self, call: ToolCall) -> Result<ToolResult> {
         let normalized_args = normalize_tool_args(&call.tool, &call.args);
-        info!(
-            "Executing tool: {} with args: {}",
+        debug!(
+            "Executing tool: {} args={}",
             call.tool,
             summarize_tool_args(&call.tool, &normalized_args)
         );

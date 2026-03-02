@@ -1,17 +1,8 @@
-use crate::engine::{PlanItemStatus, TaskPacket};
+use crate::engine::TaskPacket;
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::de::Deserializer;
 use serde_json::Value;
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PlanItemUpdate {
-    pub title: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub status: Option<PlanItemStatus>,
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -25,12 +16,6 @@ pub enum ModelAction {
     Patch { diff: String },
     #[serde(rename = "finalize_task")]
     FinalizeTask { packet: TaskPacket },
-    #[serde(rename = "update_plan")]
-    UpdatePlan {
-        #[serde(default)]
-        summary: Option<String>,
-        items: Vec<PlanItemUpdate>,
-    },
     #[serde(rename = "done")]
     Done {
         #[serde(default)]
@@ -140,6 +125,16 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
         .or_else(|| obj.get("name"))
         .and_then(|v| v.as_str())
     {
+        // Intercept "done"/"Done" — models sometimes emit {"name":"done","message":"..."}
+        // which should be a Done action, not a tool call.
+        if tool.eq_ignore_ascii_case("done") {
+            let msg = obj
+                .get("message")
+                .or_else(|| obj.get("text"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            return Some(ModelAction::Done { message: msg });
+        }
         if !is_supported_model_tool(tool) {
             return None;
         }
@@ -153,7 +148,7 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
         "Read" | "Grep" | "Write" | "Edit" | "Glob" | "Bash" | "capture_screenshot"
         | "lock_paths" | "unlock_paths" | "Task" | "delegate_to_agent" => action_type,
         // Known non-tool action types that should not be treated as tool shorthands.
-        "" | "patch" | "finalize_task" | "update_plan" | "done" | "enter_plan_mode" => {
+        "" | "patch" | "finalize_task" | "done" | "enter_plan_mode" => {
             // Fallback: if the object has a text-like field but no action type,
             // treat it as a Done message. This handles models that emit
             // {"response":"..."} or {"message":"..."} instead of a proper action.
@@ -534,6 +529,24 @@ Now let me also search:
             }
             _ => panic!("expected Done action, got {:?}", actions[0]),
         }
+    }
+
+    #[test]
+    fn parse_name_done_as_done_action() {
+        // Models sometimes emit {"name":"done","message":"..."} which should be
+        // parsed as ModelAction::Done, not as a Tool call to "done".
+        let raw = r#"{"name":"done","message":"Acked the casual greeting."}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], ModelAction::Done { message } if message.as_deref() == Some("Acked the casual greeting.")));
+    }
+
+    #[test]
+    fn parse_name_done_capitalized_as_done_action() {
+        let raw = r#"{"name":"Done","message":"All finished."}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], ModelAction::Done { message } if message.as_deref() == Some("All finished.")));
     }
 
     #[test]

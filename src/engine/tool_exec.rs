@@ -30,6 +30,7 @@ impl AgentEngine {
         let agent_id = self.agent_id.clone().unwrap_or_default();
 
         // Emit SSE event to push the permission question to the UI.
+        info!("Permission: awaiting user approval for '{}'", tool);
         let _ = bridge.events_tx.send(crate::server::ServerEvent::AskUser {
             agent_id: agent_id.clone(),
             question_id: question_id.clone(),
@@ -47,7 +48,7 @@ impl AgentEngine {
         );
 
         // Block until the user responds or timeout (5 minutes).
-        let response = tokio::time::timeout(std::time::Duration::from_secs(300), rx).await;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(8 * 3600), rx).await;
 
         // Cleanup: remove from pending map regardless of outcome.
         bridge.pending.lock().await.remove(&question_id);
@@ -59,9 +60,76 @@ impl AgentEngine {
                     .and_then(|a| a.selected.first())
                     .map(|s| s.as_str())
                     .unwrap_or("Cancel");
-                Some(parser(selected, tool))
+                let action = parser(selected, tool);
+                info!("Permission: '{}' → {:?}", tool, action);
+                Some(action)
             }
-            _ => Some(permission::PermissionAction::Deny),
+            Ok(Err(_)) => {
+                warn!("Permission: '{}' channel closed → denied", tool);
+                Some(permission::PermissionAction::Deny)
+            }
+            Err(_) => {
+                warn!("Permission: '{}' timed out → stopping agent", tool);
+                None // Timeout: no user response, signal to stop the loop
+            }
+        }
+    }
+
+    /// Ask the user for Bash permission with command-level granularity.
+    /// Returns `(PermissionAction, Option<permission_key>)`.
+    async fn ask_bash_permission(
+        &self,
+        command: &str,
+        question: tools::AskUserQuestion,
+        pattern: Option<&str>,
+    ) -> Option<(permission::PermissionAction, Option<String>)> {
+        let bridge = match self.tools.ask_user_bridge() {
+            Some(b) => Arc::clone(b),
+            None => return None,
+        };
+
+        let question_id = uuid::Uuid::new_v4().to_string();
+        let agent_id = self.agent_id.clone().unwrap_or_default();
+
+        info!("Permission: awaiting user approval for Bash '{}'", command);
+        let _ = bridge.events_tx.send(crate::server::ServerEvent::AskUser {
+            agent_id: agent_id.clone(),
+            question_id: question_id.clone(),
+            questions: vec![question],
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        bridge.pending.lock().await.insert(
+            question_id.clone(),
+            tools::PendingAskUser {
+                agent_id,
+                sender: tx,
+            },
+        );
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(8 * 3600), rx).await;
+        bridge.pending.lock().await.remove(&question_id);
+
+        match response {
+            Ok(Ok(answers)) => {
+                let selected = answers
+                    .first()
+                    .and_then(|a| a.selected.first())
+                    .map(|s| s.as_str())
+                    .unwrap_or("Cancel");
+                let (action, key) =
+                    permission::parse_bash_permission_answer(selected, "Bash", pattern);
+                info!("Permission: Bash '{}' → {:?} key={:?}", command, action, key);
+                Some((action, key))
+            }
+            Ok(Err(_)) => {
+                warn!("Permission: Bash channel closed → denied");
+                Some((permission::PermissionAction::Deny, None))
+            }
+            Err(_) => {
+                warn!("Permission: Bash timed out → stopping agent");
+                None // Timeout: no user response, signal to stop the loop
+            }
         }
     }
 
@@ -123,10 +191,7 @@ impl AgentEngine {
             serde_json::to_string(&safe_args).unwrap_or_else(|_| "{}".to_string()),
             serde_json::json!({ "args": safe_args.clone() }),
         );
-        info!(
-            "Agent requested tool: {} (requested: {}) with args: {}",
-            canonical_tool, tool, safe_args
-        );
+        info!("Tool: {} {}", canonical_tool, safe_args);
         if canonical_tool == "Read" {
             if let Some(path) = normalize_tool_path_arg(&self.cfg.ws_root, &args) {
                 read_paths.insert(path);
@@ -179,16 +244,73 @@ impl AgentEngine {
         }
 
         // --- tool permission gate ---
-        let needs_permission = self.cfg.tool_permission_mode == crate::config::ToolPermissionMode::Ask
-            && !self.permission_store.check(&canonical_tool)
-            && (permission::is_destructive_tool(&canonical_tool)
-                || permission::is_web_tool(&canonical_tool));
+        let is_destructive = permission::is_destructive_tool(&canonical_tool);
+        let is_web = permission::is_web_tool(&canonical_tool);
+
+        // Extract bash command for pattern-based permission checking.
+        let bash_command = if canonical_tool == "Bash" {
+            args.get("cmd")
+                .or_else(|| args.get("command"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        let already_allowed =
+            self.permission_store
+                .check(&canonical_tool, bash_command.as_deref());
+        let mode_is_ask = self.cfg.tool_permission_mode == crate::config::ToolPermissionMode::Ask;
+        let needs_permission = mode_is_ask && !already_allowed && (is_destructive || is_web);
+        if is_destructive || is_web {
+            info!(
+                "Permission check for '{}': mode_ask={}, already_allowed={}, destructive={}, web={} → needs_permission={}",
+                canonical_tool, mode_is_ask, already_allowed, is_destructive, is_web, needs_permission
+            );
+        }
 
         if needs_permission {
             let summary =
                 permission::permission_target_summary(&canonical_tool, &args, &self.cfg.ws_root);
 
-            if permission::is_web_tool(&canonical_tool) {
+            if canonical_tool == "Bash" {
+                // Bash uses command-level granularity with glob patterns.
+                let cmd = bash_command.as_deref().unwrap_or("");
+                let pattern = permission::derive_command_pattern(cmd);
+                let question = permission::build_bash_permission_question(
+                    cmd,
+                    pattern.as_deref(),
+                );
+                match self
+                    .ask_bash_permission(cmd, question, pattern.as_deref())
+                    .await
+                {
+                    Some((permission::PermissionAction::AllowOnce, _)) => { /* proceed */ }
+                    Some((permission::PermissionAction::AllowSession, Some(key))) => {
+                        self.permission_store.allow_for_session(&key);
+                    }
+                    Some((permission::PermissionAction::AllowProject, Some(key))) => {
+                        self.permission_store.allow_for_project(&key);
+                    }
+                    Some((permission::PermissionAction::Deny, _)) => {
+                        let msg =
+                            format!("Permission denied: Bash on '{}'", summary);
+                        messages.push(ChatMessage::new("user", msg));
+                        return PreExecOutcome::Blocked(LoopControl::Continue);
+                    }
+                    None => {
+                        // Timeout or no bridge — stop the loop so the agent goes idle.
+                        let msg = "Permission prompt timed out. Stopping.".to_string();
+                        let _ = self
+                            .manager_db_add_assistant_message(&msg, session_id)
+                            .await;
+                        return PreExecOutcome::Blocked(
+                            LoopControl::Return(AgentOutcome::None),
+                        );
+                    }
+                    _ => { /* proceed (shouldn't happen) */ }
+                }
+            } else if permission::is_web_tool(&canonical_tool) {
                 // Web tools use a simpler 3-option prompt (no project-level persistence).
                 let question =
                     permission::build_web_permission_question(&canonical_tool, &summary);
@@ -197,15 +319,25 @@ impl AgentEngine {
                     Some(permission::PermissionAction::AllowSession) => {
                         self.permission_store.allow_for_session(&canonical_tool);
                     }
-                    Some(permission::PermissionAction::Deny) | _ => {
+                    Some(permission::PermissionAction::Deny) => {
                         let msg =
                             format!("Permission denied: {} on '{}'", canonical_tool, summary);
                         messages.push(ChatMessage::new("user", msg));
                         return PreExecOutcome::Blocked(LoopControl::Continue);
                     }
+                    None => {
+                        let msg = "Permission prompt timed out. Stopping.".to_string();
+                        let _ = self
+                            .manager_db_add_assistant_message(&msg, session_id)
+                            .await;
+                        return PreExecOutcome::Blocked(
+                            LoopControl::Return(AgentOutcome::None),
+                        );
+                    }
+                    _ => { /* AllowProject not expected for web tools */ }
                 }
             } else {
-                // Destructive tools use the full 4-option prompt.
+                // Other destructive tools (Write, Edit, Patch) use the full 4-option prompt.
                 let question = permission::build_permission_question(&canonical_tool, &summary);
                 match self.ask_permission(&canonical_tool, question, permission::parse_permission_answer).await {
                     Some(permission::PermissionAction::AllowOnce) => { /* proceed */ }
@@ -215,11 +347,20 @@ impl AgentEngine {
                     Some(permission::PermissionAction::AllowProject) => {
                         self.permission_store.allow_for_project(&canonical_tool);
                     }
-                    Some(permission::PermissionAction::Deny) | None => {
+                    Some(permission::PermissionAction::Deny) => {
                         let msg =
                             format!("Permission denied: {} on '{}'", canonical_tool, summary);
                         messages.push(ChatMessage::new("user", msg));
                         return PreExecOutcome::Blocked(LoopControl::Continue);
+                    }
+                    None => {
+                        let msg = "Permission prompt timed out. Stopping.".to_string();
+                        let _ = self
+                            .manager_db_add_assistant_message(&msg, session_id)
+                            .await;
+                        return PreExecOutcome::Blocked(
+                            LoopControl::Return(AgentOutcome::None),
+                        );
                     }
                 }
             }
@@ -400,7 +541,26 @@ impl AgentEngine {
                         .unwrap_or_else(|| "unknown".to_string());
                     // Emit structured ContentBlockUpdate for the Web UI.
                     // For Edit/Write, include diff data so the frontend can render inline diffs.
-                    let extra = self.build_tool_extra(&canonical_tool, &original_args);
+                    // For Bash, include output lines so the widget has them even if
+                    // progress events arrived after the block was marked done.
+                    let extra = self.build_tool_extra(&canonical_tool, &original_args)
+                        .or_else(|| {
+                            if canonical_tool == "Bash" {
+                                if let tools::ToolResult::CommandOutput { ref stdout, ref stderr, .. } = result {
+                                    let mut lines: Vec<&str> = stdout.lines().collect();
+                                    if !stderr.is_empty() {
+                                        lines.extend(stderr.lines());
+                                    }
+                                    // Cap at 500 lines to keep the event small.
+                                    lines.truncate(500);
+                                    Some(serde_json::json!({ "bash_output": lines }))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        });
                     manager
                         .send_event(crate::agent_manager::AgentEvent::ContentBlockUpdate {
                             agent_id: agent_id.clone(),
@@ -496,7 +656,7 @@ impl AgentEngine {
                 }
             }
             Err(e) => {
-                warn!("Tool execution failed ({}): {}", canonical_tool, e);
+                warn!("Tool failed: {} err={}", canonical_tool, e);
                 let rendered = format!("tool_error: tool={} error={}", canonical_tool, e);
                 tool_cache.insert(
                     sig,

@@ -44,7 +44,7 @@ export const CM6Editor: React.FC<{
       value={value}
       onChange={onChange}
       readOnly={readOnly}
-      height="100%"
+      height="auto"
       theme={isDark ? oneDark : 'light'}
       extensions={extensions}
       basicSetup={{

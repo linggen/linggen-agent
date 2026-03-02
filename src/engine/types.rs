@@ -19,30 +19,12 @@ use tokio::sync::mpsc;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlanItem {
-    pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub status: PlanItemStatus,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum PlanItemStatus {
-    Pending,
-    InProgress,
-    Done,
-    Skipped,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
     pub summary: String,
-    pub items: Vec<PlanItem>,
     pub status: PlanStatus,
-    /// Free-form markdown plan text (from plan mode).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_text: Option<String>,
+    /// Free-form markdown plan text.
+    #[serde(default)]
+    pub plan_text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -346,15 +328,6 @@ impl AgentEngine {
         if let Some(agent_id) = &self.agent_id {
             self.tools.set_context(manager, agent_id.clone());
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn set_role(&mut self, role: AgentRole) {
-        self.role = role;
-        self.observations.clear();
-        self.context_records.clear();
-        self.next_context_id = 1;
-        self.chat_history.clear();
     }
 
     pub fn set_task(&mut self, task: String) {

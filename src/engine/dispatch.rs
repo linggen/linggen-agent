@@ -6,7 +6,7 @@ use crate::engine::tools::{self, ToolCall};
 use crate::ollama::ChatMessage;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 impl AgentEngine {
     /// Handle a batch of consecutive `Task` (delegation) actions.
@@ -253,7 +253,7 @@ impl AgentEngine {
 
         // If context files changed, rebuild the system prompt cache.
         if prompt_stale {
-            info!("Context files changed during tool execution; rebuilding system prompt cache");
+            debug!("Context files changed; rebuilding system prompt");
             let (new_stable, new_hash) = self.build_stable_system_content();
             self.cached_system_prompt = Some(CachedSystemPrompt {
                 input_hash: new_hash,
@@ -261,9 +261,7 @@ impl AgentEngine {
             });
             if !state.messages.is_empty() {
                 let mut sys = new_stable;
-                if let Some(dyn_start) = state.messages[0].content.find("\n\n## Task List") {
-                    sys.push_str(&state.messages[0].content[dyn_start..]);
-                } else if let Some(dyn_start) = state.messages[0].content.find("\n\nYou are in PLAN MODE") {
+                if let Some(dyn_start) = state.messages[0].content.find("\n\nYou are in PLAN MODE") {
                     sys.push_str(&state.messages[0].content[dyn_start..]);
                 }
                 state.messages[0] = ChatMessage::new("system", sys);
@@ -294,13 +292,13 @@ impl AgentEngine {
         &mut self,
         action: ModelAction,
         state: &mut LoopState,
-        actions_remaining: bool,
+        _actions_remaining: bool,
         session_id: Option<&str>,
     ) -> Option<AgentOutcome> {
         match action {
             ModelAction::Tool { ref tool, .. } if tool == "ExitPlanMode" => {
                 if self.plan_mode {
-                    info!("ExitPlanMode tool called — submitting plan for review");
+                    info!("ExitPlanMode → submitting plan for review");
                     let plan_text = state.last_assistant_response.clone();
                     return Some(self.finalize_plan_mode(plan_text).await);
                 } else {
@@ -336,42 +334,30 @@ impl AgentEngine {
                     LoopControl::Continue => {}
                 }
             }
-            ModelAction::UpdatePlan { summary, items } => {
-                match self.handle_update_plan_action(summary, items, session_id).await {
-                    LoopControl::Return(outcome) => return Some(outcome),
-                    LoopControl::Continue => {
-                        if !actions_remaining {
-                            state.messages.push(ChatMessage::new(
-                                "user",
-                                self.nudge(crate::prompts::NUDGE_PLAN_ONLY, &[]),
-                            ));
-                        }
-                    }
-                }
-            }
             ModelAction::Done { message } => {
                 let msg = message.unwrap_or_else(|| "Task completed.".to_string());
-                info!("Agent signalled done: {}", msg);
+                info!("Done: {}", msg);
                 self.push_context_record(
                     ContextType::Status, Some("done".to_string()),
                     self.agent_id.clone(), Some("user".to_string()),
                     msg.clone(), serde_json::json!({ "kind": "done" }),
                 );
                 let _ = self.manager_db_add_assistant_message(&msg, session_id).await;
+                self.chat_history.push(ChatMessage::new("assistant", msg.clone()));
+                self.truncate_chat_history();
                 self.last_assistant_text = Some(msg.clone());
                 self.active_skill = None;
                 if self.plan_mode {
                     // Fallback: model emitted done in plan mode without calling ExitPlanMode.
                     // Treat the last response as the plan text.
-                    info!("Fallback: done in plan mode — treating as implicit ExitPlanMode");
+                    info!("Done in plan mode → implicit ExitPlanMode");
                     let plan_text = state.last_assistant_response.clone();
                     return Some(self.finalize_plan_mode(plan_text).await);
                 }
-                self.auto_complete_plan().await;
                 return Some(AgentOutcome::None);
             }
             ModelAction::EnterPlanMode { reason } => {
-                info!("Agent requested plan mode: {:?}", reason);
+                info!("EnterPlanMode: {:?}", reason);
                 return Some(AgentOutcome::PlanModeRequested { reason });
             }
         }

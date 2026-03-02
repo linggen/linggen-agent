@@ -41,7 +41,7 @@ export type ChatAction =
   | { type: 'FINALIZE_MESSAGE'; agentId: string; content: string; to: string; tsMs: number; elapsed?: number; ctxTokens?: number }
   | { type: 'FINALIZE_ON_IDLE'; agentId: string; elapsed?: number; ctxTokens?: number }
   | { type: 'CONTENT_BLOCK_START'; agentId: string; block: ContentBlock }
-  | { type: 'CONTENT_BLOCK_UPDATE'; agentId: string; blockId: string; status?: string; summary?: string; isError?: boolean; diffData?: ContentBlock['diffData'] }
+  | { type: 'CONTENT_BLOCK_UPDATE'; agentId: string; blockId: string; status?: string; summary?: string; isError?: boolean; diffData?: ContentBlock['diffData']; bashOutput?: string[] }
   | { type: 'TOOL_PROGRESS'; agentId: string; line: string }
   | { type: 'TURN_COMPLETE'; agentId: string; durationMs?: number; contextTokens?: number };
 
@@ -407,7 +407,13 @@ function chatReducer(state: ChatMessage[], action: ChatAction): ChatMessage[] {
 
     case 'TOOL_PROGRESS': {
       const { agentId, line } = action;
-      const idx = findLastGeneratingMessageIndex(state, agentId);
+      // Try generating message first, then fall back to last message from this agent
+      let idx = findLastGeneratingMessageIndex(state, agentId);
+      if (idx < 0) {
+        for (let i = state.length - 1; i >= 0; i--) {
+          if (state[i].from === agentId) { idx = i; break; }
+        }
+      }
       if (idx < 0) return state;
       const next = [...state];
       const msg = { ...next[idx] };
@@ -418,6 +424,16 @@ function chatReducer(state: ChatMessage[], action: ChatAction): ChatMessage[] {
         if (blocks[i].type === 'tool_use' && blocks[i].status === 'running') {
           targetIdx = i;
           break;
+        }
+      }
+      // Fallback: if no running block, find the last Bash block (progress events
+      // can arrive after ContentBlockUpdate marks the block as 'done')
+      if (targetIdx < 0) {
+        for (let i = blocks.length - 1; i >= 0; i--) {
+          if (blocks[i].type === 'tool_use' && blocks[i].tool === 'Bash') {
+            targetIdx = i;
+            break;
+          }
         }
       }
       if (targetIdx >= 0) {
@@ -435,7 +451,7 @@ function chatReducer(state: ChatMessage[], action: ChatAction): ChatMessage[] {
     }
 
     case 'CONTENT_BLOCK_UPDATE': {
-      const { agentId, blockId, status, summary, isError, diffData } = action;
+      const { agentId, blockId, status, summary, isError, diffData, bashOutput } = action;
       const idx = findLastGeneratingMessageIndex(state, agentId);
       if (idx < 0) return state;
       const next = [...state];
@@ -443,12 +459,18 @@ function chatReducer(state: ChatMessage[], action: ChatAction): ChatMessage[] {
       const blocks = [...(msg.content || [])];
       const blockIdx = blocks.findIndex((b) => b.id === blockId);
       if (blockIdx >= 0) {
+        // Merge bash output from the backend if no progress events populated it yet.
+        const existingOutput = blocks[blockIdx].output;
+        const mergedOutput = (!existingOutput || existingOutput.length === 0) && bashOutput
+          ? bashOutput
+          : existingOutput;
         blocks[blockIdx] = {
           ...blocks[blockIdx],
           status: (status as ContentBlock['status']) || blocks[blockIdx].status,
           summary: summary || blocks[blockIdx].summary,
           isError: isError ?? blocks[blockIdx].isError,
           diffData: diffData || blocks[blockIdx].diffData,
+          output: mergedOutput,
         };
         msg.content = blocks;
       }

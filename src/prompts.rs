@@ -24,8 +24,6 @@ pub const TASK_BOOTSTRAP: &str = "task-bootstrap";
 pub const NUDGE_INVALID_JSON: &str = "nudge-invalid-json";
 /// Nudge when model repeats the same response.
 pub const NUDGE_REPETITION: &str = "nudge-repetition";
-/// Nudge when model emits update_plan without tool calls.
-pub const NUDGE_PLAN_ONLY: &str = "nudge-plan-only";
 /// Nudge when model calls the same tool repeatedly.  Vars: `{tool}`.
 pub const NUDGE_REDUNDANT_TOOL: &str = "nudge-redundant-tool";
 
@@ -40,7 +38,6 @@ const DEFAULTS: &[(&str, &str)] = &[
     (TASK_BOOTSTRAP, include_str!("../prompts/task-bootstrap.md")),
     (NUDGE_INVALID_JSON, include_str!("../prompts/nudge-invalid-json.md")),
     (NUDGE_REPETITION, include_str!("../prompts/nudge-repetition.md")),
-    (NUDGE_PLAN_ONLY, include_str!("../prompts/nudge-plan-only.md")),
     (NUDGE_REDUNDANT_TOOL, include_str!("../prompts/nudge-redundant-tool.md")),
 ];
 
@@ -158,10 +155,10 @@ mod tests {
     fn overlay_from_tempdir() {
         let tmp = std::env::temp_dir().join("linggen_prompt_test");
         let _ = std::fs::create_dir_all(&tmp);
-        std::fs::write(tmp.join("nudge-plan-only.md"), "custom nudge").unwrap();
+        std::fs::write(tmp.join("nudge-redundant-tool.md"), "custom nudge").unwrap();
 
         let store = PromptStore::load(Some(&tmp));
-        assert_eq!(store.get(NUDGE_PLAN_ONLY).unwrap(), "custom nudge");
+        assert_eq!(store.get(NUDGE_REDUNDANT_TOOL).unwrap(), "custom nudge");
 
         // cleanup
         let _ = std::fs::remove_dir_all(&tmp);

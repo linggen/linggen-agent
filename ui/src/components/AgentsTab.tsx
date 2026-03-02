@@ -261,9 +261,9 @@ export const AgentsTab: React.FC<{
       </aside>
 
       {/* Editor area */}
-      <section className="flex-1 min-w-0 flex flex-col">
+      <section className="flex-1 min-w-0 overflow-y-auto">
         {/* Toolbar */}
-        <div className="px-3 py-2 border-b border-slate-200 dark:border-white/10 flex items-center justify-between">
+        <div className="sticky top-0 z-10 px-3 py-2 border-b border-slate-200 dark:border-white/10 flex items-center justify-between bg-white dark:bg-[#0a0a0a]">
           <div className="flex items-center gap-2 min-w-0">
             <FileText size={14} className="text-slate-500 shrink-0" />
             <span className="text-xs font-mono truncate">{selectedPath || 'No file selected'}</span>
@@ -324,7 +324,7 @@ export const AgentsTab: React.FC<{
         )}
 
         {/* Live preview editor */}
-        <div className="flex-1 min-h-0">
+        <div>
           {loadingFile ? (
             <div className="h-full flex items-center justify-center text-xs text-slate-500">Loading file...</div>
           ) : (

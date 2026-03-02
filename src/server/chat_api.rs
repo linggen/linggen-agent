@@ -11,9 +11,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -67,241 +65,6 @@ fn parse_explicit_target_prefix(message: &str) -> Option<(&str, &str)> {
     Some((candidate, body))
 }
 
-const CHANGE_REPORT_MAX_FILES: usize = 20;
-const CHANGE_REPORT_MAX_DIFF_CHARS: usize = 12_000;
-
-#[derive(Debug, Clone)]
-struct GitChangeSnapshot {
-    repo_root: PathBuf,
-    dirty_paths: HashSet<String>,
-}
-
-fn normalize_path_separators(path: &str) -> String {
-    path.trim().replace('\\', "/")
-}
-
-fn parse_git_status_line(line: &str) -> Option<(String, String)> {
-    if line.len() < 3 {
-        return None;
-    }
-    let status = line.get(0..2)?.trim().to_string();
-    let raw_path = line.get(3..)?.trim();
-    if raw_path.is_empty() {
-        return None;
-    }
-    let candidate = if let Some((_from, to)) = raw_path.rsplit_once(" -> ") {
-        to.trim()
-    } else {
-        raw_path
-    };
-    let unquoted = candidate.trim_matches('"');
-    if unquoted.is_empty() {
-        return None;
-    }
-    Some((normalize_path_separators(unquoted), status))
-}
-
-fn git_status_for_repo(repo_root: &Path) -> Option<(HashSet<String>, HashMap<String, String>)> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["status", "--porcelain", "--untracked-files=all"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut paths = HashSet::new();
-    let mut status_by_path = HashMap::new();
-    for line in stdout.lines() {
-        if let Some((path, status)) = parse_git_status_line(line) {
-            paths.insert(path.clone());
-            status_by_path.entry(path).or_insert(status);
-        }
-    }
-    Some((paths, status_by_path))
-}
-
-
-
-fn capture_git_snapshot(project_root: &Path) -> Option<GitChangeSnapshot> {
-    let repo_output = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !repo_output.status.success() {
-        return None;
-    }
-    let repo_root = PathBuf::from(String::from_utf8_lossy(&repo_output.stdout).trim());
-    let (dirty_paths, _status_by_path) = git_status_for_repo(&repo_root)?;
-    Some(GitChangeSnapshot {
-        repo_root,
-        dirty_paths,
-    })
-}
-
-fn to_repo_relative_path(project_root: &Path, repo_root: &Path, raw_path: &str) -> Option<String> {
-    let candidate = PathBuf::from(raw_path);
-    let abs = if candidate.is_absolute() {
-        candidate
-    } else {
-        project_root.join(candidate)
-    };
-    let resolved = abs.canonicalize().unwrap_or(abs);
-    let rel = resolved.strip_prefix(repo_root).ok()?;
-    Some(normalize_path_separators(&rel.to_string_lossy()))
-}
-
-fn truncate_chars(input: &str, max_chars: usize) -> String {
-    if input.chars().count() <= max_chars {
-        return input.to_string();
-    }
-    let head: String = input.chars().take(max_chars).collect();
-    format!("{head}\n... (truncated)")
-}
-
-fn git_diff_for_path(repo_root: &Path, rel_path: &str) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .arg("diff")
-        .arg("--")
-        .arg(rel_path)
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        let diff = String::from_utf8_lossy(&output.stdout).to_string();
-        if !diff.trim().is_empty() {
-            return Some(diff);
-        }
-    }
-
-    let abs_path = repo_root.join(rel_path);
-    if !abs_path.exists() {
-        return None;
-    }
-
-    let untracked_output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["diff", "--no-index", "--", "/dev/null"])
-        .arg(abs_path)
-        .output()
-        .ok()?;
-    let diff = String::from_utf8_lossy(&untracked_output.stdout).to_string();
-    if diff.trim().is_empty() {
-        None
-    } else {
-        Some(diff)
-    }
-}
-
-fn summarize_status(status: Option<&str>, tool_hint: Option<&str>) -> String {
-    if let Some(tool) = tool_hint {
-        let tool_label = if tool.eq_ignore_ascii_case("Edit") {
-            "Edited"
-        } else if tool.eq_ignore_ascii_case("Write") {
-            "Written"
-        } else {
-            "Updated"
-        };
-        return format!("{} via {}", tool_label, tool);
-    }
-    match status.unwrap_or("").trim() {
-        "??" => "Added (untracked)".to_string(),
-        code if code.contains('R') => "Renamed".to_string(),
-        code if code.contains('A') => "Added".to_string(),
-        code if code.contains('D') => "Deleted".to_string(),
-        code if code.contains('M') => "Modified".to_string(),
-        _ => "Updated".to_string(),
-    }
-}
-
-async fn emit_change_report_if_any(
-    manager: &Arc<crate::agent_manager::AgentManager>,
-    events_tx: &tokio::sync::broadcast::Sender<ServerEvent>,
-    root: &PathBuf,
-    agent_id: &str,
-    session_id: Option<&str>,
-    baseline: Option<&GitChangeSnapshot>,
-    explicit_mutations: &HashMap<String, String>,
-) {
-    let Some(snapshot) = baseline else {
-        return;
-    };
-    let Some((current_dirty, current_status_by_path)) = git_status_for_repo(&snapshot.repo_root)
-    else {
-        return;
-    };
-
-    let mut changed_paths: HashSet<String> = current_dirty
-        .difference(&snapshot.dirty_paths)
-        .cloned()
-        .collect();
-    let mut tool_hint_by_path: HashMap<String, String> = HashMap::new();
-    for (raw_path, tool_name) in explicit_mutations {
-        if let Some(repo_rel) = to_repo_relative_path(root, &snapshot.repo_root, raw_path) {
-            changed_paths.insert(repo_rel.clone());
-            tool_hint_by_path.insert(repo_rel, tool_name.clone());
-        }
-    }
-    if changed_paths.is_empty() {
-        return;
-    }
-
-    let mut changed_paths_sorted = changed_paths.into_iter().collect::<Vec<_>>();
-    changed_paths_sorted.sort();
-
-    let omitted_count = changed_paths_sorted
-        .len()
-        .saturating_sub(CHANGE_REPORT_MAX_FILES);
-    let report_paths = changed_paths_sorted
-        .into_iter()
-        .take(CHANGE_REPORT_MAX_FILES)
-        .collect::<Vec<_>>();
-
-    let files = report_paths
-        .iter()
-        .map(|path| {
-            let summary = summarize_status(
-                current_status_by_path.get(path).map(String::as_str),
-                tool_hint_by_path.get(path).map(String::as_str),
-            );
-            let diff = git_diff_for_path(&snapshot.repo_root, path)
-                .map(|v| truncate_chars(&v, CHANGE_REPORT_MAX_DIFF_CHARS))
-                .unwrap_or_else(|| "(diff unavailable)".to_string());
-            serde_json::json!({
-                "path": path,
-                "summary": summary,
-                "diff": diff,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Emit a typed ChangeReport SSE event (not a generic Message).
-    let _ = events_tx.send(ServerEvent::ChangeReport {
-        agent_id: agent_id.to_string(),
-        files: files.clone(),
-        truncated_count: omitted_count,
-    });
-
-    // Persist the change report to DB/state_fs as a serialised message.
-    let payload = serde_json::json!({
-        "type": "change_report",
-        "files": files,
-        "truncated_count": omitted_count,
-        "review_hint": "Review these diffs in the UI and rollback any file you don't want.",
-    })
-    .to_string();
-    persist_message_only(
-        manager, root, agent_id, agent_id, "user", &payload, session_id, false,
-    )
-    .await;
-}
 
 async fn run_loop_with_tracking(
     manager: &Arc<crate::agent_manager::AgentManager>,
@@ -397,7 +160,6 @@ struct ChatRunCtx {
     agent_id: String,
     session_id: Option<String>,
     clean_msg: String,
-    git_baseline: Option<GitChangeSnapshot>,
     images: Vec<String>,
 }
 
@@ -461,6 +223,10 @@ async fn run_skill_dispatch(
     engine.observations.clear();
     engine.task = Some(task_for_loop);
 
+    // Add user message to chat history so subsequent turns have conversational context.
+    engine.chat_history.push(crate::ollama::ChatMessage::new("user", ctx.clean_msg.clone()));
+    engine.truncate_chat_history();
+
     let skill_msg = format!("Running skill: {}", cmd);
     persist_and_emit_message(
         &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
@@ -491,12 +257,6 @@ async fn run_skill_dispatch(
         if let Ok(outcome) = &outcome {
             emit_outcome_event(outcome, &ctx.events_tx, &ctx.agent_id);
         }
-        let no_explicit_mutations: HashMap<String, String> = HashMap::new();
-        emit_change_report_if_any(
-            &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
-            ctx.session_id.as_deref(), ctx.git_baseline.as_ref(), &no_explicit_mutations,
-        )
-        .await;
         let _ = ctx.events_tx.send(ServerEvent::StateUpdated);
     }
 }
@@ -545,6 +305,10 @@ async fn run_trigger_dispatch(
     engine.observations.clear();
     engine.task = Some(task_for_loop);
 
+    // Add user message to chat history so subsequent turns have conversational context.
+    engine.chat_history.push(crate::ollama::ChatMessage::new("user", ctx.clean_msg.clone()));
+    engine.truncate_chat_history();
+
     let skill_msg = format!("Running skill via trigger: {}", skill_name);
     persist_and_emit_message(
         &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
@@ -575,12 +339,6 @@ async fn run_trigger_dispatch(
         if let Ok(outcome) = &outcome {
             emit_outcome_event(outcome, &ctx.events_tx, &ctx.agent_id);
         }
-        let no_explicit_mutations: HashMap<String, String> = HashMap::new();
-        emit_change_report_if_any(
-            &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
-            ctx.session_id.as_deref(), ctx.git_baseline.as_ref(), &no_explicit_mutations,
-        )
-        .await;
         let _ = ctx.events_tx.send(ServerEvent::StateUpdated);
     }
 }
@@ -616,6 +374,10 @@ async fn run_plan_dispatch(
         &ctx.root,
         ctx.session_id.as_deref(),
     ));
+
+    // Add user message to chat history so subsequent turns have conversational context.
+    engine.chat_history.push(crate::ollama::ChatMessage::new("user", ctx.clean_msg.clone()));
+    engine.truncate_chat_history();
 
     // Wire up the thinking channel.
     let (thinking_tx, mut thinking_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -781,6 +543,10 @@ async fn run_structured_loop(
         ctx.session_id.as_deref(),
     ));
 
+    // Add user message to chat history so subsequent turns have conversational context.
+    engine.chat_history.push(crate::ollama::ChatMessage::new("user", ctx.clean_msg.clone()));
+    engine.truncate_chat_history();
+
     // Wire up the thinking channel so streaming thinking tokens reach the UI.
     let (thinking_tx, mut thinking_rx) = tokio::sync::mpsc::unbounded_channel();
     engine.thinking_tx = Some(thinking_tx);
@@ -848,12 +614,6 @@ async fn run_structured_loop(
 
     if let Ok(outcome) = &outcome {
         emit_outcome_event(outcome, &ctx.events_tx, &ctx.agent_id);
-        let no_explicit_mutations: HashMap<String, String> = HashMap::new();
-        emit_change_report_if_any(
-            &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
-            ctx.session_id.as_deref(), ctx.git_baseline.as_ref(), &no_explicit_mutations,
-        )
-        .await;
     } else if let Err(err) = outcome {
         let error_msg = format!("Error: {}", err);
         persist_and_emit_message(
@@ -977,20 +737,37 @@ pub(crate) async fn chat_handler(
             let req_mode = req.mode.clone();
             let req_images = req.images.clone();
 
-            // Persist and emit user message immediately (even when busy) so it
-            // appears in the UI chat history right away.
-            persist_and_emit_message(
-                &state.manager,
-                &events_tx,
-                &root,
-                &target_id,
-                "user",
-                &target_id,
-                &clean_msg,
-                session_id.as_deref(),
-                false,
-            )
-            .await;
+            if was_busy {
+                // When queued, only persist to disk — don't emit via SSE.
+                // The frontend shows the message in the queue banner and removes
+                // the optimistic chat bubble. Emitting here would re-add it,
+                // causing duplication.
+                persist_message_only(
+                    &state.manager,
+                    &root,
+                    &target_id,
+                    "user",
+                    &target_id,
+                    &clean_msg,
+                    session_id.as_deref(),
+                    false,
+                )
+                .await;
+            } else {
+                // Not queued — persist and emit so the UI shows the message.
+                persist_and_emit_message(
+                    &state.manager,
+                    &events_tx,
+                    &root,
+                    &target_id,
+                    "user",
+                    &target_id,
+                    &clean_msg,
+                    session_id.as_deref(),
+                    false,
+                )
+                .await;
+            }
 
             tokio::spawn(async move {
                 let mut engine = agent.lock().await;
@@ -1026,8 +803,6 @@ pub(crate) async fn chat_handler(
                         None,
                     )
                     .await;
-                let git_baseline = capture_git_snapshot(&root_clone);
-
                 let ctx = ChatRunCtx {
                     state: state_clone.clone(),
                     manager: manager.clone(),
@@ -1036,7 +811,6 @@ pub(crate) async fn chat_handler(
                     agent_id: target_id_clone.clone(),
                     session_id: session_id.clone(),
                     clean_msg: clean_msg_clone.clone(),
-                    git_baseline,
                     images: req_images,
                 };
 
@@ -1154,8 +928,6 @@ pub(crate) async fn approve_plan_handler(
             )
             .await;
 
-        let git_baseline = capture_git_snapshot(&root_clone);
-
         // Set the approved plan on the engine.
         engine.plan = Some(plan);
         engine.plan_mode = false;
@@ -1241,17 +1013,6 @@ pub(crate) async fn approve_plan_handler(
 
         if let Ok(ref outcome) = outcome {
             emit_outcome_event(outcome, &events_tx, &agent_id);
-            let no_explicit_mutations: HashMap<String, String> = HashMap::new();
-            emit_change_report_if_any(
-                &manager,
-                &events_tx,
-                &root_clone,
-                &agent_id,
-                session_id.as_deref(),
-                git_baseline.as_ref(),
-                &no_explicit_mutations,
-            )
-            .await;
         } else if let Err(err) = outcome {
             let error_msg = format!("Error: {}", err);
             persist_and_emit_message(

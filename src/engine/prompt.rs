@@ -188,31 +188,9 @@ impl AgentEngine {
         // If executing an approved plan, inject the plan into the prompt.
         if let Some(plan) = &self.plan {
             if plan.status == PlanStatus::Approved || plan.status == PlanStatus::Executing {
-                let plan_content = if let Some(text) = &plan.plan_text {
-                    text.clone()
-                } else {
-                    // Fallback for item-based task lists (progress tracking)
-                    plan.items
-                        .iter()
-                        .enumerate()
-                        .map(|(i, item)| {
-                            let desc = item.description.as_deref().unwrap_or("");
-                            format!(
-                                "{}. [{}] {} {}",
-                                i + 1,
-                                serde_json::to_string(&item.status)
-                                    .unwrap_or_default()
-                                    .trim_matches('"'),
-                                item.title,
-                                desc
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
                 if let Some(rendered) = self.prompt_store.render(
                     crate::prompts::PLAN_EXECUTE,
-                    &[("plan_text", &plan_content)],
+                    &[("plan_text", &plan.plan_text)],
                 ) {
                     system.push_str("\n\n");
                     system.push_str(&rendered);

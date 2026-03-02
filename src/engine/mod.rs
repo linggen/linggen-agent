@@ -18,7 +18,7 @@ pub mod web_search;
 // Re-export public API types
 pub use types::{
     AgentEngine, AgentOutcome, AgentRole, ContextRecord, ContextType, EngineConfig,
-    Plan, PlanItemStatus, PlanStatus, TaskPacket, ThinkingEvent,
+    Plan, PlanStatus, TaskPacket, ThinkingEvent,
 };
 
 pub use actions::{model_message_log_parts, parse_all_actions, text_before_first_json, ModelAction};
@@ -31,7 +31,7 @@ use crate::ollama::ChatMessage;
 use anyhow::Result;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{debug, info};
 
 impl AgentEngine {
     pub async fn run_agent_loop(&mut self, session_id: Option<&str>) -> Result<AgentOutcome> {
@@ -111,7 +111,7 @@ impl AgentEngine {
                 .ok()
                 .flatten();
             if let Some(cw) = self.context_window_tokens {
-                info!("Model context window: {} tokens (soft limit: {}, keep tail: {}, max passes: {})",
+                debug!("Context window: {}t, soft_limit={}, keep_tail={}, max_passes={}",
                     cw, self.context_soft_token_limit(), self.context_keep_tail_messages(), self.context_max_summary_passes());
             }
         }
@@ -160,7 +160,7 @@ impl AgentEngine {
                 while interrupt_count < 5 {
                     match rx.try_recv() {
                         Ok(msg) => {
-                            info!("Injecting user interrupt message into loop context");
+                            debug!("Injecting user interrupt into loop context");
                             let imsg = ChatMessage::new(
                                 "user",
                                 format!("[User message received while you are working]\n{}", msg),
@@ -199,14 +199,14 @@ impl AgentEngine {
             let raw = stream_result.full_text;
             let stream_first_action = stream_result.first_action;
 
-            // Debug log: split model output into text + json (truncated).
+            // Log model output: text + json (truncated).
             let (text_part, json_part) = model_message_log_parts(&raw, 100, 100);
             let json_rendered = json_part
                 .as_ref()
                 .and_then(|v| serde_json::to_string(v).ok())
                 .unwrap_or_else(|| "null".to_string());
-            info!(
-                "Model response split: text='{}' json={}",
+            debug!(
+                "Model response: text='{}' json={}",
                 text_part.replace('\n', "\\n"),
                 json_rendered
             );

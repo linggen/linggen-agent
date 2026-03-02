@@ -972,6 +972,11 @@ impl AgentManager {
         *self.models.write().await = new_models;
         *self.config.write().await = new_config.clone();
 
+        // Apply log level change at runtime.
+        if let Some(ref level) = new_config.logging.level {
+            crate::logging::set_log_level(level);
+        }
+
         // Invalidate all cached agents so they pick up new config on next use
         let keys: Vec<String> = {
             let projects = self.projects.lock().await;
@@ -1025,7 +1030,7 @@ impl AgentManager {
         let key = format!("{}|{}", project_root, agent_id);
         let mut plans = self.pending_plans.lock().await;
         if let Some(plan) = plans.get_mut(&key) {
-            plan.plan_text = Some(text.to_string());
+            plan.plan_text = text.to_string();
             plan.summary = crate::engine::AgentEngine::extract_plan_summary(text);
             true
         } else {

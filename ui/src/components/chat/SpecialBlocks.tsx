@@ -1,8 +1,7 @@
 import React from 'react';
-import DiffView, { diffStats } from '../DiffView';
 import { MarkdownContent } from './MarkdownContent';
 import { PlanBlock } from './PlanBlock';
-import { PLAN_STATUS_COLOR, PLAN_ITEM_ICON, PLAN_ITEM_COLOR } from './utils/plan';
+import { PLAN_STATUS_COLOR } from './utils/plan';
 import type { SpecialBlockProps } from './types';
 
 export function tryRenderSpecialBlock(
@@ -17,8 +16,6 @@ export function tryRenderSpecialBlock(
         <PlanBlock
           plan={parsed.plan}
           statusColor={PLAN_STATUS_COLOR}
-          itemIcon={PLAN_ITEM_ICON}
-          itemColor={PLAN_ITEM_COLOR}
           pendingPlanAgentId={props.pendingPlanAgentId}
           agentContext={props.agentContext}
           onApprovePlan={props.onApprovePlan}
@@ -53,65 +50,6 @@ export function tryRenderSpecialBlock(
                 <div key={idx} className="text-[11px] opacity-90">- {crit}</div>
               ))}
             </div>
-          )}
-        </div>
-      );
-    }
-
-    if (parsed.type === 'change_report' && Array.isArray(parsed.files)) {
-      const files = parsed.files
-        .map((item: any) => ({
-          path: typeof item?.path === 'string' ? item.path : '',
-          summary: typeof item?.summary === 'string' ? item.summary : '',
-          diff: typeof item?.diff === 'string' ? item.diff : '',
-        }))
-        .filter((item: any) => item.path);
-      const truncatedCount = Number(parsed.truncated_count || 0);
-      const reviewHint = typeof parsed.review_hint === 'string' ? parsed.review_hint : '';
-      return (
-        <div className="space-y-1">
-          <div className="font-bold text-blue-500">
-            Changed files ({files.length}
-            {truncatedCount > 0 ? ` +${truncatedCount} more` : ''})
-          </div>
-          {files.map((file: any, idx: number) => {
-            const hasDiff = !!file.diff && !file.diff.startsWith('(diff');
-            const stats = hasDiff ? diffStats(file.diff) : null;
-            if (!hasDiff) {
-              return (
-                <div
-                  key={`${file.path}-${idx}`}
-                  className="flex flex-wrap items-center gap-2 rounded-md border border-slate-200 dark:border-white/10 bg-slate-50/80 dark:bg-white/[0.03] px-2 py-1.5 text-[11px]"
-                >
-                  <span className="text-slate-500 dark:text-slate-300">{file.summary || 'Updated'}</span>
-                  <span className="font-mono text-[11px]">{file.path}</span>
-                </div>
-              );
-            }
-            return (
-              <details
-                key={`${file.path}-${idx}`}
-                className="rounded-md border border-slate-200 dark:border-white/10 bg-slate-50/80 dark:bg-white/[0.03] text-[11px]"
-              >
-                <summary className="cursor-pointer px-2 py-1.5 select-none flex flex-wrap items-center gap-2">
-                  <span className="text-slate-500 dark:text-slate-300">{file.summary || 'Updated'}</span>
-                  <span className="font-mono text-[11px]">{file.path}</span>
-                  {stats && (
-                    <span className="ml-auto font-mono text-[10px]">
-                      {stats.added > 0 && <span className="text-green-600 dark:text-green-400">+{stats.added}</span>}
-                      {stats.added > 0 && stats.deleted > 0 && ' '}
-                      {stats.deleted > 0 && <span className="text-red-600 dark:text-red-400">-{stats.deleted}</span>}
-                    </span>
-                  )}
-                </summary>
-                <div className="px-1 pb-1">
-                  <DiffView diff={file.diff} />
-                </div>
-              </details>
-            );
-          })}
-          {reviewHint && (
-            <div className="text-[11px] text-slate-500 dark:text-slate-400">{reviewHint}</div>
           )}
         </div>
       );

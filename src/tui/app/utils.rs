@@ -1,5 +1,3 @@
-use super::super::display::PlanDisplayItem;
-
 /// Parse activity text from tool_status_line format into (tool_name, args_summary).
 ///
 /// Maps patterns like:
@@ -102,28 +100,3 @@ pub(super) fn parse_content_block_args(tool_name: &str, args_str: &str) -> Strin
     }
 }
 
-/// Strip "Step N: " prefix from a plan item title, returning the rest.
-fn strip_step_prefix(s: &str) -> &str {
-    if let Some(rest) = s.strip_prefix("Step ") {
-        if let Some(colon_pos) = rest.find(": ") {
-            let num_part = &rest[..colon_pos];
-            if num_part.chars().all(|c| c.is_ascii_digit()) {
-                return &rest[colon_pos + 2..];
-            }
-        }
-    }
-    s
-}
-
-/// Deduplicate plan items: normalize by stripping "Step N: " prefixes,
-/// then keep only the first occurrence of each unique title.
-pub(super) fn dedup_plan_items(items: Vec<PlanDisplayItem>) -> Vec<PlanDisplayItem> {
-    let mut seen = std::collections::HashSet::new();
-    items
-        .into_iter()
-        .filter(|item| {
-            let normalized = strip_step_prefix(&item.title).to_string();
-            seen.insert(normalized)
-        })
-        .collect()
-}

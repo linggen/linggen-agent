@@ -2,7 +2,6 @@ import React, { useCallback, useMemo, useState, useEffect, useRef } from 'react'
 import { Bot, FilePenLine, Settings, Sparkles, Target, Zap } from 'lucide-react';
 import { AgentsCard } from './components/AgentsCard';
 import { SessionNav } from './components/SessionNav';
-import { TaskListCard } from './components/TaskListCard';
 import { ModelsCard } from './components/ModelsCard';
 import { CollapsibleCard } from './components/CollapsibleCard';
 import { SkillsCard } from './components/SkillsCard';
@@ -1107,7 +1106,6 @@ const App: React.FC = () => {
               onOpenMission={() => setCurrentPage('mission')}
             />
           </CollapsibleCard>
-          <TaskListCard plan={activePlan} />
           <CollapsibleCard
             title="MODELS"
             icon={<Sparkles size={12} />}

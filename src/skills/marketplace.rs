@@ -71,7 +71,7 @@ pub enum SkillScope {
 
 impl Default for SkillScope {
     fn default() -> Self {
-        Self::Project
+        Self::Global
     }
 }
 
@@ -276,6 +276,79 @@ pub fn skill_target_dir(name: &str, scope: SkillScope, project_root: Option<&Pat
             Ok(crate::paths::global_skills_dir().join(name))
         }
     }
+}
+
+/// Resolve the actual filesystem directory for a skill based on its loaded source.
+/// Unlike `skill_target_dir` (which only knows Project/Global), this handles
+/// Compat sources (Claude, Codex) correctly.
+pub fn skill_dir_for_source(
+    name: &str,
+    source: &super::SkillSource,
+    project_root: Option<&Path>,
+) -> Result<PathBuf> {
+    match source {
+        super::SkillSource::Global => Ok(crate::paths::global_skills_dir().join(name)),
+        super::SkillSource::Project => {
+            let root = project_root
+                .ok_or_else(|| anyhow::anyhow!("Project root required for project-scoped skill"))?;
+            // Check all project skill dirs to find which one actually contains this skill.
+            for dir_name in &[".linggen/skills", ".claude/skills", ".codex/skills"] {
+                let candidate = root.join(dir_name).join(name);
+                if candidate.exists() {
+                    return Ok(candidate);
+                }
+            }
+            // Fallback to the canonical location.
+            Ok(root.join(".linggen/skills").join(name))
+        }
+        super::SkillSource::Compat { label } => {
+            // Find the matching compat dir by label.
+            for (dir, compat_label) in crate::paths::compat_skills_dirs() {
+                if compat_label == label.as_str() {
+                    return Ok(dir.join(name));
+                }
+            }
+            anyhow::bail!("Unknown compat source '{}'", label)
+        }
+    }
+}
+
+/// Move a project skill to the global `~/.linggen/skills/` directory.
+pub fn move_skill_to_global(
+    name: &str,
+    source: &super::SkillSource,
+    project_root: Option<&Path>,
+) -> Result<String> {
+    let src_dir = skill_dir_for_source(name, source, project_root)?;
+    if !src_dir.exists() {
+        anyhow::bail!("Skill '{}' not found at {}", name, src_dir.display());
+    }
+    let dest_dir = crate::paths::global_skills_dir().join(name);
+    if dest_dir.exists() {
+        anyhow::bail!(
+            "Skill '{}' already exists in global at {}",
+            name,
+            dest_dir.display()
+        );
+    }
+    copy_dir_all(&src_dir, &dest_dir)?;
+    fs::remove_dir_all(&src_dir)?;
+    Ok(format!("Moved '{}' to {}", name, dest_dir.display()))
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_all(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -765,7 +838,7 @@ mod tests {
 
     #[test]
     fn test_skill_scope_default() {
-        assert_eq!(SkillScope::default(), SkillScope::Project);
+        assert_eq!(SkillScope::default(), SkillScope::Global);
     }
 
     #[test]

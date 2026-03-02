@@ -181,41 +181,6 @@ impl ModelManager {
         }
     }
 
-    #[allow(dead_code)]
-    pub async fn chat_json(&self, model_id: &str, messages: &[ChatMessage]) -> Result<String> {
-        let instance = self
-            .models
-            .get(model_id)
-            .ok_or_else(|| anyhow::anyhow!("Model {} not found", model_id))?;
-        self.chat_json_with_keep_alive(model_id, messages, instance.config.keep_alive.clone())
-            .await
-    }
-
-    #[allow(dead_code)]
-    pub async fn chat_json_with_keep_alive(
-        &self,
-        model_id: &str,
-        messages: &[ChatMessage],
-        keep_alive: Option<String>,
-    ) -> Result<String> {
-        let instance = self
-            .models
-            .get(model_id)
-            .ok_or_else(|| anyhow::anyhow!("Model {} not found", model_id))?;
-
-        let _permit = instance.semaphore.acquire().await?;
-        match &instance.client {
-            ProviderClient::Ollama(client) => {
-                client
-                    .chat_json_with_keep_alive(&instance.config.model, messages, keep_alive)
-                    .await
-            }
-            ProviderClient::OpenAi(client) => {
-                client.chat_json(&instance.config.model, messages).await
-            }
-        }
-    }
-
     pub async fn chat_text_stream(
         &self,
         model_id: &str,
@@ -336,23 +301,6 @@ impl ModelManager {
         }
     }
 
-    #[allow(dead_code)]
-    pub async fn preload_model(&self, model_id: &str, keep_alive: &str) -> Result<()> {
-        let instance = self
-            .models
-            .get(model_id)
-            .ok_or_else(|| anyhow::anyhow!("Model {} not found", model_id))?;
-        match &instance.client {
-            ProviderClient::Ollama(client) => {
-                client
-                    .preload_model(&instance.config.model, keep_alive)
-                    .await
-            }
-            // OpenAI-compatible APIs don't support preloading; no-op.
-            ProviderClient::OpenAi(_) => Ok(()),
-        }
-    }
-
     pub fn list_models(&self) -> Vec<&ModelConfig> {
         self.models.values().map(|m| &m.config).collect()
     }
@@ -423,29 +371,9 @@ impl ModelManager {
         }
     }
 
-    /// Check if a model has a specific tag.
-    #[allow(dead_code)]
-    pub fn has_tag(&self, model_id: &str, tag: &str) -> bool {
-        self.models
-            .get(model_id)
-            .map(|inst| inst.config.tags.iter().any(|t| t.eq_ignore_ascii_case(tag)))
-            .unwrap_or(false)
-    }
-
     /// Check if a model ID exists in the configured models.
     pub fn has_model(&self, model_id: &str) -> bool {
         self.models.contains_key(model_id)
-    }
-
-    /// Return the OllamaClient for a specific model (if it's an Ollama provider).
-    /// Used by server status endpoints.
-    #[allow(dead_code)]
-    pub fn ollama_client_for_model(&self, model_id: &str) -> Option<&OllamaClient> {
-        let instance = self.models.get(model_id)?;
-        match &instance.client {
-            ProviderClient::Ollama(client) => Some(client),
-            ProviderClient::OpenAi(_) => None,
-        }
     }
 
     /// Return the first OllamaClient found among configured models.

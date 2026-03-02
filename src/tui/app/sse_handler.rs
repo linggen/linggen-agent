@@ -1,5 +1,5 @@
 use super::super::display::*;
-use super::utils::{dedup_plan_items, parse_activity_text, parse_content_block_args};
+use super::utils::{parse_activity_text, parse_content_block_args};
 use super::{ActiveToolGroup, App, ConnectionStatus, InteractivePrompt};
 use crate::server::UiSseMessage;
 use std::time::Instant;
@@ -458,42 +458,17 @@ impl App {
                         .and_then(|v| v.as_str())
                         .unwrap_or("planned")
                         .to_string();
-                    let items: Vec<PlanDisplayItem> = plan
-                        .get("items")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .map(|item| PlanDisplayItem {
-                                    title: item
-                                        .get("title")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("?")
-                                        .to_string(),
-                                    status: item
-                                        .get("status")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("pending")
-                                        .to_string(),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    // Dedup items: strip "Step N: " prefixes and keep
-                    // only one copy of each unique title.
-                    let items = dedup_plan_items(items);
 
                     // Replace the LAST PlanBlock (regardless of summary)
                     // since the agent may update its plan title mid-run.
                     let replaced = self.blocks.iter_mut().rev().any(|block| {
                         if let DisplayBlock::PlanBlock {
                             summary: existing_summary,
-                            items: existing_items,
                             status: existing_status,
                             ..
                         } = block
                         {
                             *existing_summary = summary.clone();
-                            *existing_items = items.clone();
                             *existing_status = status.clone();
                             return true;
                         }
@@ -507,7 +482,6 @@ impl App {
                     } else {
                         self.blocks.push(DisplayBlock::PlanBlock {
                             summary,
-                            items,
                             status: status.clone(),
                         });
                         if status == "planned" {
@@ -531,42 +505,6 @@ impl App {
                             self.prompt = None;
                         }
                     }
-                }
-            }
-        }
-        if msg.phase.as_deref() == Some("change_report") {
-            if let Some(data) = &msg.data {
-                let files: Vec<ChangedFile> = data
-                    .get("files")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|item| {
-                                let path = item.get("path")?.as_str()?.to_string();
-                                let summary = item
-                                    .get("summary")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("Updated")
-                                    .to_string();
-                                let diff = item
-                                    .get("diff")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                Some(ChangedFile { path, summary, diff })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let truncated_count = data
-                    .get("truncated_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
-                if !files.is_empty() {
-                    self.blocks.push(DisplayBlock::ChangeReport {
-                        files,
-                        truncated_count,
-                    });
                 }
             }
         }

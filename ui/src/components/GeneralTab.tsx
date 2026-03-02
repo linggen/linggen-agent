@@ -1,5 +1,4 @@
 import React from 'react';
-import { Plus, Trash2 } from 'lucide-react';
 import type { AppConfig } from '../types';
 
 const inputCls = 'w-full bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:ring-1 focus:ring-blue-500/50';
@@ -10,20 +9,6 @@ export const GeneralTab: React.FC<{
   config: AppConfig;
   onChange: (config: AppConfig) => void;
 }> = ({ config, onChange }) => {
-  const addAgentRef = () => {
-    onChange({ ...config, agents: [...config.agents, { id: '', spec_path: '', model: null }] });
-  };
-
-  const removeAgentRef = (index: number) => {
-    onChange({ ...config, agents: config.agents.filter((_, i) => i !== index) });
-  };
-
-  const updateAgentRef = (index: number, field: string, value: string | null) => {
-    const agents = [...config.agents];
-    agents[index] = { ...agents[index], [field]: value };
-    onChange({ ...config, agents });
-  };
-
   return (
     <div className="space-y-6">
       {/* Agent Settings */}
@@ -120,46 +105,6 @@ export const GeneralTab: React.FC<{
               placeholder="(default)"
             />
           </div>
-        </div>
-      </section>
-
-      {/* Agent Spec Refs */}
-      <section className={sectionCls}>
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-xs font-bold uppercase tracking-wider text-slate-700 dark:text-slate-300">Agent Spec Refs</h2>
-          <button onClick={addAgentRef} className="flex items-center gap-1 text-[10px] font-bold text-blue-600 hover:text-blue-700">
-            <Plus size={12} /> Add Ref
-          </button>
-        </div>
-        <div className="space-y-3">
-          {config.agents.map((ref_, i) => (
-            <div key={ref_.id || i} className="flex items-center gap-3 bg-slate-50 dark:bg-white/[0.02] rounded-lg p-3 border border-slate-100 dark:border-white/5">
-              <div className="flex-1 grid grid-cols-3 gap-2">
-                <div>
-                  <label className={labelCls}>ID</label>
-                  <input className={inputCls} value={ref_.id} onChange={(e) => updateAgentRef(i, 'id', e.target.value)} placeholder="agent id" />
-                </div>
-                <div>
-                  <label className={labelCls}>Spec Path</label>
-                  <input className={inputCls} value={ref_.spec_path} onChange={(e) => updateAgentRef(i, 'spec_path', e.target.value)} placeholder="agents/lead.md" />
-                </div>
-                <div>
-                  <label className={labelCls}>Model Override</label>
-                  <input className={inputCls} value={ref_.model || ''} onChange={(e) => updateAgentRef(i, 'model', e.target.value || null)} placeholder="(inherit)" />
-                </div>
-              </div>
-              <button
-                onClick={() => removeAgentRef(i)}
-                className="p-1 text-slate-400 hover:text-red-500 transition-colors self-end mb-1"
-                title="Remove ref"
-              >
-                <Trash2 size={12} />
-              </button>
-            </div>
-          ))}
-          {config.agents.length === 0 && (
-            <p className="text-xs text-slate-400 text-center py-4">No agent spec refs. Agents are discovered from the agents/ directory.</p>
-          )}
         </div>
       </section>
     </div>

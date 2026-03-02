@@ -233,12 +233,15 @@ impl SkillManager {
                 .await;
         }
 
-        // 3. Load Project Skills (.linggen/skills/) — highest priority
+        // 3. Load Project Skills — highest priority
+        //    Scan both .linggen/skills/ and .claude/skills/ (compat) in the project root.
         if let Some(root) = project_root {
-            let project_dir = root.join(".linggen/skills");
-            let _ = self
-                .load_from_dir_nested(&project_dir, SkillSource::Project, &mut *skills)
-                .await;
+            for dir_name in &[".claude/skills", ".codex/skills", ".linggen/skills"] {
+                let project_dir = root.join(dir_name);
+                let _ = self
+                    .load_from_dir_nested(&project_dir, SkillSource::Project, &mut *skills)
+                    .await;
+            }
         }
 
         // Rebuild trigger index from skills with trigger field set.

@@ -114,12 +114,22 @@ pub(crate) async fn marketplace_uninstall(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<UninstallRequest>,
 ) -> impl IntoResponse {
-    let scope = req.scope.unwrap_or_default();
     let project_root_path = req.project_root.as_deref().map(Path::new);
 
-    let target_dir = match marketplace::skill_target_dir(&req.name, scope, project_root_path) {
-        Ok(d) => d,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    // Look up the skill's actual source to resolve the correct directory.
+    // This handles Compat (Codex/Claude) skills that aren't in ~/.linggen/skills/.
+    let target_dir = if let Some(skill) = state.skill_manager.get_skill(&req.name).await {
+        match marketplace::skill_dir_for_source(&req.name, &skill.source, project_root_path) {
+            Ok(d) => d,
+            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        }
+    } else {
+        // Skill not loaded — fall back to scope-based resolution.
+        let scope = req.scope.unwrap_or_default();
+        match marketplace::skill_target_dir(&req.name, scope, project_root_path) {
+            Ok(d) => d,
+            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        }
     };
 
     match marketplace::delete_skill(&req.name, &target_dir) {
@@ -132,6 +142,37 @@ pub(crate) async fn marketplace_uninstall(
             tracing::error!(err = %e, skill = %req.name, "Marketplace uninstall failed");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Move to global
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub(crate) struct MoveToGlobalRequest {
+    name: String,
+    project_root: Option<String>,
+}
+
+pub(crate) async fn marketplace_move_to_global(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<MoveToGlobalRequest>,
+) -> impl IntoResponse {
+    let project_root_path = req.project_root.as_deref().map(Path::new);
+
+    let skill = match state.skill_manager.get_skill(&req.name).await {
+        Some(s) => s,
+        None => return (StatusCode::NOT_FOUND, "Skill not found").into_response(),
+    };
+
+    match marketplace::move_skill_to_global(&req.name, &skill.source, project_root_path) {
+        Ok(msg) => {
+            let _ = state.skill_manager.load_all(project_root_path).await;
+            let _ = state.events_tx.send(ServerEvent::StateUpdated);
+            axum::Json(serde_json::json!({ "ok": true, "message": msg })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

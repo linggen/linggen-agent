@@ -28,62 +28,6 @@ impl OllamaClient {
         }
     }
 
-    /// Ask Ollama to return a JSON-formatted assistant message (we set format: "json").
-    #[allow(dead_code)]
-    pub async fn chat_json(&self, model: &str, messages: &[ChatMessage]) -> Result<String> {
-        self.chat_json_with_keep_alive(model, messages, None).await
-    }
-
-    #[allow(dead_code)]
-    pub async fn chat_json_with_keep_alive(
-        &self,
-        model: &str,
-        messages: &[ChatMessage],
-        keep_alive: Option<String>,
-    ) -> Result<String> {
-        let total_len: usize = messages.iter().map(|m| m.content.len()).sum();
-        if let Some(last) = messages.last() {
-            tracing::info!("Ollama Request (JSON): model={}, messages={}, total_chars={}\nLast Message ({}): {:.200}...", 
-                model, messages.len(), total_len, last.role, last.content);
-        } else {
-            tracing::info!(
-                "Ollama Request (JSON): model={}, messages={}, total_chars={}",
-                model,
-                messages.len(),
-                total_len
-            );
-        }
-
-        let url = format!("{}/api/chat", self.base_url);
-        let req = ChatRequest {
-            model: model.to_string(),
-            messages: messages.to_vec(),
-            stream: Some(false),
-            format: Some("json".to_string()),
-            keep_alive,
-        };
-
-        let mut rb = self.http.post(url).json(&req);
-        if let Some(key) = &self.api_key {
-            rb = rb.header("Authorization", format!("Bearer {}", key));
-        }
-        let resp = rb.send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("ollama error ({}): {}", status, text);
-        }
-
-        let payload: ChatResponse = resp.json().await?;
-        Ok(payload.message.content)
-    }
-
-    /// Plain text chat (no structured output enforcement).
-    #[allow(dead_code)]
-    pub async fn chat_text(&self, model: &str, messages: &[ChatMessage]) -> Result<String> {
-        self.chat_text_with_keep_alive(model, messages, None).await
-    }
-
     pub async fn chat_text_with_keep_alive(
         &self,
         model: &str,
@@ -132,17 +76,6 @@ impl OllamaClient {
         Ok(result)
     }
 
-    /// Streaming text chat.
-    #[allow(dead_code)]
-    pub async fn chat_text_stream(
-        &self,
-        model: &str,
-        messages: &[ChatMessage],
-    ) -> Result<impl Stream<Item = Result<StreamChunk>> + Send> {
-        self.chat_text_stream_with_keep_alive(model, messages, None)
-            .await
-    }
-
     pub async fn chat_text_stream_with_keep_alive(
         &self,
         model: &str,
@@ -150,16 +83,9 @@ impl OllamaClient {
         keep_alive: Option<String>,
     ) -> Result<impl Stream<Item = Result<StreamChunk>> + Send> {
         let total_len: usize = messages.iter().map(|m| m.content.len()).sum();
+        tracing::info!("Ollama stream: model={} msgs={} chars={}", model, messages.len(), total_len);
         if let Some(last) = messages.last() {
-            tracing::info!("Ollama Request (Stream): model={}, messages={}, total_chars={}\nLast Message ({}): {:.200}...",
-                model, messages.len(), total_len, last.role, last.content);
-        } else {
-            tracing::info!(
-                "Ollama Request (Stream): model={}, messages={}, total_chars={}",
-                model,
-                messages.len(),
-                total_len
-            );
+            tracing::debug!("Last msg ({}): {:.200}", last.role, last.content);
         }
 
         let url = format!("{}/api/chat", self.base_url);
@@ -229,36 +155,6 @@ impl OllamaClient {
         });
 
         Ok(token_stream)
-    }
-
-    /// Preload a model into memory and keep it there.
-    #[allow(dead_code)]
-    pub async fn preload_model(&self, model: &str, keep_alive: &str) -> Result<()> {
-        tracing::info!(
-            "Preloading Ollama model: {} (keep_alive={})",
-            model,
-            keep_alive
-        );
-        let url = format!("{}/api/chat", self.base_url);
-        let req = ChatRequest {
-            model: model.to_string(),
-            messages: vec![],
-            stream: Some(false),
-            format: None,
-            keep_alive: Some(keep_alive.to_string()),
-        };
-
-        let mut rb = self.http.post(url).json(&req);
-        if let Some(key) = &self.api_key {
-            rb = rb.header("Authorization", format!("Bearer {}", key));
-        }
-        let resp = rb.send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("ollama error ({}): {}", status, text);
-        }
-        Ok(())
     }
 
     /// Get the status of currently running models in Ollama.
@@ -510,11 +406,6 @@ impl ChatMessage {
         self
     }
 
-    #[allow(dead_code)]
-    pub fn with_cache_control(mut self) -> Self {
-        self.cache_control = Some(serde_json::json!({"type": "ephemeral"}));
-        self
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]

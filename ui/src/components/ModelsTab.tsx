@@ -118,6 +118,7 @@ export const ModelsTab: React.FC<{
 
   const updateModel = (index: number, field: keyof ModelConfigUI, value: string | null) => {
     const models = [...config.models];
+    const oldId = models[index]?.id;
     const updated = { ...models[index], [field]: value };
     if (field === 'provider' && value && PROVIDER_PRESETS[value]) {
       updated.url = PROVIDER_PRESETS[value].url;
@@ -127,7 +128,13 @@ export const ModelsTab: React.FC<{
       }
     }
     models[index] = updated;
-    onChange({ ...config, models });
+    // When model ID is renamed, update default_models to keep it in sync
+    let routing = config.routing;
+    if (field === 'id' && oldId && value && oldId !== value && defaultModels.includes(oldId)) {
+      const newDefaults = defaultModels.map((id) => id === oldId ? value : id);
+      routing = { ...routing, default_models: newDefaults };
+    }
+    onChange({ ...config, models, routing });
   };
 
   const addModel = () => {
