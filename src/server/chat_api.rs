@@ -401,12 +401,28 @@ async fn run_plan_dispatch(
                         thinking: true,
                     });
                 }
+                crate::engine::ThinkingEvent::ContentToken(token) => {
+                    let _ = events_tx_clone.send(ServerEvent::Token {
+                        agent_id: agent_id_clone.clone(),
+                        token,
+                        done: false,
+                        thinking: false,
+                    });
+                }
                 crate::engine::ThinkingEvent::Done => {
                     let _ = events_tx_clone.send(ServerEvent::Token {
                         agent_id: agent_id_clone.clone(),
                         token: String::new(),
                         done: true,
                         thinking: true,
+                    });
+                }
+                crate::engine::ThinkingEvent::ContentDone => {
+                    let _ = events_tx_clone.send(ServerEvent::Token {
+                        agent_id: agent_id_clone.clone(),
+                        token: String::new(),
+                        done: true,
+                        thinking: false,
                     });
                 }
             }
@@ -569,12 +585,28 @@ async fn run_structured_loop(
                         thinking: true,
                     });
                 }
+                crate::engine::ThinkingEvent::ContentToken(token) => {
+                    let _ = events_tx_clone.send(ServerEvent::Token {
+                        agent_id: agent_id_clone.clone(),
+                        token,
+                        done: false,
+                        thinking: false,
+                    });
+                }
                 crate::engine::ThinkingEvent::Done => {
                     let _ = events_tx_clone.send(ServerEvent::Token {
                         agent_id: agent_id_clone.clone(),
                         token: String::new(),
                         done: true,
                         thinking: true,
+                    });
+                }
+                crate::engine::ThinkingEvent::ContentDone => {
+                    let _ = events_tx_clone.send(ServerEvent::Token {
+                        agent_id: agent_id_clone.clone(),
+                        token: String::new(),
+                        done: true,
+                        thinking: false,
                     });
                 }
             }
@@ -615,6 +647,20 @@ async fn run_structured_loop(
 
     if let Ok(outcome) = &outcome {
         emit_outcome_event(outcome, &ctx.events_tx, &ctx.agent_id);
+        // For text-only responses (AgentOutcome::None with streamed content),
+        // the engine persists the message to DB but doesn't emit a Message event.
+        // Emit one now so the UI can finalize liveText → text.
+        if matches!(outcome, crate::engine::AgentOutcome::None) {
+            if let Some(text) = &engine.last_assistant_text {
+                if !text.is_empty() {
+                    let _ = ctx.events_tx.send(ServerEvent::Message {
+                        from: ctx.agent_id.clone(),
+                        to: "user".to_string(),
+                        content: text.clone(),
+                    });
+                }
+            }
+        }
     } else if let Err(err) = outcome {
         let error_msg = format!("Error: {}", err);
         persist_and_emit_message(
@@ -1022,12 +1068,28 @@ pub(crate) async fn approve_plan_handler(
                             thinking: true,
                         });
                     }
+                    crate::engine::ThinkingEvent::ContentToken(token) => {
+                        let _ = events_tx_inner.send(ServerEvent::Token {
+                            agent_id: agent_id_inner.clone(),
+                            token,
+                            done: false,
+                            thinking: false,
+                        });
+                    }
                     crate::engine::ThinkingEvent::Done => {
                         let _ = events_tx_inner.send(ServerEvent::Token {
                             agent_id: agent_id_inner.clone(),
                             token: String::new(),
                             done: true,
                             thinking: true,
+                        });
+                    }
+                    crate::engine::ThinkingEvent::ContentDone => {
+                        let _ = events_tx_inner.send(ServerEvent::Token {
+                            agent_id: agent_id_inner.clone(),
+                            token: String::new(),
+                            done: true,
+                            thinking: false,
                         });
                     }
                 }
