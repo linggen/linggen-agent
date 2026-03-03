@@ -17,6 +17,10 @@ pub enum PermissionAction {
     AllowSession,
     AllowProject,
     Deny,
+    /// User denied with a custom message to relay to the model.
+    DenyWithMessage(String),
+    /// Deny for this project (persisted deny rule).
+    DenyProject,
 }
 
 // ---------------------------------------------------------------------------
@@ -27,6 +31,8 @@ pub enum PermissionAction {
 struct PersistedPermissions {
     #[serde(default)]
     tool_allows: HashSet<String>,
+    #[serde(default)]
+    tool_denies: HashSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -37,6 +43,7 @@ struct PersistedPermissions {
 pub struct PermissionStore {
     session_allows: HashSet<String>,
     project_allows: HashSet<String>,
+    project_denies: HashSet<String>,
     project_file: Option<PathBuf>,
 }
 
@@ -45,26 +52,27 @@ impl PermissionStore {
     /// `project_dir` is `{workspace}/.linggen/` (same pattern as Claude Code's `.claude/`).
     pub fn load(project_dir: &Path) -> Self {
         let file = project_dir.join("permissions.json");
-        let project_allows = if file.exists() {
+        let (project_allows, project_denies) = if file.exists() {
             match fs::read_to_string(&file) {
                 Ok(content) => match serde_json::from_str::<PersistedPermissions>(&content) {
-                    Ok(p) => p.tool_allows,
+                    Ok(p) => (p.tool_allows, p.tool_denies),
                     Err(e) => {
                         warn!("Failed to parse permissions.json: {}", e);
-                        HashSet::new()
+                        (HashSet::new(), HashSet::new())
                     }
                 },
                 Err(e) => {
                     warn!("Failed to read permissions.json: {}", e);
-                    HashSet::new()
+                    (HashSet::new(), HashSet::new())
                 }
             }
         } else {
-            HashSet::new()
+            (HashSet::new(), HashSet::new())
         };
         Self {
             session_allows: HashSet::new(),
             project_allows,
+            project_denies,
             project_file: Some(file),
         }
     }
@@ -75,6 +83,7 @@ impl PermissionStore {
         Self {
             session_allows: HashSet::new(),
             project_allows: HashSet::new(),
+            project_denies: HashSet::new(),
             project_file: None,
         }
     }
@@ -85,14 +94,38 @@ impl PermissionStore {
     /// A blanket `"Bash"` entry still grants access to all commands (backward compat).
     /// Pattern entries like `"Bash:npm run *"` only match commands that fit the glob.
     pub fn check(&self, tool: &str, command: Option<&str>) -> bool {
+        // 0. Deny rules take precedence over allows.
+        if self.is_denied(tool, command) {
+            return false;
+        }
         // 1. Blanket tool-level allow (backward compat)
         if self.session_allows.contains(tool) || self.project_allows.contains(tool) {
             return true;
         }
-        // 2. Pattern-based matching for Bash commands
+        // 2. Pattern-based matching (Bash commands, file paths)
         if let Some(cmd) = command {
             let prefix = format!("{}:", tool);
             for entry in self.session_allows.iter().chain(self.project_allows.iter()) {
+                if let Some(pattern) = entry.strip_prefix(&prefix) {
+                    if command_matches_pattern(cmd, pattern) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Check whether a tool + arg is project-denied.
+    pub fn is_denied(&self, tool: &str, arg: Option<&str>) -> bool {
+        // Blanket deny: "Bash", "Write", etc.
+        if self.project_denies.contains(tool) {
+            return true;
+        }
+        // Pattern-based deny: "Bash:npm run *", "Edit:src/secret/*"
+        if let Some(cmd) = arg {
+            let prefix = format!("{}:", tool);
+            for entry in self.project_denies.iter() {
                 if let Some(pattern) = entry.strip_prefix(&prefix) {
                     if command_matches_pattern(cmd, pattern) {
                         return true;
@@ -114,6 +147,12 @@ impl PermissionStore {
         self.persist();
     }
 
+    /// Deny a tool/pattern for this project (persisted to disk).
+    pub fn deny_for_project(&mut self, key: &str) {
+        self.project_denies.insert(key.to_string());
+        self.persist();
+    }
+
     /// Clear session-scoped permissions (called on session reset).
     #[allow(dead_code)]
     pub fn clear_session(&mut self) {
@@ -129,6 +168,7 @@ impl PermissionStore {
         }
         let data = PersistedPermissions {
             tool_allows: self.project_allows.clone(),
+            tool_denies: self.project_denies.clone(),
         };
         match serde_json::to_string_pretty(&data) {
             Ok(json) => {
@@ -207,12 +247,99 @@ pub fn command_matches_pattern(cmd: &str, pattern: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// File-scoped permission helpers (Write / Edit)
+// ---------------------------------------------------------------------------
+
+/// Extracts a directory-level glob pattern from a relative file path.
+///
+/// - `"src/components/App.tsx"` → `"src/components/*"`
+/// - `"README.md"` (root file)  → `"*"`
+/// - `"deep/nested/dir/file.rs"` → `"deep/nested/dir/*"`
+pub fn derive_file_pattern(rel_path: &str) -> String {
+    // Strip leading slashes to avoid absolute-path patterns in stored rules
+    let rel_path = rel_path.trim_start_matches('/');
+    if rel_path.is_empty() {
+        return "*".to_string();
+    }
+    match rel_path.rfind('/') {
+        Some(idx) => format!("{}/*", &rel_path[..idx]),
+        None => "*".to_string(), // root-level file
+    }
+}
+
+/// Build the AskUser question for a file-scoped Write/Edit permission prompt.
+pub fn build_file_permission_question(
+    tool: &str,
+    file_path: &str,
+    pattern: &str,
+) -> AskUserQuestion {
+    let mut options = vec![AskUserOption {
+        label: "Allow once".to_string(),
+        description: Some("Proceed this one time only".to_string()),
+        preview: None,
+    }];
+
+    options.push(AskUserOption {
+        label: format!("Allow {}({}) for this task", tool, pattern),
+        description: Some("Session-scoped; resets on new session".to_string()),
+        preview: None,
+    });
+    options.push(AskUserOption {
+        label: format!("Allow {}({}) for this project", tool, pattern),
+        description: Some("Persisted; won't ask again for this project".to_string()),
+        preview: None,
+    });
+    options.push(AskUserOption {
+        label: "Deny".to_string(),
+        description: Some(format!("Deny this {} call", tool)),
+        preview: None,
+    });
+    options.push(AskUserOption {
+        label: format!("Deny {}({}) for this project", tool, pattern),
+        description: Some("Persisted deny rule; auto-blocked without prompt".to_string()),
+        preview: None,
+    });
+
+    AskUserQuestion {
+        question: format!("{} {}", tool, file_path),
+        header: "Permission".to_string(),
+        options,
+        multi_select: false,
+    }
+}
+
+/// Parse the selected option from a file-scoped Write/Edit permission prompt.
+/// Returns `(action, permission_key)` where `permission_key` is the string to store
+/// (e.g., `"Edit:src/components/*"` for pattern-scoped).
+pub fn parse_file_permission_answer(
+    selected: &str,
+    tool: &str,
+    pattern: &str,
+) -> (PermissionAction, Option<String>) {
+    if selected == "Allow once" {
+        return (PermissionAction::AllowOnce, None);
+    }
+    let key = format!("{}:{}", tool, pattern);
+    if selected == format!("Allow {}({}) for this task", tool, pattern) {
+        return (PermissionAction::AllowSession, Some(key));
+    }
+    if selected == format!("Allow {}({}) for this project", tool, pattern) {
+        return (PermissionAction::AllowProject, Some(key));
+    }
+    if selected == format!("Deny {}({}) for this project", tool, pattern) {
+        return (PermissionAction::DenyProject, Some(key));
+    }
+    // "Deny", "Cancel" (backward compat), or anything unexpected
+    (PermissionAction::Deny, None)
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /// Returns true for tools that modify the filesystem or execute commands.
 pub fn is_destructive_tool(tool: &str) -> bool {
-    matches!(tool, "Write" | "Edit" | "Bash" | "Patch")
+    matches!(tool, "Write" | "Edit" | "Bash")
 }
 
 /// Returns true for tools that make network requests (WebFetch, WebSearch).
@@ -299,8 +426,13 @@ pub fn build_permission_question(tool: &str, target_summary: &str) -> AskUserQue
                 preview: None,
             },
             AskUserOption {
-                label: "Cancel".to_string(),
+                label: "Deny".to_string(),
                 description: Some("Deny this tool call".to_string()),
+                preview: None,
+            },
+            AskUserOption {
+                label: format!("Deny all {} for this project", tool),
+                description: Some("Persisted deny rule; auto-blocked without prompt".to_string()),
                 preview: None,
             },
         ],
@@ -309,7 +441,6 @@ pub fn build_permission_question(tool: &str, target_summary: &str) -> AskUserQue
 }
 
 /// Build the AskUser question for a web tool permission prompt.
-/// Uses a simpler 3-option layout (no project-level persistence for web tools).
 pub fn build_web_permission_question(tool: &str, target_summary: &str) -> AskUserQuestion {
     AskUserQuestion {
         question: format!("{} {}", tool, target_summary),
@@ -326,8 +457,18 @@ pub fn build_web_permission_question(tool: &str, target_summary: &str) -> AskUse
                 preview: None,
             },
             AskUserOption {
-                label: "Cancel".to_string(),
+                label: format!("Allow all {} for this project", tool),
+                description: Some("Persisted; won't ask again for this project".to_string()),
+                preview: None,
+            },
+            AskUserOption {
+                label: "Deny".to_string(),
                 description: Some("Deny this web request".to_string()),
+                preview: None,
+            },
+            AskUserOption {
+                label: format!("Deny all {} for this project", tool),
+                description: Some("Persisted deny rule; auto-blocked without prompt".to_string()),
                 preview: None,
             },
         ],
@@ -341,6 +482,10 @@ pub fn parse_web_permission_answer(selected: &str, tool: &str) -> PermissionActi
         PermissionAction::AllowOnce
     } else if selected == format!("Allow all {} for this task", tool) {
         PermissionAction::AllowSession
+    } else if selected == format!("Allow all {} for this project", tool) {
+        PermissionAction::AllowProject
+    } else if selected == format!("Deny all {} for this project", tool) {
+        PermissionAction::DenyProject
     } else {
         PermissionAction::Deny
     }
@@ -358,6 +503,7 @@ pub fn build_bash_permission_question(command: &str, pattern: Option<&str>) -> A
     }];
 
     if let Some(pat) = pattern {
+        // Pattern-scoped options for simple commands
         options.push(AskUserOption {
             label: format!("Allow Bash({}) for this task", pat),
             description: Some("Session-scoped; resets on new session".to_string()),
@@ -368,19 +514,39 @@ pub fn build_bash_permission_question(command: &str, pattern: Option<&str>) -> A
             description: Some("Persisted; won't ask again for this project".to_string()),
             preview: None,
         });
+        options.push(AskUserOption {
+            label: "Deny".to_string(),
+            description: Some("Deny this command".to_string()),
+            preview: None,
+        });
+        options.push(AskUserOption {
+            label: format!("Deny Bash({}) for this project", pat),
+            description: Some("Persisted deny rule; auto-blocked without prompt".to_string()),
+            preview: None,
+        });
+    } else {
+        // Blanket options for compound commands (no pattern derivable)
+        options.push(AskUserOption {
+            label: "Allow all Bash for this task".to_string(),
+            description: Some("Session-scoped; resets on new session".to_string()),
+            preview: None,
+        });
+        options.push(AskUserOption {
+            label: "Allow all Bash for this project".to_string(),
+            description: Some("Saved to project; won't ask again".to_string()),
+            preview: None,
+        });
+        options.push(AskUserOption {
+            label: "Deny".to_string(),
+            description: Some("Deny this command".to_string()),
+            preview: None,
+        });
+        options.push(AskUserOption {
+            label: "Deny all Bash for this project".to_string(),
+            description: Some("Persisted deny rule; auto-blocked without prompt".to_string()),
+            preview: None,
+        });
     }
-
-    options.push(AskUserOption {
-        label: "Allow all Bash for this task".to_string(),
-        description: Some("Session-scoped; allows any Bash command".to_string()),
-        preview: None,
-    });
-
-    options.push(AskUserOption {
-        label: "Cancel".to_string(),
-        description: Some("Deny this command".to_string()),
-        preview: None,
-    });
 
     AskUserQuestion {
         question: format!("Bash {}", command),
@@ -401,9 +567,6 @@ pub fn parse_bash_permission_answer(
     if selected == "Allow once" {
         return (PermissionAction::AllowOnce, None);
     }
-    if selected == "Allow all Bash for this task" {
-        return (PermissionAction::AllowSession, Some("Bash".to_string()));
-    }
     if let Some(pat) = pattern {
         let key = format!("Bash:{}", pat);
         if selected == format!("Allow Bash({}) for this task", pat) {
@@ -412,8 +575,22 @@ pub fn parse_bash_permission_answer(
         if selected == format!("Allow Bash({}) for this project", pat) {
             return (PermissionAction::AllowProject, Some(key));
         }
+        if selected == format!("Deny Bash({}) for this project", pat) {
+            return (PermissionAction::DenyProject, Some(key));
+        }
+    } else {
+        // Blanket Bash options for compound commands
+        if selected == "Allow all Bash for this task" {
+            return (PermissionAction::AllowSession, Some("Bash".to_string()));
+        }
+        if selected == "Allow all Bash for this project" {
+            return (PermissionAction::AllowProject, Some("Bash".to_string()));
+        }
+        if selected == "Deny all Bash for this project" {
+            return (PermissionAction::DenyProject, Some("Bash".to_string()));
+        }
     }
-    // "Cancel" or anything unexpected
+    // "Deny", "Cancel" (backward compat), or anything unexpected
     (PermissionAction::Deny, None)
 }
 
@@ -425,6 +602,8 @@ pub fn parse_permission_answer(selected: &str, tool: &str) -> PermissionAction {
         PermissionAction::AllowSession
     } else if selected == format!("Allow all {} for this project", tool) {
         PermissionAction::AllowProject
+    } else if selected == format!("Deny all {} for this project", tool) {
+        PermissionAction::DenyProject
     } else {
         // "Cancel" or anything unexpected
         PermissionAction::Deny
@@ -440,7 +619,8 @@ mod tests {
         assert!(is_destructive_tool("Write"));
         assert!(is_destructive_tool("Edit"));
         assert!(is_destructive_tool("Bash"));
-        assert!(is_destructive_tool("Patch"));
+        // Patch is gated by agent policy, not user permissions.
+        assert!(!is_destructive_tool("Patch"));
         assert!(!is_destructive_tool("Read"));
         assert!(!is_destructive_tool("Glob"));
         assert!(!is_destructive_tool("Grep"));
@@ -486,6 +666,8 @@ mod tests {
             parse_permission_answer("Allow all Bash for this project", "Bash"),
             PermissionAction::AllowProject
         );
+        // Both "Deny" and "Cancel" (backward compat) resolve to Deny
+        assert_eq!(parse_permission_answer("Deny", "Write"), PermissionAction::Deny);
         assert_eq!(parse_permission_answer("Cancel", "Write"), PermissionAction::Deny);
         assert_eq!(parse_permission_answer("anything else", "Write"), PermissionAction::Deny);
     }
@@ -495,9 +677,10 @@ mod tests {
         let q = build_permission_question("Write", "src/main.rs");
         assert_eq!(q.question, "Write src/main.rs");
         assert_eq!(q.header, "Permission");
-        assert_eq!(q.options.len(), 4);
+        assert_eq!(q.options.len(), 5);
         assert_eq!(q.options[0].label, "Allow once");
         assert!(q.options[1].label.contains("Write"));
+        assert_eq!(q.options[4].label, "Deny all Write for this project");
     }
 
     #[test]
@@ -541,10 +724,12 @@ mod tests {
     fn test_build_web_permission_question() {
         let q = build_web_permission_question("WebFetch", "https://example.com");
         assert_eq!(q.question, "WebFetch https://example.com");
-        assert_eq!(q.options.len(), 3);
+        assert_eq!(q.options.len(), 5);
         assert_eq!(q.options[0].label, "Allow this request");
         assert!(q.options[1].label.contains("WebFetch"));
-        assert_eq!(q.options[2].label, "Cancel");
+        assert_eq!(q.options[2].label, "Allow all WebFetch for this project");
+        assert_eq!(q.options[3].label, "Deny");
+        assert_eq!(q.options[4].label, "Deny all WebFetch for this project");
     }
 
     #[test]
@@ -556,6 +741,15 @@ mod tests {
         assert_eq!(
             parse_web_permission_answer("Allow all WebFetch for this task", "WebFetch"),
             PermissionAction::AllowSession
+        );
+        assert_eq!(
+            parse_web_permission_answer("Allow all WebFetch for this project", "WebFetch"),
+            PermissionAction::AllowProject
+        );
+        // Both "Deny" and "Cancel" (backward compat) resolve to Deny
+        assert_eq!(
+            parse_web_permission_answer("Deny", "WebFetch"),
+            PermissionAction::Deny
         );
         assert_eq!(
             parse_web_permission_answer("Cancel", "WebFetch"),
@@ -683,7 +877,7 @@ mod tests {
     fn test_build_bash_permission_question_with_pattern() {
         let q = build_bash_permission_question("npm run build", Some("npm run *"));
         assert_eq!(q.question, "Bash npm run build");
-        // With pattern: Allow once, Allow Bash(pattern) task, Allow Bash(pattern) project, Allow all Bash task, Cancel
+        // With pattern: Allow once, Allow Bash(pattern) task, Allow Bash(pattern) project, Deny, Deny for project
         assert_eq!(q.options.len(), 5);
         assert_eq!(q.options[0].label, "Allow once");
         assert_eq!(q.options[1].label, "Allow Bash(npm run *) for this task");
@@ -691,19 +885,21 @@ mod tests {
             q.options[2].label,
             "Allow Bash(npm run *) for this project"
         );
-        assert_eq!(q.options[3].label, "Allow all Bash for this task");
-        assert_eq!(q.options[4].label, "Cancel");
+        assert_eq!(q.options[3].label, "Deny");
+        assert_eq!(q.options[4].label, "Deny Bash(npm run *) for this project");
     }
 
     #[test]
     fn test_build_bash_permission_question_no_pattern() {
         let q = build_bash_permission_question("ls && cat foo", None);
         assert_eq!(q.question, "Bash ls && cat foo");
-        // Without pattern: Allow once, Allow all Bash task, Cancel
-        assert_eq!(q.options.len(), 3);
+        // Without pattern (compound command): Allow once, blanket task, blanket project, Deny, Deny for project
+        assert_eq!(q.options.len(), 5);
         assert_eq!(q.options[0].label, "Allow once");
         assert_eq!(q.options[1].label, "Allow all Bash for this task");
-        assert_eq!(q.options[2].label, "Cancel");
+        assert_eq!(q.options[2].label, "Allow all Bash for this project");
+        assert_eq!(q.options[3].label, "Deny");
+        assert_eq!(q.options[4].label, "Deny all Bash for this project");
     }
 
     #[test]
@@ -727,21 +923,23 @@ mod tests {
         assert_eq!(action, PermissionAction::AllowProject);
         assert_eq!(key.as_deref(), Some("Bash:npm run *"));
 
-        // Blanket session
-        let (action, key) =
-            parse_bash_permission_answer("Allow all Bash for this task", "Bash", pat);
-        assert_eq!(action, PermissionAction::AllowSession);
-        assert_eq!(key.as_deref(), Some("Bash"));
-
-        // Cancel
+        // Deny (and backward-compat Cancel)
+        let (action, key) = parse_bash_permission_answer("Deny", "Bash", pat);
+        assert_eq!(action, PermissionAction::Deny);
+        assert!(key.is_none());
         let (action, key) = parse_bash_permission_answer("Cancel", "Bash", pat);
         assert_eq!(action, PermissionAction::Deny);
         assert!(key.is_none());
 
-        // No pattern: only blanket or cancel
+        // Blanket options for compound commands (pattern=None)
         let (action, key) =
             parse_bash_permission_answer("Allow all Bash for this task", "Bash", None);
         assert_eq!(action, PermissionAction::AllowSession);
+        assert_eq!(key.as_deref(), Some("Bash"));
+
+        let (action, key) =
+            parse_bash_permission_answer("Allow all Bash for this project", "Bash", None);
+        assert_eq!(action, PermissionAction::AllowProject);
         assert_eq!(key.as_deref(), Some("Bash"));
     }
 
@@ -765,5 +963,208 @@ mod tests {
         assert!(!store2.check("Bash", Some("npm install")));
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // --- File-scoped permission tests ---
+
+    #[test]
+    fn test_derive_file_pattern() {
+        assert_eq!(derive_file_pattern("src/components/App.tsx"), "src/components/*");
+        assert_eq!(derive_file_pattern("src/main.rs"), "src/*");
+        assert_eq!(derive_file_pattern("README.md"), "*");
+        assert_eq!(derive_file_pattern("deep/nested/dir/file.rs"), "deep/nested/dir/*");
+        // Absolute paths should be sanitized
+        assert_eq!(derive_file_pattern("/etc/passwd"), "etc/*");
+        assert_eq!(derive_file_pattern("/usr/local/bin/tool"), "usr/local/bin/*");
+        // Edge cases
+        assert_eq!(derive_file_pattern(""), "*");
+        assert_eq!(derive_file_pattern("/"), "*");
+    }
+
+    #[test]
+    fn test_build_file_permission_question() {
+        let q = build_file_permission_question("Edit", "src/components/App.tsx", "src/components/*");
+        assert_eq!(q.question, "Edit src/components/App.tsx");
+        assert_eq!(q.options.len(), 5);
+        assert_eq!(q.options[0].label, "Allow once");
+        assert_eq!(q.options[1].label, "Allow Edit(src/components/*) for this task");
+        assert_eq!(q.options[2].label, "Allow Edit(src/components/*) for this project");
+        assert_eq!(q.options[3].label, "Deny");
+        assert_eq!(q.options[4].label, "Deny Edit(src/components/*) for this project");
+    }
+
+    #[test]
+    fn test_parse_file_permission_answer_all_paths() {
+        let pat = "src/components/*";
+
+        // Allow once
+        let (action, key) = parse_file_permission_answer("Allow once", "Edit", pat);
+        assert_eq!(action, PermissionAction::AllowOnce);
+        assert!(key.is_none());
+
+        // Pattern-scoped session
+        let (action, key) = parse_file_permission_answer(
+            "Allow Edit(src/components/*) for this task", "Edit", pat,
+        );
+        assert_eq!(action, PermissionAction::AllowSession);
+        assert_eq!(key.as_deref(), Some("Edit:src/components/*"));
+
+        // Pattern-scoped project
+        let (action, key) = parse_file_permission_answer(
+            "Allow Edit(src/components/*) for this project", "Edit", pat,
+        );
+        assert_eq!(action, PermissionAction::AllowProject);
+        assert_eq!(key.as_deref(), Some("Edit:src/components/*"));
+
+        // Deny
+        let (action, key) = parse_file_permission_answer("Deny", "Edit", pat);
+        assert_eq!(action, PermissionAction::Deny);
+        assert!(key.is_none());
+
+        // Deny for project
+        let (action, key) = parse_file_permission_answer(
+            "Deny Edit(src/components/*) for this project", "Edit", pat,
+        );
+        assert_eq!(action, PermissionAction::DenyProject);
+        assert_eq!(key.as_deref(), Some("Edit:src/components/*"));
+    }
+
+    #[test]
+    fn test_check_with_file_pattern() {
+        let mut store = PermissionStore::empty();
+
+        // No permissions → denied
+        assert!(!store.check("Edit", Some("src/components/App.tsx")));
+
+        // Add pattern-scoped permission
+        store.allow_for_session("Edit:src/components/*");
+        assert!(store.check("Edit", Some("src/components/App.tsx")));
+        assert!(store.check("Edit", Some("src/components/Header.tsx")));
+        assert!(!store.check("Edit", Some("src/main.rs")));
+
+        // Root glob pattern — "*" matches single path segment (root-level files)
+        store.allow_for_session("Write:*");
+        assert!(store.check("Write", Some("README.md")));
+        // Note: globset's "*" matches any single path segment, but our command_matches_pattern
+        // uses is_match which treats the input as a path, so "*" matches "src/main.rs" too.
+        // This is acceptable for root-level file patterns — users granting Write(*) accept all files.
+        assert!(store.check("Write", Some("src/main.rs")));
+    }
+
+    #[test]
+    fn test_backward_compat_blanket_write() {
+        let mut store = PermissionStore::empty();
+
+        // Old-style blanket "Write" entry still allows everything
+        store.allow_for_session("Write");
+        assert!(store.check("Write", Some("src/main.rs")));
+        assert!(store.check("Write", Some("README.md")));
+        assert!(store.check("Write", None));
+    }
+
+    // --- Deny rules tests ---
+
+    #[test]
+    fn test_deny_takes_precedence_over_allow() {
+        let mut store = PermissionStore::empty();
+
+        // Allow everything, then deny a pattern
+        store.allow_for_session("Bash");
+        store.deny_for_project("Bash:rm *");
+
+        // Blanket allow works for non-denied commands
+        assert!(store.check("Bash", Some("git status")));
+        // But denied pattern is blocked
+        assert!(!store.check("Bash", Some("rm -rf /")));
+    }
+
+    #[test]
+    fn test_deny_blanket_tool() {
+        let mut store = PermissionStore::empty();
+
+        store.allow_for_session("WebFetch");
+        assert!(store.check("WebFetch", None));
+
+        store.deny_for_project("WebFetch");
+        assert!(!store.check("WebFetch", None));
+    }
+
+    #[test]
+    fn test_deny_file_pattern() {
+        let mut store = PermissionStore::empty();
+
+        store.allow_for_session("Edit:src/*");
+        assert!(store.check("Edit", Some("src/main.rs")));
+
+        store.deny_for_project("Edit:src/*");
+        assert!(!store.check("Edit", Some("src/main.rs")));
+    }
+
+    #[test]
+    fn test_deny_persistence() {
+        let tmp = std::env::temp_dir().join("linggen_deny_persist_test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let mut store = PermissionStore::load(&tmp);
+        store.deny_for_project("Bash:rm *");
+
+        // Reload from disk
+        let store2 = PermissionStore::load(&tmp);
+        assert!(store2.is_denied("Bash", Some("rm -rf /")));
+        assert!(!store2.is_denied("Bash", Some("git status")));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_backward_compat_no_denies_in_json() {
+        let tmp = std::env::temp_dir().join("linggen_compat_deny_test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Write a permissions.json without tool_denies field (old format)
+        let json = r#"{ "tool_allows": ["Bash"] }"#;
+        fs::write(tmp.join("permissions.json"), json).unwrap();
+
+        let store = PermissionStore::load(&tmp);
+        assert!(store.check("Bash", Some("any command")));
+        assert!(!store.is_denied("Bash", Some("any command")));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_parse_bash_deny_project() {
+        let pat = Some("npm run *");
+
+        let (action, key) = parse_bash_permission_answer(
+            "Deny Bash(npm run *) for this project", "Bash", pat,
+        );
+        assert_eq!(action, PermissionAction::DenyProject);
+        assert_eq!(key.as_deref(), Some("Bash:npm run *"));
+
+        // Blanket deny for compound commands
+        let (action, key) = parse_bash_permission_answer(
+            "Deny all Bash for this project", "Bash", None,
+        );
+        assert_eq!(action, PermissionAction::DenyProject);
+        assert_eq!(key.as_deref(), Some("Bash"));
+    }
+
+    #[test]
+    fn test_parse_web_deny_project() {
+        assert_eq!(
+            parse_web_permission_answer("Deny all WebFetch for this project", "WebFetch"),
+            PermissionAction::DenyProject,
+        );
+    }
+
+    #[test]
+    fn test_parse_permission_answer_deny_project() {
+        assert_eq!(
+            parse_permission_answer("Deny all Patch for this project", "Patch"),
+            PermissionAction::DenyProject,
+        );
     }
 }

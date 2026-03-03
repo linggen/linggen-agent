@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import type { PendingAskUser, AskUserAnswer } from '../types';
 
 interface ToolPermissionCardProps {
@@ -8,6 +8,9 @@ interface ToolPermissionCardProps {
 
 export const ToolPermissionCard: React.FC<ToolPermissionCardProps> = ({ pending, onRespond }) => {
   const question = pending.questions[0];
+  const [otherActive, setOtherActive] = useState(false);
+  const [customText, setCustomText] = useState('');
+
   if (!question) return null;
 
   const handleClick = (label: string) => {
@@ -16,11 +19,25 @@ export const ToolPermissionCard: React.FC<ToolPermissionCardProps> = ({ pending,
     ]);
   };
 
-  // Determine if the option is "Cancel" to style it differently.
-  const isCancel = (label: string) => label === 'Cancel';
+  const handleOtherSubmit = () => {
+    const text = customText.trim();
+    if (!text) return;
+    onRespond(pending.questionId, [
+      { question_index: 0, selected: [], custom_text: text },
+    ]);
+  };
 
-  // "Allow all Bash for this task" is a blanket escape hatch — style it muted.
-  const isBlanketBash = (label: string) => label === 'Allow all Bash for this task';
+  // Determine if the option is a deny action (session or project-level).
+  const isDeny = (label: string) =>
+    label === 'Deny' || label === 'Cancel' || label.startsWith('Deny ');
+
+  // Blanket allow options — style them muted (session or project-level).
+  const isBlanketOption = (label: string) =>
+    label.startsWith('Allow all ');
+
+  // Project-persisted option (allow or deny) — show a save indicator.
+  const isPersistedOption = (label: string) =>
+    label.includes('for this project');
 
   // Parse the question text: "Bash npm run build" → tool="Bash", command="npm run build"
   // For non-Bash tools: "Write src/main.rs" → tool="Write", command="src/main.rs"
@@ -63,14 +80,19 @@ export const ToolPermissionCard: React.FC<ToolPermissionCardProps> = ({ pending,
               key={opt.label}
               onClick={() => handleClick(opt.label)}
               className={`text-left text-[11px] px-3 py-1.5 rounded-lg border transition-colors cursor-pointer ${
-                isCancel(opt.label)
+                isDeny(opt.label)
                   ? 'bg-white text-slate-400 border-slate-200 hover:border-red-300 hover:text-red-500 dark:bg-white/5 dark:text-slate-500 dark:border-white/10 dark:hover:border-red-500/40 dark:hover:text-red-400'
-                  : isBlanketBash(opt.label)
+                  : isBlanketOption(opt.label)
                     ? 'bg-white text-slate-400 border-slate-200 hover:border-slate-300 hover:text-slate-500 dark:bg-white/5 dark:text-slate-500 dark:border-white/10 dark:hover:border-slate-400/30 dark:hover:text-slate-400'
                     : 'bg-white text-slate-600 border-slate-200 hover:border-amber-300 hover:text-amber-700 hover:bg-amber-50/50 dark:bg-white/5 dark:text-slate-300 dark:border-white/10 dark:hover:border-amber-500/40 dark:hover:bg-amber-500/5'
               }`}
             >
               <span className="font-medium">{opt.label}</span>
+              {isPersistedOption(opt.label) && (
+                <svg className="inline-block w-3 h-3 ml-1 -mt-0.5 text-slate-400 dark:text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
+                </svg>
+              )}
               {opt.description && (
                 <span className="ml-2 text-[10px] text-slate-400 dark:text-slate-500">
                   {opt.description}
@@ -78,7 +100,48 @@ export const ToolPermissionCard: React.FC<ToolPermissionCardProps> = ({ pending,
               )}
             </button>
           ))}
+
+          {/* "Other..." toggle button */}
+          <button
+            onClick={() => setOtherActive(prev => !prev)}
+            className={`text-left text-[11px] px-3 py-1.5 rounded-lg border transition-colors cursor-pointer ${
+              otherActive
+                ? 'bg-amber-50 text-amber-700 border-amber-300 dark:bg-amber-500/10 dark:text-amber-400 dark:border-amber-500/30'
+                : 'bg-white text-slate-400 border-dashed border-slate-200 hover:border-amber-300 hover:text-amber-600 dark:bg-transparent dark:text-slate-500 dark:border-white/10 dark:hover:border-amber-500/30 dark:hover:text-amber-400'
+            }`}
+          >
+            <span className="font-medium">Other…</span>
+            <span className="ml-2 text-[10px] text-slate-400 dark:text-slate-500">
+              Tell the agent what to do instead
+            </span>
+          </button>
         </div>
+
+        {/* Free-text input when "Other..." is active */}
+        {otherActive && (
+          <div className="flex gap-1.5">
+            <input
+              type="text"
+              autoFocus
+              placeholder="Tell the agent what to do instead…"
+              value={customText}
+              onChange={e => setCustomText(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && customText.trim()) handleOtherSubmit(); }}
+              className="flex-1 text-[11px] px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-white/5 text-slate-700 dark:text-slate-300 placeholder-slate-300 dark:placeholder-slate-600 focus:outline-none focus:border-amber-400 dark:focus:border-amber-500/40"
+            />
+            <button
+              onClick={handleOtherSubmit}
+              disabled={!customText.trim()}
+              className={`text-[11px] px-3 py-1.5 rounded-lg font-medium transition-colors cursor-pointer ${
+                customText.trim()
+                  ? 'bg-amber-500 text-white hover:bg-amber-600 dark:bg-amber-600 dark:hover:bg-amber-700'
+                  : 'bg-slate-100 text-slate-300 dark:bg-white/5 dark:text-slate-600 cursor-not-allowed'
+              }`}
+            >
+              Send
+            </button>
+          </div>
+        )}
       </div>
     </section>
   );

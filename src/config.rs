@@ -213,6 +213,8 @@ impl Default for WriteSafetyMode {
 pub enum ToolPermissionMode {
     Ask,
     Auto,
+    /// Auto-approve Write/Edit but still prompt for Bash and web tools.
+    AcceptEdits,
 }
 
 impl Default for ToolPermissionMode {

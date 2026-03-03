@@ -37,6 +37,18 @@ export const GeneralTab: React.FC<{
               <option value="off">off</option>
             </select>
           </div>
+          <div>
+            <label className={labelCls}>Tool Permission Mode</label>
+            <select
+              className={inputCls}
+              value={config.agent.tool_permission_mode}
+              onChange={(e) => onChange({ ...config, agent: { ...config.agent, tool_permission_mode: e.target.value } })}
+            >
+              <option value="ask">ask</option>
+              <option value="auto">auto</option>
+              <option value="accept_edits">accept_edits</option>
+            </select>
+          </div>
           <div className="col-span-2">
             <label className={labelCls}>Prompt Loop Breaker</label>
             <textarea
