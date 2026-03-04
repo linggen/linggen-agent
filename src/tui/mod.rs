@@ -51,9 +51,6 @@ pub async fn run_tui(port: u16, project_root: String) -> Result<()> {
 
         terminal.draw(|f| app.render(f))?;
 
-        // Wait for terminal event, SSE event, or tick — whichever comes first.
-        // No mouse capture: mouse wheel controls the terminal scrollbar natively
-        // (like Claude Code). Use keyboard ↑/↓/PgUp/PgDn for internal scrolling.
         tokio::select! {
             maybe_event = event_stream.next() => {
                 if let Some(Ok(event)) = maybe_event {
@@ -62,6 +59,17 @@ pub async fn run_tui(port: u16, project_root: String) -> Result<()> {
                             if app.handle_key(key)? {
                                 restore_terminal(terminal)?;
                                 return Ok(());
+                            }
+                        }
+                        Event::Mouse(mouse) => {
+                            match mouse.kind {
+                                crossterm::event::MouseEventKind::ScrollUp => {
+                                    app.scroll_offset = app.scroll_offset.saturating_add(3);
+                                }
+                                crossterm::event::MouseEventKind::ScrollDown => {
+                                    app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                                }
+                                _ => {}
                             }
                         }
                         _ => {}
@@ -78,6 +86,7 @@ pub async fn run_tui(port: u16, project_root: String) -> Result<()> {
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
+    crossterm::execute!(io::stdout(), crossterm::event::EnableMouseCapture)?;
     let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
     let (_, rows) = crossterm::terminal::size()?;
@@ -91,6 +100,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 }
 
 fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture)?;
     disable_raw_mode()?;
     terminal.show_cursor()?;
     Ok(())

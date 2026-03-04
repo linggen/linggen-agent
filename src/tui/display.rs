@@ -47,6 +47,10 @@ pub struct ToolStep {
     pub tool_name: String,
     pub args_summary: String,
     pub status: StepStatus,
+    /// Live bash output lines (capped at 500).
+    pub output_lines: Vec<String>,
+    /// Result detail, e.g. "Wrote 42 lines", "+3 -1 lines".
+    pub result_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

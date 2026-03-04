@@ -116,7 +116,7 @@ pub async fn run_single_task(
     let (config, _config_path) =
         Config::load_with_path().unwrap_or_else(|_| (Config::default(), None));
     let skill_manager = Arc::new(SkillManager::new());
-    let (manager, _rx) = AgentManager::new(config.clone(), None, store.clone(), skill_manager.clone());
+    let (manager, _rx) = AgentManager::new(config.clone(), None, store.clone(), skill_manager.clone(), crate::engine::InterfaceMode::Web);
 
     // 6. Get or create agent
     let agent = manager

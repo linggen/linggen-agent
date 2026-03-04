@@ -161,6 +161,43 @@ impl TuiClient {
         Ok(())
     }
 
+    /// Respond to an AskUser prompt with custom free-text ("Other" option).
+    pub async fn respond_ask_user_custom(&self, question_id: &str, custom_text: &str) -> Result<()> {
+        let body = json!({
+            "question_id": question_id,
+            "answers": [{ "question_index": 0, "selected": [], "custom_text": custom_text }]
+        });
+        let resp = self
+            .client
+            .post(format!("{}/api/ask-user-response", self.base_url))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("AskUser custom response failed ({}): {}", status, text);
+        }
+        Ok(())
+    }
+
+    /// Cancel an agent run by run_id.
+    pub async fn cancel_run(&self, run_id: &str) -> Result<()> {
+        let body = json!({ "run_id": run_id });
+        let resp = self
+            .client
+            .post(format!("{}/api/agent-cancel", self.base_url))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Cancel run failed ({}): {}", status, text);
+        }
+        Ok(())
+    }
+
     /// Fetch workspace state from the REST API (used for resync after reconnection or lag).
     pub async fn fetch_workspace_state(
         &self,

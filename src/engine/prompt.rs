@@ -3,6 +3,34 @@ use crate::config::AgentPolicyCapability;
 use crate::engine::tools;
 use crate::ollama::ChatMessage;
 use std::collections::HashSet;
+use std::sync::OnceLock;
+
+fn get_os_version() -> String {
+    static OS_VERSION: OnceLock<String> = OnceLock::new();
+    OS_VERSION
+        .get_or_init(|| {
+            #[cfg(unix)]
+            {
+                std::process::Command::new("uname")
+                    .args(["-rs"])
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        if o.status.success() {
+                            String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "unknown".into())
+            }
+            #[cfg(not(unix))]
+            {
+                "unknown".into()
+            }
+        })
+        .clone()
+}
 
 fn workspace_listing(ws_root: &std::path::Path) -> String {
     let entries = match std::fs::read_dir(ws_root) {
@@ -77,6 +105,22 @@ impl AgentEngine {
         use std::hash::{Hash, Hasher};
 
         let mut stable = self.system_prompt();
+
+        // --- Environment block ---
+        {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".into());
+            let os_version = get_os_version();
+            stable.push_str(&self.prompt_store.render_or_fallback(
+                keys::SYSTEM_ENVIRONMENT_BLOCK,
+                &[
+                    ("platform", std::env::consts::OS),
+                    ("os_version", &os_version),
+                    ("shell", &shell),
+                    ("ws_root", &self.cfg.ws_root.display().to_string()),
+                    ("interface_mode", &self.cfg.interface_mode.to_string()),
+                ],
+            ));
+        }
 
         // --- Project context files (AGENTS.md, CLAUDE.md, .cursorrules) ---
         {

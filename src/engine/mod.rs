@@ -18,7 +18,7 @@ pub mod web_search;
 // Re-export public API types
 pub use types::{
     AgentEngine, AgentOutcome, AgentRole, ContextRecord, ContextType, EngineConfig,
-    Plan, PlanStatus, TaskPacket, ThinkingEvent,
+    InterfaceMode, Plan, PlanStatus, TaskPacket, ThinkingEvent,
 };
 pub use plan::generate_plan_filename;
 

@@ -11,7 +11,9 @@ export const activityEntriesForMessage = (msg: ChatMessage): string[] => {
 
 export const isTransientStatus = (entry: string): boolean => {
   const t = entry.trim();
-  return t === 'Thinking...' || t === 'Thinking' || t === 'Model loading...' || t === 'Model loading' || t === 'Running';
+  return t === 'Thinking...' || t === 'Thinking' || /^Thinking\s*\(/.test(t) ||
+    t === 'Model loading...' || t === 'Model loading' || /^Model loading\s*\(/.test(t) ||
+    t === 'Running' || /^Running skill:/.test(t);
 };
 
 /** Tool status line prefixes — these are already rendered by the tool widget, so text blocks

@@ -60,23 +60,47 @@ impl App {
         // AskUser prompt (not plan-related) — render at end of blocks
         if self.pending_ask_user_id.is_some() {
             if let Some(prompt) = &self.prompt {
-                all_lines.push(Line::from(""));
-                for (i, option) in prompt.options.iter().enumerate() {
-                    let marker = if i == prompt.selected { ">" } else { " " };
-                    let label = format!("  {} {}. {}", marker, i + 1, option);
-                    let style = if i == prompt.selected {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    };
-                    all_lines.push(Line::from(Span::styled(label, style)));
+                if prompt.other_mode {
+                    // Other-text input mode
+                    all_lines.push(Line::from(""));
+                    all_lines.push(Line::from(Span::styled(
+                        "  Type your response:",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    all_lines.push(Line::from(vec![
+                        Span::styled(
+                            "  > ",
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            prompt.other_text.clone(),
+                            Style::default().fg(Color::White),
+                        ),
+                    ]));
+                    all_lines.push(Line::from(Span::styled(
+                        "  Enter to submit, Esc to go back",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    all_lines.push(Line::from(""));
+                } else {
+                    all_lines.push(Line::from(""));
+                    for (i, option) in prompt.options.iter().enumerate() {
+                        let marker = if i == prompt.selected { ">" } else { " " };
+                        let label = format!("  {} {}. {}", marker, i + 1, option);
+                        let style = if i == prompt.selected {
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        };
+                        all_lines.push(Line::from(Span::styled(label, style)));
+                    }
+                    all_lines.push(Line::from(""));
+                    all_lines.push(Line::from(Span::styled(
+                        "  ↑↓ to select, Enter to confirm",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    all_lines.push(Line::from(""));
                 }
-                all_lines.push(Line::from(""));
-                all_lines.push(Line::from(Span::styled(
-                    "  ↑↓ to select, Enter to confirm",
-                    Style::default().fg(Color::DarkGray),
-                )));
-                all_lines.push(Line::from(""));
             }
         }
 
@@ -202,6 +226,14 @@ impl App {
             status_spans.push(Span::styled(
                 tool.clone(),
                 Style::default().fg(Color::Yellow),
+            ));
+        }
+        // Show "Esc to cancel" hint when agent is running
+        if self.status_state != "idle" && self.prompt.is_none() {
+            status_spans.push(Span::styled("  ", Style::default()));
+            status_spans.push(Span::styled(
+                "Esc to cancel",
+                Style::default().fg(Color::DarkGray),
             ));
         }
         if let ConnectionStatus::Disconnected = &self.connection_status {

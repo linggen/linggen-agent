@@ -7,6 +7,36 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         // When an interactive prompt is active, handle its keys first.
         if let Some(prompt) = &mut self.prompt {
+            // "Other" free-text input mode
+            if prompt.other_mode {
+                match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(true);
+                    }
+                    KeyCode::Char(ch) => {
+                        prompt.other_text.push(ch);
+                    }
+                    KeyCode::Backspace => {
+                        prompt.other_text.pop();
+                    }
+                    KeyCode::Enter => {
+                        let custom_text = prompt.other_text.clone();
+                        self.prompt = None;
+                        if !custom_text.is_empty() {
+                            self.handle_prompt_choice_custom(&custom_text)?;
+                        }
+                    }
+                    KeyCode::Esc => {
+                        // Exit other_mode back to option selection
+                        prompt.other_mode = false;
+                        prompt.other_text.clear();
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
+
+            // Normal option selection mode
             match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(true);
@@ -22,8 +52,13 @@ impl App {
                 }
                 KeyCode::Enter => {
                     let choice = prompt.options[prompt.selected].clone();
-                    self.prompt = None;
-                    self.handle_prompt_choice(&choice)?;
+                    if choice == "Other..." {
+                        prompt.other_mode = true;
+                        prompt.other_text.clear();
+                    } else {
+                        self.prompt = None;
+                        self.handle_prompt_choice(&choice)?;
+                    }
                 }
                 KeyCode::Esc => {
                     self.prompt = None;
@@ -83,9 +118,53 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                self.input.clear();
+                if !self.input.is_empty() {
+                    self.input.clear();
+                } else if self.status_state != "idle" {
+                    // Cancel running agent
+                    self.push_system("Cancelling...");
+                    let client = self.client.clone();
+                    let project_root = self.project_root.clone();
+                    let session_id = self.session_id.clone();
+                    tokio::spawn(async move {
+                        // Fetch running run_id from API, then cancel
+                        match client.fetch_agent_runs(&project_root, session_id.as_deref()).await {
+                            Ok(data) => {
+                                if let Some(runs) = data.as_array() {
+                                    for run in runs {
+                                        let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                                        let parent = run.get("parent_run_id").and_then(|v| v.as_str());
+                                        if status == "running" && parent.is_none() {
+                                            if let Some(run_id) = run.get("run_id").and_then(|v| v.as_str()) {
+                                                let _ = client.cancel_run(run_id).await;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to fetch runs for cancel: {}", e);
+                            }
+                        }
+                    });
+                }
             }
             _ => {}
+        }
+        Ok(false)
+    }
+
+    pub(super) fn handle_prompt_choice_custom(&mut self, custom_text: &str) -> Result<bool> {
+        if let Some(question_id) = self.pending_ask_user_id.take() {
+            self.push_system(&format!("Other: {}", custom_text));
+            let client = self.client.clone();
+            let text = custom_text.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = client.respond_ask_user_custom(&question_id, &text).await {
+                    tracing::warn!("AskUser custom response failed: {}", e);
+                }
+            });
         }
         Ok(false)
     }
@@ -172,6 +251,7 @@ impl App {
             self.push_system("  <text>            send message to current agent");
             self.push_system("  Ctrl+V            paste image from clipboard");
             self.push_system("  Ctrl+O            toggle verbose/compact tool display");
+            self.push_system("  Esc               cancel running agent / clear input");
             self.push_system("  ↑/↓, scroll       scroll output");
             self.push_system("  PgUp/PgDn         scroll output (fast)");
             return Ok(false);

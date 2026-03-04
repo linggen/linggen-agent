@@ -83,6 +83,10 @@ pub struct App {
 pub struct InteractivePrompt {
     pub options: Vec<String>,
     pub selected: usize,
+    /// True when the user is typing custom "Other" text.
+    pub other_mode: bool,
+    /// Custom text buffer for "Other" input.
+    pub other_text: String,
 }
 
 impl App {

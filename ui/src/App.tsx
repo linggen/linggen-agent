@@ -290,8 +290,10 @@ const App: React.FC = () => {
         if (data.path) {
           setNewProjectPath(data.path);
         }
-      } else {
-        addLog("Folder picker not supported on this OS yet.");
+      } else if (resp.status === 204) {
+        // User cancelled the folder picker — do nothing
+      } else if (resp.status === 501) {
+        addLog("Folder picker not supported on this platform.");
       }
     } catch (e) {
       addLog(`Error picking folder: ${e}`);

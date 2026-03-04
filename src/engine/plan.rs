@@ -293,6 +293,7 @@ mod tests {
                 write_safety_mode: crate::config::WriteSafetyMode::Off,
                 tool_permission_mode: crate::config::ToolPermissionMode::Auto,
                 prompt_loop_breaker: None,
+                interface_mode: InterfaceMode::Both,
             },
             model_manager,
             "test".to_string(),

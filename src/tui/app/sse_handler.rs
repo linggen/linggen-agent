@@ -142,10 +142,15 @@ impl App {
                             })
                             .unwrap_or_default();
                         if !options.is_empty() {
+                            // Add "Other..." option for free-text input
+                            let mut opts = options;
+                            opts.push("Other...".to_string());
                             self.pending_ask_user_id = Some(question_id);
                             self.prompt = Some(InteractivePrompt {
-                                options,
+                                options: opts,
                                 selected: 0,
+                                other_mode: false,
+                                other_text: String::new(),
                             });
                         }
                     }
@@ -163,6 +168,14 @@ impl App {
                         .unwrap_or("");
                     if !line.is_empty() {
                         self.status_tool = Some(line.to_string());
+                        // Append to the last InProgress step's output_lines
+                        if let Some(group) = &mut self.active_tool_group {
+                            if let Some(step) = group.steps.iter_mut().rev().find(|s| s.status == StepStatus::InProgress) {
+                                if step.output_lines.len() < 500 {
+                                    step.output_lines.push(line.to_string());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -293,6 +306,8 @@ impl App {
                             tool_name,
                             args_summary,
                             status: StepStatus::InProgress,
+                            output_lines: Vec::new(),
+                            result_detail: None,
                         });
                         return;
                     }
@@ -307,6 +322,8 @@ impl App {
                         tool_name,
                         args_summary,
                         status: StepStatus::InProgress,
+                        output_lines: Vec::new(),
+                        result_detail: None,
                     }],
                 });
             } else if phase == "done" {
@@ -499,6 +516,8 @@ impl App {
                             self.prompt = Some(InteractivePrompt {
                                 options,
                                 selected: 0,
+                                other_mode: false,
+                                other_text: String::new(),
                             });
                         } else {
                             // Clear prompt when plan is no longer pending approval
@@ -588,6 +607,8 @@ impl App {
                             tool_name,
                             args_summary,
                             status: StepStatus::InProgress,
+                            output_lines: Vec::new(),
+                            result_detail: None,
                         });
                         return;
                     }
@@ -600,6 +621,8 @@ impl App {
                         tool_name,
                         args_summary,
                         status: StepStatus::InProgress,
+                        output_lines: Vec::new(),
+                        result_detail: None,
                     }],
                 });
             }
@@ -610,14 +633,77 @@ impl App {
 
             if status == "done" || status == "failed" {
                 let new_status = if is_error || status == "failed" { StepStatus::Failed } else { StepStatus::Done };
+
+                // Extract result detail from data
+                let result_detail = Self::extract_result_detail(data, &msg.text);
+
                 if let Some(group) = &mut self.active_tool_group {
                     let idx = group.steps.iter().position(|s| s.status_id == block_id)
                         .or_else(|| group.steps.iter().rposition(|s| s.status == StepStatus::InProgress));
                     if let Some(idx) = idx {
                         group.steps[idx].status = new_status;
+                        if result_detail.is_some() {
+                            group.steps[idx].result_detail = result_detail;
+                        }
+                        // For Bash: populate output_lines from bash_output if not already populated
+                        if group.steps[idx].output_lines.is_empty() {
+                            if let Some(bash_output) = data.and_then(|d| d.get("bash_output")).and_then(|v| v.as_str()) {
+                                for line in bash_output.lines().take(500) {
+                                    group.steps[idx].output_lines.push(line.to_string());
+                                }
+                            }
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// Extract a human-readable result detail from content_block update data.
+    fn extract_result_detail(
+        data: Option<&serde_json::Value>,
+        text: &Option<String>,
+    ) -> Option<String> {
+        let d = data?;
+        let tool = d.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+        match tool {
+            "Write" => {
+                if let Some(n) = d.get("lines_written").and_then(|v| v.as_u64()) {
+                    return Some(format!("wrote {} lines", n));
+                }
+                // Fallback: count from summary text
+                text.as_deref().map(|t| t.to_string())
+            }
+            "Edit" => {
+                let old_lines = d
+                    .get("old_string")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                let new_lines = d
+                    .get("new_string")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                if old_lines > 0 || new_lines > 0 {
+                    return Some(format!("+{} -{} lines", new_lines, old_lines));
+                }
+                text.as_deref().map(|t| t.to_string())
+            }
+            "Bash" => {
+                if let Some(output) = d.get("bash_output").and_then(|v| v.as_str()) {
+                    let line_count = output.lines().count();
+                    if line_count > 0 {
+                        return Some(format!("{} lines of output", line_count));
+                    }
+                }
+                text.as_deref().map(|t| t.to_string())
+            }
+            "Read" => {
+                // Just use summary text (usually file path)
+                text.as_deref().map(|t| t.to_string())
+            }
+            _ => text.as_deref().map(|t| t.to_string()),
         }
     }
 

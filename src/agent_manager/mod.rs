@@ -1,7 +1,7 @@
 use crate::agent_manager::locks::LockManager;
 use crate::agent_manager::models::ModelManager;
 use crate::config::{AgentPolicyCapability, AgentSpec, Config};
-use crate::engine::{AgentEngine, AgentOutcome, AgentRole, EngineConfig, Plan};
+use crate::engine::{AgentEngine, AgentOutcome, AgentRole, EngineConfig, InterfaceMode, Plan};
 use crate::project_store::ProjectStore;
 use crate::skills::SkillManager;
 use crate::state_fs::{SessionStore, StateFile, StateFs};
@@ -48,6 +48,8 @@ pub struct AgentManager {
     run_project_map: Mutex<HashMap<String, String>>,
     /// Last activity time per agent, keyed by "{project_root}|{agent_id}".
     last_activity: Mutex<HashMap<String, Instant>>,
+    /// Interface mode (Web, TUI, or Both) passed into every EngineConfig.
+    interface_mode: InterfaceMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -389,6 +391,7 @@ impl AgentManager {
         config_dir: Option<PathBuf>,
         store: Arc<ProjectStore>,
         skill_manager: Arc<SkillManager>,
+        interface_mode: InterfaceMode,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<AgentEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let models = Arc::new(ModelManager::new(config.models.clone()));
@@ -408,6 +411,7 @@ impl AgentManager {
                 pending_plans: Mutex::new(HashMap::new()),
                 run_project_map: Mutex::new(HashMap::new()),
                 last_activity: Mutex::new(HashMap::new()),
+                interface_mode,
             }),
             rx,
         )
@@ -582,6 +586,7 @@ impl AgentManager {
                 write_safety_mode: config.agent.write_safety_mode,
                 tool_permission_mode: config.agent.tool_permission_mode,
                 prompt_loop_breaker: config.agent.prompt_loop_breaker.clone(),
+                interface_mode: self.interface_mode,
             },
             models,
             model_id,
@@ -660,6 +665,7 @@ impl AgentManager {
                 write_safety_mode: config.agent.write_safety_mode,
                 tool_permission_mode: config.agent.tool_permission_mode,
                 prompt_loop_breaker: config.agent.prompt_loop_breaker.clone(),
+                interface_mode: self.interface_mode,
             },
             models,
             model_id,

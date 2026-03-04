@@ -67,12 +67,30 @@ pub struct TaskPacket {
     pub mermaid_wireframe: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterfaceMode {
+    Web,
+    Tui,
+    Both,
+}
+
+impl std::fmt::Display for InterfaceMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InterfaceMode::Web => write!(f, "Web UI"),
+            InterfaceMode::Tui => write!(f, "TUI"),
+            InterfaceMode::Both => write!(f, "Web UI + TUI (synced)"),
+        }
+    }
+}
+
 pub struct EngineConfig {
     pub ws_root: PathBuf,
     pub max_iters: usize,
     pub write_safety_mode: crate::config::WriteSafetyMode,
     pub tool_permission_mode: crate::config::ToolPermissionMode,
     pub prompt_loop_breaker: Option<String>,
+    pub interface_mode: InterfaceMode,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -257,8 +257,16 @@ async fn main() -> Result<()> {
             let config_dir = config_path
                 .as_ref()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+            let interface_mode = if cli.web {
+                engine::InterfaceMode::Web
+            } else if cli.cmd.is_some() {
+                engine::InterfaceMode::Tui
+            } else {
+                engine::InterfaceMode::Both
+            };
+
             let (manager, rx) =
-                agent_manager::AgentManager::new(config, config_dir, store, skill_manager.clone());
+                agent_manager::AgentManager::new(config, config_dir, store, skill_manager.clone(), interface_mode);
 
             let _ = skill_manager.load_all(Some(&ws_root)).await;
 

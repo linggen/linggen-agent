@@ -201,10 +201,12 @@ pub fn render_tool_group(
             StepStatus::Failed => Color::Red,
         };
 
-        let result_text = match step.status {
-            StepStatus::InProgress => "Running...",
-            StepStatus::Done => "Done",
-            StepStatus::Failed => "Failed",
+        let result_text = match (&step.status, &step.result_detail) {
+            (StepStatus::InProgress, _) => "Running...".to_string(),
+            (StepStatus::Failed, Some(detail)) => format!("Failed ({})", detail),
+            (StepStatus::Failed, None) => "Failed".to_string(),
+            (StepStatus::Done, Some(detail)) => format!("Done ({})", detail),
+            (StepStatus::Done, None) => "Done".to_string(),
         };
 
         // Tool line: ⏺ ToolName(args)
@@ -225,14 +227,35 @@ pub fn render_tool_group(
             Span::styled(args_display, Style::default().fg(Color::White)),
         ]));
 
-        // Result line: ⎿  Done
+        // Result line: ⎿  Done (detail)
         lines.push(Line::from(vec![
             Span::styled("    ⎿  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                result_text.to_string(),
+                result_text,
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
+
+        // Output lines (bash live output) — show last 3 lines
+        if !step.output_lines.is_empty() {
+            let total = step.output_lines.len();
+            let start = total.saturating_sub(3);
+            if start > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("    ... +{} more lines", start),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            for line in &step.output_lines[start..] {
+                lines.push(Line::from(vec![
+                    Span::styled("    ⎿ ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        truncate_str(line, 120),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
     }
 
     // Summary line
@@ -282,6 +305,17 @@ pub fn render_tool_group_active(steps: &[ToolStep]) -> Vec<Line<'static>> {
         ),
         Span::styled(args_display, Style::default().fg(Color::White)),
     ]));
+
+    // Show last output line under the active step
+    if let Some(last_line) = last.output_lines.last() {
+        lines.push(Line::from(vec![
+            Span::styled("    ⎿ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate_str(last_line, 100),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
 
     // Show "+N more" if there are previous steps
     let prev_count = steps.len() - 1;

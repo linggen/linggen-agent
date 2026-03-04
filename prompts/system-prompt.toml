@@ -59,6 +59,19 @@ Guidelines:
 {truncated}
 --- END AUTO MEMORY ---'''
 
+[environment_block]
+description = "Runtime environment context"
+vars = ["platform", "os_version", "shell", "ws_root", "interface_mode"]
+text = '''
+
+# Environment
+- Platform: {platform}
+- OS: {os_version}
+- Shell: {shell}
+- Workspace: {ws_root}
+- Interface: {interface_mode}
+- Bash tool: non-interactive subprocess (no TTY, no stdin). Interactive programs (curses, GUI) cannot run inside it. For such programs, write the code and instruct the user to run it in their terminal.'''
+
 [memory_block_empty]
 description = "Auto memory block when MEMORY.md does not yet exist"
 vars = ["mem_dir"]

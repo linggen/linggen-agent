@@ -300,37 +300,35 @@ pub fn derive_file_pattern(rel_path: &str) -> String {
 }
 
 /// Build the AskUser question for a file-scoped Write/Edit permission prompt.
+/// Edit/Write permissions are session-scoped only — no project-level persistence
+/// so users re-approve each session.
 pub fn build_file_permission_question(
     tool: &str,
     file_path: &str,
     pattern: &str,
 ) -> AskUserQuestion {
-    let mut options = vec![AskUserOption {
-        label: "Allow once".to_string(),
-        description: Some("Proceed this one time only".to_string()),
-        preview: None,
-    }];
-
-    options.push(AskUserOption {
-        label: format!("Allow {}({}) for this session", tool, pattern),
-        description: Some("Session-scoped; resets on new session".to_string()),
-        preview: None,
-    });
-    options.push(AskUserOption {
-        label: format!("Allow {}({}) for this project", tool, pattern),
-        description: Some("Persisted; won't ask again for this project".to_string()),
-        preview: None,
-    });
-    options.push(AskUserOption {
-        label: "Deny".to_string(),
-        description: Some(format!("Deny this {} call", tool)),
-        preview: None,
-    });
-    options.push(AskUserOption {
-        label: format!("Deny {}({}) for this project", tool, pattern),
-        description: Some("Persisted deny rule; auto-blocked without prompt".to_string()),
-        preview: None,
-    });
+    let options = vec![
+        AskUserOption {
+            label: "Allow once".to_string(),
+            description: Some("Proceed this one time only".to_string()),
+            preview: None,
+        },
+        AskUserOption {
+            label: format!("Allow {}({}) for this session", tool, pattern),
+            description: Some("Session-scoped; resets on new session".to_string()),
+            preview: None,
+        },
+        AskUserOption {
+            label: format!("Allow all {} for this session", tool),
+            description: Some(format!("Allow every {} without asking again this session", tool)),
+            preview: None,
+        },
+        AskUserOption {
+            label: "Deny".to_string(),
+            description: Some(format!("Deny this {} call", tool)),
+            preview: None,
+        },
+    ];
 
     AskUserQuestion {
         question: format!("{} {}", tool, file_path),
@@ -342,7 +340,7 @@ pub fn build_file_permission_question(
 
 /// Parse the selected option from a file-scoped Write/Edit permission prompt.
 /// Returns `(action, permission_key)` where `permission_key` is the string to store
-/// (e.g., `"Edit:src/components/*"` for pattern-scoped).
+/// (e.g., `"Edit:src/components/*"` for pattern-scoped, or `"Edit"` for blanket session allow).
 pub fn parse_file_permission_answer(
     selected: &str,
     tool: &str,
@@ -355,11 +353,9 @@ pub fn parse_file_permission_answer(
     if selected == format!("Allow {}({}) for this session", tool, pattern) {
         return (PermissionAction::AllowSession, Some(key));
     }
-    if selected == format!("Allow {}({}) for this project", tool, pattern) {
-        return (PermissionAction::AllowProject, Some(key));
-    }
-    if selected == format!("Deny {}({}) for this project", tool, pattern) {
-        return (PermissionAction::DenyProject, Some(key));
+    // Blanket "allow all Edit/Write for this session" — key is just the tool name.
+    if selected == format!("Allow all {} for this session", tool) {
+        return (PermissionAction::AllowSession, Some(tool.to_string()));
     }
     // "Deny", "Cancel" (backward compat), or anything unexpected
     (PermissionAction::Deny, None)
@@ -1025,12 +1021,11 @@ mod tests {
     fn test_build_file_permission_question() {
         let q = build_file_permission_question("Edit", "src/components/App.tsx", "src/components/*");
         assert_eq!(q.question, "Edit src/components/App.tsx");
-        assert_eq!(q.options.len(), 5);
+        assert_eq!(q.options.len(), 4);
         assert_eq!(q.options[0].label, "Allow once");
         assert_eq!(q.options[1].label, "Allow Edit(src/components/*) for this session");
-        assert_eq!(q.options[2].label, "Allow Edit(src/components/*) for this project");
+        assert_eq!(q.options[2].label, "Allow all Edit for this session");
         assert_eq!(q.options[3].label, "Deny");
-        assert_eq!(q.options[4].label, "Deny Edit(src/components/*) for this project");
     }
 
     #[test]
@@ -1049,24 +1044,17 @@ mod tests {
         assert_eq!(action, PermissionAction::AllowSession);
         assert_eq!(key.as_deref(), Some("Edit:src/components/*"));
 
-        // Pattern-scoped project
+        // Blanket session allow
         let (action, key) = parse_file_permission_answer(
-            "Allow Edit(src/components/*) for this project", "Edit", pat,
+            "Allow all Edit for this session", "Edit", pat,
         );
-        assert_eq!(action, PermissionAction::AllowProject);
-        assert_eq!(key.as_deref(), Some("Edit:src/components/*"));
+        assert_eq!(action, PermissionAction::AllowSession);
+        assert_eq!(key.as_deref(), Some("Edit"));
 
         // Deny
         let (action, key) = parse_file_permission_answer("Deny", "Edit", pat);
         assert_eq!(action, PermissionAction::Deny);
         assert!(key.is_none());
-
-        // Deny for project
-        let (action, key) = parse_file_permission_answer(
-            "Deny Edit(src/components/*) for this project", "Edit", pat,
-        );
-        assert_eq!(action, PermissionAction::DenyProject);
-        assert_eq!(key.as_deref(), Some("Edit:src/components/*"));
     }
 
     #[test]
