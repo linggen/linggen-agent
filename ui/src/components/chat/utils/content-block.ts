@@ -52,14 +52,56 @@ export const contentBlockSummary = (block: ContentBlock): string => {
   }
 };
 
-/** Build a simple unified diff from old/new strings with optional start line. */
+/** Build a unified diff from old/new strings with context lines (common prefix/suffix). */
 export const buildInlineDiff = (oldStr: string, newStr: string, startLine?: number): string => {
   const oldLines = oldStr.split('\n');
   const newLines = newStr.split('\n');
   const start = startLine || 1;
+
+  // Find common prefix lines
+  let prefixLen = 0;
+  const maxPrefix = Math.min(oldLines.length, newLines.length);
+  while (prefixLen < maxPrefix && oldLines[prefixLen] === newLines[prefixLen]) {
+    prefixLen++;
+  }
+
+  // Find common suffix lines (don't overlap with prefix)
+  let suffixLen = 0;
+  const maxSuffix = Math.min(oldLines.length - prefixLen, newLines.length - prefixLen);
+  while (
+    suffixLen < maxSuffix &&
+    oldLines[oldLines.length - 1 - suffixLen] === newLines[newLines.length - 1 - suffixLen]
+  ) {
+    suffixLen++;
+  }
+
+  // Limit context to 3 lines (like standard unified diff)
+  const ctxBefore = Math.min(prefixLen, 3);
+  const ctxAfter = Math.min(suffixLen, 3);
+
+  const changedOld = oldLines.slice(prefixLen, oldLines.length - suffixLen);
+  const changedNew = newLines.slice(prefixLen, newLines.length - suffixLen);
+
+  const hunkOldStart = start + prefixLen - ctxBefore;
+  const hunkOldLen = ctxBefore + changedOld.length + ctxAfter;
+  const hunkNewStart = start + prefixLen - ctxBefore;
+  const hunkNewLen = ctxBefore + changedNew.length + ctxAfter;
+
   const lines: string[] = [];
-  lines.push(`@@ -${start},${oldLines.length} +${start},${newLines.length} @@`);
-  for (const l of oldLines) lines.push(`-${l}`);
-  for (const l of newLines) lines.push(`+${l}`);
+  lines.push(`@@ -${hunkOldStart},${hunkOldLen} +${hunkNewStart},${hunkNewLen} @@`);
+
+  // Context before
+  for (let i = prefixLen - ctxBefore; i < prefixLen; i++) {
+    lines.push(` ${oldLines[i]}`);
+  }
+  // Removed lines
+  for (const l of changedOld) lines.push(`-${l}`);
+  // Added lines
+  for (const l of changedNew) lines.push(`+${l}`);
+  // Context after
+  for (let i = oldLines.length - suffixLen; i < oldLines.length - suffixLen + ctxAfter; i++) {
+    lines.push(` ${oldLines[i]}`);
+  }
+
   return lines.join('\n');
 };

@@ -1,6 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { cn } from '../../lib/cn';
-import DiffView from '../DiffView';
+import DiffView, { diffStats } from '../DiffView';
 import type { ChatMessage, ContentBlock } from '../../types';
 import { truncateDetail, contentBlockSummary, buildInlineDiff } from './utils/content-block';
 
@@ -36,7 +36,7 @@ export const TurnSummaryFooter: React.FC<{ msg: ChatMessage }> = ({ msg }) => {
 export const ContentBlockView: React.FC<{
   block: ContentBlock;
   isLast: boolean;
-}> = ({ block, isLast }) => {
+}> = React.memo(({ block, isLast }) => {
   const [expanded, setExpanded] = useState(false);
   const [bashExpanded, setBashExpanded] = useState(false);
   const outputEndRef = useRef<HTMLDivElement | null>(null);
@@ -55,6 +55,16 @@ export const ContentBlockView: React.FC<{
   const lineOpacity = isRunning || (isLast && !isDone) ? '' : isFailed ? '' : 'opacity-70';
 
   const detail = contentBlockSummary(block);
+
+  // Memoize diff computation to avoid recalculating on every parent re-render
+  const memoizedDiff = useMemo(() => {
+    const d = block.diffData;
+    if (!d || d.diff_type === 'write' || !d.old_string || !d.new_string) {
+      return { text: '', stats: { added: 0, deleted: 0 } };
+    }
+    const text = buildInlineDiff(d.old_string, d.new_string, d.start_line);
+    return { text, stats: diffStats(text) };
+  }, [block.diffData]);
 
   const isBash = block.tool === 'Bash';
   const hasOutput = isBash && block.output && block.output.length > 0;
@@ -177,29 +187,22 @@ export const ContentBlockView: React.FC<{
       );
     }
 
+    // Edit diffs: always show inline (like CC)
     if (!d.old_string || !d.new_string) return null;
-    const stats = (() => {
-      const oldLines = d.old_string!.split('\n').length;
-      const newLines = d.new_string!.split('\n').length;
-      const added = Math.max(0, newLines - oldLines) || newLines;
-      const removed = Math.max(0, oldLines - newLines) || oldLines;
-      return { added, removed };
-    })();
+    const diffText = memoizedDiff.text;
+    const { added, deleted } = memoizedDiff.stats;
+    const summaryParts: string[] = [];
+    if (added > 0) summaryParts.push(`Added ${added} line${added !== 1 ? 's' : ''}`);
+    if (deleted > 0) summaryParts.push(`removed ${deleted} line${deleted !== 1 ? 's' : ''}`);
+    const summary = summaryParts.join(', ');
 
-    if (!showExpanded) {
-      return (
-        <div className="pl-4 mt-0.5 text-[10px] text-slate-400 dark:text-slate-500 font-mono cursor-pointer" onClick={handleClick}>
-          <span className="text-green-600 dark:text-green-400">+{stats.added}</span>
-          {' / '}
-          <span className="text-red-600 dark:text-red-400">-{stats.removed}</span>
-          {' lines (click to expand)'}
-        </div>
-      );
-    }
-
-    const diffText = buildInlineDiff(d.old_string!, d.new_string!, d.start_line);
     return (
-      <div className="pl-4 mt-1">
+      <div className="pl-4 mt-0.5">
+        {summary && (
+          <div className="text-[10px] text-slate-400 dark:text-slate-500 font-mono mb-0.5">
+            <span className="text-slate-300 dark:text-slate-600 select-none">⎿  </span>{summary}
+          </div>
+        )}
         <DiffView diff={diffText} />
       </div>
     );
@@ -239,81 +242,5 @@ export const ContentBlockView: React.FC<{
       {diffWidget()}
     </div>
   );
-};
+});
 
-/** Renders msg.content[] tool_use blocks as an action widget with collapsible header. */
-export const ContentBlockList: React.FC<{
-  blocks: ContentBlock[];
-  isGenerating: boolean;
-}> = ({ blocks, isGenerating }) => {
-  const toolBlocks = blocks.filter(b => b.type === 'tool_use');
-  const hasRunning = toolBlocks.some(b => b.status === 'running');
-  const allDone = !isGenerating && !hasRunning;
-
-  const [collapsed, setCollapsed] = useState(false);
-  const prevAllDone = useRef(allDone);
-  useEffect(() => {
-    if (allDone && !prevAllDone.current && toolBlocks.length > 3) {
-      setCollapsed(true);
-    }
-    prevAllDone.current = allDone;
-  }, [allDone, toolBlocks.length]);
-
-  const listRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    if (!collapsed && listRef.current && hasRunning) {
-      const el = listRef.current;
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [blocks.length, hasRunning, collapsed]);
-
-  if (toolBlocks.length === 0) return null;
-
-  const headerIcon = allDone ? '✓' : '⚡';
-  const headerColor = allDone
-    ? 'text-emerald-600 dark:text-emerald-400'
-    : 'text-amber-600 dark:text-amber-400';
-  const headerText = `${toolBlocks.length} tool${toolBlocks.length === 1 ? '' : 's'} called`;
-
-  if (collapsed) {
-    return (
-      <div
-        className="mb-1.5 text-[11px] cursor-pointer select-none flex items-center gap-1.5 font-mono"
-        onClick={() => setCollapsed(false)}
-      >
-        <span className="text-[9px] text-slate-400 dark:text-slate-500">▶</span>
-        <span className={cn('font-medium', headerColor)}>{headerIcon} {headerText}</span>
-      </div>
-    );
-  }
-
-  return (
-    <div className="mb-1.5">
-      <div
-        className={cn(
-          'flex items-center gap-1.5 text-[11px] font-mono select-none',
-          allDone && 'cursor-pointer'
-        )}
-        onClick={allDone ? () => setCollapsed(true) : undefined}
-      >
-        {allDone && <span className="text-[9px] text-slate-400 dark:text-slate-500">▼</span>}
-        <span className={cn('font-medium', headerColor)}>{headerIcon} {headerText}</span>
-      </div>
-      <div
-        ref={listRef}
-        className={cn(
-          "mt-0.5 pl-1 space-y-0.5 overflow-y-auto custom-scrollbar",
-          allDone ? 'max-h-[180px]' : 'max-h-[480px]'
-        )}
-      >
-        {toolBlocks.map((block, idx) => (
-          <ContentBlockView
-            key={block.id || `cb-${idx}`}
-            block={block}
-            isLast={idx === toolBlocks.length - 1}
-          />
-        ))}
-      </div>
-    </div>
-  );
-};

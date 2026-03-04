@@ -4,7 +4,7 @@ import type { SpecialBlockProps } from './types';
 import { MarkdownContent } from './MarkdownContent';
 import { ThinkingIndicator, StatusSpinner } from './ThinkingIndicator';
 import { SubagentTreeView } from './SubagentTreeView';
-import { ContentBlockList, TurnSummaryFooter } from './ContentBlockView';
+import { ContentBlockView, TurnSummaryFooter } from './ContentBlockView';
 import { tryRenderSpecialBlock } from './SpecialBlocks';
 import { getMessagePhase, isTransientStatus, isToolStatusText } from './MessagePhase';
 import { visibleMessageText } from './MessageHelpers';
@@ -16,7 +16,7 @@ import { visibleMessageText } from './MessageHelpers';
  *
  *  Styling is identical in generating and done states — the only difference is:
  *  - StatusSpinner appears during generation gaps
- *  - ContentBlockList auto-collapses when round ends
+ *  - Tool widgets appear inline as individual items
  *  - TurnSummaryFooter appears when done
  */
 export const AgentMessage: React.FC<{
@@ -37,7 +37,7 @@ export const AgentMessage: React.FC<{
 
   const showSpinner = !!msg.isGenerating && !hasRunningTools && !isStreamingText && !showThinking;
 
-  const segments: Array<{ kind: 'text'; text: string } | { kind: 'tools'; blocks: ContentBlock[] }> = [];
+  const segments: Array<{ kind: 'text'; text: string } | { kind: 'tool'; block: ContentBlock }> = [];
   if (hasToolBlocks) {
     for (const block of contentBlocks) {
       if (block.type === 'text' && block.text) {
@@ -45,12 +45,7 @@ export const AgentMessage: React.FC<{
           segments.push({ kind: 'text', text: block.text });
         }
       } else if (block.type === 'tool_use') {
-        const last = segments[segments.length - 1];
-        if (last && last.kind === 'tools') {
-          last.blocks.push(block);
-        } else {
-          segments.push({ kind: 'tools', blocks: [block] });
-        }
+        segments.push({ kind: 'tool', block });
       }
     }
     // If no text content blocks exist but msg.text has content (set by FINALIZE_MESSAGE),
@@ -59,7 +54,7 @@ export const AgentMessage: React.FC<{
     if (!hasTextSegments) {
       const msgText = visibleMessageText(msg);
       if (msgText && !isTransientStatus(msgText) && !isToolStatusText(msgText)) {
-        segments.unshift({ kind: 'text', text: msgText });
+        segments.push({ kind: 'text', text: msgText });
       }
     }
   }
@@ -99,10 +94,10 @@ export const AgentMessage: React.FC<{
           return <MarkdownContent key={`seg-${idx}`} text={seg.text} />;
         }
         return (
-          <ContentBlockList
+          <ContentBlockView
             key={`seg-${idx}`}
-            blocks={seg.blocks}
-            isGenerating={!!msg.isGenerating}
+            block={seg.block}
+            isLast={idx === segments.length - 1}
           />
         );
       })}
