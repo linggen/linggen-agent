@@ -1,13 +1,14 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Eye, EyeOff, Plus, Star, Trash2 } from 'lucide-react';
+import { Eye, EyeOff, LogIn, LogOut, Plus, Star, Trash2 } from 'lucide-react';
 import type { AppConfig, ModelConfigUI, ModelHealthInfo, OllamaPsResponse } from '../types';
 
 const inputCls = 'w-full bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:ring-1 focus:ring-blue-500/50';
 const labelCls = 'text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400';
 const sectionCls = 'bg-white dark:bg-[#141414] rounded-xl border border-slate-200 dark:border-white/5 shadow-sm p-5';
 
-const PROVIDER_PRESETS: Record<string, { url: string; defaultModel: string; placeholder: string }> = {
+const PROVIDER_PRESETS: Record<string, { url: string; defaultModel: string; placeholder: string; authMode?: string }> = {
   ollama: { url: 'http://127.0.0.1:11434', defaultModel: '', placeholder: 'e.g. qwen3:32b' },
+  chatgpt: { url: 'https://chatgpt.com/backend-api/codex', defaultModel: 'o3', placeholder: 'e.g. gpt-5.4, o3, gpt-4o', authMode: 'chatgpt_oauth' },
   openai: { url: 'https://api.openai.com/v1', defaultModel: 'gpt-4o', placeholder: 'e.g. gpt-4o' },
   gemini: { url: 'https://generativelanguage.googleapis.com/v1beta/openai', defaultModel: 'gemini-2.5-flash', placeholder: 'e.g. gemini-2.5-flash, gemini-3-flash-preview' },
   groq: { url: 'https://api.groq.com/openai/v1', defaultModel: 'llama-3.3-70b-versatile', placeholder: 'e.g. llama-3.3-70b-versatile' },
@@ -67,6 +68,8 @@ export const ModelsTab: React.FC<{
   const [localKeys, setLocalKeys] = useState<Record<string, string>>({});
   const [revealKeys, setRevealKeys] = useState<Record<string, boolean>>({});
   const [credsDirty, setCredsDirty] = useState(false);
+  const [codexAuthStatus, setCodexAuthStatus] = useState<{ authenticated: boolean; account_id?: string } | null>(null);
+  const [codexAuthLoading, setCodexAuthLoading] = useState(false);
 
   const defaultModels = config.routing?.default_models ?? [];
 
@@ -105,13 +108,49 @@ export const ModelsTab: React.FC<{
     } catch { /* ignore */ }
   }, []);
 
+  const fetchCodexAuthStatus = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/auth/codex/status');
+      if (resp.ok) setCodexAuthStatus(await resp.json());
+    } catch { /* ignore */ }
+  }, []);
+
+  const handleCodexLogin = async () => {
+    setCodexAuthLoading(true);
+    try {
+      await fetch('/api/auth/codex/login', { method: 'POST' });
+      // Poll for auth status (browser flow takes time)
+      const poll = setInterval(async () => {
+        const resp = await fetch('/api/auth/codex/status');
+        if (resp.ok) {
+          const data = await resp.json();
+          setCodexAuthStatus(data);
+          if (data.authenticated) {
+            clearInterval(poll);
+            setCodexAuthLoading(false);
+          }
+        }
+      }, 2000);
+      // Timeout after 5 min
+      setTimeout(() => { clearInterval(poll); setCodexAuthLoading(false); }, 300_000);
+    } catch {
+      setCodexAuthLoading(false);
+    }
+  };
+
+  const handleCodexLogout = async () => {
+    await fetch('/api/auth/codex/logout', { method: 'POST' });
+    setCodexAuthStatus({ authenticated: false });
+  };
+
   useEffect(() => {
     fetchOllamaStatus();
     fetchHealth();
     fetchCredentials();
+    fetchCodexAuthStatus();
     const timer = setInterval(() => { fetchOllamaStatus(); fetchHealth(); }, 5000);
     return () => clearInterval(timer);
-  }, [fetchOllamaStatus, fetchHealth, fetchCredentials]);
+  }, [fetchOllamaStatus, fetchHealth, fetchCredentials, fetchCodexAuthStatus]);
 
   const updateModel = (index: number, field: keyof ModelConfigUI, value: string | null) => {
     const models = [...config.models];
@@ -123,6 +162,8 @@ export const ModelsTab: React.FC<{
       if (!updated.model && PROVIDER_PRESETS[value].defaultModel) {
         updated.model = PROVIDER_PRESETS[value].defaultModel;
       }
+      // Set auth_mode for ChatGPT OAuth provider
+      updated.auth_mode = PROVIDER_PRESETS[value].authMode || null;
     }
     models[index] = updated;
     // When model ID is renamed, update default_models to keep it in sync
@@ -280,8 +321,9 @@ export const ModelsTab: React.FC<{
                     <label className={labelCls}>Provider</label>
                     <select className={inputCls} value={model.provider} onChange={(e) => updateModel(i, 'provider', e.target.value)}>
                       <option value="ollama">Ollama (local)</option>
+                      <option value="chatgpt">ChatGPT (Subscription)</option>
                       <option value="gemini">Google Gemini</option>
-                      <option value="openai">OpenAI</option>
+                      <option value="openai">OpenAI (API)</option>
                       <option value="groq">Groq</option>
                       <option value="deepseek">DeepSeek</option>
                       <option value="openrouter">OpenRouter</option>
@@ -297,27 +339,62 @@ export const ModelsTab: React.FC<{
                     <input className={inputCls} value={model.model} onChange={(e) => updateModel(i, 'model', e.target.value)} placeholder={PROVIDER_PRESETS[model.provider]?.placeholder || 'e.g. model-name'} />
                   </div>
                   <div>
-                    <label className={labelCls}>
-                      API Key
-                      {hasKey(model.id) && <span className="ml-1 text-green-500 text-[8px]">(set)</span>}
-                    </label>
-                    <div className="relative">
-                      <input
-                        className={inputCls + ' pr-8'}
-                        type={revealKeys[model.id] ? 'text' : 'password'}
-                        value={localKeys[model.id] ?? ''}
-                        onChange={(e) => updateLocalKey(model.id, e.target.value)}
-                        placeholder={hasKey(model.id) ? '(stored in ~/.linggen/credentials.json)' : '(optional)'}
-                      />
-                      <button
-                        type="button"
-                        className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
-                        onClick={() => setRevealKeys((prev) => ({ ...prev, [model.id]: !prev[model.id] }))}
-                        tabIndex={-1}
-                      >
-                        {revealKeys[model.id] ? <EyeOff size={12} /> : <Eye size={12} />}
-                      </button>
-                    </div>
+                    {model.auth_mode === 'chatgpt_oauth' ? (
+                      <>
+                        <label className={labelCls}>ChatGPT OAuth</label>
+                        {codexAuthStatus?.authenticated ? (
+                          <div className="flex items-center gap-2 mt-1">
+                            <span className="inline-flex items-center gap-1.5 text-[10px] text-green-600 dark:text-green-400 font-medium">
+                              <span className="w-2 h-2 rounded-full bg-green-500" />
+                              Signed in
+                              {codexAuthStatus.account_id && (
+                                <span className="text-slate-400 font-normal ml-1">({codexAuthStatus.account_id.slice(0, 8)}…)</span>
+                              )}
+                            </span>
+                            <button
+                              onClick={handleCodexLogout}
+                              className="flex items-center gap-1 text-[10px] text-red-500 hover:text-red-600 font-medium"
+                            >
+                              <LogOut size={10} /> Sign out
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={handleCodexLogin}
+                            disabled={codexAuthLoading}
+                            className="mt-1 flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-semibold rounded-lg bg-green-600 text-white hover:bg-green-700 disabled:opacity-50 transition-colors"
+                          >
+                            <LogIn size={12} />
+                            {codexAuthLoading ? 'Waiting for browser login...' : 'Sign in with ChatGPT'}
+                          </button>
+                        )}
+                        <p className="text-[9px] text-slate-400 mt-1">Uses your ChatGPT Plus/Pro subscription — no API key needed.</p>
+                      </>
+                    ) : (
+                      <>
+                        <label className={labelCls}>
+                          API Key
+                          {hasKey(model.id) && <span className="ml-1 text-green-500 text-[8px]">(set)</span>}
+                        </label>
+                        <div className="relative">
+                          <input
+                            className={inputCls + ' pr-8'}
+                            type={revealKeys[model.id] ? 'text' : 'password'}
+                            value={localKeys[model.id] ?? ''}
+                            onChange={(e) => updateLocalKey(model.id, e.target.value)}
+                            placeholder={hasKey(model.id) ? '(stored in ~/.linggen/credentials.json)' : '(optional)'}
+                          />
+                          <button
+                            type="button"
+                            className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                            onClick={() => setRevealKeys((prev) => ({ ...prev, [model.id]: !prev[model.id] }))}
+                            tabIndex={-1}
+                          >
+                            {revealKeys[model.id] ? <EyeOff size={12} /> : <Eye size={12} />}
+                          </button>
+                        </div>
+                      </>
+                    )}
                   </div>
                   <div>
                     <label className={labelCls}>Keep Alive</label>

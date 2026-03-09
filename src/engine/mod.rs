@@ -399,6 +399,7 @@ impl AgentEngine {
                             })
                             .count();
                         let batch: Vec<ModelAction> = actions.drain(..batch_size).collect();
+                        let batch_start = action_idx;
                         action_idx += batch_size;
 
                         if let Some(outcome) = self
@@ -407,6 +408,8 @@ impl AgentEngine {
                                 &state.allowed_tools,
                                 &mut state.messages,
                                 session_id,
+                                &tc_ids,
+                                batch_start,
                             )
                             .await
                         {
@@ -454,15 +457,41 @@ impl AgentEngine {
 
             // --- Native mode: text-only response (no tool calls) ---
             if native_tools.is_some() && native_tool_calls.is_empty() && !raw.trim().is_empty() {
-                // Content tokens were already streamed to the UI in real-time via
-                // ContentToken events in stream_with_tool_calling(), so we don't
-                // need to emit TextSegment/ContentBlockStart events here.
-                let _ = self.persist_assistant_message(&raw, session_id).await;
-                self.chat_history.push(ChatMessage::new("assistant", raw.clone()));
-                self.truncate_chat_history();
-                self.last_assistant_text = Some(raw);
-                self.active_skill = None;
-                return Ok(AgentOutcome::None);
+                // Check if the text contains JSON actions (some models output JSON text
+                // instead of using native function calls). If so, fall through to the
+                // legacy JSON action parser below.
+                let has_json_actions = {
+                    let trimmed = raw.trim();
+                    trimmed.starts_with('{') && (
+                        trimmed.contains("\"type\"") || trimmed.contains("\"name\"")
+                    )
+                };
+                if !has_json_actions {
+                    // Plan mode fallback: model output plan text without calling
+                    // ExitPlanMode.  Treat the text as the plan and auto-finalize.
+                    if self.plan_mode {
+                        info!("Text-only response in plan mode → implicit ExitPlanMode");
+                        let plan_text = raw.trim().to_string();
+                        let (outcome, feedback) = self.finalize_plan_mode(plan_text).await;
+                        if let Some(feedback) = feedback {
+                            self.inject_plan_feedback(&mut state.messages, &feedback);
+                            // Continue loop so the model can revise the plan.
+                        } else {
+                            return Ok(outcome);
+                        }
+                        continue;
+                    }
+
+                    // Pure conversational text — content tokens were already streamed
+                    // to the UI in real-time via ContentToken events.
+                    let _ = self.persist_assistant_message(&raw, session_id).await;
+                    self.chat_history.push(ChatMessage::new("assistant", raw.clone()));
+                    self.truncate_chat_history();
+                    self.last_assistant_text = Some(raw);
+                    self.active_skill = None;
+                    return Ok(AgentOutcome::None);
+                }
+                // Fall through to legacy JSON action parser
             }
 
             // --- Legacy path: parse JSON actions from free-form text ---
@@ -650,6 +679,8 @@ impl AgentEngine {
                             &state.allowed_tools,
                             &mut state.messages,
                             session_id,
+                            &[], // No tc_ids in text-based path
+                            0,
                         )
                         .await
                     {

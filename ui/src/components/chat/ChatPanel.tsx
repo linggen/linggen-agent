@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Send, Square, X, Sparkles, FolderOpen, FileText } from 'lucide-react';
+import { Send, Square, X, Sparkles, FolderOpen, FileText, ArrowDown } from 'lucide-react';
 import 'highlight.js/styles/github.css';
 import { cn } from '../../lib/cn';
 import { AskUserCard } from '../AskUserCard';
@@ -20,6 +20,119 @@ import { getMessagePhase } from './MessagePhase';
 import { visibleMessageText } from './MessageHelpers';
 import { MarkdownContent } from './MarkdownContent';
 import { AgentMessage } from './AgentMessage';
+import { TodoPanel } from './TodoPanel';
+
+/** Render a single message row. */
+const ChatMessageRow = React.memo<{
+  msg: ChatMessage;
+  msgKey: string;
+  isUser: boolean;
+  isExpanded: boolean;
+  onToggle: () => void;
+  isLastUser: boolean;
+  lastUserMsgRef?: React.RefObject<HTMLDivElement | null>;
+  planProps: {
+    pendingPlanAgentId?: string | null;
+    agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
+    onApprovePlan?: (clearContext: boolean) => void;
+    onRejectPlan?: () => void;
+    onEditPlan?: (text: string) => void;
+    inputRef: React.RefObject<HTMLTextAreaElement | null>;
+  };
+}>(({ msg, msgKey, isUser, isExpanded, onToggle, isLastUser, lastUserMsgRef, planProps }) => {
+  const phase = isUser ? undefined : getMessagePhase(msg);
+  const messageClass = isUser
+    ? 'bg-slate-100 dark:bg-white/10 text-slate-900 dark:text-slate-100 rounded-md px-2.5 py-1.5'
+    : phase === 'thinking'
+      ? ''
+      : msg.isThinking && !msg.isGenerating
+        ? 'text-slate-500 dark:text-slate-400 italic opacity-60'
+        : 'text-slate-800 dark:text-slate-200';
+  return (
+    <div
+      key={msgKey}
+      ref={isLastUser ? lastUserMsgRef : undefined}
+      className={cn('w-full flex', isUser ? 'justify-end' : 'justify-start')}
+    >
+      <div className={cn(isUser ? 'max-w-[96%]' : 'max-w-full', 'text-[13px] leading-relaxed', messageClass)}>
+        {isUser ? (
+          <>
+            {msg.text}
+            {msg.images && msg.images.length > 0 && (
+              <div className="flex gap-1.5 mt-1.5 flex-wrap">
+                {msg.images.map((img, imgIdx) => (
+                  <img key={imgIdx} src={`data:image/png;base64,${img}`} alt={`Image ${imgIdx + 1}`}
+                    className="max-w-[200px] max-h-[200px] rounded-md border border-slate-200 dark:border-white/10 object-contain" />
+                ))}
+              </div>
+            )}
+          </>
+        ) : (
+          <AgentMessage msg={msg} isExpanded={isExpanded} onToggle={onToggle} planProps={planProps} />
+        )}
+      </div>
+    </div>
+  );
+});
+
+/** Memoized historical message list — skips re-render during streaming & typing. */
+const ChatMessageList = React.memo<{
+  messages: ChatMessage[];
+  expandedMessages: Set<string>;
+  setExpandedMessages: React.Dispatch<React.SetStateAction<Set<string>>>;
+  verboseMode?: boolean;
+  lastUserMsgInfo: { index: number; text: string } | null;
+  lastUserMsgRef: React.RefObject<HTMLDivElement | null>;
+  selectedAgent: string;
+  pendingPlanAgentId?: string | null;
+  agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
+  onApprovePlan?: (clearContext: boolean) => void;
+  onRejectPlan?: () => void;
+  onEditPlan?: (text: string) => void;
+  inputRef: React.RefObject<HTMLTextAreaElement | null>;
+}>(({ messages, expandedMessages, setExpandedMessages, verboseMode, lastUserMsgInfo, lastUserMsgRef, selectedAgent, pendingPlanAgentId, agentContext, onApprovePlan, onRejectPlan, onEditPlan, inputRef }) => {
+  const planProps = useMemo(() => ({ pendingPlanAgentId, agentContext, onApprovePlan, onRejectPlan, onEditPlan, inputRef }), [pendingPlanAgentId, agentContext, onApprovePlan, onRejectPlan, onEditPlan, inputRef]);
+  return (
+    <>
+      {messages.length === 0 && (
+        <div className="self-center mt-12 max-w-md text-center">
+          <div className="text-sm font-semibold text-slate-600 dark:text-slate-300">
+            No messages for {selectedAgent}
+          </div>
+          <div className="mt-2 text-xs text-slate-500">
+            Send a message to this main agent or switch tabs.
+          </div>
+        </div>
+      )}
+      {messages.map((msg, i) => {
+        const key = `${msg.timestamp}-${i}-${msg.from || msg.role}-${msg.text.slice(0, 24)}`;
+        const isUser = msg.role === 'user';
+        const isExpanded = verboseMode || expandedMessages.has(key);
+        const isLastUser = isUser && lastUserMsgInfo?.index === i;
+        return (
+          <ChatMessageRow
+            key={key}
+            msg={msg}
+            msgKey={key}
+            isUser={isUser}
+            isExpanded={isExpanded}
+            onToggle={() => {
+              setExpandedMessages((prev) => {
+                const next = new Set(prev);
+                if (next.has(key)) next.delete(key);
+                else next.add(key);
+                return next;
+              });
+            }}
+            isLastUser={isLastUser}
+            lastUserMsgRef={lastUserMsgRef}
+            planProps={planProps}
+          />
+        );
+      })}
+    </>
+  );
+});
 
 const statusBadgeClass = (status?: string) => {
   if (status === 'working') return 'bg-green-500/15 text-green-600 dark:text-green-300';
@@ -49,6 +162,7 @@ export const ChatPanel: React.FC<{
   cancellingRunIds?: Record<string, boolean>;
   onCancelRun?: (runId: string) => void | Promise<void>;
   onSendMessage: (message: string, targetAgent?: string, images?: string[]) => void;
+  activePlan?: import('../../types').Plan | null;
   pendingPlan?: import('../../types').Plan | null;
   pendingPlanAgentId?: string | null;
   agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
@@ -67,6 +181,7 @@ export const ChatPanel: React.FC<{
   models?: import('../../types').ModelInfo[];
   defaultModels?: string[];
   onSwitchModel?: (modelId: string) => void;
+  tokensPerSec?: number;
 }> = ({
   chatMessages,
   queuedMessages,
@@ -87,6 +202,7 @@ export const ChatPanel: React.FC<{
   cancellingRunIds,
   onCancelRun,
   onSendMessage,
+  activePlan,
   pendingPlan: _pendingPlan,
   pendingPlanAgentId,
   agentContext,
@@ -105,6 +221,7 @@ export const ChatPanel: React.FC<{
   models: modelsList,
   defaultModels: defaultModelsList,
   onSwitchModel,
+  tokensPerSec,
 }) => {
   const [chatInput, setChatInput] = useState('');
   const [pendingImages, setPendingImages] = useState<string[]>([]);
@@ -166,6 +283,34 @@ export const ChatPanel: React.FC<{
       chatEndRef?.current?.scrollIntoView({ behavior: 'auto', block: 'nearest' });
     }
   }, [pendingAskUser, chatEndRef]);
+
+  // Auto-scroll to bottom during streaming, but only if user is near bottom.
+  // "Near bottom" = within 10% of scroll height (respects manual scroll-up).
+  const isNearBottomRef = useRef(true);
+  const [showScrollButton, setShowScrollButton] = useState(false);
+  useEffect(() => {
+    const container = chatScrollRef.current;
+    if (!container) return;
+    const onScroll = () => {
+      const { scrollTop, scrollHeight, clientHeight } = container;
+      const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+      const nearBottom = distanceFromBottom <= scrollHeight * 0.1;
+      isNearBottomRef.current = nearBottom;
+      setShowScrollButton(!nearBottom && distanceFromBottom > 100);
+    };
+    container.addEventListener('scroll', onScroll, { passive: true });
+    return () => container.removeEventListener('scroll', onScroll);
+  }, []);
+
+  const scrollToBottom = useCallback(() => {
+    chatEndRef?.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [chatEndRef]);
+
+  useEffect(() => {
+    if (isNearBottomRef.current) {
+      chatEndRef?.current?.scrollIntoView({ behavior: 'auto', block: 'nearest' });
+    }
+  }, [chatMessages, chatEndRef]);
 
   // Track agent active state and elapsed time
   const currentStatus = agentStatus?.[selectedAgent];
@@ -355,6 +500,18 @@ export const ChatPanel: React.FC<{
       );
     });
   }, [displayedMainMessages, mainMessageFilter]);
+  // Split messages: historical (stable, memoized) vs streaming (re-renders per token)
+  const { historicalMessages, streamingMessage } = useMemo(() => {
+    const len = filteredMainMessages.length;
+    if (len > 0 && filteredMainMessages[len - 1].isGenerating) {
+      return {
+        historicalMessages: filteredMainMessages.slice(0, len - 1),
+        streamingMessage: filteredMainMessages[len - 1],
+      };
+    }
+    return { historicalMessages: filteredMainMessages, streamingMessage: null };
+  }, [filteredMainMessages]);
+
   const lastUserMsgInfo = useMemo(() => {
     for (let i = filteredMainMessages.length - 1; i >= 0; i--) {
       if (filteredMainMessages[i].role === 'user') {
@@ -851,12 +1008,14 @@ export const ChatPanel: React.FC<{
       <div ref={chatScrollRef} className="relative flex-1 overflow-y-scroll px-2 py-1.5 flex flex-col gap-2 custom-scrollbar min-h-0">
         {showLastUserMsg && lastUserMsgInfo && (
           <div
-            className="sticky top-0 z-20 mx-1 mb-1 px-3 py-1.5 rounded-md bg-slate-100/95 dark:bg-white/10 backdrop-blur text-[12px] text-slate-700 dark:text-slate-200 border border-slate-200/60 dark:border-white/10 truncate cursor-pointer"
+            className="sticky top-0 z-20 mx-1 mb-1 px-3 py-2 rounded-md bg-slate-100/95 dark:bg-white/10 backdrop-blur text-[12px] text-slate-700 dark:text-slate-200 border border-slate-200/60 dark:border-white/10 cursor-pointer"
             onClick={() => lastUserMsgRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })}
             title={lastUserMsgInfo.text}
           >
-            <span className="font-medium text-slate-500 dark:text-slate-400 mr-1.5">You:</span>
-            {lastUserMsgInfo.text.length > 120 ? lastUserMsgInfo.text.slice(0, 120) + '…' : lastUserMsgInfo.text}
+            <p className="line-clamp-4 whitespace-pre-wrap break-words">
+              <span className="font-medium text-slate-500 dark:text-slate-400 mr-1.5">You:</span>
+              {lastUserMsgInfo.text}
+            </p>
           </div>
         )}
         <div className="flex items-center justify-between gap-2 mb-1">
@@ -882,84 +1041,32 @@ export const ChatPanel: React.FC<{
             className="w-52 text-[11px] bg-white dark:bg-black/30 border border-slate-200 dark:border-white/10 rounded px-2 py-1 outline-none"
           />
         </div>
-        {filteredMainMessages.length === 0 && (
-          <div className="self-center mt-12 max-w-md text-center">
-            <div className="text-sm font-semibold text-slate-600 dark:text-slate-300">
-              No messages for {selectedAgent}
-            </div>
-            <div className="mt-2 text-xs text-slate-500">
-              Send a message to this main agent or switch tabs.
-            </div>
-          </div>
+        <ChatMessageList
+          messages={historicalMessages}
+          expandedMessages={expandedMessages}
+          setExpandedMessages={setExpandedMessages}
+          verboseMode={verboseMode}
+          lastUserMsgInfo={streamingMessage ? null : lastUserMsgInfo}
+          lastUserMsgRef={lastUserMsgRef}
+          selectedAgent={selectedAgent}
+          pendingPlanAgentId={pendingPlanAgentId}
+          agentContext={agentContext}
+          onApprovePlan={onApprovePlan}
+          onRejectPlan={onRejectPlan}
+          onEditPlan={onEditPlan}
+          inputRef={inputRef}
+        />
+        {streamingMessage && (
+          <ChatMessageRow
+            msg={streamingMessage}
+            msgKey={`${streamingMessage.timestamp}-${filteredMainMessages.length - 1}-${streamingMessage.from || streamingMessage.role}-${streamingMessage.text.slice(0, 24)}`}
+            isUser={false}
+            isExpanded={verboseMode || false}
+            onToggle={() => {}}
+            isLastUser={false}
+            planProps={{ pendingPlanAgentId, agentContext, onApprovePlan, onRejectPlan, onEditPlan, inputRef }}
+          />
         )}
-        {filteredMainMessages.map((msg, i) => {
-          const key = `${msg.timestamp}-${i}-${msg.from || msg.role}-${msg.text.slice(0, 24)}`;
-          const isUser = msg.role === 'user';
-          const phase = isUser ? undefined : getMessagePhase(msg);
-          const messageClass = isUser
-            ? 'bg-slate-100 dark:bg-white/10 text-slate-900 dark:text-slate-100 rounded-md px-2.5 py-1.5'
-            : phase === 'thinking'
-              ? ''
-              : msg.isThinking && !msg.isGenerating
-                ? 'text-slate-500 dark:text-slate-400 italic opacity-60'
-                : 'text-slate-800 dark:text-slate-200';
-          const isExpanded = verboseMode || expandedMessages.has(key);
-          const toggleExpand = () => {
-            setExpandedMessages((prev) => {
-              const next = new Set(prev);
-              if (next.has(key)) next.delete(key);
-              else next.add(key);
-              return next;
-            });
-          };
-          const isLastUser = isUser && lastUserMsgInfo?.index === i;
-          return (
-            <div
-              key={key}
-              ref={isLastUser ? lastUserMsgRef : undefined}
-              className={cn('w-full flex', isUser ? 'justify-end' : 'justify-start')}
-            >
-              <div
-                className={cn(
-                  isUser ? 'max-w-[96%]' : 'max-w-full', 'text-[13px] leading-relaxed',
-                  messageClass
-                )}
-              >
-                {isUser ? (
-                  <>
-                    {msg.text}
-                    {msg.images && msg.images.length > 0 && (
-                      <div className="flex gap-1.5 mt-1.5 flex-wrap">
-                        {msg.images.map((img, imgIdx) => (
-                          <img
-                            key={imgIdx}
-                            src={`data:image/png;base64,${img}`}
-                            alt={`Image ${imgIdx + 1}`}
-                            className="max-w-[200px] max-h-[200px] rounded-md border border-slate-200 dark:border-white/10 object-contain"
-                          />
-                        ))}
-                      </div>
-                    )}
-                  </>
-                ) : (
-                  <AgentMessage
-                    msg={msg}
-                    isExpanded={isExpanded}
-                    onToggle={toggleExpand}
-                    planProps={{
-                      pendingPlanAgentId,
-                      agentContext,
-                      onApprovePlan,
-                      onRejectPlan,
-                      onEditPlan,
-                      inputRef,
-                    }}
-                  />
-                )}
-              </div>
-            </div>
-          );
-        })}
         {pendingAskUser && onRespondToAskUser && (
           <div className="px-3 py-2">
             {pendingAskUser.questions[0]?.header === 'Permission'
@@ -968,6 +1075,15 @@ export const ChatPanel: React.FC<{
           </div>
         )}
         <div ref={chatEndRef} />
+        {showScrollButton && (
+          <button
+            onClick={scrollToBottom}
+            className="sticky bottom-2 left-1/2 -translate-x-1/2 z-30 w-8 h-8 rounded-full bg-white dark:bg-[#1a1a1a] border border-slate-300 dark:border-white/15 shadow-lg flex items-center justify-center hover:bg-slate-50 dark:hover:bg-white/10 transition-all opacity-80 hover:opacity-100"
+            title="Scroll to bottom"
+          >
+            <ArrowDown size={14} className="text-slate-600 dark:text-slate-300" />
+          </button>
+        )}
       </div>
 
       {/* Status spinner — always visible when active or just completed */}
@@ -983,8 +1099,11 @@ export const ChatPanel: React.FC<{
                     thinkingElapsed >= 60
                       ? `${Math.floor(thinkingElapsed / 60)}m ${thinkingElapsed % 60}s`
                       : thinkingElapsed > 0 ? `${thinkingElapsed}s` : '',
+                    (tokensPerSec ?? 0) > 0
+                      ? `${tokensPerSec!.toFixed(1)} tok/s`
+                      : '',
                     (agentContext?.[selectedAgent]?.tokens ?? 0) > 0
-                      ? `↑ ${((agentContext?.[selectedAgent]?.tokens ?? 0) / 1000).toFixed(1)}k tokens`
+                      ? `${((agentContext?.[selectedAgent]?.tokens ?? 0) / 1000).toFixed(1)}k ctx`
                       : '',
                   ].filter(Boolean).join(' · ')})
                 </span>
@@ -1061,6 +1180,9 @@ export const ChatPanel: React.FC<{
               ))}
             </div>
           </div>
+        )}
+        {activePlan && activePlan.items && activePlan.items.length > 0 && (
+          <TodoPanel plan={activePlan} />
         )}
         {pendingImages.length > 0 && (
           <div className="flex gap-1.5 px-2 py-1.5 flex-wrap">

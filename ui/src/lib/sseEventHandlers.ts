@@ -397,6 +397,8 @@ function handleActivity(item: UiSseMessage, deps: SseHandlerDeps): void {
     const ctxTokens = deps.latestContextTokensRef.current[agentId] || undefined;
     delete deps.runStartTsRef.current[agentId];
     deps.chatDispatch({ type: 'FINALIZE_ON_IDLE', agentId, elapsed, ctxTokens });
+    // Clear the todo panel when the agent finishes
+    deps.setActivePlan(null);
   }
 }
 
@@ -537,6 +539,7 @@ function handleContentBlock(item: UiSseMessage, deps: SseHandlerDeps): void {
           path: data.path || '',
           old_string: data.old_string,
           new_string: data.new_string,
+          new_content: data.new_content,
           start_line: typeof data.start_line === 'number' ? data.start_line : undefined,
           lines_written: typeof data.lines_written === 'number' ? data.lines_written : undefined,
         }

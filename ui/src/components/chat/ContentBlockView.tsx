@@ -173,16 +173,33 @@ export const ContentBlockView: React.FC<{
     const d = block.diffData!;
 
     if (d.diff_type === 'write') {
+      const lineLabel = `Wrote ${d.lines_written} line${d.lines_written === 1 ? '' : 's'}`;
       if (!showExpanded) {
         return (
           <div className="pl-4 mt-0.5 text-[10px] text-slate-400 dark:text-slate-500 font-mono cursor-pointer" onClick={handleClick}>
-            Wrote {d.lines_written} line{d.lines_written === 1 ? '' : 's'}
+            <span className="text-slate-300 dark:text-slate-600 select-none">⎿  </span>
+            {lineLabel}
+            {d.new_content && <span className="text-slate-400 dark:text-slate-500 ml-1">(click to expand)</span>}
           </div>
         );
       }
       return (
-        <div className="pl-4 mt-0.5 text-[10px] text-slate-500 dark:text-slate-400 font-mono">
-          Wrote {d.lines_written} line{d.lines_written === 1 ? '' : 's'} to {d.path}
+        <div className="pl-4 mt-0.5">
+          <div className="text-[10px] text-slate-400 dark:text-slate-500 font-mono mb-0.5">
+            <span className="text-slate-300 dark:text-slate-600 select-none">⎿  </span>{lineLabel}
+          </div>
+          {d.new_content && (
+            <div className="max-h-80 overflow-y-auto custom-scrollbar rounded border border-slate-200 dark:border-white/10 bg-slate-50 dark:bg-white/[0.02]">
+              <pre className="text-[10px] leading-4 p-2 text-green-700 dark:text-green-400 whitespace-pre-wrap break-words">
+                {d.new_content.split('\n').map((line, i) => (
+                  <div key={i}>
+                    <span className="text-slate-300 dark:text-slate-600 select-none inline-block w-8 text-right mr-2">{i + 1}</span>
+                    <span className="text-green-600/20 dark:text-green-500/20 select-none">+</span> {line}
+                  </div>
+                ))}
+              </pre>
+            </div>
+          )}
         </div>
       );
     }

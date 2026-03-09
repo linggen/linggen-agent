@@ -17,22 +17,33 @@ impl AgentEngine {
         allowed_tools: &Option<HashSet<String>>,
         messages: &mut Vec<ChatMessage>,
         session_id: Option<&str>,
+        tc_ids: &[String],
+        batch_start: usize,
     ) -> Option<AgentOutcome> {
         use crate::agent_manager::AgentManager;
 
-        // Parse TaskArgs from each action.
-        let mut delegation_args: Vec<tools::TaskArgs> = Vec::new();
-        for action in batch {
+        // Helper to get the tc_id for a given action index.
+        let tc_id_for = |idx: usize| -> Option<String> {
+            tc_ids.get(batch_start + idx).cloned()
+        };
+        let tool_msg = |this: &Self, content: String, idx: usize| -> ChatMessage {
+            this.tool_result_msg_for(content, &tc_id_for(idx), "Task")
+        };
+
+        // Parse TaskArgs from each action, tracking original index.
+        let mut delegation_args: Vec<(usize, tools::TaskArgs)> = Vec::new();
+        for (i, action) in batch.into_iter().enumerate() {
             if let ModelAction::Tool { tool, args } = action {
                 let normalized = tools::normalize_tool_args(&tool, args.clone());
                 match serde_json::from_value::<tools::TaskArgs>(normalized) {
-                    Ok(da) => delegation_args.push(da),
+                    Ok(da) => delegation_args.push((i, da)),
                     Err(e) => {
-                        messages.push(self.tool_result_msg(
+                        messages.push(tool_msg(self,
                             self.prompt_store.render_or_fallback(
                                 crate::prompts::keys::INVALID_TASK_ARGS,
                                 &[("error", &e.to_string())],
                             ),
+                            i,
                         ));
                     }
                 }
@@ -46,12 +57,13 @@ impl AgentEngine {
         // Permission check (once for the whole batch).
         if let Some(allowed) = allowed_tools {
             if !self.is_tool_allowed(allowed, "Task") {
-                for da in &delegation_args {
-                    messages.push(self.tool_result_msg(
+                for (i, da) in &delegation_args {
+                    messages.push(tool_msg(self,
                         self.prompt_store.render_or_fallback(
                             crate::prompts::keys::DELEGATION_BLOCKED,
                             &[("target", &da.target_agent_id)],
                         ),
+                        *i,
                     ));
                 }
                 return None;
@@ -60,6 +72,7 @@ impl AgentEngine {
 
         // Validate all delegations and collect spawn params.
         struct DelegationSpawn {
+            action_idx: usize,
             manager: Arc<AgentManager>,
             caller_id: String,
             target_agent_id: String,
@@ -71,10 +84,11 @@ impl AgentEngine {
         }
         let mut spawns: Vec<DelegationSpawn> = Vec::new();
 
-        for da in delegation_args {
+        for (i, da) in delegation_args {
             match self.tools.builtins.validate_delegation(&da) {
                 Ok((manager, caller_id)) => {
                     spawns.push(DelegationSpawn {
+                        action_idx: i,
                         manager,
                         caller_id,
                         target_agent_id: da.target_agent_id,
@@ -86,11 +100,12 @@ impl AgentEngine {
                     });
                 }
                 Err(e) => {
-                    messages.push(self.tool_result_msg(
+                    messages.push(tool_msg(self,
                         self.prompt_store.render_or_fallback(
                             crate::prompts::keys::DELEGATION_VALIDATION_FAILED,
                             &[("target", &da.target_agent_id), ("error", &e.to_string())],
                         ),
+                        i,
                     ));
                     let rendered = format!(
                         "tool_error: tool=Task target={} error={}",
@@ -110,9 +125,10 @@ impl AgentEngine {
 
         // Spawn each delegation on a blocking thread with its own tokio runtime.
         let mut join_set = tokio::task::JoinSet::new();
-        for (spawn_idx, spawn) in spawns.into_iter().enumerate() {
+        for spawn in spawns.into_iter() {
             let ws = ws_root.clone();
             let bridge = ask_bridge.clone();
+            let action_idx = spawn.action_idx;
             join_set.spawn_blocking(move || {
                 let rt = match tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
@@ -122,7 +138,7 @@ impl AgentEngine {
                     Ok(rt) => rt,
                     Err(e) => {
                         let target = spawn.target_agent_id.clone();
-                        return (spawn_idx, target, Err(anyhow::anyhow!("failed to create delegation runtime: {}", e)));
+                        return (action_idx, target, Err(anyhow::anyhow!("failed to create delegation runtime: {}", e)));
                     }
                 };
                 let target = spawn.target_agent_id.clone();
@@ -134,7 +150,7 @@ impl AgentEngine {
                     )
                     .await
                 });
-                (spawn_idx, target, result)
+                (action_idx, target, result)
             });
         }
 
@@ -153,19 +169,20 @@ impl AgentEngine {
         results.sort_by_key(|(idx, _, _)| *idx);
 
         // Merge results into messages.
-        for (_idx, target, result) in results {
+        for (idx, target, result) in results {
             match result {
                 Ok(tool_result) => {
                     let rendered = render_tool_result(&tool_result);
                     let _ = self
                         .persist_observation("Task", &rendered, session_id)
                         .await;
-                    messages.push(self.tool_result_msg(
+                    messages.push(tool_msg(self,
                         self.observation_text(
                             "tool",
                             &format!("Task({})", target),
                             &rendered,
                         ),
+                        idx,
                     ));
                     self.upsert_observation("tool", "Task", rendered);
                 }
@@ -176,11 +193,12 @@ impl AgentEngine {
                     let _ = self
                         .persist_observation("Task", &rendered, session_id)
                         .await;
-                    messages.push(self.tool_result_msg(
+                    messages.push(tool_msg(self,
                         self.prompt_store.render_or_fallback(
                             crate::prompts::keys::DELEGATION_FAILED,
                             &[("target", &target), ("error", &e.to_string())],
                         ),
+                        idx,
                     ));
                     self.upsert_observation("error", "Task", rendered);
                 }
@@ -325,11 +343,12 @@ impl AgentEngine {
                     }
 
                     // Acknowledge ExitPlanMode so the model knows it was processed.
-                    state.messages.push(self.tool_result_msg(
+                    state.messages.push(self.tool_result_msg_for(
                         self.prompt_store.render_or_fallback(
                             crate::prompts::keys::PLAN_SUBMITTED,
                             &[],
                         ),
+                        &tc_id, "ExitPlanMode",
                     ));
 
                     // Persist + ask for approval via shared helper.
@@ -341,11 +360,12 @@ impl AgentEngine {
                         return Some(outcome);
                     }
                 } else {
-                    state.messages.push(self.tool_result_msg(
+                    state.messages.push(self.tool_result_msg_for(
                         self.prompt_store.render_or_fallback(
                             crate::prompts::keys::EXIT_PLAN_MODE_OUTSIDE_PLAN,
                             &[],
                         ),
+                        &tc_id, "ExitPlanMode",
                     ));
                 }
             }
@@ -415,7 +435,7 @@ impl AgentEngine {
                 return Some(AgentOutcome::PlanModeRequested { reason });
             }
             ModelAction::UpdatePlan { items } => {
-                self.handle_update_plan_action(items, &mut state.messages, session_id).await;
+                self.handle_update_plan_action(items, &mut state.messages, session_id, &tc_id).await;
             }
         }
         None
@@ -423,7 +443,7 @@ impl AgentEngine {
 
     /// Inject user feedback on a plan into the message stream so the model
     /// can revise. Used by both the ExitPlanMode and Done-in-plan-mode paths.
-    fn inject_plan_feedback(&self, messages: &mut Vec<ChatMessage>, feedback: &str) {
+    pub(crate) fn inject_plan_feedback(&self, messages: &mut Vec<ChatMessage>, feedback: &str) {
         info!("User feedback on plan: {}", feedback);
         messages.push(self.tool_result_msg(format!(
             "User feedback on plan:\n{}\n\nPlease revise the plan based on this feedback.",
@@ -438,13 +458,16 @@ impl AgentEngine {
         items: Vec<serde_json::Value>,
         messages: &mut Vec<ChatMessage>,
         session_id: Option<&str>,
+        tc_id: &Option<String>,
     ) {
-        // Build markdown plan text from items.
+        // Build structured items + markdown plan text.
+        let mut plan_items = Vec::new();
         let mut lines = Vec::new();
         for item in &items {
-            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("?");
-            let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
-            let checkbox = match status {
+            let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string();
+            let checkbox = match status.as_str() {
                 "completed" | "done" => "- [x]",
                 "in_progress" | "working" => "- [~]",
                 _ => "- [ ]",
@@ -455,6 +478,7 @@ impl AgentEngine {
                 ""
             };
             lines.push(format!("{} {}{}", checkbox, title, suffix));
+            plan_items.push(PlanItem { id, title, status });
         }
         let plan_text = lines.join("\n");
         let summary = Self::extract_plan_summary(&plan_text);
@@ -463,6 +487,7 @@ impl AgentEngine {
             summary,
             status: PlanStatus::Executing,
             plan_text,
+            items: plan_items,
         };
         self.persist_and_emit_plan(plan).await;
 
@@ -473,7 +498,7 @@ impl AgentEngine {
         info!("UpdatePlan: {}", ack);
 
         // Push acknowledgement to model messages so it sees the feedback.
-        messages.push(self.tool_result_msg(ack.clone()));
+        messages.push(self.tool_result_msg_for(ack.clone(), tc_id, "UpdatePlan"));
         let _ = self
             .persist_observation("UpdatePlan", &ack, session_id)
             .await;

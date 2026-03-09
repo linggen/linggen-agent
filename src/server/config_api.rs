@@ -1,3 +1,4 @@
+use crate::codex_auth;
 use crate::config::Config;
 use crate::credentials::{self, Credentials};
 use crate::server::ServerState;
@@ -137,6 +138,48 @@ pub(crate) async fn update_credentials_api(
     }
 
     match creds.save(&creds_file) {
+        Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ChatGPT OAuth API — login, status, logout
+// ---------------------------------------------------------------------------
+
+/// Get ChatGPT OAuth status.
+pub(crate) async fn get_codex_auth_status() -> impl IntoResponse {
+    let tokens = codex_auth::CodexAuthTokens::load(&codex_auth::codex_auth_file());
+    Json(serde_json::json!({
+        "authenticated": tokens.is_valid(),
+        "account_id": tokens.account_id,
+        "needs_refresh": tokens.needs_refresh(),
+        "last_refresh": tokens.last_refresh,
+    }))
+    .into_response()
+}
+
+/// Start ChatGPT OAuth browser login flow.
+pub(crate) async fn start_codex_auth_login() -> impl IntoResponse {
+    // Spawn the browser login in a background task
+    tokio::spawn(async {
+        match codex_auth::browser_login().await {
+            Ok(_) => tracing::info!("ChatGPT OAuth login completed via Web UI"),
+            Err(e) => tracing::warn!("ChatGPT OAuth login failed: {}", e),
+        }
+    });
+
+    Json(serde_json::json!({
+        "status": "login_started",
+        "message": "Browser opened for ChatGPT login. Complete sign-in in the browser.",
+    }))
+    .into_response()
+}
+
+/// Logout from ChatGPT OAuth.
+pub(crate) async fn codex_auth_logout() -> impl IntoResponse {
+    let manager = codex_auth::CodexAuthManager::new();
+    match manager.logout().await {
         Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

@@ -19,12 +19,22 @@ use tokio::sync::mpsc;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanItem {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
     pub summary: String,
     pub status: PlanStatus,
     /// Free-form markdown plan text.
     #[serde(default)]
     pub plan_text: String,
+    /// Structured todo items from UpdatePlan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<PlanItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

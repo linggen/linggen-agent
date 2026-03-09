@@ -37,6 +37,7 @@ export interface ContentBlock {
     path: string;
     old_string?: string;
     new_string?: string;
+    new_content?: string;
     start_line?: number;
     lines_written?: number;
   };
@@ -199,6 +200,7 @@ export interface ModelConfigUI {
   api_key?: string | null;
   keep_alive?: string | null;
   tags?: string[];
+  auth_mode?: string | null;
 }
 
 export interface SessionInfo {
@@ -313,20 +315,23 @@ export type ManagementTab = 'models' | 'agents' | 'skills' | 'tools' | 'general'
 
 // --- Mission types (cron-based) ---
 
-export type MissionTab = 'list' | 'create' | 'edit' | 'runs';
+export type MissionTab = 'list' | 'create' | 'edit' | 'runs' | 'agent';
 
 export interface CronMission {
   id: string;
+  name?: string | null;
   schedule: string;
   agent_id: string;
   prompt: string;
   model?: string | null;
+  project?: string | null;
   enabled: boolean;
   created_at: number;
 }
 
 export interface MissionRunEntry {
   run_id: string;
+  session_id?: string | null;
   triggered_at: number;
   status: string;
   skipped: boolean;
@@ -351,10 +356,17 @@ export interface StorageEntry {
 // Plan mode types
 export type PlanStatus = 'planned' | 'approved' | 'executing' | 'completed';
 
+export interface PlanItem {
+  id: string;
+  title: string;
+  status: string;
+}
+
 export interface Plan {
   summary: string;
   status: PlanStatus;
   plan_text: string;
+  items?: PlanItem[];
 }
 
 // --- AskUser types ---

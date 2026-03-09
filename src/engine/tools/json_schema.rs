@@ -286,13 +286,13 @@ fn builtin_tool_schemas() -> Vec<Value> {
         // Non-tool actions promoted to tools for native function calling
         tool_def(
             "Done",
-            "Signal task completion with a summary. For conversational replies, just respond with text content instead.",
+            "Signal task completion with a summary. Format the message using Markdown (headings, bullets, code blocks). For conversational replies, just respond with text content instead.",
             json!({
                 "type": "object",
                 "properties": {
                     "message": {
                         "type": "string",
-                        "description": "Summary of what was accomplished"
+                        "description": "Markdown-formatted summary of what was accomplished"
                     }
                 },
                 "required": []
@@ -300,7 +300,7 @@ fn builtin_tool_schemas() -> Vec<Value> {
         ),
         tool_def(
             "EnterPlanMode",
-            "Request plan mode for complex tasks that need upfront exploration before implementation.",
+            "Enter plan mode to research and produce a detailed implementation plan for user approval. Use this when the user asks you to 'plan', 'design', or 'propose' something, or when a task is complex enough to need upfront exploration before making changes. In plan mode you are restricted to read-only tools until you call ExitPlanMode.",
             json!({
                 "type": "object",
                 "properties": {
@@ -314,7 +314,7 @@ fn builtin_tool_schemas() -> Vec<Value> {
         ),
         tool_def(
             "UpdatePlan",
-            "Track progress on multi-step tasks. Update item statuses as you complete each step.",
+            "Update the progress checklist for a task in progress. This is for tracking execution progress (marking steps as completed/in_progress/pending) — NOT for creating plans. To plan a task, use EnterPlanMode instead.",
             json!({
                 "type": "object",
                 "properties": {

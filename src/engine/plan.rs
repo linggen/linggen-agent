@@ -109,6 +109,7 @@ impl AgentEngine {
             summary,
             status: PlanStatus::Planned,
             plan_text,
+            items: Vec::new(),
         };
         // Write to disk but don't emit SSE yet — ask_plan_approval will
         // emit a single PlanUpdate at the final status (Approved/Planned).
@@ -314,6 +315,7 @@ mod tests {
             summary: "Add avatar upload".to_string(),
             status: PlanStatus::Planned,
             plan_text: plan_text.to_string(),
+            items: Vec::new(),
         };
 
         engine.write_plan_file(&plan);
@@ -333,6 +335,7 @@ mod tests {
             summary: "Test".to_string(),
             status: PlanStatus::Executing,
             plan_text: String::new(),
+            items: Vec::new(),
         };
 
         engine.write_plan_file(&plan);

@@ -1035,10 +1035,17 @@ impl AgentEngine {
                     .unwrap_or_else(|| path.to_string());
                 let line_count = content.lines().count();
 
+                // Truncate content for diff display (avoid huge payloads)
+                let preview = if content.len() > 10_000 {
+                    format!("{}…\n(truncated, {} total chars)", &content[..10_000], content.len())
+                } else {
+                    content.to_string()
+                };
                 Some(serde_json::json!({
                     "diff_type": "write",
                     "path": rel,
                     "lines_written": line_count,
+                    "new_content": preview,
                 }))
             }
             _ => None,

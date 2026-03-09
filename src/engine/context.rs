@@ -385,6 +385,87 @@ impl AgentEngine {
         snippets.push(short);
     }
 
+    /// Ensure tool_use (assistant with tool_calls) and tool_result (role="tool")
+    /// messages are always kept or dropped together. OpenAI requires every
+    /// tool_call to have a matching tool output in the next message.
+    fn preserve_tool_pairs(
+        window_msgs: &[ChatMessage],
+        keep_indices: &mut Vec<usize>,
+        drop_indices: &mut Vec<usize>,
+    ) {
+        use std::collections::HashSet;
+
+        let keep_set: HashSet<usize> = keep_indices.iter().copied().collect();
+        let mut promote: HashSet<usize> = HashSet::new();
+
+        // For each kept assistant message with tool_calls, find the tool_result
+        // messages that follow it and promote them to keep.
+        for &ki in keep_indices.iter() {
+            let msg = &window_msgs[ki];
+            if msg.role == "assistant" && !msg.tool_calls.is_empty() {
+                let tc_ids: HashSet<&str> = msg
+                    .tool_calls
+                    .iter()
+                    .map(|tc| tc.id.as_str())
+                    .collect();
+                // Scan forward for matching tool results
+                for j in (ki + 1)..window_msgs.len() {
+                    if let Some(ref tc_id) = window_msgs[j].tool_call_id {
+                        if tc_ids.contains(tc_id.as_str()) && !keep_set.contains(&j) {
+                            promote.insert(j);
+                        }
+                    }
+                    // Stop once we hit another assistant message
+                    if window_msgs[j].role == "assistant" {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // For each kept tool_result, ensure its parent assistant message is also kept.
+        for &ki in keep_indices.iter() {
+            let msg = &window_msgs[ki];
+            if let Some(ref tc_id) = msg.tool_call_id {
+                // Scan backward for the assistant message with this tool_call_id
+                for j in (0..ki).rev() {
+                    if window_msgs[j].role == "assistant"
+                        && window_msgs[j]
+                            .tool_calls
+                            .iter()
+                            .any(|tc| tc.id == *tc_id)
+                        && !keep_set.contains(&j)
+                    {
+                        promote.insert(j);
+                        // Also promote all other tool_results for this assistant
+                        let all_tc_ids: HashSet<&str> = window_msgs[j]
+                            .tool_calls
+                            .iter()
+                            .map(|tc| tc.id.as_str())
+                            .collect();
+                        for k in (j + 1)..window_msgs.len() {
+                            if let Some(ref tid) = window_msgs[k].tool_call_id {
+                                if all_tc_ids.contains(tid.as_str()) && !keep_set.contains(&k) {
+                                    promote.insert(k);
+                                }
+                            }
+                            if window_msgs[k].role == "assistant" {
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !promote.is_empty() {
+            drop_indices.retain(|i| !promote.contains(i));
+            keep_indices.extend(promote);
+            keep_indices.sort_unstable();
+        }
+    }
+
     pub(crate) fn maybe_compact_model_messages(
         &mut self,
         messages: &mut Vec<ChatMessage>,
@@ -439,6 +520,11 @@ impl AgentEngine {
                     drop_indices.push(i);
                 }
             }
+
+            // Preserve tool_use ↔ tool_result pairing: if an assistant message
+            // with tool_calls is kept, its tool_result messages must also be kept
+            // (and vice versa). Otherwise OpenAI errors with "No tool output found".
+            Self::preserve_tool_pairs(window_msgs, &mut keep_indices, &mut drop_indices);
 
             // If nothing to drop, fall back to dropping everything in window
             // (original behavior) — the model needs space.

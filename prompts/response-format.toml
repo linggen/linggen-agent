@@ -59,9 +59,9 @@ Multiple parallel reads (all in one response):
 {"name": "Glob", "args": {"pattern": "src/**/*.rs"}}
 ```
 
-### 2. Enter Plan Mode — request research phase before implementation
+### 2. Enter Plan Mode — research and plan before implementation
 
-For complex tasks that need upfront exploration, enter plan mode. This restricts you to read-only tools while you research and produce a plan for user approval.
+**When the user asks you to "plan", "design", or "propose" something — or when a task is complex enough to benefit from upfront exploration — enter plan mode.** This restricts you to read-only tools while you research and produce a detailed plan for user approval.
 
 ```json
 {"type": "enter_plan_mode", "reason": "Need to explore the codebase before implementing the feature"}
@@ -72,9 +72,9 @@ In plan mode, use Read/Glob/Grep/WebSearch/WebFetch to research, then call ExitP
 {"name": "ExitPlanMode", "args": {}}
 ```
 
-### 3. Update Plan — track progress on multi-step tasks
+### 3. Update Plan — track execution progress (NOT for planning)
 
-For tasks with 3+ steps, emit a plan to show progress. Update item statuses as you complete each step.
+For tasks with 3+ steps that you are actively executing, emit a progress checklist. Update item statuses as you complete each step. Do NOT use this as a substitute for plan mode — if you need to plan, use Enter Plan Mode above.
 
 ```json
 {"type": "update_plan", "items": [
@@ -131,17 +131,21 @@ You have access to tools via native function calling. The model API provides too
 
 When responding to the user conversationally (greetings, explanations, questions), just write your response as text content — no tool calls needed. Your text output is shown directly to the user exactly as written.
 
+**Formatting:** Always use **Markdown** in your text responses — headings, bullet points, numbered lists, code blocks, bold/italic. Never output a wall of unformatted text. Structure your response so it is easy to scan and read.
+
 **CRITICAL:** Do NOT include your reasoning, analysis, or thought process in text output. Do NOT write things like "The user is asking about X, I should..." or "Let me think about this..." — those are internal thoughts that must not appear in the response. Just write the actual response the user should see.
 
 Use the Done tool only when finishing a multi-step task and you want to provide a completion summary.
 
-### Plan Mode
+### Plan Mode (EnterPlanMode)
 
-For complex tasks that need upfront exploration, call EnterPlanMode. This restricts you to read-only tools while you research and produce a plan for user approval. When your plan is ready, call ExitPlanMode.
+**When the user asks you to "plan", "design", or "propose" something — or when a task is complex enough to benefit from upfront exploration — call EnterPlanMode.** This enters a research phase where you are restricted to read-only tools. Explore the codebase, then produce a detailed plan and call ExitPlanMode to submit it for user approval.
 
-### Plan Tracking
+Do NOT use UpdatePlan as a substitute for planning. UpdatePlan is only for tracking execution progress — it does NOT enter plan mode.
 
-For tasks with 3+ steps, use UpdatePlan to show progress. Update item statuses as you complete each step. Status values: `pending`, `in_progress`, `completed`.
+### Progress Tracking (UpdatePlan)
+
+For tasks with 3+ steps that you are actively executing, use UpdatePlan to show a progress checklist. Update item statuses as you complete each step. Status values: `pending`, `in_progress`, `completed`.
 
 ### Rules
 

@@ -18,7 +18,7 @@ pub enum ModelAction {
     FinalizeTask { packet: TaskPacket },
     #[serde(rename = "done")]
     Done {
-        #[serde(default)]
+        #[serde(default, alias = "summary")]
         message: Option<String>,
     },
     #[serde(rename = "enter_plan_mode")]
@@ -154,11 +154,33 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
         | "lock_paths" | "unlock_paths" | "Task" | "delegate_to_agent" => action_type,
         // Known non-tool action types that should not be treated as tool shorthands.
         "" | "patch" | "finalize_task" | "done" | "enter_plan_mode" => {
+            // Handle {"type":"done","summary":"..."} or {"type":"done","message":"..."}
+            if action_type == "done" {
+                for key in &["message", "summary", "text", "content"] {
+                    if let Some(val) = obj.get(*key).and_then(|v| v.as_str()) {
+                        return Some(ModelAction::Done {
+                            message: Some(val.to_string()),
+                        });
+                    }
+                }
+                return Some(ModelAction::Done { message: None });
+            }
             // Fallback: if the object has a text-like field but no action type,
             // treat it as a Done message. This handles models that emit
             // {"response":"..."} or {"message":"..."} instead of a proper action.
             if action_type.is_empty() {
-                for key in &["response", "message", "text", "content", "answer"] {
+                // Handle {"done":true,"summary":"..."} — a common model output format.
+                if obj.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    for key in &["summary", "message", "text", "content"] {
+                        if let Some(val) = obj.get(*key).and_then(|v| v.as_str()) {
+                            return Some(ModelAction::Done {
+                                message: Some(val.to_string()),
+                            });
+                        }
+                    }
+                    return Some(ModelAction::Done { message: None });
+                }
+                for key in &["response", "message", "summary", "text", "content", "answer"] {
                     if let Some(val) = obj.get(*key).and_then(|v| v.as_str()) {
                         return Some(ModelAction::Done {
                             message: Some(val.to_string()),
@@ -601,6 +623,15 @@ Now let me also search:
     }
 
     #[test]
+    fn parse_done_with_summary_field() {
+        // GPT models sometimes emit "summary" instead of "message"
+        let raw = r#"{"type":"done","summary":"Code review completed."}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], ModelAction::Done { message } if message.as_deref() == Some("Code review completed.")));
+    }
+
+    #[test]
     fn parse_text_json_as_done() {
         let raw = r#"{"text":"Here is the answer."}"#;
         let actions = parse_all_actions(raw).unwrap();
@@ -731,5 +762,13 @@ Now let me also search:
     fn looks_like_final_answer_long_substantive_text_is_final() {
         let review = format!("## Code Review\n\nThe logging module is well-structured. {}", "Details here. ".repeat(30));
         assert!(looks_like_final_answer(&review));
+    }
+
+    #[test]
+    fn parse_done_bool_with_summary() {
+        let raw = r#"{"done":true,"summary":"Reviewed the codebase and found issues."}"#;
+        let actions = parse_all_actions(raw).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], ModelAction::Done { message } if message.as_deref() == Some("Reviewed the codebase and found issues.")));
     }
 }

@@ -1,16 +1,12 @@
 use crate::skills::marketplace;
 use anyhow::{Context, Result};
+use rust_embed::Embed;
 use std::path::PathBuf;
 
-/// Default agent specs shipped with linggen.
-const DEFAULT_AGENTS: &[(&str, &str)] = &[
-    ("ling.md", include_str!("../../agents/ling.md")),
-    ("coder.md", include_str!("../../agents/coder.md")),
-    ("debugger.md", include_str!("../../agents/debugger.md")),
-    ("explorer.md", include_str!("../../agents/explorer.md")),
-    ("general.md", include_str!("../../agents/general.md")),
-    ("linggen-guide.md", include_str!("../../agents/linggen-guide.md")),
-];
+/// All files under `agents/` are embedded at compile time.
+#[derive(Embed)]
+#[folder = "agents/"]
+struct AgentAssets;
 
 pub async fn run(global: bool, root: Option<PathBuf>) -> Result<()> {
     let target_dir = if global {
@@ -57,9 +53,11 @@ pub fn install_default_agents() -> Result<()> {
     let agents_dir = crate::paths::global_agents_dir();
     std::fs::create_dir_all(&agents_dir)?;
 
-    for (filename, content) in DEFAULT_AGENTS {
-        let dest = agents_dir.join(filename);
-        std::fs::write(&dest, content)?;
+    for filename in AgentAssets::iter() {
+        if let Some(file) = AgentAssets::get(&filename) {
+            let dest = agents_dir.join(filename.as_ref());
+            std::fs::write(&dest, file.data.as_ref())?;
+        }
     }
 
     Ok(())

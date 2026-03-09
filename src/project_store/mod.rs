@@ -2,7 +2,7 @@ pub mod missions;
 pub mod path_encoding;
 pub mod runs;
 
-pub use missions::{Mission as CronMission, MissionRunEntry};
+pub use missions::{Mission as CronMission, MissionRunEntry, MissionStore};
 pub use runs::{AgentRunRecord, AgentRunStatus, RunStore};
 
 use anyhow::Result;

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { ArrowLeft, Target, Plus, Play, Pause, Trash2, Clock, History, Edit3, Check, X } from 'lucide-react';
+import { ArrowLeft, Target, Plus, Play, Pause, Trash2, Clock, History, Edit3, Check, X, Eye, ExternalLink, FolderOpen } from 'lucide-react';
 import { cn } from '../lib/cn';
-import type { AgentInfo, CronMission, MissionRunEntry, MissionTab } from '../types';
+import type { AgentInfo, CronMission, MissionRunEntry, MissionTab, ProjectInfo } from '../types';
 
 const formatTimestamp = (ts: number) => {
   if (!ts || ts <= 0) return '-';
@@ -51,22 +51,27 @@ const describeCron = (schedule: string): string => {
   return schedule;
 };
 
-// --- API helpers ---
+const projectLabel = (path: string | null | undefined, projects: ProjectInfo[]): string | null => {
+  if (!path) return null;
+  const proj = projects.find(p => p.path === path);
+  if (proj) return proj.name || path.split('/').pop() || path;
+  return path.split('/').pop() || path;
+};
 
-async function fetchMissions(projectRoot: string): Promise<CronMission[]> {
-  const url = new URL('/api/missions', window.location.origin);
-  url.searchParams.append('project_root', projectRoot);
-  const resp = await fetch(url.toString());
+// --- API helpers (global, no project_root required) ---
+
+async function fetchMissions(): Promise<CronMission[]> {
+  const resp = await fetch('/api/missions');
   if (!resp.ok) return [];
   const data = await resp.json();
   return Array.isArray(data.missions) ? data.missions : [];
 }
 
-async function createMission(projectRoot: string, schedule: string, agentId: string, prompt: string, model?: string): Promise<CronMission | null> {
+async function createMission(name: string | undefined, schedule: string, prompt: string, model?: string, project?: string): Promise<CronMission | null> {
   const resp = await fetch('/api/missions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ project_root: projectRoot, schedule, agent_id: agentId, prompt, model: model || null }),
+    body: JSON.stringify({ name: name || null, schedule, prompt, model: model || null, project: project || null }),
   });
   if (!resp.ok) {
     const text = await resp.text();
@@ -75,11 +80,11 @@ async function createMission(projectRoot: string, schedule: string, agentId: str
   return resp.json();
 }
 
-async function updateMission(id: string, projectRoot: string, updates: Record<string, any>): Promise<CronMission | null> {
+async function updateMission(id: string, updates: Record<string, any>): Promise<CronMission | null> {
   const resp = await fetch(`/api/missions/${encodeURIComponent(id)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ project_root: projectRoot, ...updates }),
+    body: JSON.stringify(updates),
   });
   if (!resp.ok) {
     const text = await resp.text();
@@ -88,32 +93,42 @@ async function updateMission(id: string, projectRoot: string, updates: Record<st
   return resp.json();
 }
 
-async function deleteMission(id: string, projectRoot: string): Promise<void> {
-  const url = new URL(`/api/missions/${encodeURIComponent(id)}`, window.location.origin);
-  url.searchParams.append('project_root', projectRoot);
-  await fetch(url.toString(), { method: 'DELETE' });
+async function deleteMission(id: string): Promise<void> {
+  await fetch(`/api/missions/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
-async function fetchMissionRuns(id: string, projectRoot: string): Promise<MissionRunEntry[]> {
-  const url = new URL(`/api/missions/${encodeURIComponent(id)}/runs`, window.location.origin);
-  url.searchParams.append('project_root', projectRoot);
-  const resp = await fetch(url.toString());
+async function fetchMissionRuns(id: string): Promise<MissionRunEntry[]> {
+  const resp = await fetch(`/api/missions/${encodeURIComponent(id)}/runs`);
   if (!resp.ok) return [];
   const data = await resp.json();
   return Array.isArray(data.runs) ? data.runs : [];
+}
+
+async function triggerMission(id: string, project?: string): Promise<void> {
+  const resp = await fetch(`/api/missions/${encodeURIComponent(id)}/trigger`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_root: project || null }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(text);
+  }
 }
 
 // --- Mission List ---
 
 const MissionCard: React.FC<{
   mission: CronMission;
-  projectRoot: string;
+  projects: ProjectInfo[];
   onToggle: (id: string, enabled: boolean) => void;
   onEdit: (m: CronMission) => void;
   onDelete: (id: string) => void;
   onViewRuns: (m: CronMission) => void;
-}> = ({ mission, projectRoot: _projectRoot, onToggle, onEdit, onDelete, onViewRuns }) => {
+  onTrigger: (m: CronMission) => void;
+}> = ({ mission, projects, onToggle, onEdit, onDelete, onViewRuns, onTrigger }) => {
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const projLabel = projectLabel(mission.project, projects);
 
   return (
     <div className={cn(
@@ -142,6 +157,13 @@ const MissionCard: React.FC<{
           <span className="text-[10px] text-slate-500 truncate">{describeCron(mission.schedule)}</span>
         </div>
         <div className="flex items-center gap-1 shrink-0">
+          <button
+            onClick={() => onTrigger(mission)}
+            className="p-1 rounded hover:bg-green-100 dark:hover:bg-green-500/10 text-slate-400 hover:text-green-600"
+            title="Run now"
+          >
+            <Play size={14} />
+          </button>
           <button
             onClick={() => onViewRuns(mission)}
             className="p-1 rounded hover:bg-slate-100 dark:hover:bg-white/5 text-slate-400 hover:text-slate-600"
@@ -185,13 +207,28 @@ const MissionCard: React.FC<{
         </div>
       </div>
 
+      {mission.name && (
+        <div className="text-sm font-medium text-slate-800 dark:text-slate-200 mb-1.5">
+          {mission.name}
+        </div>
+      )}
+
       <div className="flex items-center gap-2 mb-2">
         <span className="text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-600 dark:text-purple-400">
-          {mission.agent_id}
+          mission
         </span>
         {mission.model && (
           <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-slate-100 dark:bg-white/5 text-slate-500">
             {mission.model}
+          </span>
+        )}
+        {projLabel ? (
+          <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-600 dark:text-blue-400 flex items-center gap-1">
+            <FolderOpen size={9} /> {projLabel}
+          </span>
+        ) : (
+          <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-slate-100 dark:bg-white/5 text-slate-400 italic">
+            global
           </span>
         )}
         <span className="text-[10px] text-slate-400 ml-auto">
@@ -208,13 +245,14 @@ const MissionCard: React.FC<{
 
 const MissionList: React.FC<{
   missions: CronMission[];
-  projectRoot: string;
+  projects: ProjectInfo[];
   onToggle: (id: string, enabled: boolean) => void;
   onEdit: (m: CronMission) => void;
   onDelete: (id: string) => void;
   onViewRuns: (m: CronMission) => void;
+  onTrigger: (m: CronMission) => void;
   onCreate: () => void;
-}> = ({ missions, projectRoot, onToggle, onEdit, onDelete, onViewRuns, onCreate }) => {
+}> = ({ missions, projects, onToggle, onEdit, onDelete, onViewRuns, onTrigger, onCreate }) => {
   const enabledCount = missions.filter(m => m.enabled).length;
 
   return (
@@ -250,11 +288,12 @@ const MissionList: React.FC<{
             <MissionCard
               key={m.id}
               mission={m}
-              projectRoot={projectRoot}
+              projects={projects}
               onToggle={onToggle}
               onEdit={onEdit}
               onDelete={onDelete}
               onViewRuns={onViewRuns}
+              onTrigger={onTrigger}
             />
           ))}
         </div>
@@ -277,16 +316,28 @@ const CRON_PRESETS = [
 const MissionEditor: React.FC<{
   editing: CronMission | null;
   agents: AgentInfo[];
-  projectRoot: string;
+  projects: ProjectInfo[];
   onSave: (mission: CronMission) => void;
   onCancel: () => void;
-}> = ({ editing, agents, projectRoot, onSave, onCancel }) => {
+  onViewAgent: () => void;
+}> = ({ editing, agents: _agents, projects, onSave, onCancel, onViewAgent }) => {
+  const [name, setName] = useState(editing?.name || '');
   const [schedule, setSchedule] = useState(editing?.schedule || '*/30 * * * *');
-  const [agentId, setAgentId] = useState(editing?.agent_id || (agents[0]?.name || 'ling'));
   const [prompt, setPrompt] = useState(editing?.prompt || '');
   const [model, setModel] = useState(editing?.model || '');
+  const [selectedProject, setSelectedProject] = useState(editing?.project || '');
+  const [models, setModels] = useState<{ id: string; model: string; provider: string }[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    fetch('/api/config')
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (data?.models) setModels(data.models);
+      })
+      .catch(() => {});
+  }, []);
 
   const handleSave = async () => {
     if (!schedule.trim() || !prompt.trim()) {
@@ -298,14 +349,15 @@ const MissionEditor: React.FC<{
     try {
       let result: CronMission | null;
       if (editing) {
-        result = await updateMission(editing.id, projectRoot, {
+        result = await updateMission(editing.id, {
+          name: name || null,
           schedule,
-          agent_id: agentId,
           prompt,
           model: model || null,
+          project: selectedProject || null,
         });
       } else {
-        result = await createMission(projectRoot, schedule, agentId, prompt, model || undefined);
+        result = await createMission(name || undefined, schedule, prompt, model || undefined, selectedProject || undefined);
       }
       if (result) onSave(result);
     } catch (e: any) {
@@ -325,6 +377,20 @@ const MissionEditor: React.FC<{
           {error}
         </div>
       )}
+
+      {/* Name */}
+      <div>
+        <label className="text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
+          Name
+        </label>
+        <input
+          type="text"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="e.g. Daily code review"
+          className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+        />
+      </div>
 
       {/* Schedule */}
       <div>
@@ -359,18 +425,60 @@ const MissionEditor: React.FC<{
         </div>
       </div>
 
-      {/* Agent */}
+      {/* Agent (readonly) */}
       <div>
         <label className="text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
           Agent
         </label>
+        <div className="flex items-center gap-2">
+          <div className="flex-1 px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-white/10 bg-slate-50 dark:bg-white/[0.03] text-slate-500">
+            <span className="font-semibold text-purple-600 dark:text-purple-400">mission</span>
+            <span className="text-slate-400 ml-2">— Autonomous mission agent (no human interaction)</span>
+          </div>
+          <button
+            onClick={onViewAgent}
+            className="flex items-center gap-1 px-2.5 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5 transition-colors shrink-0"
+            title="View mission.md"
+          >
+            <Eye size={13} /> View
+          </button>
+        </div>
+      </div>
+
+      {/* Model override (optional) */}
+      <div>
+        <label className="text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
+          Model <span className="text-slate-400">(optional — defaults to agent model)</span>
+        </label>
         <select
-          value={agentId}
-          onChange={(e) => setAgentId(e.target.value)}
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
           className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
         >
-          {agents.map(a => (
-            <option key={a.name} value={a.name}>{a.name} — {a.description}</option>
+          <option value="">Default (inherit from agent)</option>
+          {models.map(m => (
+            <option key={m.id} value={m.id}>
+              {m.id} — {m.provider}/{m.model}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {/* Project (optional) */}
+      <div>
+        <label className="text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
+          Project <span className="text-slate-400">(optional — scope mission to a project)</span>
+        </label>
+        <select
+          value={selectedProject}
+          onChange={(e) => setSelectedProject(e.target.value)}
+          className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+        >
+          <option value="">No project (global)</option>
+          {projects.map(p => (
+            <option key={p.path} value={p.path}>
+              {p.name || p.path.split('/').pop()}
+            </option>
           ))}
         </select>
       </div>
@@ -386,20 +494,6 @@ const MissionEditor: React.FC<{
           placeholder="The instruction to send to the agent on each trigger..."
           rows={6}
           className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 resize-y focus:outline-none focus:ring-2 focus:ring-blue-500/30"
-        />
-      </div>
-
-      {/* Model override (optional) */}
-      <div>
-        <label className="text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
-          Model Override <span className="text-slate-400">(optional)</span>
-        </label>
-        <input
-          type="text"
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-          placeholder="Leave empty to use agent default"
-          className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
         />
       </div>
 
@@ -427,17 +521,17 @@ const MissionEditor: React.FC<{
 
 const RunsView: React.FC<{
   mission: CronMission;
-  projectRoot: string;
   onBack: () => void;
-}> = ({ mission, projectRoot, onBack }) => {
+  onOpenSession?: (sessionId: string) => void;
+}> = ({ mission, onBack, onOpenSession }) => {
   const [runs, setRuns] = useState<MissionRunEntry[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetchMissionRuns(mission.id, projectRoot)
+    fetchMissionRuns(mission.id)
       .then(setRuns)
       .finally(() => setLoading(false));
-  }, [mission.id, projectRoot]);
+  }, [mission.id]);
 
   return (
     <div className="space-y-4">
@@ -454,7 +548,7 @@ const RunsView: React.FC<{
       </div>
 
       <div className="text-xs text-slate-500 mb-2">
-        Agent: <span className="font-semibold">{mission.agent_id}</span> — {mission.prompt.slice(0, 100)}{mission.prompt.length > 100 ? '...' : ''}
+        {mission.prompt.slice(0, 100)}{mission.prompt.length > 100 ? '...' : ''}
       </div>
 
       {loading ? (
@@ -493,13 +587,88 @@ const RunsView: React.FC<{
               )}>
                 {run.skipped ? 'skipped' : run.status}
               </span>
-              {run.run_id && !run.skipped && (
+              {run.session_id && !run.skipped && onOpenSession && (
+                <button
+                  onClick={() => onOpenSession(run.session_id!)}
+                  className="flex items-center gap-1 text-[10px] text-blue-500 hover:text-blue-600 font-medium"
+                  title="Open session log"
+                >
+                  <ExternalLink size={10} /> Session
+                </button>
+              )}
+              {run.run_id && !run.skipped && !run.session_id && (
                 <span className="text-[10px] text-slate-400 font-mono truncate">
                   {run.run_id}
                 </span>
               )}
             </div>
           ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// --- Agent Viewer (readonly) ---
+
+const AgentViewer: React.FC<{
+  onBack: () => void;
+  projectRoot: string;
+}> = ({ onBack, projectRoot }) => {
+  const [content, setContent] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    // Try project-local first, then global ~/.linggen/agents/mission.md
+    const tryFetch = async () => {
+      const localUrl = new URL('/api/agent-file', window.location.origin);
+      localUrl.searchParams.append('project_root', projectRoot);
+      localUrl.searchParams.append('path', 'agents/mission.md');
+      const localResp = await fetch(localUrl.toString());
+      if (localResp.ok) {
+        const data = await localResp.json();
+        if (data.content) return data.content;
+      }
+      // Fallback to global
+      const globalUrl = new URL('/api/agent-file', window.location.origin);
+      globalUrl.searchParams.append('project_root', projectRoot);
+      globalUrl.searchParams.append('path', '~/.linggen/agents/mission.md');
+      const globalResp = await fetch(globalUrl.toString());
+      if (globalResp.ok) {
+        const data = await globalResp.json();
+        if (data.content) return data.content;
+      }
+      return null;
+    };
+    tryFetch()
+      .then(setContent)
+      .catch(() => setContent(null))
+      .finally(() => setLoading(false));
+  }, [projectRoot]);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-3">
+        <button
+          onClick={onBack}
+          className="p-1 rounded hover:bg-slate-100 dark:hover:bg-white/5 text-slate-500"
+        >
+          <ArrowLeft size={14} />
+        </button>
+        <h2 className="text-sm font-semibold text-slate-700 dark:text-slate-300">
+          Mission Agent <span className="text-[10px] text-slate-400 font-normal ml-1">agents/mission.md</span>
+        </h2>
+      </div>
+
+      {loading ? (
+        <div className="text-center py-16 text-sm text-slate-400">Loading...</div>
+      ) : content ? (
+        <pre className="text-xs font-mono whitespace-pre-wrap bg-slate-50 dark:bg-white/[0.03] border border-slate-200 dark:border-white/10 rounded-lg p-4 overflow-x-auto text-slate-700 dark:text-slate-300">
+          {content}
+        </pre>
+      ) : (
+        <div className="text-center py-16 text-sm text-slate-400">
+          Could not load mission.md
         </div>
       )}
     </div>
@@ -513,26 +682,37 @@ export const MissionPage: React.FC<{
   projectRoot: string;
   agents: AgentInfo[];
   embedded?: boolean;
-}> = ({ onBack, projectRoot, agents, embedded }) => {
+  onOpenSession?: (sessionId: string) => void;
+}> = ({ onBack, projectRoot, agents, embedded, onOpenSession }) => {
   const [tab, setTab] = useState<MissionTab>('list');
   const [missions, setMissions] = useState<CronMission[]>([]);
   const [loading, setLoading] = useState(true);
   const [editingMission, setEditingMission] = useState<CronMission | null>(null);
   const [viewingRunsMission, setViewingRunsMission] = useState<CronMission | null>(null);
+  const [projects, setProjects] = useState<ProjectInfo[]>([]);
+
+  // Fetch projects list
+  useEffect(() => {
+    fetch('/api/projects')
+      .then(r => r.ok ? r.json() : [])
+      .then((data: ProjectInfo[]) => setProjects(data))
+      .catch(() => {});
+  }, []);
 
   const loadMissions = useCallback(async () => {
-    const data = await fetchMissions(projectRoot);
+    const data = await fetchMissions();
     setMissions(data);
     setLoading(false);
-  }, [projectRoot]);
+  }, []);
 
   useEffect(() => {
+    setLoading(true);
     loadMissions();
   }, [loadMissions]);
 
   const handleToggle = async (id: string, enabled: boolean) => {
     try {
-      await updateMission(id, projectRoot, { enabled });
+      await updateMission(id, { enabled });
       await loadMissions();
     } catch (e) {
       console.error('Failed to toggle mission:', e);
@@ -541,7 +721,7 @@ export const MissionPage: React.FC<{
 
   const handleDelete = async (id: string) => {
     try {
-      await deleteMission(id, projectRoot);
+      await deleteMission(id);
       await loadMissions();
     } catch (e) {
       console.error('Failed to delete mission:', e);
@@ -556,6 +736,14 @@ export const MissionPage: React.FC<{
   const handleViewRuns = (m: CronMission) => {
     setViewingRunsMission(m);
     setTab('runs');
+  };
+
+  const handleTrigger = async (m: CronMission) => {
+    try {
+      await triggerMission(m.id, m.project || undefined);
+    } catch (e: any) {
+      console.error('Failed to trigger mission:', e);
+    }
   };
 
   const handleSave = async (_mission: CronMission) => {
@@ -602,6 +790,11 @@ export const MissionPage: React.FC<{
           Runs
         </span>
       )}
+      {tab === 'agent' && (
+        <span className="px-3 py-1.5 rounded-md text-xs font-semibold bg-blue-600 text-white">
+          Agent
+        </span>
+      )}
     </div>
   );
 
@@ -613,26 +806,33 @@ export const MissionPage: React.FC<{
         ) : tab === 'list' ? (
           <MissionList
             missions={missions}
-            projectRoot={projectRoot}
+            projects={projects}
             onToggle={handleToggle}
             onEdit={handleEdit}
             onDelete={handleDelete}
             onViewRuns={handleViewRuns}
+            onTrigger={handleTrigger}
             onCreate={() => { setEditingMission(null); setTab('create'); }}
           />
         ) : tab === 'create' || tab === 'edit' ? (
           <MissionEditor
             editing={editingMission}
             agents={agents}
-            projectRoot={projectRoot}
+            projects={projects}
             onSave={handleSave}
             onCancel={handleCancel}
+            onViewAgent={() => setTab('agent')}
           />
         ) : tab === 'runs' && viewingRunsMission ? (
           <RunsView
             mission={viewingRunsMission}
-            projectRoot={projectRoot}
             onBack={() => { setViewingRunsMission(null); setTab('list'); }}
+            onOpenSession={onOpenSession}
+          />
+        ) : tab === 'agent' ? (
+          <AgentViewer
+            onBack={() => setTab(editingMission ? 'edit' : 'list')}
+            projectRoot={projectRoot}
           />
         ) : null}
       </div>

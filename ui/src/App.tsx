@@ -67,6 +67,7 @@ const App: React.FC = () => {
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [ollamaStatus, setOllamaStatus] = useState<OllamaPsResponse | null>(null);
   const [defaultModels, setDefaultModels] = useState<string[]>([]);
+  const [sessionTokens, setSessionTokens] = useState<{ prompt: number; completion: number }>({ prompt: 0, completion: 0 });
 
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(() => {
@@ -610,6 +611,16 @@ const App: React.FC = () => {
     }
   }, []);
 
+  const fetchSessionTokens = useCallback(async () => {
+    try {
+      const resp = await fetch(`/api/status?project_root=${encodeURIComponent(selectedProjectRoot)}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        setSessionTokens({ prompt: data.session_prompt_tokens || 0, completion: data.session_completion_tokens || 0 });
+      }
+    } catch { /* ignore */ }
+  }, [selectedProjectRoot]);
+
   const fetchAgentRuns = useCallback(async () => {
     if (!selectedProjectRoot) return;
     if (!activeSessionId) { setAgentRuns([]); return; }
@@ -654,10 +665,11 @@ const App: React.FC = () => {
     fetchModels();
     fetchDefaultModels();
 
-    const interval = setInterval(fetchOllamaStatus, 5000);
+    const interval = setInterval(() => { fetchOllamaStatus(); fetchSessionTokens(); }, 5000);
     fetchOllamaStatus();
+    fetchSessionTokens();
     return () => clearInterval(interval);
-  }, [fetchProjects, fetchSkills, fetchAgents, fetchModels, fetchDefaultModels, fetchOllamaStatus]);
+  }, [fetchProjects, fetchSkills, fetchAgents, fetchModels, fetchDefaultModels, fetchOllamaStatus, fetchSessionTokens]);
 
   useEffect(() => {
     if (selectedProjectRoot) {
@@ -1334,6 +1346,7 @@ const App: React.FC = () => {
               onCancelAgentRun={cancelAgentRun}
               isRunning={isRunning}
               onSendMessage={sendChatMessage}
+              activePlan={activePlan}
               pendingPlan={pendingPlan}
               pendingPlanAgentId={pendingPlanAgentId}
               agentContext={agentContext}
@@ -1349,6 +1362,7 @@ const App: React.FC = () => {
               modelPickerOpen={modelPickerOpen}
               models={models}
               defaultModels={defaultModels}
+              tokensPerSec={tokensPerSec}
               onSwitchModel={async (modelId: string) => {
                 try {
                   const resp = await fetch('/api/config');
@@ -1384,11 +1398,17 @@ const App: React.FC = () => {
             icon={<Target size={12} />}
             iconColor={'text-slate-400'}
             defaultOpen
+            headerAction={
+              <button
+                onClick={() => { setInitialSettingsTab('mission'); setCurrentPage('settings'); }}
+                className="p-1 hover:bg-slate-100 dark:hover:bg-white/5 rounded transition-colors text-slate-400 hover:text-blue-500"
+                title="Manage Missions"
+              >
+                <Settings size={12} />
+              </button>
+            }
           >
-            <MissionSidebarCard
-              projectRoot={selectedProjectRoot}
-              onOpenMission={() => { setInitialSettingsTab('mission'); setCurrentPage('settings'); }}
-            />
+            <MissionSidebarCard />
           </CollapsibleCard>
           <CollapsibleCard
             title="MODELS"
@@ -1416,6 +1436,7 @@ const App: React.FC = () => {
               agentContext={agentContext}
               defaultModels={defaultModels}
               onToggleDefault={toggleDefaultModel}
+              sessionTokens={sessionTokens}
             />
           </CollapsibleCard>
           <CollapsibleCard

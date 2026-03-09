@@ -21,7 +21,8 @@ export const ModelsCard: React.FC<{
   agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
   defaultModels?: string[];
   onToggleDefault?: (modelId: string) => void;
-}> = ({ models, agents, ollamaStatus, tokensPerSec, activeModelId, agentContext, defaultModels = [], onToggleDefault }) => {
+  sessionTokens?: { prompt: number; completion: number };
+}> = ({ models, agents, ollamaStatus, tokensPerSec, activeModelId, agentContext, defaultModels = [], onToggleDefault, sessionTokens }) => {
   const tps = Number.isFinite(Number(tokensPerSec)) ? Number(tokensPerSec) : 0;
 
   return (
@@ -119,6 +120,18 @@ export const ModelsCard: React.FC<{
           </div>
         );
       })}
+      {sessionTokens && (sessionTokens.prompt > 0 || sessionTokens.completion > 0) && (
+        <div className="pt-1.5 border-t border-slate-100 dark:border-white/5">
+          <div className="flex items-center justify-between text-[9px] font-mono text-slate-400">
+            <span>Session tokens</span>
+            <span className="tabular-nums">
+              <span title="Prompt tokens">↑{formatCompactInt(sessionTokens.prompt)}</span>
+              {' '}
+              <span title="Completion tokens">↓{formatCompactInt(sessionTokens.completion)}</span>
+            </span>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

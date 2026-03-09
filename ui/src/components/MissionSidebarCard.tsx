@@ -1,31 +1,15 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ChevronRight } from 'lucide-react';
 import type { CronMission } from '../types';
 
-interface MissionSidebarCardProps {
-  projectRoot: string | null;
-  onOpenMission: () => void;
-}
-
-export const MissionSidebarCard: React.FC<MissionSidebarCardProps> = ({
-  projectRoot,
-  onOpenMission,
-}) => {
+export const MissionSidebarCard: React.FC = () => {
   const [missions, setMissions] = useState<CronMission[]>([]);
   const endpointAvailable = useRef<boolean | null>(null);
 
   useEffect(() => {
-    endpointAvailable.current = null;
-  }, [projectRoot]);
-
-  useEffect(() => {
-    if (!projectRoot) return;
     if (endpointAvailable.current === false) return;
     const fetchMissions = async () => {
       try {
-        const url = new URL('/api/missions', window.location.origin);
-        url.searchParams.append('project_root', projectRoot);
-        const resp = await fetch(url.toString());
+        const resp = await fetch('/api/missions');
         if (resp.status === 404) {
           endpointAvailable.current = false;
           return;
@@ -41,7 +25,7 @@ export const MissionSidebarCard: React.FC<MissionSidebarCardProps> = ({
       }
     };
     fetchMissions();
-  }, [projectRoot]);
+  }, []);
 
   const enabledMissions = missions.filter(m => m.enabled);
 
@@ -53,7 +37,7 @@ export const MissionSidebarCard: React.FC<MissionSidebarCardProps> = ({
             <div key={m.id} className="flex items-center gap-1.5">
               <span className="inline-block w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" />
               <span className="text-[10px] font-mono text-blue-600 dark:text-blue-400">{m.schedule}</span>
-              <span className="text-[10px] text-slate-500 truncate">{m.agent_id}</span>
+              <span className="text-[10px] text-slate-500 truncate">{m.name || m.id}</span>
             </div>
           ))}
           {enabledMissions.length > 3 && (
@@ -63,13 +47,6 @@ export const MissionSidebarCard: React.FC<MissionSidebarCardProps> = ({
       ) : (
         <p className="text-slate-400 dark:text-slate-500 text-[10px] italic">No active missions</p>
       )}
-      <button
-        onClick={onOpenMission}
-        className="w-full flex items-center justify-center gap-1 px-2 py-1 text-[10px] font-semibold rounded-md text-slate-500 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-slate-50 dark:hover:bg-white/5 transition-colors"
-      >
-        {enabledMissions.length > 0 ? 'Manage' : 'Create Mission'}
-        <ChevronRight size={10} />
-      </button>
     </div>
   );
 };

@@ -118,6 +118,7 @@ mod tests {
             context_window: None,
             tags: Vec::new(),
             supports_tools: None,
+            auth_mode: None,
         }
     }
 
@@ -132,6 +133,7 @@ mod tests {
             context_window: None,
             tags: Vec::new(),
             supports_tools: None,
+            auth_mode: None,
         }
     }
 

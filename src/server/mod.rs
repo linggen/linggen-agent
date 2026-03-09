@@ -39,7 +39,7 @@ use agent_api::{
     run_agent, set_task,
 };
 use chat_api::{approve_plan_handler, ask_user_response_handler, chat_handler, clear_chat_history_api, edit_plan_handler, reject_plan_handler};
-use config_api::{get_config_api, get_credentials_api, get_models_health, update_config_api, update_credentials_api};
+use config_api::{get_config_api, get_credentials_api, get_models_health, update_config_api, update_credentials_api, get_codex_auth_status, start_codex_auth_login, codex_auth_logout};
 use projects_api::{
     add_project, create_session, delete_agent_file_api, delete_skill_file_api,
     get_agent_context_api, get_agent_file_api, get_skill_file_api, list_agent_children_api,
@@ -51,7 +51,7 @@ use projects_api::{
 use marketplace_api::{builtin_skills_install, builtin_skills_install_all, builtin_skills_list, marketplace_install, marketplace_list, marketplace_move_to_global, marketplace_search, marketplace_uninstall};
 use missions_api::{
     create_mission, delete_mission, get_mission, list_mission_runs, list_missions,
-    update_mission,
+    trigger_mission, update_mission,
 };
 use storage_api::{storage_roots, storage_tree, storage_read_file, storage_write_file, storage_delete_file};
 use workspace_api::{get_agent_tree, get_workspace_state, list_files, read_file_api, search_files};
@@ -1007,6 +1007,9 @@ pub async fn prepare_server(
         .route("/api/models/health", get(get_models_health))
         .route("/api/config", get(get_config_api).post(update_config_api))
         .route("/api/credentials", get(get_credentials_api).put(update_credentials_api))
+        .route("/api/auth/codex/status", get(get_codex_auth_status))
+        .route("/api/auth/codex/login", post(start_codex_auth_login))
+        .route("/api/auth/codex/logout", post(codex_auth_logout))
         .route("/api/skills", get(list_skills))
         .route("/api/skills/reload", post(reload_skills))
         .route("/api/marketplace/search", get(marketplace_search))
@@ -1033,6 +1036,7 @@ pub async fn prepare_server(
         .route("/api/missions", get(list_missions).post(create_mission))
         .route("/api/missions/{id}", get(get_mission).put(update_mission).delete(delete_mission))
         .route("/api/missions/{id}/runs", get(list_mission_runs))
+        .route("/api/missions/{id}/trigger", post(trigger_mission))
         .route("/api/chat", post(chat_handler))
         .route("/api/chat/clear", post(clear_chat_history_api))
         .route("/api/plan/approve", post(approve_plan_handler))
@@ -1331,6 +1335,7 @@ mod tests {
                     summary: "Test plan".into(),
                     status: crate::engine::PlanStatus::Planned,
                     plan_text: String::new(),
+                    items: Vec::new(),
                 },
             },
             ServerEvent::MissionTriggered {

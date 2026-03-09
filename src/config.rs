@@ -37,6 +37,10 @@ pub struct ModelConfig {
     /// `Some(false)` = force disable (use legacy JSON action format).
     #[serde(default)]
     pub supports_tools: Option<bool>,
+    /// Authentication mode: "api_key" (default) or "chatgpt_oauth".
+    /// When "chatgpt_oauth", uses ChatGPT subscription OAuth tokens instead of API key.
+    #[serde(default)]
+    pub auth_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -324,7 +328,7 @@ impl Config {
                 );
             }
             // Validate provider is known.
-            let known_providers = ["ollama", "openai", "gemini", "groq", "deepseek", "openrouter", "github"];
+            let known_providers = ["ollama", "openai", "chatgpt", "gemini", "groq", "deepseek", "openrouter", "github"];
             if !known_providers.contains(&model.provider.as_str()) {
                 anyhow::bail!(
                     "Model '{}' has unknown provider '{}'. Known providers: {}",
@@ -378,6 +382,7 @@ impl Default for Config {
                 context_window: None,
                 tags: Vec::new(),
                 supports_tools: None,
+                auth_mode: None,
             }],
             server: ServerConfig { port: 9898 },
             agent: AgentConfig {

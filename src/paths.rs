@@ -53,6 +53,11 @@ pub fn plans_dir() -> PathBuf {
     linggen_home().join("plans")
 }
 
+/// `~/.linggen/missions/`
+pub fn global_missions_dir() -> PathBuf {
+    linggen_home().join("missions")
+}
+
 /// `~/.linggen/projects/`
 pub fn projects_dir() -> PathBuf {
     linggen_home().join("projects")

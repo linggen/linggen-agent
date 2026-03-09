@@ -1,3 +1,4 @@
+use crate::codex_auth;
 use crate::config::ModelConfig;
 use crate::credentials::{self, Credentials};
 use crate::ollama::{ChatMessage, OllamaClient};
@@ -165,15 +166,54 @@ impl ModelManager {
 
     pub fn new_with_credentials(configs: Vec<ModelConfig>, creds: &Credentials) -> Self {
         let mut models = HashMap::new();
+
+        // Load ChatGPT OAuth tokens if any model uses chatgpt_oauth
+        let codex_tokens = {
+            let needs_oauth = configs.iter().any(|c| c.auth_mode.as_deref() == Some("chatgpt_oauth"));
+            if needs_oauth {
+                let tokens = codex_auth::CodexAuthTokens::load(&codex_auth::codex_auth_file());
+                if tokens.is_valid() { Some(tokens) } else { None }
+            } else {
+                None
+            }
+        };
+
         for mut cfg in configs {
-            // Resolve effective API key: TOML > credentials.json > env var
-            let effective_key =
-                credentials::resolve_api_key(&cfg.id, cfg.api_key.as_deref(), creds);
-            cfg.api_key = effective_key;
+            // Check if this model uses ChatGPT OAuth
+            let is_chatgpt_oauth = cfg.auth_mode.as_deref() == Some("chatgpt_oauth")
+                || cfg.provider == "chatgpt";
+
+            if !is_chatgpt_oauth {
+                // Standard: resolve API key from TOML > credentials.json > env var
+                let effective_key =
+                    credentials::resolve_api_key(&cfg.id, cfg.api_key.as_deref(), creds);
+                cfg.api_key = effective_key;
+            }
 
             let client = match cfg.provider.as_str() {
                 "ollama" => {
                     ProviderClient::Ollama(OllamaClient::new(cfg.url.clone(), cfg.api_key.clone()))
+                }
+                _ if is_chatgpt_oauth => {
+                    // ChatGPT OAuth: use subscription tokens
+                    if let Some(ref tokens) = codex_tokens {
+                        let base_url = if cfg.url.is_empty() || cfg.url == "https://api.openai.com/v1" {
+                            codex_auth::CHATGPT_API_BASE.to_string()
+                        } else {
+                            cfg.url.clone()
+                        };
+                        ProviderClient::OpenAi(OpenAiClient::new_chatgpt_oauth(
+                            base_url,
+                            tokens.access_token.clone().unwrap_or_default(),
+                            tokens.account_id.clone(),
+                        ))
+                    } else {
+                        tracing::warn!(
+                            "Model '{}' uses chatgpt_oauth but no valid tokens found. Run `ling auth login`.",
+                            cfg.id
+                        );
+                        ProviderClient::OpenAi(OpenAiClient::new(cfg.url.clone(), None))
+                    }
                 }
                 // All other providers (openai, gemini, groq, deepseek, etc.) use OpenAI-compatible API.
                 _ => {
@@ -450,14 +490,9 @@ impl ModelManager {
         let Some(instance) = self.models.get(model_id) else {
             return false;
         };
-        if let Some(explicit) = instance.config.supports_tools {
-            return explicit;
-        }
-        // Auto-detect: all known providers support tool calling
-        matches!(
-            instance.config.provider.as_str(),
-            "ollama" | "openai" | "gemini" | "groq" | "deepseek" | "openrouter" | "github"
-        )
+        // Default to true — most providers support native tool calling.
+        // Users can set `supports_tools = false` in config for providers that don't.
+        instance.config.supports_tools.unwrap_or(true)
     }
 
     /// Check if a model ID exists in the configured models.

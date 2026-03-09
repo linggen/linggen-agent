@@ -2,6 +2,7 @@ mod agent_manager;
 #[allow(dead_code)]
 mod check;
 mod cli;
+mod codex_auth;
 mod config;
 mod credentials;
 mod engine;
@@ -98,6 +99,25 @@ enum Command {
         #[command(subcommand)]
         action: SkillsAction,
     },
+    /// Manage ChatGPT OAuth authentication
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AuthAction {
+    /// Login with ChatGPT (opens browser)
+    Login {
+        /// Use device code flow instead of browser
+        #[arg(long, default_value_t = false)]
+        device: bool,
+    },
+    /// Logout (clear stored tokens)
+    Logout,
+    /// Show authentication status
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -169,6 +189,43 @@ async fn main() -> Result<()> {
         }
         Some(Command::Install) | Some(Command::Update) => {
             return cli::self_update::run().await;
+        }
+        Some(Command::Auth { action }) => {
+            match action {
+                AuthAction::Login { device } => {
+                    if *device {
+                        codex_auth::device_code_login().await?;
+                    } else {
+                        codex_auth::browser_login().await?;
+                    }
+                    println!("ChatGPT OAuth login successful.");
+                }
+                AuthAction::Logout => {
+                    let manager = codex_auth::CodexAuthManager::new();
+                    manager.logout().await?;
+                    println!("ChatGPT OAuth tokens cleared.");
+                }
+                AuthAction::Status => {
+                    let tokens = codex_auth::CodexAuthTokens::load(&codex_auth::codex_auth_file());
+                    if tokens.is_valid() {
+                        println!("Authenticated via ChatGPT OAuth.");
+                        if let Some(ref account_id) = tokens.account_id {
+                            println!("  Account ID: {}", account_id);
+                        }
+                        if let Some(ref last) = tokens.last_refresh {
+                            println!("  Last refresh: {}", last);
+                        }
+                        if tokens.needs_refresh() {
+                            println!("  Status: Needs refresh (will auto-refresh on next use)");
+                        } else {
+                            println!("  Status: Valid");
+                        }
+                    } else {
+                        println!("Not authenticated. Run `ling auth login` to sign in with ChatGPT.");
+                    }
+                }
+            }
+            return Ok(());
         }
         Some(Command::Skills { action }) => {
             let sa = match action {
@@ -342,7 +399,8 @@ async fn main() -> Result<()> {
         | Some(Command::Init { .. })
         | Some(Command::Install)
         | Some(Command::Update)
-        | Some(Command::Skills { .. }) => unreachable!(),
+        | Some(Command::Skills { .. })
+        | Some(Command::Auth { .. }) => unreachable!(),
     }
 
     Ok(())
