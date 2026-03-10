@@ -73,7 +73,7 @@ export interface UiSseMessage {
   seq: number;
   rev: number;
   ts_ms: number;
-  kind: 'message' | 'activity' | 'queue' | 'run' | 'token' | 'text_segment' | 'ask_user' | 'model_fallback' | 'content_block' | 'turn_complete';
+  kind: 'message' | 'activity' | 'queue' | 'run' | 'token' | 'text_segment' | 'ask_user' | 'model_fallback' | 'content_block' | 'turn_complete' | 'app_launched' | 'tool_progress';
   phase?: string;
   text?: string;
   agent_id?: string;
@@ -275,6 +275,13 @@ export interface SkillToolDef {
   timeout_ms: number;
 }
 
+export interface SkillAppConfig {
+  launcher: 'web' | 'bash' | 'url';
+  entry: string;
+  width?: number;
+  height?: number;
+}
+
 export interface SkillInfoFull {
   name: string;
   description: string;
@@ -287,6 +294,7 @@ export interface SkillInfoFull {
   model?: string | null;
   trigger?: string | null;
   agent?: string | null;
+  app?: SkillAppConfig | null;
 }
 
 export interface SkillFileInfo {
@@ -325,6 +333,8 @@ export interface CronMission {
   prompt: string;
   model?: string | null;
   project?: string | null;
+  /** Permission tier: "readonly", "standard", "full". Default: "full". */
+  permission_tier?: string;
   enabled: boolean;
   created_at: number;
 }

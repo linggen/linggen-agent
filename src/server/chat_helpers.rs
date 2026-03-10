@@ -32,6 +32,38 @@ pub(crate) async fn persist_and_emit_message(
         .await;
 }
 
+/// Emit a `ServerEvent::Message` and persist directly to a `SessionStore`.
+/// Used for mission sessions that live outside any project.
+pub(crate) async fn persist_and_emit_to_store(
+    store: &crate::state_fs::SessionStore,
+    events_tx: &broadcast::Sender<ServerEvent>,
+    agent_id: &str,
+    from: &str,
+    to: &str,
+    content: &str,
+    session_id: Option<&str>,
+    is_observation: bool,
+) {
+    let _ = events_tx.send(ServerEvent::Message {
+        from: from.to_string(),
+        to: to.to_string(),
+        content: content.to_string(),
+        session_id: session_id.map(|s| s.to_string()),
+    });
+    let sid = session_id.unwrap_or("default");
+    let msg = crate::state_fs::sessions::ChatMsg {
+        agent_id: agent_id.to_string(),
+        from_id: from.to_string(),
+        to_id: to.to_string(),
+        content: content.to_string(),
+        timestamp: crate::util::now_ts_secs(),
+        is_observation,
+    };
+    if let Err(e) = store.add_chat_message(sid, &msg) {
+        tracing::warn!("Failed to persist chat message to mission store: {}", e);
+    }
+}
+
 /// Persist to flat-file session store without emitting an SSE event.
 pub(crate) async fn persist_message_only(
     manager: &Arc<AgentManager>,

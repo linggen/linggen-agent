@@ -96,11 +96,20 @@ impl std::fmt::Display for InterfaceMode {
 
 pub struct EngineConfig {
     pub ws_root: PathBuf,
+    /// Override for session storage root (e.g. `~/.linggen/missions/sessions/`).
+    /// When set, chat messages are persisted here instead of `{ws_root}/.linggen/sessions/`.
+    pub session_root: Option<PathBuf>,
     pub max_iters: usize,
     pub write_safety_mode: crate::config::WriteSafetyMode,
     pub tool_permission_mode: crate::config::ToolPermissionMode,
     pub prompt_loop_breaker: Option<String>,
     pub interface_mode: InterfaceMode,
+    /// When set, Bash commands must match one of these prefixes.
+    /// Used by mission "standard" tier to restrict commands to build/test/git-read.
+    pub bash_allow_prefixes: Option<Vec<String>>,
+    /// When set, restricts available tools to this set (mission permission tiers).
+    /// This is applied at engine level, before the agent spec tool list.
+    pub mission_allowed_tools: Option<std::collections::HashSet<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -372,6 +381,12 @@ impl AgentEngine {
             native_tool_mode: false,
             denied_tool_sigs: HashSet::new(),
         })
+    }
+
+    /// Returns the root path used for session storage.
+    /// Uses `session_root` override if set, otherwise falls back to `ws_root`.
+    pub fn session_storage_root(&self) -> &std::path::Path {
+        self.cfg.session_root.as_deref().unwrap_or(&self.cfg.ws_root)
     }
 
     pub fn set_spec(&mut self, agent_id: String, spec: AgentSpec, system_prompt: String) {

@@ -440,6 +440,31 @@ impl TuiClient {
         Ok(())
     }
 
+    /// Compact chat context for the given project/session.
+    pub async fn compact_chat(
+        &self,
+        project_root: &str,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+        focus: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(format!("{}/api/chat/compact", self.base_url))
+            .json(&serde_json::json!({
+                "project_root": project_root,
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "focus": focus,
+            }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("compact chat failed: {}", resp.status());
+        }
+        Ok(resp.json().await?)
+    }
+
     /// Fetch the current default model id (first in `routing.default_models`).
     pub async fn fetch_default_model(&self) -> Result<Option<String>> {
         let resp = self

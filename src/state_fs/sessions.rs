@@ -59,6 +59,16 @@ impl SessionStore {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionMeta>> {
+        self.list_sessions_paginated(None, None)
+    }
+
+    /// List sessions with optional pagination. Results are sorted newest-first.
+    /// `limit` caps how many are returned; `offset` skips that many from the top.
+    pub fn list_sessions_paginated(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<Vec<SessionMeta>> {
         if !self.sessions_dir.exists() {
             return Ok(Vec::new());
         }
@@ -84,7 +94,50 @@ impl SessionStore {
             }
         }
         sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let off = offset.unwrap_or(0);
+        if off > 0 {
+            sessions = sessions.into_iter().skip(off).collect();
+        }
+        if let Some(lim) = limit {
+            sessions.truncate(lim);
+        }
         Ok(sessions)
+    }
+
+    /// Return total session count without reading YAML files (just counts directories).
+    pub fn count_sessions(&self) -> usize {
+        if !self.sessions_dir.exists() {
+            return 0;
+        }
+        fs::read_dir(&self.sessions_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+                    .filter(|e| e.path().join("session.yaml").exists())
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Check whether a session has any chat messages (without loading them all).
+    pub fn session_has_messages(&self, session_id: &str) -> bool {
+        let msgs_path = self.session_dir(session_id).join("messages.jsonl");
+        if !msgs_path.exists() {
+            return false;
+        }
+        // Check if file has any non-empty lines
+        if let Ok(file) = fs::File::open(&msgs_path) {
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                if let Ok(l) = line {
+                    if !l.trim().is_empty() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     pub fn rename_session(&self, session_id: &str, new_title: &str) -> Result<()> {

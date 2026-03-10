@@ -33,6 +33,13 @@ pub(super) struct SkillArgs {
     pub(super) args: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct RunAppArgs {
+    #[serde(alias = "name")]
+    pub(super) skill: String,
+    pub(super) args: Option<String>,
+}
+
 impl Tools {
     /// Validate delegation policy/depth/target without executing.
     /// Returns the manager and caller agent id on success.
@@ -103,6 +110,99 @@ impl Tools {
             ask_bridge,
             session_id,
         ))
+    }
+
+    pub(super) fn run_app(&self, args: RunAppArgs) -> Result<ToolResult> {
+        let manager = self
+            .manager
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("RunApp requires AgentManager context"))?;
+
+        let skill = block_on_async(manager.skill_manager.get_skill(&args.skill));
+
+        match skill {
+            Some(skill) => {
+                let app = skill.app.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Skill '{}' does not have an app configuration. Only skills with 'app.launcher' can be run as apps.",
+                        args.skill
+                    )
+                })?;
+
+                match app.launcher.as_str() {
+                    "web" => {
+                        let url = format!("/apps/{}/{}", skill.name, app.entry);
+                        // Emit AppLaunched SSE event if we have the bridge.
+                        if let Some(bridge) = &self.ask_user_bridge {
+                            let _ = bridge.events_tx.send(crate::server::ServerEvent::AppLaunched {
+                                skill: skill.name.clone(),
+                                launcher: "web".to_string(),
+                                url: url.clone(),
+                                title: skill.description.clone(),
+                                width: app.width,
+                                height: app.height,
+                            });
+                        }
+                        Ok(ToolResult::Success(format!(
+                            "Launched web app '{}' at {}", skill.name, url
+                        )))
+                    }
+                    "url" => {
+                        let url = app.entry.clone();
+                        if let Some(bridge) = &self.ask_user_bridge {
+                            let _ = bridge.events_tx.send(crate::server::ServerEvent::AppLaunched {
+                                skill: skill.name.clone(),
+                                launcher: "url".to_string(),
+                                url: url.clone(),
+                                title: skill.description.clone(),
+                                width: app.width,
+                                height: app.height,
+                            });
+                        }
+                        Ok(ToolResult::Success(format!(
+                            "Launched URL app '{}': {}", skill.name, url
+                        )))
+                    }
+                    "bash" => {
+                        // Execute the entry script in the skill directory.
+                        let skill_dir = skill.skill_dir.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("Skill '{}' has no directory path", args.skill)
+                        })?;
+                        let script = skill_dir.join(&app.entry);
+                        if !script.exists() {
+                            anyhow::bail!(
+                                "App script not found: {}",
+                                script.display()
+                            );
+                        }
+                        let mut cmd = std::process::Command::new("sh");
+                        cmd.arg(script.as_os_str());
+                        if let Some(extra) = &args.args {
+                            for arg in extra.split_whitespace() {
+                                cmd.arg(arg);
+                            }
+                        }
+                        cmd.current_dir(&self.root);
+                        let output = cmd.output()
+                            .map_err(|e| anyhow::anyhow!("Failed to run app script: {}", e))?;
+                        Ok(ToolResult::CommandOutput {
+                            exit_code: output.status.code(),
+                            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                        })
+                    }
+                    other => {
+                        anyhow::bail!(
+                            "Unknown app launcher type '{}'. Supported: web, bash, url.",
+                            other
+                        )
+                    }
+                }
+            }
+            None => {
+                anyhow::bail!("Skill '{}' not found.", args.skill)
+            }
+        }
     }
 
     pub(super) fn invoke_skill(&self, args: SkillArgs) -> Result<ToolResult> {

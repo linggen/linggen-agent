@@ -66,7 +66,9 @@ Messages are queued per-agent and checked at each iteration boundary via an inte
 ## Context management
 
 - Context is built from system prompt + conversation history + tool observations.
-- When context approaches token limit, automatic compaction summarizes older messages.
+- When context approaches token limit, automatic compaction summarizes older messages using model-based summarization (falls back to deterministic extraction on failure).
+- `/compact [focus]` command forces compaction regardless of budget. Optional focus parameter guides the summarizer to emphasize specific topics.
+- High/Critical importance messages survive compaction; Low/Normal messages are summarized.
 - Tool results are trimmed to fit within limits.
 - Read cache invalidated after Write/Edit to keep observations fresh.
 

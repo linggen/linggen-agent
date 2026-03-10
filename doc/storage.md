@@ -25,7 +25,8 @@ Two-tier layout, aligned with Claude Code's `~/.claude/` + `{repo}/.claude/` con
 | Directory | Purpose |
 |-----------|---------|
 | `~/.linggen/` | Global home (override with `$LINGGEN_HOME`) |
-| `~/.linggen/projects/{encoded}/` | Per-project state (sessions, runs, missions) |
+| `~/.linggen/missions/` | Global missions and their sessions |
+| `~/.linggen/projects/{encoded}/` | Per-project state (sessions, runs) |
 | `{workspace}/.linggen/` | Workspace-local settings (permissions, future config) |
 
 Project path encoding: `/Users/foo/project` → `-Users-foo-project` (same convention as Claude Code).
@@ -46,6 +47,14 @@ Project path encoding: `/Users/foo/project` → `-Users-foo-project` (same conve
 │   ├── {name}.md                     # Flat skill files
 │   └── {name}/SKILL.md              # Nested skill directories
 ├── credentials.json                  # API keys for model providers (JSON)
+├── missions/
+│   └── {mission_id}/
+│       ├── mission.md                # Mission definition (markdown + YAML frontmatter)
+│       ├── runs.jsonl                # Mission run history (JSONL)
+│       └── sessions/
+│           └── {session_id}/
+│               ├── session.yaml      # Mission session metadata (YAML)
+│               └── messages.jsonl    # Mission session messages (JSONL)
 ├── ling.pid                          # Daemon PID
 └── ling.log                          # Daemon stdout
 ```
@@ -61,10 +70,6 @@ Project path encoding: `/Users/foo/project` → `-Users-foo-project` (same conve
 │       └── messages.jsonl            # Chat messages, append-only (JSONL)
 ├── runs/
 │   └── {run_id}.json                 # Agent run records (JSON)
-├── missions/
-│   └── {mission_id}/
-│       ├── mission.json              # Mission definition (JSON)
-│       └── runs.jsonl                # Mission run history (JSONL)
 └── memory/
     └── ...                           # Agent memory (managed by memory skill)
 ```
@@ -140,26 +145,34 @@ One JSON object per line, append-only.
 
 Status values: `running`, `completed`, `failed`, `cancelled`.
 
-### Mission (`mission.json`)
+### Mission (`mission.md`)
 
-```json
-{
-  "id": "mission-1700000000-abc12345",
-  "schedule": "*/30 * * * *",
-  "agent_id": "ling",
-  "prompt": "Check CI/CD status and report issues",
-  "model": null,
-  "enabled": true,
-  "created_at": 1700000000
-}
+Markdown file with YAML frontmatter. Stored at `~/.linggen/missions/{id}/mission.md`.
+
+```markdown
+---
+schedule: '*/30 * * * *'
+enabled: true
+project: /path/to/project
+permission_tier: standard
+created_at: 1700000000
+---
+
+Check CI/CD status and report issues
 ```
 
-Multiple missions can be active simultaneously — each in its own `missions/{id}/` directory. See [`mission-spec.md`](mission-spec.md) for full details.
+Frontmatter fields: `schedule` (5-field cron), `enabled`, `model` (optional), `project` (optional), `permission_tier` ("readonly", "standard", "full"), `created_at`.
+
+The markdown body is the mission prompt. Multiple missions can be active simultaneously — each in its own directory. See [`mission-spec.md`](mission-spec.md) for full details.
+
+### Mission sessions
+
+Mission runs create sessions at `~/.linggen/missions/{mission_id}/sessions/` (per-mission, not per-project). Same format as project sessions (`session.yaml` + `messages.jsonl`). Each mission's sessions live alongside its definition and run history.
 
 ### Mission run history (`runs.jsonl`)
 
 ```json
-{ "run_id": "run-ling-1700000000-123456", "triggered_at": 1700000000, "status": "completed", "skipped": false }
+{ "run_id": "run-mission-1700000000-123456", "session_id": "sess-1700000000-abc12345", "triggered_at": 1700000000, "status": "completed", "skipped": false }
 ```
 
 Append-only. Skipped triggers (agent busy) logged with `"skipped": true`.
@@ -195,7 +208,8 @@ Search order for `linggen.toml`:
 | Module | Responsibility |
 |--------|---------------|
 | `paths.rs` | All `~/.linggen/` path constants |
-| `project_store/mod.rs` | Projects, missions, agent overrides |
+| `project_store/mod.rs` | Projects, agent overrides |
+| `project_store/missions.rs` | Global mission store (CRUD, cron, run history) |
 | `project_store/runs.rs` | Run records (CRUD) |
 | `project_store/path_encoding.rs` | Path → directory name encoding |
 | `state_fs/sessions.rs` | Sessions, chat messages (CRUD) |

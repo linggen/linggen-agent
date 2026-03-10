@@ -42,6 +42,7 @@ Built-in tools are the kernel API. Skills are userspace.
 | `WebSearch` | `query, max_results?` | Web search (DuckDuckGo) |
 | `WebFetch` | `url, max_bytes?` | Fetch URL content as text |
 | `Skill` | `skill, args?` | Invoke a skill by name |
+| `RunApp` | `skill, args?` | Launch an app-enabled skill |
 | `AskUser` | `questions` | Ask user structured questions mid-execution |
 
 **Aliases**: `Read`/`Write`/`Edit` accept `file`/`filepath` for `path`. `Edit` accepts `old`/`search`/`from` for `old_string`, `new`/`replace`/`to` for `new_string`.
@@ -63,6 +64,22 @@ Lets the agent pause mid-loop to ask the user structured questions. Aligned with
 **Flow**: tool emits `AskUser` SSE event → UI renders card → user submits via `POST /api/ask-user-response` → oneshot channel delivers answer → loop continues.
 
 **Implementation**: `engine/tools.rs` (execution), `server/chat_api.rs` (response endpoint), `ui/src/components/AskUserCard.tsx` (UI).
+
+## RunApp
+
+Launches an app-enabled skill. The skill must have an `app` section in its frontmatter with a `launcher` type. See `skills.md` → App skills.
+
+- **`web`**: serves the skill directory as static files at `/apps/{skill-name}/`, emits `AppLaunched` SSE event, UI opens an iframe panel.
+- **`bash`**: executes the entry script in the skill directory, returns stdout/stderr.
+- **`url`**: emits `AppLaunched` SSE event with the external URL, UI opens in panel or new tab.
+
+**Direct invocation**: when a user invokes an app skill via `/skill-name`, the server short-circuits the model — executes the app directly without entering the agent loop.
+
+**Model invocation**: any agent can call `RunApp` to launch an app during a conversation (e.g., "let me open the dashboard for you").
+
+**SSE event**: `AppLaunched { skill, launcher, url, title, width?, height? }` — tells the UI to open the app panel.
+
+**Implementation**: `engine/tools/delegation.rs` (`run_app()`), `server/chat_api.rs` (direct dispatch), `server/mod.rs` (static serving at `/apps/`), `ui/src/components/AppPanel.tsx` (UI).
 
 ## Tool dispatch
 

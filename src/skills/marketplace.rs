@@ -219,11 +219,17 @@ pub async fn install_skill(
                     if fallback.top_source != "linggen/skills" {
                         let fallback_repo =
                             format!("https://github.com/{}", fallback.top_source);
+                        // Recompute target_dir using fallback id if it differs from original name.
+                        let fallback_target = if fallback.id != name {
+                            target_dir.parent().unwrap_or(target_dir).join(&fallback.id)
+                        } else {
+                            target_dir.to_path_buf()
+                        };
                         return install_skill_inner(
                             &fallback.id,
                             &fallback_repo,
                             "main",
-                            target_dir,
+                            &fallback_target,
                         )
                         .await;
                     }
@@ -360,11 +366,11 @@ pub fn normalize_github_url(url: &str) -> Result<String> {
 
     if url.starts_with("https://github.com/") {
         Ok(url.to_string())
-    } else if !url.contains("://") && url.contains('/') {
-        Ok(format!("https://github.com/{}", url))
     } else if url.starts_with("git@github.com:") {
         let repo = url.trim_start_matches("git@github.com:");
         Ok(format!("https://github.com/{}", repo))
+    } else if !url.contains("://") && url.contains('/') {
+        Ok(format!("https://github.com/{}", url))
     } else if url.contains("github.com") {
         Ok(url.to_string())
     } else {
@@ -410,7 +416,8 @@ fn is_default_repo(normalized_url: &str) -> bool {
 
 pub(crate) async fn download_to_temp(client: &reqwest::Client, url: &str) -> Result<PathBuf> {
     let tmp = tempfile::NamedTempFile::new().context("Failed to create temp file")?;
-    let tmp_path = tmp.path().to_path_buf();
+    // Persist immediately so the path is stable; caller is responsible for cleanup.
+    let tmp_path = tmp.into_temp_path();
 
     let max_attempts = 3;
     let mut last_error = None;
@@ -420,8 +427,8 @@ pub(crate) async fn download_to_temp(client: &reqwest::Client, url: &str) -> Res
             Ok(r) if r.status().is_success() => {
                 let bytes = r.bytes().await.context("Failed to read response")?;
                 fs::write(&tmp_path, &bytes).context("Failed to write temp file")?;
-                tmp.keep().map_err(|e| anyhow::anyhow!("tempfile keep error: {}", e.error))?;
-                return Ok(tmp_path);
+                let kept = tmp_path.keep().map_err(|e| anyhow::anyhow!("tempfile keep error: {}", e))?;
+                return Ok(kept);
             }
             Ok(r) if attempt < max_attempts - 1 && is_retryable_status(r.status()) => {
                 let delay = Duration::from_secs(1 << attempt);
@@ -509,7 +516,10 @@ fn extract_skill_from_zip(
                 Some((dir_name.clone(), parent.to_path_buf(), name.clone()));
         }
 
-        if name.contains(&format!("/{}/", skill_name)) {
+        // Match directory name against skill name, normalizing hyphens/underscores
+        let norm_skill = skill_name.replace('-', "_");
+        let norm_dir = dir_name.replace('-', "_");
+        if norm_dir == norm_skill || name.contains(&format!("/{}/", skill_name)) {
             skill_root_in_zip = Some(parent.to_path_buf());
             break;
         }
@@ -732,17 +742,14 @@ mod tests {
 
     #[test]
     fn test_normalize_git_ssh() {
-        // NOTE: The shorthand branch ("!url.contains("://") && url.contains('/')")
-        // currently matches before the "git@github.com:" branch, so SSH URLs
-        // are not normalized correctly. This test documents the actual behavior.
         let result = normalize_github_url("git@github.com:linggen/skills").unwrap();
-        assert_eq!(result, "https://github.com/git@github.com:linggen/skills");
+        assert_eq!(result, "https://github.com/linggen/skills");
     }
 
     #[test]
     fn test_normalize_git_ssh_with_git_suffix() {
         let result = normalize_github_url("git@github.com:linggen/skills.git").unwrap();
-        assert_eq!(result, "https://github.com/git@github.com:linggen/skills");
+        assert_eq!(result, "https://github.com/linggen/skills");
     }
 
     #[test]

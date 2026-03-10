@@ -1,0 +1,288 @@
+/**
+ * Project, session, and workspace tree state.
+ */
+import { create } from 'zustand';
+import type { ProjectInfo, SessionInfo, AgentTreeItem } from '../types';
+
+const SELECTED_PROJECT_STORAGE_KEY = 'linggen:selected-project';
+const ACTIVE_SESSION_STORAGE_KEY = 'linggen:active-session';
+
+interface ProjectState {
+  projects: ProjectInfo[];
+  selectedProjectRoot: string;
+  sessions: SessionInfo[];
+  activeSessionId: string | null;
+  isMissionSession: boolean;
+  activeMissionId: string | null;
+  agentTreesByProject: Record<string, Record<string, AgentTreeItem>>;
+  sessionCountsByProject: Record<string, number>;
+  currentPath: string;
+
+  // Add-project UI
+  newProjectPath: string;
+  showAddProject: boolean;
+
+  // Actions
+  setSelectedProjectRoot: (root: string) => void;
+  setActiveSessionId: (id: string | null) => void;
+  setIsMissionSession: (val: boolean) => void;
+  setActiveMissionId: (id: string | null) => void;
+  setNewProjectPath: (path: string) => void;
+  setShowAddProject: (show: boolean) => void;
+  setCurrentPath: (path: string) => void;
+
+  fetchProjects: () => Promise<void>;
+  addProject: () => Promise<void>;
+  removeProject: (path: string) => Promise<void>;
+  pickFolder: () => Promise<void>;
+
+  fetchSessions: () => Promise<void>;
+  createSession: () => Promise<void>;
+  removeSession: (id: string) => Promise<void>;
+  renameSession: (id: string, title: string) => Promise<void>;
+  fetchAllSessionCounts: () => Promise<void>;
+
+  fetchAgentTree: (projectRoot?: string) => Promise<void>;
+  fetchAllAgentTrees: () => Promise<void>;
+  fetchFiles: (path?: string) => Promise<void>;
+}
+
+export const useProjectStore = create<ProjectState>((set, get) => ({
+  projects: [],
+  selectedProjectRoot: typeof window !== 'undefined'
+    ? window.localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY) || ''
+    : '',
+  sessions: [],
+  activeSessionId: typeof window !== 'undefined'
+    ? window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY) || null
+    : null,
+  isMissionSession: false,
+  activeMissionId: null,
+  agentTreesByProject: {},
+  sessionCountsByProject: {},
+  currentPath: '',
+  newProjectPath: '',
+  showAddProject: false,
+
+  setSelectedProjectRoot: (root) => {
+    if (root) window.localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, root);
+    else window.localStorage.removeItem(SELECTED_PROJECT_STORAGE_KEY);
+    set({ selectedProjectRoot: root });
+  },
+  setActiveSessionId: (id) => {
+    if (id) window.localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, id);
+    else window.localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
+    set({ activeSessionId: id });
+  },
+  setIsMissionSession: (val) => set({ isMissionSession: val }),
+  setActiveMissionId: (id) => set({ activeMissionId: id }),
+  setNewProjectPath: (path) => set({ newProjectPath: path }),
+  setShowAddProject: (show) => set({ showAddProject: show }),
+  setCurrentPath: (path) => set({ currentPath: path }),
+
+  fetchProjects: async () => {
+    try {
+      const resp = await fetch('/api/projects');
+      const data: ProjectInfo[] = await resp.json();
+      set((s) => {
+        const valid = new Set(data.map((p) => p.path));
+        const agentTreesByProject: Record<string, Record<string, AgentTreeItem>> = {};
+        for (const [path, tree] of Object.entries(s.agentTreesByProject)) {
+          if (valid.has(path)) agentTreesByProject[path] = tree;
+        }
+        const selectedProjectRoot =
+          data.length === 0
+            ? ''
+            : s.selectedProjectRoot && data.some((p) => p.path === s.selectedProjectRoot)
+              ? s.selectedProjectRoot
+              : data[0].path;
+        return { projects: data, agentTreesByProject, selectedProjectRoot };
+      });
+    } catch (e) {
+      console.error('Error fetching projects:', e);
+    }
+  },
+
+  addProject: async () => {
+    const { newProjectPath, fetchProjects } = get();
+    if (!newProjectPath.trim()) return;
+    try {
+      await fetch('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: newProjectPath }),
+      });
+      set({ newProjectPath: '', showAddProject: false });
+      fetchProjects();
+    } catch (e) {
+      console.error('Error adding project:', e);
+    }
+  },
+
+  removeProject: async (path) => {
+    if (!confirm(`Are you sure you want to remove project: ${path}?`)) return;
+    try {
+      await fetch('/api/projects', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }),
+      });
+      get().fetchProjects();
+    } catch (e) {
+      console.error('Error removing project:', e);
+    }
+  },
+
+  pickFolder: async () => {
+    try {
+      const resp = await fetch('/api/utils/pick-folder');
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.path) {
+          await fetch('/api/projects', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: data.path }),
+          });
+          set({ newProjectPath: '', showAddProject: false });
+          get().fetchProjects();
+        }
+      }
+    } catch (e) {
+      console.error('Error picking folder:', e);
+    }
+  },
+
+  fetchSessions: async () => {
+    const { selectedProjectRoot, isMissionSession } = get();
+    if (!selectedProjectRoot) return;
+    try {
+      const resp = await fetch(`/api/sessions?project_root=${encodeURIComponent(selectedProjectRoot)}&limit=50`);
+      const raw = await resp.json();
+      const data: SessionInfo[] = raw.sessions ?? raw ?? [];
+      set((s) => {
+        let activeSessionId = s.activeSessionId;
+        if (activeSessionId && data.some((sess) => sess.id === activeSessionId)) {
+          // Keep current — only update sessions list
+          return { sessions: data };
+        } else if (activeSessionId && isMissionSession) {
+          // Keep mission session — only update sessions list
+          return { sessions: data };
+        } else if (data.length > 0) {
+          activeSessionId = data[0].id;
+          if (s.isMissionSession) return { sessions: data };
+        } else {
+          activeSessionId = null;
+        }
+        // Only include activeSessionId if it actually changed
+        if (activeSessionId === s.activeSessionId) return { sessions: data };
+        return { sessions: data, activeSessionId };
+      });
+    } catch (e) {
+      console.error('Failed to fetch sessions:', e);
+    }
+  },
+
+  createSession: async () => {
+    const { selectedProjectRoot, fetchSessions, fetchAllSessionCounts } = get();
+    if (!selectedProjectRoot) return;
+    const now = new Date();
+    const title = `Chat ${now.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}, ${now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`;
+    try {
+      const resp = await fetch('/api/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_root: selectedProjectRoot, title }),
+      });
+      const data = await resp.json();
+      set({ activeSessionId: data.id });
+      fetchSessions();
+      fetchAllSessionCounts();
+    } catch (e) {
+      console.error('Error creating session:', e);
+    }
+  },
+
+  removeSession: async (id) => {
+    const { selectedProjectRoot, activeSessionId, fetchSessions, fetchAllSessionCounts } = get();
+    if (!selectedProjectRoot || !confirm('Remove this session?')) return;
+    try {
+      await fetch('/api/sessions', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_root: selectedProjectRoot, session_id: id }),
+      });
+      if (activeSessionId === id) set({ activeSessionId: null });
+      fetchSessions();
+      fetchAllSessionCounts();
+    } catch (e) {
+      console.error('Error removing session:', e);
+    }
+  },
+
+  renameSession: async (id, title) => {
+    const { selectedProjectRoot, fetchSessions } = get();
+    if (!selectedProjectRoot) return;
+    try {
+      await fetch('/api/sessions', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_root: selectedProjectRoot, session_id: id, title }),
+      });
+      fetchSessions();
+    } catch (e) {
+      console.error('Error renaming session:', e);
+    }
+  },
+
+  fetchAllSessionCounts: async () => {
+    const { projects } = get();
+    if (projects.length === 0) return;
+    const counts: Record<string, number> = {};
+    await Promise.all(
+      projects.map(async (project) => {
+        try {
+          const resp = await fetch(`/api/sessions?project_root=${encodeURIComponent(project.path)}&limit=1`);
+          const data = await resp.json();
+          // Use total from paginated response, or fall back to array length
+          counts[project.path] = data.total ?? (Array.isArray(data) ? data.length : Array.isArray(data.sessions) ? data.sessions.length : 0);
+        } catch {
+          counts[project.path] = 0;
+        }
+      }),
+    );
+    set({ sessionCountsByProject: counts });
+  },
+
+  fetchAgentTree: async (projectRoot?: string) => {
+    const { selectedProjectRoot } = get();
+    const root = projectRoot || selectedProjectRoot;
+    if (!root) return;
+    try {
+      const resp = await fetch(`/api/workspace/tree?project_root=${encodeURIComponent(root)}`);
+      const data = await resp.json();
+      set((s) => ({
+        agentTreesByProject: { ...s.agentTreesByProject, [root]: data },
+      }));
+    } catch (e) {
+      console.error(`Error fetching agent tree (${root}):`, e);
+    }
+  },
+
+  fetchAllAgentTrees: async () => {
+    const { projects, fetchAgentTree } = get();
+    if (projects.length === 0) return;
+    await Promise.all(projects.map((p) => fetchAgentTree(p.path)));
+  },
+
+  fetchFiles: async (path = '') => {
+    const { selectedProjectRoot } = get();
+    if (!selectedProjectRoot) return;
+    try {
+      await fetch(`/api/files?project_root=${encodeURIComponent(selectedProjectRoot)}&path=${encodeURIComponent(path)}`);
+      set({ currentPath: path });
+    } catch (e) {
+      console.error('Error fetching files:', e);
+    }
+  },
+}));

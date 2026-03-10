@@ -246,6 +246,15 @@ impl AgentEngine {
             });
         }
 
+        // Apply mission permission tier restrictions — narrow the tool set so
+        // the model never even sees tools it cannot use during automated runs.
+        if let Some(ref mission_tools) = self.cfg.mission_allowed_tools {
+            allowed_tools = Some(match allowed_tools {
+                Some(existing) => existing.intersection(mission_tools).cloned().collect(),
+                None => mission_tools.clone(),
+            });
+        }
+
         // Dynamic content appended after cached stable prefix.
 
         // --- Response Format ---

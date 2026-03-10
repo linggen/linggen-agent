@@ -388,6 +388,11 @@ impl Tools {
                     .map_err(|e| anyhow::anyhow!("invalid args for Skill: {}", e))?;
                 self.invoke_skill(args)
             }
+            "RunApp" => {
+                let args: delegation::RunAppArgs = serde_json::from_value(normalized_args)
+                    .map_err(|e| anyhow::anyhow!("invalid args for RunApp: {}", e))?;
+                self.run_app(args)
+            }
             "AskUser" => {
                 let args: AskUserArgs = serde_json::from_value(normalized_args)
                     .map_err(|e| anyhow::anyhow!("invalid args for AskUser: {}", e))?;

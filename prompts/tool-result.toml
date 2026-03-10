@@ -61,6 +61,6 @@ vars = ["type", "name", "content"]
 text = "Observation:\ntype: {type}\nname: {name}\ncontent:\n{content}"
 
 [compaction_summary]
-description = "Prefix for context compaction summary messages"
+description = "Prefix for deterministic fallback compaction summary"
 vars = ["count"]
 text = "Context summary (compressed {count} messages)."

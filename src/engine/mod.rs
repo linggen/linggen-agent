@@ -138,7 +138,7 @@ impl AgentEngine {
                 .unwrap_or_else(|| "unknown".to_string());
             manager
                 .add_chat_message(
-                    &self.cfg.ws_root,
+                    self.session_storage_root(),
                     session_id.unwrap_or("default"),
                     &crate::state_fs::sessions::ChatMsg {
                         agent_id: aid.clone(),
@@ -232,7 +232,7 @@ impl AgentEngine {
                     .await;
             }
 
-            let summary_count = self.maybe_compact_model_messages(&mut state.messages, "loop_iter");
+            let summary_count = self.maybe_compact_model_messages(&mut state.messages, "loop_iter").await;
             self.emit_context_usage_event("loop_iter", &state.messages, summary_count)
                 .await;
 

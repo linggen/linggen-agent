@@ -193,7 +193,8 @@ When a user sends a message to a busy agent, it queues. The agent picks it up at
 
 - `POST /api/chat` — send message (queues if busy).
 - `POST /api/chat/clear` — clear chat history.
-- `GET /api/events` — SSE event stream.
+- `POST /api/chat/compact` — force context compaction (optional `focus` parameter).
+- `GET /api/events` — SSE event stream. Every event carries an optional `session_id`. The UI **filters events by `session_id`**: if an event has a `session_id` that differs from the active session, it is dropped. Events without a `session_id` are global and always delivered. This ensures mission sessions and project sessions don't bleed into each other.
 - `GET /api/agent-runs` — list runs for a project/session.
 - `GET /api/agent-children` — list child runs (delegation).
 - `GET /api/agent-context` — run context and messages.
@@ -202,3 +203,23 @@ When a user sends a message to a busy agent, it queues. The agent picks it up at
 - `POST /api/plan/approve` — approve a pending plan.
 - `POST /api/plan/reject` — reject a pending plan.
 - `POST /api/plan/edit` — edit a pending plan.
+
+## Slash commands
+
+Available in both TUI and Web UI. Handled client-side (not sent to the agent).
+
+| Command | Description |
+|:--------|:------------|
+| `/help` | Show available commands |
+| `/clear` | Clear chat context |
+| `/compact [focus]` | Force context compaction (summarize old messages). Optional focus guides the summarizer. |
+| `/status` | Show project status, models, token usage |
+| `/model [id]` | List models or switch default model |
+| `/agent <name>` | Switch default agent |
+| `/plan <task>` | Ask agent to create a plan (read-only) |
+| `/plan approve` | Approve and execute the pending plan |
+| `/plan reject` | Reject the pending plan |
+| `/image <path>` | Attach an image file |
+| `/paste` | Paste image from clipboard (TUI) |
+| `@path` | Mention a file |
+| `@@agent message` | Send to a specific agent |

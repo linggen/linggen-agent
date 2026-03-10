@@ -110,7 +110,8 @@ Follow `doc/code-style.md`:
 - **Tool names are Claude Code-style**: `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep` (capitalized).
 - **Workspace-scoped file operations**: all paths are sandboxed to workspace root; parent traversal (`..`) is rejected.
 - **Agent policy enforcement**: tools and actions (Patch, Finalize, Delegate) are hard-gated per agent via frontmatter policy, not just prompt guidance.
-- **SSE events**: server publishes real-time events (`Token`, `Message`, `AgentStatus`, `SubagentSpawned`, `ToolStatus`, `PlanUpdate`, etc.) consumed by the web UI.
+- **SSE events**: server publishes real-time events (`Token`, `Message`, `AgentStatus`, `SubagentSpawned`, `ToolStatus`, `PlanUpdate`, `AppLaunched`, etc.) consumed by the web UI.
+- **App skills**: skills with `app` frontmatter section run directly (no model). Launcher types: `web` (static files served at `/apps/{name}/`), `bash` (script execution), `url` (external link). Model can also call `RunApp` tool.
 - **Delegation depth**: configurable via `max_delegation_depth` (default 2). Any agent can delegate to any other agent.
 - **Model routing**: default model chain with health tracking and auto-fallback on errors/rate limits.
 - **Tool permissions**: three modes — `auto` (always allow), `warn` (log destructive ops), `ask` (prompt user via AskUser bridge).

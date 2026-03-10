@@ -7,6 +7,7 @@ use axum::{
     response::IntoResponse,
 };
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -180,7 +181,12 @@ pub(crate) async fn marketplace_move_to_global(
 // Built-in skills
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn builtin_skills_list() -> impl IntoResponse {
+pub(crate) async fn builtin_skills_list(
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if params.get("refresh").is_some_and(|v| v == "true" || v == "1") {
+        skills::clear_builtin_cache().await;
+    }
     axum::Json(skills::fetch_builtin_skills().await)
 }
 

@@ -1,5 +1,6 @@
 use super::types::*;
 use crate::ollama::ChatMessage;
+use futures_util::StreamExt;
 
 /// Maximum number of messages to retain in chat_history across turns.
 const CHAT_HISTORY_MAX_MESSAGES: usize = 120;
@@ -56,7 +57,7 @@ impl AgentEngine {
                 .unwrap_or_else(|| "unknown".to_string());
             manager
                 .add_chat_message(
-                    &self.cfg.ws_root,
+                    self.session_storage_root(),
                     session_id.unwrap_or("default"),
                     &crate::state_fs::sessions::ChatMsg {
                         agent_id: aid.clone(),
@@ -94,7 +95,7 @@ impl AgentEngine {
                 .await;
             manager
                 .add_chat_message(
-                    &self.cfg.ws_root,
+                    self.session_storage_root(),
                     session_id.unwrap_or("default"),
                     &crate::state_fs::sessions::ChatMsg {
                         agent_id: agent_id.clone(),
@@ -466,7 +467,7 @@ impl AgentEngine {
         }
     }
 
-    pub(crate) fn maybe_compact_model_messages(
+    pub(crate) async fn maybe_compact_model_messages(
         &mut self,
         messages: &mut Vec<ChatMessage>,
         stage: &str,
@@ -543,9 +544,10 @@ impl AgentEngine {
                 .map(|&i| window_msgs[i].content.chars().count())
                 .sum();
 
-            // Build richer summary from dropped messages.
+            // Summarize dropped messages using the model (CC-aligned).
+            // Falls back to deterministic summary if model call fails.
             let drop_refs: Vec<&ChatMessage> = drop_indices.iter().map(|&i| &window_msgs[i]).collect();
-            let summary = self.summarize_message_window_rich(&drop_refs);
+            let summary = self.summarize_with_model(&drop_refs, None).await;
 
             // Collect kept high-importance messages.
             let kept_msgs: Vec<ChatMessage> = keep_indices
@@ -594,5 +596,138 @@ impl AgentEngine {
         self.accumulated_token_estimate = token_est;
 
         summary_count
+    }
+
+    /// Force-compact the context, regardless of whether we're over budget.
+    /// Used by the `/compact` command. Returns the summary text, or None if
+    /// there's nothing to compact.
+    pub(crate) async fn force_compact(
+        &mut self,
+        messages: &mut Vec<ChatMessage>,
+        focus: Option<&str>,
+    ) -> Option<String> {
+        let keep_tail = self.context_keep_tail_messages().min(messages.len().saturating_sub(2));
+
+        // Sync importance vector.
+        while self.message_importance.len() < messages.len() {
+            self.message_importance.push(MessageImportance::Normal);
+        }
+
+        let start = 1usize; // Keep system prompt.
+        let end = messages.len().saturating_sub(keep_tail);
+        if end <= start {
+            return None; // Nothing to compact.
+        }
+
+        let window_msgs = &messages[start..end];
+        let window_imp = &self.message_importance[start..end];
+
+        let mut keep_indices: Vec<usize> = Vec::new();
+        let mut drop_indices: Vec<usize> = Vec::new();
+        for (i, imp) in window_imp.iter().enumerate() {
+            if *imp >= MessageImportance::High {
+                keep_indices.push(i);
+            } else {
+                drop_indices.push(i);
+            }
+        }
+        Self::preserve_tool_pairs(window_msgs, &mut keep_indices, &mut drop_indices);
+
+        if drop_indices.is_empty() {
+            drop_indices = (0..window_msgs.len()).collect();
+            keep_indices.clear();
+        }
+
+        let drop_refs: Vec<&ChatMessage> = drop_indices.iter().map(|&i| &window_msgs[i]).collect();
+        let summary = self.summarize_with_model(&drop_refs, focus).await;
+
+        let kept_msgs: Vec<ChatMessage> = keep_indices.iter().map(|&i| window_msgs[i].clone()).collect();
+        let kept_imp: Vec<MessageImportance> = keep_indices.iter().map(|&i| window_imp[i]).collect();
+
+        messages.drain(start..end);
+        self.message_importance.drain(start..end);
+
+        messages.insert(start, ChatMessage::new("user", summary.clone()));
+        self.message_importance.insert(start, MessageImportance::Normal);
+
+        for (offset, (msg, imp)) in kept_msgs.into_iter().zip(kept_imp).enumerate() {
+            messages.insert(start + 1 + offset, msg);
+            self.message_importance.insert(start + 1 + offset, imp);
+        }
+
+        self.accumulated_token_estimate = Self::estimate_tokens_for_messages(messages);
+
+        Some(summary)
+    }
+
+    /// Summarize dropped messages by sending them to the model.
+    /// Falls back to `summarize_message_window_rich` if the model call fails.
+    async fn summarize_with_model(&self, dropped: &[&ChatMessage], focus: Option<&str>) -> String {
+        // Build a compact transcript of the dropped messages for the model.
+        let mut transcript = String::new();
+        for msg in dropped {
+            let role = &msg.role;
+            let content = &msg.content;
+            // Truncate very long messages to avoid blowing up the summarization context.
+            let truncated = if content.len() > 2000 {
+                format!("{}...[truncated]", &content[..2000])
+            } else {
+                content.clone()
+            };
+            transcript.push_str(&format!("[{}] {}\n", role, truncated));
+        }
+
+        let focus_instruction = match focus {
+            Some(f) if !f.is_empty() => format!("\n\nIMPORTANT: Focus especially on: {}\n", f),
+            _ => String::new(),
+        };
+
+        let prompt = format!(
+            "You are summarizing a conversation between a user and a coding assistant. \
+             The following {} messages are being compacted to free up context space.\n\n\
+             Summarize them into a concise working state that preserves:\n\
+             - What task the user asked for and current progress\n\
+             - Key decisions made and why\n\
+             - Files created, modified, or read (with paths)\n\
+             - Errors encountered and how they were resolved\n\
+             - Any pending work or next steps\n\n\
+             Be concise but complete. Use bullet points. Do not lose important details \
+             like file paths, function names, or error messages.{}\n\n\
+             --- MESSAGES TO SUMMARIZE ---\n{}",
+            dropped.len(),
+            focus_instruction,
+            transcript
+        );
+
+        let summarize_msgs = vec![
+            ChatMessage::new("system", "You are a context compaction assistant. Produce a concise summary."),
+            ChatMessage::new("user", prompt),
+        ];
+
+        // Try model-based summarization.
+        match self.model_manager.chat_text_stream(&self.model_id, &summarize_msgs).await {
+            Ok(mut stream) => {
+                let mut result = String::new();
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(crate::agent_manager::models::StreamChunk::Token(t)) => result.push_str(&t),
+                        Ok(_) => {} // Usage stats, tool calls — ignore
+                        Err(e) => {
+                            tracing::warn!("Compaction stream error, falling back to deterministic: {e}");
+                            return self.summarize_message_window_rich(dropped);
+                        }
+                    }
+                }
+                if result.trim().is_empty() {
+                    tracing::warn!("Compaction model returned empty response, falling back");
+                    return self.summarize_message_window_rich(dropped);
+                }
+                format!("[Context compacted — {} messages summarized by model]\n\n{}", dropped.len(), result.trim())
+            }
+            Err(e) => {
+                tracing::warn!("Compaction model call failed, falling back to deterministic: {e}");
+                self.summarize_message_window_rich(dropped)
+            }
+        }
     }
 }

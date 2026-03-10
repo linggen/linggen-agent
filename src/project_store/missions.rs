@@ -18,8 +18,19 @@ struct MissionFrontmatter {
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     project: Option<String>,
+    /// Permission tier: "readonly", "standard", "full". Default: "full".
+    #[serde(default = "default_permission_tier", skip_serializing_if = "is_default_permission_tier")]
+    permission_tier: String,
     #[serde(default)]
     created_at: u64,
+}
+
+fn default_permission_tier() -> String {
+    "full".to_string()
+}
+
+fn is_default_permission_tier(s: &str) -> bool {
+    s == "full"
 }
 
 /// A cron-scheduled mission stored as `~/.linggen/missions/<id>/mission.md`.
@@ -40,6 +51,9 @@ pub struct Mission {
     /// Optional project path this mission is scoped to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Permission tier: "readonly", "standard", "full". Default: "full".
+    #[serde(default = "default_permission_tier")]
+    pub permission_tier: String,
     pub enabled: bool,
     pub created_at: u64,
 }
@@ -143,6 +157,7 @@ fn parse_mission_md(id: &str, content: &str) -> Result<Mission> {
                     enabled: false,
                     model: None,
                     project: None,
+                    permission_tier: default_permission_tier(),
                     created_at: 0,
                 },
                 content.to_string(),
@@ -156,6 +171,7 @@ fn parse_mission_md(id: &str, content: &str) -> Result<Mission> {
                 enabled: false,
                 model: None,
                 project: None,
+                permission_tier: default_permission_tier(),
                 created_at: 0,
             },
             content.to_string(),
@@ -170,6 +186,7 @@ fn parse_mission_md(id: &str, content: &str) -> Result<Mission> {
         prompt: body,
         model: fm.model,
         project: fm.project,
+        permission_tier: fm.permission_tier,
         enabled: fm.enabled,
         created_at: fm.created_at,
     })
@@ -182,6 +199,7 @@ fn mission_to_md(mission: &Mission) -> String {
         enabled: mission.enabled,
         model: mission.model.clone(),
         project: mission.project.clone(),
+        permission_tier: mission.permission_tier.clone(),
         created_at: mission.created_at,
     };
     let yaml = serde_yml::to_string(&fm).unwrap_or_default();
@@ -277,6 +295,7 @@ impl MissionStore {
         prompt: &str,
         model: Option<String>,
         project: Option<String>,
+        permission_tier: Option<String>,
     ) -> Result<Mission> {
         validate_cron(schedule)?;
         self.ensure_dir()?;
@@ -300,6 +319,7 @@ impl MissionStore {
             }
         }
 
+        let tier = permission_tier.unwrap_or_else(|| "full".to_string());
         let mission = Mission {
             id: id.clone(),
             name: Some(display_name),
@@ -308,6 +328,7 @@ impl MissionStore {
             prompt: prompt.to_string(),
             model,
             project,
+            permission_tier: tier,
             enabled: true,
             created_at: crate::util::now_ts_secs(),
         };
@@ -338,6 +359,7 @@ impl MissionStore {
         model: Option<Option<String>>,
         project: Option<Option<String>>,
         enabled: Option<bool>,
+        permission_tier: Option<String>,
     ) -> Result<Mission> {
         let Some(mut mission) = self.get_mission(mission_id)? else {
             bail!("Mission '{}' not found", mission_id);
@@ -361,6 +383,9 @@ impl MissionStore {
         }
         if let Some(e) = enabled {
             mission.enabled = e;
+        }
+        if let Some(t) = permission_tier {
+            mission.permission_tier = t;
         }
 
         let content = mission_to_md(&mission);
@@ -434,6 +459,19 @@ impl MissionStore {
     }
 
     pub fn list_mission_runs(&self, mission_id: &str) -> Result<Vec<MissionRunEntry>> {
+        self.list_mission_runs_paginated(mission_id, None, None)
+    }
+
+    /// List mission runs with optional pagination.
+    /// Results are in chronological order (oldest first) from the JSONL file.
+    /// `limit` and `offset` apply after reading. For newest-first with limit,
+    /// callers should reverse the result.
+    pub fn list_mission_runs_paginated(
+        &self,
+        mission_id: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<Vec<MissionRunEntry>> {
         let path = self.runs_path(mission_id);
         if !path.exists() {
             return Ok(Vec::new());
@@ -453,240 +491,42 @@ impl MissionStore {
                 }
             }
         }
+        let total = entries.len();
+        // Reverse to newest-first, then apply offset/limit
+        entries.reverse();
+        let off = offset.unwrap_or(0);
+        if off > 0 && off < total {
+            entries = entries.into_iter().skip(off).collect();
+        } else if off >= total {
+            return Ok(Vec::new());
+        }
+        if let Some(lim) = limit {
+            entries.truncate(lim);
+        }
         Ok(entries)
     }
-}
 
-// ---------------------------------------------------------------------------
-// Migration from per-project JSON to global markdown
-// ---------------------------------------------------------------------------
-
-use super::ProjectStore;
-
-/// Old JSON-based mission for migration.
-#[derive(Deserialize)]
-struct OldJsonMission {
-    id: String,
-    #[serde(default)]
-    name: Option<String>,
-    schedule: String,
-    #[serde(default)]
-    agent_id: String,
-    prompt: String,
-    #[serde(default)]
-    model: Option<String>,
-    enabled: bool,
-    created_at: u64,
-}
-
-/// Legacy mission format (even older).
-#[derive(Deserialize)]
-struct OldLegacyMission {
-    text: String,
-    created_at: u64,
-    #[allow(dead_code)]
-    active: bool,
-    #[serde(default)]
-    #[allow(dead_code)]
-    agents: Vec<OldLegacyAgent>,
-}
-
-#[derive(Deserialize)]
-#[allow(dead_code)]
-struct OldLegacyAgent {
-    id: String,
-    #[serde(default)]
-    idle_prompt: Option<String>,
-    #[serde(default)]
-    idle_interval_secs: Option<u64>,
-}
-
-impl MissionStore {
-    /// Migrate missions from old per-project storage to global markdown files.
-    /// Scans `~/.linggen/projects/*/missions/` for JSON missions.
-    pub fn migrate_from_project_store(&self, store: &ProjectStore) -> Result<()> {
-        let projects = store.list_projects().unwrap_or_default();
-        for project in &projects {
-            self.migrate_project_missions(store, &project.path)?;
-        }
-        Ok(())
-    }
-
-    fn migrate_project_missions(&self, store: &ProjectStore, project_path: &str) -> Result<()> {
-        let old_dir = store.project_dir(project_path).join("missions");
-        if !old_dir.exists() {
-            return Ok(());
-        }
-
-        // Check for legacy flat mission.json at project root
-        let legacy = store.project_dir(project_path).join("mission.json");
-        if legacy.exists() {
-            if let Ok(content) = fs::read_to_string(&legacy) {
-                if let Ok(old) = serde_json::from_str::<OldLegacyMission>(&content) {
-                    let _ = self.migrate_legacy_mission(&old, project_path);
-                }
-            }
-            let _ = fs::remove_file(&legacy);
-        }
-
-        for entry in fs::read_dir(&old_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                // New-ish format: directory with mission.json inside
-                let json_path = path.join("mission.json");
-                if json_path.exists() {
-                    if let Ok(content) = fs::read_to_string(&json_path) {
-                        if let Ok(old) = serde_json::from_str::<OldJsonMission>(&content) {
-                            let _ = self.migrate_json_mission(&old, project_path);
-                        }
-                    }
-                }
-            } else if path.extension().map(|e| e == "json").unwrap_or(false) {
-                // Old flat format: {timestamp}.json
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if let Ok(old) = serde_json::from_str::<OldLegacyMission>(&content) {
-                        let _ = self.migrate_legacy_mission(&old, project_path);
-                    }
-                }
-                let _ = fs::remove_file(&path);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn migrate_json_mission(&self, old: &OldJsonMission, project_path: &str) -> Result<Mission> {
-        self.ensure_dir()?;
-        let name = old.name.clone().unwrap_or_else(|| old.id.clone());
-        let id = name_to_filename(&name);
-        if id.is_empty() || self.mission_dir(&id).exists() {
-            // Already migrated or conflict
-            return Ok(Mission {
-                id,
-                name: Some(name),
-                schedule: old.schedule.clone(),
-                agent_id: MISSION_AGENT_ID.to_string(),
-                prompt: old.prompt.clone(),
-                model: old.model.clone(),
-                project: Some(project_path.to_string()),
-                enabled: old.enabled,
-                created_at: old.created_at,
-            });
-        }
-
-        let mission = Mission {
-            id: id.clone(),
-            name: Some(name),
-            schedule: old.schedule.clone(),
-            agent_id: MISSION_AGENT_ID.to_string(),
-            prompt: old.prompt.clone(),
-            model: old.model.clone(),
-            project: Some(project_path.to_string()),
-            enabled: old.enabled,
-            created_at: old.created_at,
-        };
-
-        fs::create_dir_all(self.mission_dir(&id))?;
-        let content = mission_to_md(&mission);
-        fs::write(self.mission_path(&id), content)?;
-
-        // Migrate runs too
-        let old_runs_path = crate::paths::projects_dir()
-            .join(super::path_encoding::encode_project_path(project_path))
-            .join("missions")
-            .join(&old.id)
-            .join("runs.jsonl");
-        if old_runs_path.exists() {
-            if let Ok(runs_content) = fs::read_to_string(&old_runs_path) {
-                let _ = fs::write(self.runs_path(&id), runs_content);
-            }
-        }
-
-        Ok(mission)
-    }
-
-    fn migrate_legacy_mission(
+    /// Remove the run entry whose `session_id` matches, rewriting `runs.jsonl`.
+    pub fn remove_run_by_session(
         &self,
-        old: &OldLegacyMission,
-        project_path: &str,
-    ) -> Result<Mission> {
-        self.ensure_dir()?;
-        let id = format!("migrated-{}", old.created_at);
-        if self.mission_dir(&id).exists() {
-            bail!("Already migrated");
-        }
-
-        let mission = Mission {
-            id: id.clone(),
-            name: None,
-            schedule: "0 * * * *".to_string(),
-            agent_id: MISSION_AGENT_ID.to_string(),
-            prompt: old.text.clone(),
-            model: None,
-            project: Some(project_path.to_string()),
-            enabled: false, // disabled — user should configure and re-enable
-            created_at: old.created_at,
-        };
-
-        fs::create_dir_all(self.mission_dir(&id))?;
-        let content = mission_to_md(&mission);
-        fs::write(self.mission_path(&id), content)?;
-
-        Ok(mission)
-    }
-
-    /// Migrate from old flat-file format (`<id>.md` + `<id>.runs.jsonl`) to
-    /// directory-based format (`<id>/mission.md` + `<id>/runs.jsonl`).
-    pub fn migrate_flat_to_dirs(&self) -> Result<()> {
-        if !self.dir.exists() {
-            return Ok(());
-        }
-        for entry in fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(ext) = path.extension() else {
-                continue;
-            };
-            if ext != "md" {
-                continue;
-            }
-            let filename = path.file_name().unwrap().to_string_lossy().to_string();
-            let id = filename.strip_suffix(".md").unwrap_or(&filename).to_string();
-
-            // Read the old flat file
-            let content = match fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            // Create directory and write mission.md inside
-            let mission_dir = self.dir.join(&id);
-            if mission_dir.exists() {
-                continue; // already migrated
-            }
-            fs::create_dir_all(&mission_dir)?;
-            fs::write(mission_dir.join("mission.md"), &content)?;
-
-            // Move runs file if it exists
-            let old_runs = self.dir.join(format!("{}.runs.jsonl", id));
-            if old_runs.exists() {
-                let runs_content = fs::read_to_string(&old_runs)?;
-                fs::write(mission_dir.join("runs.jsonl"), runs_content)?;
-                fs::remove_file(&old_runs)?;
-            }
-
-            // Remove old flat file
-            fs::remove_file(&path)?;
-            tracing::info!("Migrated mission '{}' from flat file to directory", id);
+        mission_id: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        let entries = self.list_mission_runs(mission_id)?;
+        let filtered: Vec<&MissionRunEntry> = entries
+            .iter()
+            .filter(|e| e.session_id.as_deref() != Some(session_id))
+            .collect();
+        let path = self.runs_path(mission_id);
+        let mut file = fs::File::create(&path)?;
+        for entry in filtered {
+            serde_json::to_writer(&mut file, entry)?;
+            std::io::Write::write_all(&mut file, b"\n")?;
         }
         Ok(())
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -717,14 +557,14 @@ mod tests {
         let (store, _dir) = temp_store();
 
         let m1 = store
-            .create_mission(Some("Check Status".into()), "*/30 * * * *", "Check status", None, None)
+            .create_mission(Some("Check Status".into()), "*/30 * * * *", "Check status", None, None, None)
             .unwrap();
         assert_eq!(m1.id, "check-status");
         assert!(m1.enabled);
         assert_eq!(m1.agent_id, MISSION_AGENT_ID);
 
         let m2 = store
-            .create_mission(Some("Review Code".into()), "0 9 * * 1-5", "Review code", Some("gpt-4".into()), Some("/tmp/proj".into()))
+            .create_mission(Some("Review Code".into()), "0 9 * * 1-5", "Review code", Some("gpt-4".into()), Some("/tmp/proj".into()), None)
             .unwrap();
         assert_eq!(m2.id, "review-code");
         assert_eq!(m2.project, Some("/tmp/proj".to_string()));
@@ -738,7 +578,7 @@ mod tests {
         let (store, _dir) = temp_store();
 
         let created = store
-            .create_mission(Some("Daily Cleanup".into()), "0 9 * * *", "Clean up old files\n\nRemove build artifacts.", Some("gpt-4".into()), Some("/tmp/proj".into()))
+            .create_mission(Some("Daily Cleanup".into()), "0 9 * * *", "Clean up old files\n\nRemove build artifacts.", Some("gpt-4".into()), Some("/tmp/proj".into()), None)
             .unwrap();
 
         let loaded = store.get_mission("daily-cleanup").unwrap().unwrap();
@@ -755,11 +595,11 @@ mod tests {
         let (store, _dir) = temp_store();
 
         let m = store
-            .create_mission(Some("Test".into()), "0 * * * *", "Hello", None, None)
+            .create_mission(Some("Test".into()), "0 * * * *", "Hello", None, None, None)
             .unwrap();
 
         let updated = store
-            .update_mission(&m.id, None, Some("*/15 * * * *"), Some("Updated prompt"), None, None, Some(false))
+            .update_mission(&m.id, None, Some("*/15 * * * *"), Some("Updated prompt"), None, None, Some(false), None)
             .unwrap();
         assert_eq!(updated.schedule, "*/15 * * * *");
         assert_eq!(updated.prompt, "Updated prompt");
@@ -776,7 +616,7 @@ mod tests {
         let (store, _dir) = temp_store();
 
         let m = store
-            .create_mission(Some("Test".into()), "0 * * * *", "Test", None, None)
+            .create_mission(Some("Test".into()), "0 * * * *", "Test", None, None, None)
             .unwrap();
 
         let entry1 = MissionRunEntry {
@@ -799,8 +639,10 @@ mod tests {
 
         let runs = store.list_mission_runs(&m.id).unwrap();
         assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].run_id, "run-1");
-        assert!(runs[1].skipped);
+        // Newest first (reverse chronological)
+        assert_eq!(runs[0].run_id, "run-2");
+        assert_eq!(runs[1].run_id, "run-1");
+        assert!(runs[0].skipped);
     }
 
     #[test]
@@ -815,10 +657,10 @@ mod tests {
     fn test_duplicate_name_gets_suffix() {
         let (store, _dir) = temp_store();
 
-        let m1 = store.create_mission(Some("Test".into()), "0 * * * *", "First", None, None).unwrap();
+        let m1 = store.create_mission(Some("Test".into()), "0 * * * *", "First", None, None, None).unwrap();
         assert_eq!(m1.id, "test");
 
-        let m2 = store.create_mission(Some("Test".into()), "0 * * * *", "Second", None, None).unwrap();
+        let m2 = store.create_mission(Some("Test".into()), "0 * * * *", "Second", None, None, None).unwrap();
         assert_eq!(m2.id, "test-2");
     }
 
@@ -827,45 +669,11 @@ mod tests {
         let (store, _dir) = temp_store();
 
         let m = store
-            .create_mission(Some("Test".into()), "0 * * * *", "Test", None, None)
+            .create_mission(Some("Test".into()), "0 * * * *", "Test", None, None, None)
             .unwrap();
 
-        let result = store.update_mission(&m.id, None, Some("bad cron"), None, None, None, None);
+        let result = store.update_mission(&m.id, None, Some("bad cron"), None, None, None, None, None);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_migrate_flat_to_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-
-        // Create old flat-format files
-        let md_content = "---\nschedule: '0 9 * * *'\nenabled: true\ncreated_at: 1000\n---\n\nDo stuff\n";
-        fs::write(root.join("my-mission.md"), md_content).unwrap();
-
-        let run_entry = r#"{"run_id":"r1","triggered_at":2000,"status":"completed","skipped":false}"#;
-        fs::write(root.join("my-mission.runs.jsonl"), format!("{}\n", run_entry)).unwrap();
-
-        let store = MissionStore::with_dir(root.clone());
-        store.migrate_flat_to_dirs().unwrap();
-
-        // Old files should be gone
-        assert!(!root.join("my-mission.md").exists());
-        assert!(!root.join("my-mission.runs.jsonl").exists());
-
-        // New directory structure should exist
-        assert!(root.join("my-mission").join("mission.md").exists());
-        assert!(root.join("my-mission").join("runs.jsonl").exists());
-
-        // Data should be intact
-        let m = store.get_mission("my-mission").unwrap().unwrap();
-        assert_eq!(m.schedule, "0 9 * * *");
-        assert_eq!(m.prompt, "Do stuff");
-        assert!(m.enabled);
-
-        let runs = store.list_mission_runs("my-mission").unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].run_id, "r1");
     }
 
     #[test]
@@ -874,7 +682,7 @@ mod tests {
         let root = dir.path().to_path_buf();
 
         let m = store
-            .create_mission(Some("Test Dir".into()), "0 * * * *", "Hello", None, None)
+            .create_mission(Some("Test Dir".into()), "0 * * * *", "Hello", None, None, None)
             .unwrap();
 
         // Verify directory-based layout

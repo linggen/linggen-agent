@@ -131,7 +131,6 @@ class MermaidWidget extends WidgetType {
     return this.code === other.code && this.blockPos === other.blockPos;
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   ignoreEvent(_event: Event) {
     return false;
   }

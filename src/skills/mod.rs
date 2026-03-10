@@ -29,6 +29,12 @@ fn builtin_cache() -> &'static BuiltInCache {
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
+/// Clears the built-in skills cache so the next fetch hits GitHub.
+pub async fn clear_builtin_cache() {
+    let mut cache = builtin_cache().lock().await;
+    *cache = None;
+}
+
 /// Fetches the list of built-in skills from the linggen/skills GitHub repo.
 /// Results are cached for 10 minutes. On error, returns cached data or empty vec.
 pub async fn fetch_builtin_skills() -> Vec<BuiltInSkillInfo> {
@@ -83,37 +89,35 @@ async fn fetch_builtin_skills_inner() -> Result<Vec<BuiltInSkillInfo>> {
 
     let global_skills_dir = crate::paths::global_skills_dir();
 
-    let mut skills = Vec::new();
-    for entry in &entries {
-        if entry.entry_type != "dir" || SKIP_DIRS.contains(&entry.name.as_str()) {
-            continue;
+    let dirs: Vec<&GitHubContentEntry> = entries
+        .iter()
+        .filter(|e| e.entry_type == "dir" && !SKIP_DIRS.contains(&e.name.as_str()))
+        .collect();
+
+    // Fetch all SKILL.md files concurrently.
+    let fetches = dirs.iter().map(|entry| {
+        let client = &client;
+        let url = format!("{}/{}/SKILL.md", GITHUB_RAW_URL, entry.name);
+        async move {
+            let resp = client.get(&url).send().await.ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let text = resp.text().await.ok()?;
+            let (name, description) = parse_frontmatter_meta(&text)?;
+            Some((entry.name.clone(), name, description))
         }
+    });
+    let results = futures_util::future::join_all(fetches).await;
 
-        // Fetch raw SKILL.md for this directory
-        let raw_url = format!("{}/{}/SKILL.md", GITHUB_RAW_URL, entry.name);
-        let resp = match client.get(&raw_url).send().await {
-            Ok(r) if r.status().is_success() => r,
-            _ => continue, // skip dirs without SKILL.md
-        };
-        let text = match resp.text().await {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-
-        // Parse frontmatter for name + description
-        let (name, description) = match parse_frontmatter_meta(&text) {
-            Some(pair) => pair,
-            None => continue,
-        };
-
-        let installed = global_skills_dir.join(&entry.name).join("SKILL.md").exists();
-
-        skills.push(BuiltInSkillInfo {
-            name,
-            description,
-            installed,
-        });
-    }
+    let skills = results
+        .into_iter()
+        .flatten()
+        .map(|(dir_name, name, description)| {
+            let installed = global_skills_dir.join(&dir_name).join("SKILL.md").exists();
+            BuiltInSkillInfo { name, description, installed }
+        })
+        .collect();
 
     Ok(skills)
 }
@@ -136,6 +140,20 @@ fn parse_frontmatter_meta(text: &str) -> Option<(String, String)> {
 
     let meta: Meta = serde_yml::from_str(parts[1]).ok()?;
     Some((meta.name, meta.description))
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AppConfig {
+    /// How to launch: "web" (serve static files), "bash" (run script), "url" (open URL).
+    pub launcher: String,
+    /// Entry point: filename (web/bash) or URL (url launcher).
+    pub entry: String,
+    /// Suggested panel width in pixels.
+    #[serde(default)]
+    pub width: Option<u32>,
+    /// Suggested panel height in pixels.
+    #[serde(default)]
+    pub height: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -162,6 +180,11 @@ pub struct Skill {
     pub agent: Option<String>,
     #[serde(default)]
     pub trigger: Option<String>,
+    #[serde(default)]
+    pub app: Option<AppConfig>,
+    /// Filesystem path to the skill directory (set at load time, not serialized to clients).
+    #[serde(skip)]
+    pub skill_dir: Option<std::path::PathBuf>,
 }
 
 fn default_user_invocable() -> bool {
@@ -198,6 +221,8 @@ struct SkillFrontmatter {
     agent: Option<String>,
     #[serde(default)]
     trigger: Option<String>,
+    #[serde(default)]
+    app: Option<AppConfig>,
 }
 
 pub struct SkillManager {
@@ -279,6 +304,7 @@ impl SkillManager {
                 let text = std::fs::read_to_string(&path)?;
                 if let Ok(mut skill) = self.parse_skill(&text, source.clone()) {
                     if let Some(parent) = path.parent() {
+                        skill.skill_dir = Some(parent.to_path_buf());
                         for tool_def in &mut skill.tool_defs {
                             tool_def.skill_dir = Some(parent.to_path_buf());
                         }
@@ -291,6 +317,7 @@ impl SkillManager {
                 if skill_md.exists() {
                     let text = std::fs::read_to_string(&skill_md)?;
                     if let Ok(mut skill) = self.parse_skill(&text, source.clone()) {
+                        skill.skill_dir = Some(path.clone());
                         for tool_def in &mut skill.tool_defs {
                             tool_def.skill_dir = Some(path.clone());
                         }
@@ -327,6 +354,8 @@ impl SkillManager {
             context: frontmatter.context,
             agent: frontmatter.agent,
             trigger: frontmatter.trigger,
+            app: frontmatter.app,
+            skill_dir: None,
         })
     }
 
@@ -516,6 +545,40 @@ Nested content."#;
         assert_eq!(skills.len(), 2);
         assert!(skills.contains_key("flat-skill"));
         assert!(skills.contains_key("nested-skill"));
+    }
+
+    #[test]
+    fn test_parse_skill_with_app_config() {
+        let mgr = make_manager();
+        let text = r#"---
+name: arcade-game
+description: Retro arcade games
+app:
+  launcher: web
+  entry: index.html
+  width: 800
+  height: 600
+---
+Play games."#;
+        let skill = mgr.parse_skill(text, SkillSource::Global).unwrap();
+        assert_eq!(skill.name, "arcade-game");
+        let app = skill.app.unwrap();
+        assert_eq!(app.launcher, "web");
+        assert_eq!(app.entry, "index.html");
+        assert_eq!(app.width, Some(800));
+        assert_eq!(app.height, Some(600));
+    }
+
+    #[test]
+    fn test_parse_skill_without_app_config() {
+        let mgr = make_manager();
+        let text = r#"---
+name: normal-skill
+description: A normal skill
+---
+No app."#;
+        let skill = mgr.parse_skill(text, SkillSource::Global).unwrap();
+        assert!(skill.app.is_none());
     }
 
     #[test]

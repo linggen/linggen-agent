@@ -227,6 +227,7 @@ pub fn canonical_tool_name(tool: &str) -> Option<&'static str> {
         "WebFetch" | "web_fetch" => "WebFetch",
         "Skill" | "skill" => "Skill",
         "AskUser" | "ask_user" => "AskUser",
+        "RunApp" | "run_app" => "RunApp",
         "ExitPlanMode" | "exit_plan_mode" => "ExitPlanMode",
         "EnterPlanMode" | "enter_plan_mode" => "EnterPlanMode",
         "UpdatePlan" | "update_plan" => "UpdatePlan",
@@ -308,6 +309,12 @@ pub(crate) fn full_tool_schema_entries() -> Vec<Value> {
             },
             "returns": "{answers: [{question_index: number, selected: string[], custom_text?: string}]}",
             "notes": "Ask user 1-4 structured questions with 2-6 options each. User can always type custom text via 'Other'. Blocks until response (5 min timeout). Not available in sub-agents."
+        }),
+        serde_json::json!({
+            "name": "RunApp",
+            "args": {"skill": "string", "args": "string?"},
+            "returns": "{skill,launcher,url}",
+            "notes": "Launch an app-enabled skill. The skill must have an 'app' config with a launcher (web/bash/url). For web apps, returns the URL to open."
         }),
         serde_json::json!({
             "name": "ExitPlanMode",

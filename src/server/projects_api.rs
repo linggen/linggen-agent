@@ -15,6 +15,12 @@ use std::sync::Arc;
 #[derive(Deserialize)]
 pub(crate) struct ProjectQuery {
     project_root: String,
+    /// Max items to return (default: all).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Skip this many items from the start.
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -641,24 +647,30 @@ pub(crate) async fn list_sessions(
 ) -> impl IntoResponse {
     let root = canonical_project_root(&query.project_root);
     match state.manager.get_or_create_project(root).await {
-        Ok(ctx) => match ctx.sessions.list_sessions() {
-            Ok(sessions) => {
-                // Convert to API-compatible format
-                let api_sessions: Vec<serde_json::Value> = sessions
-                    .into_iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "id": s.id,
-                            "repo_path": query.project_root,
-                            "title": s.title,
-                            "created_at": s.created_at,
+        Ok(ctx) => {
+            let total = ctx.sessions.count_sessions();
+            match ctx.sessions.list_sessions_paginated(query.limit, query.offset) {
+                Ok(sessions) => {
+                    let api_sessions: Vec<serde_json::Value> = sessions
+                        .into_iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "id": s.id,
+                                "repo_path": query.project_root,
+                                "title": s.title,
+                                "created_at": s.created_at,
+                            })
                         })
-                    })
-                    .collect();
-                Json(api_sessions).into_response()
+                        .collect();
+                    Json(serde_json::json!({
+                        "sessions": api_sessions,
+                        "total": total,
+                    }))
+                    .into_response()
+                }
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             }
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        },
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -710,17 +722,16 @@ pub(crate) async fn resolve_session_api(
     match state.manager.get_or_create_project(root).await {
         Ok(ctx) => {
             // Check for the most recent session with no messages (empty).
-            if let Ok(sessions) = ctx.sessions.list_sessions() {
+            // Only check the latest few sessions — no need to scan all.
+            if let Ok(sessions) = ctx.sessions.list_sessions_paginated(Some(10), None) {
                 for s in &sessions {
-                    if let Ok(msgs) = ctx.sessions.get_chat_history(&s.id, None) {
-                        if msgs.is_empty() {
-                            return Json(serde_json::json!({
-                                "id": s.id,
-                                "title": s.title,
-                                "reused": true,
-                            }))
-                            .into_response();
-                        }
+                    if !ctx.sessions.session_has_messages(&s.id) {
+                        return Json(serde_json::json!({
+                            "id": s.id,
+                            "title": s.title,
+                            "reused": true,
+                        }))
+                        .into_response();
                     }
                 }
             }

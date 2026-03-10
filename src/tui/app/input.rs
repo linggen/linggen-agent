@@ -341,6 +341,7 @@ impl App {
                 "  /agent <name>     switch default agent".to_string(),
                 "  /model            select default model".to_string(),
                 "  /clear            clear chat context".to_string(),
+                "  /compact [focus]  compact context (summarize old messages)".to_string(),
                 "  /status           show project status".to_string(),
                 "  @agent message    send to specific agent".to_string(),
                 "  /plan <task>      create a plan (read-only)".to_string(),
@@ -542,6 +543,32 @@ impl App {
             return Ok(false);
         }
 
+        // Compact context
+        if line == "/compact" || line.starts_with("/compact ") {
+            let focus = line.strip_prefix("/compact").map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+            self.push_system("Compacting context...");
+            let client = self.client.clone();
+            let project_root = self.project_root.clone();
+            let session_id = self.session_id.clone();
+            let agent_id = self.agent_id.clone();
+            tokio::spawn(async move {
+                match client.compact_chat(&project_root, session_id.as_deref(), Some(&agent_id), focus.as_deref()).await {
+                    Ok(data) => {
+                        let compacted = data.get("compacted").and_then(|v| v.as_bool()).unwrap_or(false);
+                        if compacted {
+                            tracing::info!("Context compacted successfully");
+                        } else {
+                            tracing::info!("Nothing to compact");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to compact chat: {}", e);
+                    }
+                }
+            });
+            return Ok(false);
+        }
+
         // Image commands
         if line == "/image" || line.starts_with("/image ") || line == "/paste" {
             self.handle_image_command(&line);
@@ -694,6 +721,7 @@ impl App {
         ("/agent <name>", "Switch default agent"),
         ("/model <id>", "Switch default model"),
         ("/clear", "Clear chat context"),
+        ("/compact", "Compact context (summarize old messages)"),
         ("/status", "Show project status"),
         ("/plan <task>", "Create a plan"),
         ("/copy", "Copy last response to clipboard"),

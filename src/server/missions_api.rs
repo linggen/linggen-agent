@@ -9,32 +9,13 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
-#[derive(Deserialize)]
-pub(crate) struct OptionalProjectQuery {
-    #[serde(default)]
-    project_root: Option<String>,
-}
-
-/// GET /api/missions — list all global missions (optionally filtered by project).
+/// GET /api/missions — list all global missions.
 pub(crate) async fn list_missions(
     State(state): State<Arc<ServerState>>,
-    Query(q): Query<OptionalProjectQuery>,
 ) -> impl IntoResponse {
     match state.manager.missions.list_all_missions() {
         Ok(missions) => {
-            let filtered = if let Some(ref pr) = q.project_root {
-                if pr == "__all__" {
-                    missions
-                } else {
-                    missions
-                        .into_iter()
-                        .filter(|m| m.project.as_deref() == Some(pr.as_str()) || m.project.is_none())
-                        .collect()
-                }
-            } else {
-                missions
-            };
-            Json(serde_json::json!({ "missions": filtered })).into_response()
+            Json(serde_json::json!({ "missions": missions })).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -54,10 +35,9 @@ pub(crate) struct CreateMissionRequest {
     model: Option<String>,
     #[serde(default)]
     project: Option<String>,
-    // Legacy field — accept but ignore
+    /// Permission tier: "readonly", "standard", "full".
     #[serde(default)]
-    #[allow(dead_code)]
-    project_root: Option<String>,
+    permission_tier: Option<String>,
 }
 
 /// POST /api/missions
@@ -69,7 +49,7 @@ pub(crate) async fn create_mission(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    let project = req.project.or(req.project_root);
+    let project = req.project;
 
     match state.manager.missions.create_mission(
         req.name,
@@ -77,6 +57,7 @@ pub(crate) async fn create_mission(
         &req.prompt,
         req.model,
         project,
+        req.permission_tier,
     ) {
         Ok(mission) => {
             let _ = state.events_tx.send(ServerEvent::StateUpdated);
@@ -120,10 +101,9 @@ pub(crate) struct UpdateMissionRequest {
     project: Option<Option<String>>,
     #[serde(default)]
     enabled: Option<bool>,
-    // Legacy field — accept but ignore
+    /// Permission tier: "readonly", "standard", "full".
     #[serde(default)]
-    #[allow(dead_code)]
-    project_root: Option<String>,
+    permission_tier: Option<String>,
 }
 
 /// PUT /api/missions/:id
@@ -146,6 +126,7 @@ pub(crate) async fn update_mission(
         req.model,
         req.project,
         req.enabled,
+        req.permission_tier,
     ) {
         Ok(mission) => {
             let _ = state.events_tx.send(ServerEvent::StateUpdated);
@@ -206,15 +187,6 @@ pub(crate) async fn trigger_mission(
 
     let root = std::path::PathBuf::from(&project_path);
 
-    // Check if mission agent is busy
-    let agent = match state.manager.get_or_create_agent(&root, MISSION_AGENT_ID).await {
-        Ok(a) => a,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get agent: {}", e)).into_response(),
-    };
-    if agent.try_lock().is_err() {
-        return (StatusCode::CONFLICT, "Mission agent is busy".to_string()).into_response();
-    }
-
     let _ = state.events_tx.send(ServerEvent::MissionTriggered {
         mission_id: mission.id.clone(),
         agent_id: MISSION_AGENT_ID.to_string(),
@@ -226,7 +198,30 @@ pub(crate) async fn trigger_mission(
         .update_agent_activity(&project_path, MISSION_AGENT_ID)
         .await;
 
+    // Pre-create the session so we can return its ID immediately
+    let session_id = crate::server::mission_scheduler::create_mission_session(&mission);
+
+    // Persist the initial user message so the UI has content when it loads the session
+    if let Some(ref sid) = session_id {
+        let store = crate::state_fs::SessionStore::with_sessions_dir(
+            crate::paths::mission_sessions_dir(&mission.id),
+        );
+        let message = format!("[Mission: {}]\n\n{}", mission.id, mission.prompt);
+        let _ = store.add_chat_message(
+            sid,
+            &crate::state_fs::sessions::ChatMsg {
+                agent_id: MISSION_AGENT_ID.to_string(),
+                from_id: "user".to_string(),
+                to_id: MISSION_AGENT_ID.to_string(),
+                content: message,
+                timestamp: crate::util::now_ts_secs(),
+                is_observation: false,
+            },
+        );
+    }
+
     let state_clone = state.clone();
+    let session_id_clone = session_id.clone();
 
     tokio::spawn(async move {
         crate::server::mission_scheduler::dispatch_mission_prompt_public(
@@ -234,19 +229,120 @@ pub(crate) async fn trigger_mission(
             root,
             &project_path,
             &mission,
+            session_id_clone,
         )
         .await;
     });
 
-    Json(serde_json::json!({ "ok": true, "message": "Mission triggered" })).into_response()
+    Json(serde_json::json!({ "ok": true, "message": "Mission triggered", "session_id": session_id })).into_response()
 }
 
-/// GET /api/missions/:id/runs
+/// GET /api/missions/sessions/state?mission_id=xxx&session_id=xxx — read mission session messages
+pub(crate) async fn get_mission_session_state(
+    Query(q): Query<MissionSessionQuery>,
+) -> impl IntoResponse {
+    let Some(session_id) = q.session_id.filter(|s| !s.is_empty()) else {
+        return Json(serde_json::json!({ "messages": [] })).into_response();
+    };
+    let Some(mission_id) = q.mission_id.filter(|s| !s.is_empty()) else {
+        return Json(serde_json::json!({ "messages": [] })).into_response();
+    };
+
+    let store = crate::state_fs::SessionStore::with_sessions_dir(
+        crate::paths::mission_sessions_dir(&mission_id),
+    );
+    let messages = store
+        .get_chat_history(&session_id, None)
+        .unwrap_or_default();
+
+    let mapped: Vec<serde_json::Value> = messages
+        .into_iter()
+        .filter_map(|m| {
+            let cleaned =
+                crate::server::chat_helpers::sanitize_message_for_ui(&m.from_id, &m.content)?;
+            Some(serde_json::json!([
+                {
+                    "id": format!("msg-{}", m.timestamp),
+                    "from": m.from_id,
+                    "to": m.to_id,
+                    "ts": m.timestamp,
+                    "task_id": null
+                },
+                cleaned
+            ]))
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "active_task": null,
+        "user_stories": null,
+        "tasks": [],
+        "messages": mapped
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct MissionSessionQuery {
+    #[serde(default)]
+    mission_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// GET /api/missions/:id/sessions — list sessions for a specific mission
+pub(crate) async fn list_mission_sessions(
+    Path(mission_id): Path<String>,
+) -> impl IntoResponse {
+    let store = crate::state_fs::SessionStore::with_sessions_dir(
+        crate::paths::mission_sessions_dir(&mission_id),
+    );
+    let sessions = store.list_sessions().unwrap_or_default();
+    Json(serde_json::json!({ "sessions": sessions })).into_response()
+}
+
+/// DELETE /api/missions/:mission_id/sessions/:session_id — delete a mission session and its run entry
+pub(crate) async fn delete_mission_session(
+    State(state): State<Arc<ServerState>>,
+    Path((mission_id, session_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let store = crate::state_fs::SessionStore::with_sessions_dir(
+        crate::paths::mission_sessions_dir(&mission_id),
+    );
+    if let Err(e) = store.remove_session(&session_id) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to delete session: {}", e),
+        )
+            .into_response();
+    }
+    // Also remove the corresponding run entry from runs.jsonl
+    let _ = state
+        .manager
+        .missions
+        .remove_run_by_session(&mission_id, &session_id);
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PaginationQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
+/// GET /api/missions/:id/runs?limit=N&offset=N
 pub(crate) async fn list_mission_runs(
     State(state): State<Arc<ServerState>>,
     Path(id): Path<String>,
+    Query(page): Query<PaginationQuery>,
 ) -> impl IntoResponse {
-    match state.manager.missions.list_mission_runs(&id) {
+    match state
+        .manager
+        .missions
+        .list_mission_runs_paginated(&id, page.limit, page.offset)
+    {
         Ok(runs) => Json(serde_json::json!({ "runs": runs })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -48,6 +48,14 @@ pub(crate) struct ClearChatRequest {
     session_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct CompactChatRequest {
+    project_root: String,
+    session_id: Option<String>,
+    agent_id: Option<String>,
+    focus: Option<String>,
+}
+
 fn parse_explicit_target_prefix(message: &str) -> Option<(&str, &str)> {
     let rest = message.strip_prefix('@')?;
     let space_idx = rest.find(' ')?;
@@ -139,6 +147,61 @@ pub(crate) async fn clear_chat_history_api(
     }
 }
 
+pub(crate) async fn compact_chat_api(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<CompactChatRequest>,
+) -> impl IntoResponse {
+    let _session_id = req
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let agent_id = req.agent_id.clone().unwrap_or_else(|| "ling".to_string());
+    let root = match PathBuf::from(&req.project_root).canonicalize() {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    let focus = req.focus.as_deref();
+
+    match state.manager.get_or_create_project(root).await {
+        Ok(ctx) => {
+            let agents = ctx.agents.lock().await;
+            let agent_mutex = match agents.get(&agent_id) {
+                Some(a) => a.clone(),
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        format!("Agent '{}' not found", agent_id),
+                    )
+                        .into_response()
+                }
+            };
+            drop(agents);
+
+            let mut engine = agent_mutex.lock().await;
+            let mut messages = std::mem::take(&mut engine.chat_history);
+            let result = engine.force_compact(&mut messages, focus).await;
+            engine.chat_history = messages;
+            drop(engine);
+
+            let _ = state.events_tx.send(ServerEvent::StateUpdated);
+
+            match result {
+                Some(summary) => Json(serde_json::json!({
+                    "compacted": true,
+                    "summary": summary,
+                }))
+                .into_response(),
+                None => Json(serde_json::json!({
+                    "compacted": false,
+                    "summary": "Nothing to compact — context is too small.",
+                }))
+                .into_response(),
+            }
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 /// Generate a new plan file path in `~/.linggen/plans/`.
 fn new_plan_file_path() -> std::path::PathBuf {
     crate::paths::plans_dir().join(crate::engine::generate_plan_filename())
@@ -181,6 +244,80 @@ async fn run_skill_dispatch(
                     &ctx.agent_id, "user", &err_msg, ctx.session_id.as_deref(), false,
                 )
                 .await;
+                return;
+            }
+            // App skill: skip model, execute directly.
+            if let Some(ref app) = skill.app {
+                let launch_msg = format!("Launching app: {}", skill.name);
+                persist_and_emit_message(
+                    &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+                    "user", &ctx.agent_id, &launch_msg, ctx.session_id.as_deref(), false,
+                )
+                .await;
+
+                match app.launcher.as_str() {
+                    "web" => {
+                        let url = format!("/apps/{}/{}", skill.name, app.entry);
+                        let full_url = format!("http://localhost:{}{}", ctx.state.port, url);
+                        let _ = ctx.events_tx.send(ServerEvent::AppLaunched {
+                            skill: skill.name.clone(),
+                            launcher: "web".to_string(),
+                            url,
+                            title: skill.description.clone(),
+                            width: app.width,
+                            height: app.height,
+                        });
+                        // Also open in the system browser (for TUI users).
+                        let _ = open_in_browser(&full_url);
+                    }
+                    "url" => {
+                        let _ = ctx.events_tx.send(ServerEvent::AppLaunched {
+                            skill: skill.name.clone(),
+                            launcher: "url".to_string(),
+                            url: app.entry.clone(),
+                            title: skill.description.clone(),
+                            width: app.width,
+                            height: app.height,
+                        });
+                        let _ = open_in_browser(&app.entry);
+                    }
+                    "bash" => {
+                        if let Some(ref skill_dir) = skill.skill_dir {
+                            let script = skill_dir.join(&app.entry);
+                            let mut cmd = std::process::Command::new("sh");
+                            cmd.arg(script.as_os_str());
+                            if let Some(ref args) = user_args {
+                                for arg in args.split_whitespace() {
+                                    cmd.arg(arg);
+                                }
+                            }
+                            cmd.current_dir(&ctx.root);
+                            match cmd.output()
+                            {
+                                Ok(output) => {
+                                    let result_msg = String::from_utf8_lossy(&output.stdout).to_string();
+                                    if !result_msg.trim().is_empty() {
+                                        persist_and_emit_message(
+                                            &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+                                            &ctx.agent_id, "user", &result_msg, ctx.session_id.as_deref(), false,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                Err(e) => {
+                                    let err_msg = format!("Failed to run app: {}", e);
+                                    persist_and_emit_message(
+                                        &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+                                        &ctx.agent_id, "user", &err_msg, ctx.session_id.as_deref(), false,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                let _ = ctx.events_tx.send(ServerEvent::StateUpdated);
                 return;
             }
             engine.active_skill = Some(skill);
@@ -387,7 +524,7 @@ async fn run_plan_dispatch(
         while let Some(event) = thinking_rx.recv().await {
             match event {
                 crate::engine::ThinkingEvent::Token(token) => {
-                    let _ = events_tx_clone.send(ServerEvent::Token {
+                    let _ = events_tx_clone.send(ServerEvent::Token { session_id: None,
                         agent_id: agent_id_clone.clone(),
                         token,
                         done: false,
@@ -395,7 +532,7 @@ async fn run_plan_dispatch(
                     });
                 }
                 crate::engine::ThinkingEvent::ContentToken(token) => {
-                    let _ = events_tx_clone.send(ServerEvent::Token {
+                    let _ = events_tx_clone.send(ServerEvent::Token { session_id: None,
                         agent_id: agent_id_clone.clone(),
                         token,
                         done: false,
@@ -403,7 +540,7 @@ async fn run_plan_dispatch(
                     });
                 }
                 crate::engine::ThinkingEvent::Done => {
-                    let _ = events_tx_clone.send(ServerEvent::Token {
+                    let _ = events_tx_clone.send(ServerEvent::Token { session_id: None,
                         agent_id: agent_id_clone.clone(),
                         token: String::new(),
                         done: true,
@@ -411,7 +548,7 @@ async fn run_plan_dispatch(
                     });
                 }
                 crate::engine::ThinkingEvent::ContentDone => {
-                    let _ = events_tx_clone.send(ServerEvent::Token {
+                    let _ = events_tx_clone.send(ServerEvent::Token { session_id: None,
                         agent_id: agent_id_clone.clone(),
                         token: String::new(),
                         done: true,
@@ -506,22 +643,22 @@ async fn run_plan_execution(
         while let Some(event) = thinking_rx.recv().await {
             match event {
                 crate::engine::ThinkingEvent::Token(token) => {
-                    let _ = events_tx_clone.send(ServerEvent::Token {
+                    let _ = events_tx_clone.send(ServerEvent::Token { session_id: None,
                         agent_id: agent_id_clone.clone(), token, done: false, thinking: true,
                     });
                 }
                 crate::engine::ThinkingEvent::ContentToken(token) => {
-                    let _ = events_tx_clone.send(ServerEvent::Token {
+                    let _ = events_tx_clone.send(ServerEvent::Token { session_id: None,
                         agent_id: agent_id_clone.clone(), token, done: false, thinking: false,
                     });
                 }
                 crate::engine::ThinkingEvent::Done => {
-                    let _ = events_tx_clone.send(ServerEvent::Token {
+                    let _ = events_tx_clone.send(ServerEvent::Token { session_id: None,
                         agent_id: agent_id_clone.clone(), token: String::new(), done: true, thinking: true,
                     });
                 }
                 crate::engine::ThinkingEvent::ContentDone => {
-                    let _ = events_tx_clone.send(ServerEvent::Token {
+                    let _ = events_tx_clone.send(ServerEvent::Token { session_id: None,
                         agent_id: agent_id_clone.clone(), token: String::new(), done: true, thinking: false,
                     });
                 }
@@ -700,7 +837,7 @@ async fn run_structured_loop(
         while let Some(event) = thinking_rx.recv().await {
             match event {
                 crate::engine::ThinkingEvent::Token(token) => {
-                    let _ = events_tx_clone.send(ServerEvent::Token {
+                    let _ = events_tx_clone.send(ServerEvent::Token { session_id: None,
                         agent_id: agent_id_clone.clone(),
                         token,
                         done: false,
@@ -708,7 +845,7 @@ async fn run_structured_loop(
                     });
                 }
                 crate::engine::ThinkingEvent::ContentToken(token) => {
-                    let _ = events_tx_clone.send(ServerEvent::Token {
+                    let _ = events_tx_clone.send(ServerEvent::Token { session_id: None,
                         agent_id: agent_id_clone.clone(),
                         token,
                         done: false,
@@ -716,7 +853,7 @@ async fn run_structured_loop(
                     });
                 }
                 crate::engine::ThinkingEvent::Done => {
-                    let _ = events_tx_clone.send(ServerEvent::Token {
+                    let _ = events_tx_clone.send(ServerEvent::Token { session_id: None,
                         agent_id: agent_id_clone.clone(),
                         token: String::new(),
                         done: true,
@@ -724,7 +861,7 @@ async fn run_structured_loop(
                     });
                 }
                 crate::engine::ThinkingEvent::ContentDone => {
-                    let _ = events_tx_clone.send(ServerEvent::Token {
+                    let _ = events_tx_clone.send(ServerEvent::Token { session_id: None,
                         agent_id: agent_id_clone.clone(),
                         token: String::new(),
                         done: true,
@@ -1348,4 +1485,21 @@ mod tests {
         let parsed = parse_explicit_target_prefix("@coder! please review");
         assert_eq!(parsed, None);
     }
+}
+
+/// Open a URL in the system's default browser.
+fn open_in_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn()?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn()?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd").args(["/C", "start", url]).spawn()?;
+    }
+    Ok(())
 }

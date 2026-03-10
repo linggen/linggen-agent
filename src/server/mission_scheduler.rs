@@ -44,7 +44,6 @@ impl MissionState {
 pub async fn mission_scheduler_loop(state: Arc<ServerState>) {
     let mut interval = time::interval(Duration::from_secs(CHECK_INTERVAL_SECS));
     let mut mission_states: HashMap<String, MissionState> = HashMap::new();
-    let mut migrated = false;
 
     loop {
         interval.tick().await;
@@ -52,13 +51,6 @@ pub async fn mission_scheduler_loop(state: Arc<ServerState>) {
         let now = Local::now();
         let today = now.date_naive();
         let current_minute = now.timestamp() / 60;
-
-        // One-time migrations
-        if !migrated {
-            let _ = state.manager.missions.migrate_flat_to_dirs();
-            let _ = state.manager.missions.migrate_from_project_store(&state.manager.store);
-            migrated = true;
-        }
 
         let enabled_missions = match state.manager.missions.list_enabled_missions() {
             Ok(m) => m,
@@ -122,17 +114,9 @@ pub async fn mission_scheduler_loop(state: Arc<ServerState>) {
                     "Mission scheduler: mission agent is busy, skipping mission '{}'",
                     mission.id
                 );
-                let entry = MissionRunEntry {
-                    run_id: String::new(),
-                    session_id: None,
-                    triggered_at: crate::util::now_ts_secs(),
-                    status: "skipped".to_string(),
-                    skipped: true,
-                };
-                let _ = state
-                    .manager
-                    .missions
-                    .append_mission_run(&mission.id, &entry);
+                // Don't record skipped entries — they flood the runs list
+                // and add no value. The dedup check already prevents re-firing.
+                ms.last_fire_minute = Some(current_minute);
                 continue;
             }
 
@@ -167,6 +151,7 @@ pub async fn mission_scheduler_loop(state: Arc<ServerState>) {
                     root_owned,
                     &project_path_owned,
                     &mission_owned,
+                    None,
                 )
                 .await;
             });
@@ -210,51 +195,40 @@ fn mission_session_title(mission: &Mission) -> String {
     format!("Mission: {}{} — {}", prompt_preview, suffix, time)
 }
 
-/// Create a new session for a mission run.
-async fn create_mission_session(
-    state: &Arc<ServerState>,
-    project_path: &str,
-    mission: &Mission,
-) -> Option<String> {
+/// Create a new session for a mission run under `~/.linggen/missions/{mission_id}/sessions/`.
+pub fn create_mission_session(mission: &Mission) -> Option<String> {
     let session_id = format!(
         "sess-{}-{}",
         crate::util::now_ts_secs(),
         &uuid::Uuid::new_v4().to_string()[..8]
     );
-    let root = match std::path::PathBuf::from(project_path).canonicalize() {
-        Ok(r) => r,
-        Err(_) => std::path::PathBuf::from(project_path),
+    let store = crate::state_fs::SessionStore::with_sessions_dir(
+        crate::paths::mission_sessions_dir(&mission.id),
+    );
+    let meta = crate::state_fs::sessions::SessionMeta {
+        id: session_id.clone(),
+        title: mission_session_title(mission),
+        created_at: crate::util::now_ts_secs(),
     };
-    match state.manager.get_or_create_project(root).await {
-        Ok(ctx) => {
-            let meta = crate::state_fs::sessions::SessionMeta {
-                id: session_id.clone(),
-                title: mission_session_title(mission),
-                created_at: crate::util::now_ts_secs(),
-            };
-            match ctx.sessions.add_session(&meta) {
-                Ok(_) => Some(session_id),
-                Err(e) => {
-                    warn!("Mission scheduler: failed to create session: {}", e);
-                    None
-                }
-            }
-        }
+    match store.add_session(&meta) {
+        Ok(_) => Some(session_id),
         Err(e) => {
-            warn!("Mission scheduler: failed to get project for session: {}", e);
+            warn!("Mission scheduler: failed to create session: {}", e);
             None
         }
     }
 }
 
 /// Public wrapper for triggering a mission manually (from API).
+/// Accepts an optional pre-created `session_id` so the caller can return it immediately.
 pub async fn dispatch_mission_prompt_public(
     state: Arc<ServerState>,
     root: std::path::PathBuf,
     project_path: &str,
     mission: &Mission,
+    session_id: Option<String>,
 ) {
-    dispatch_mission_prompt(state, root, project_path, mission).await;
+    dispatch_mission_prompt(state, root, project_path, mission, session_id).await;
 }
 
 /// Dispatch a mission prompt to the mission agent.
@@ -263,6 +237,7 @@ async fn dispatch_mission_prompt(
     root: std::path::PathBuf,
     project_path: &str,
     mission: &Mission,
+    pre_session_id: Option<String>,
 ) {
     use crate::server::AgentStatusKind;
 
@@ -286,11 +261,13 @@ async fn dispatch_mission_prompt(
         return;
     };
 
-    // Create a session for this run
-    let session_id = create_mission_session(&state, project_path, mission).await;
+    // Use pre-created session or create a new one
+    let has_pre_session = pre_session_id.is_some();
+    let session_id = pre_session_id.or_else(|| create_mission_session(mission));
 
     let manager = state.manager.clone();
     let events_tx = state.events_tx.clone();
+    let missions_sessions_dir = crate::paths::mission_sessions_dir(&mission.id);
 
     // Begin a run record
     let run_id = match manager
@@ -319,19 +296,26 @@ async fn dispatch_mission_prompt(
         mission.id, mission.prompt
     );
 
-    // Persist and emit the mission prompt as a system message
-    crate::server::chat_helpers::persist_and_emit_message(
-        &manager,
-        &events_tx,
-        &root,
-        agent_id,
-        "system",
-        agent_id,
-        &message,
-        session_id.as_deref(),
-        false,
-    )
-    .await;
+    // Persist the mission prompt as a "user" message so it appears in the session chat.
+    // Skip if the trigger API already persisted it (pre-created session).
+    if !has_pre_session {
+        let mission_store = crate::state_fs::SessionStore::with_sessions_dir(
+            missions_sessions_dir.clone(),
+        );
+        if let Some(sid) = session_id.as_deref() {
+            let _ = mission_store.add_chat_message(
+                sid,
+                &crate::state_fs::sessions::ChatMsg {
+                    agent_id: agent_id.to_string(),
+                    from_id: "user".to_string(),
+                    to_id: agent_id.to_string(),
+                    content: message.clone(),
+                    timestamp: crate::util::now_ts_secs(),
+                    is_observation: false,
+                },
+            );
+        }
+    }
 
     state
         .send_agent_status(
@@ -346,7 +330,49 @@ async fn dispatch_mission_prompt(
     engine.task = Some(message.clone());
     engine.set_parent_agent(None);
     engine.set_run_id(Some(run_id.clone()));
+    // Route session persistence to the missions sessions directory
+    engine.cfg.session_root = Some(missions_sessions_dir);
+
+    // Force Auto permission mode — missions run without human supervision,
+    // so Ask/AcceptEdits would hang forever waiting for approval.
+    engine.cfg.tool_permission_mode = crate::config::ToolPermissionMode::Auto;
+
+    // Apply permission tier restrictions.
+    apply_permission_tier(&mut engine, &mission.permission_tier);
+
+    // Wire up thinking channel so tokens are emitted as SSE events,
+    // allowing the UI to stream mission output in real time.
+    let (thinking_tx, mut thinking_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::engine::ThinkingEvent>();
+    engine.thinking_tx = Some(thinking_tx);
+
+    let events_tx_stream = events_tx.clone();
+    let agent_id_stream = agent_id.to_string();
+    let session_id_stream = session_id.clone();
+    tokio::spawn(async move {
+        while let Some(event) = thinking_rx.recv().await {
+            let (token, done, thinking) = match event {
+                crate::engine::ThinkingEvent::Token(t) => (t, false, true),
+                crate::engine::ThinkingEvent::ContentToken(t) => (t, false, false),
+                crate::engine::ThinkingEvent::Done => (String::new(), true, true),
+                crate::engine::ThinkingEvent::ContentDone => (String::new(), true, false),
+            };
+            let _ = events_tx_stream.send(ServerEvent::Token {
+                agent_id: agent_id_stream.clone(),
+                token,
+                done,
+                thinking,
+                session_id: session_id_stream.clone(),
+            });
+            // Emit StateUpdated on content done so the UI reloads persisted messages
+            if done && !thinking {
+                let _ = events_tx_stream.send(ServerEvent::StateUpdated);
+            }
+        }
+    });
+
     let result = engine.run_agent_loop(session_id.as_deref()).await;
+    engine.thinking_tx = None;
     engine.set_run_id(None);
 
     let status = match result {
@@ -393,6 +419,75 @@ async fn dispatch_mission_prompt(
 
     // Record mission run
     record_mission_run(&state, mission, &run_id, session_id.as_deref(), status, false);
+}
+
+/// Configure engine restrictions based on the mission's permission tier.
+///
+/// - **readonly**: Only read/search/web tools. No Write, Edit, Bash.
+/// - **standard**: All tools, but Bash restricted to build/test/git-read commands.
+/// - **full** (default): All tools, no restrictions.
+fn apply_permission_tier(engine: &mut crate::engine::AgentEngine, tier: &str) {
+    use std::collections::HashSet;
+
+    match tier {
+        "readonly" => {
+            let allowed: HashSet<String> = [
+                "Read", "Glob", "Grep", "WebSearch", "WebFetch", "Task",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            engine.cfg.mission_allowed_tools = Some(allowed);
+        }
+        "standard" => {
+            // All tools allowed, but bash restricted to safe commands.
+            let prefixes = vec![
+                // Build & test
+                "cargo ".to_string(),
+                "npm ".to_string(),
+                "npx ".to_string(),
+                "yarn ".to_string(),
+                "pnpm ".to_string(),
+                "make".to_string(),
+                "pytest".to_string(),
+                "python -m pytest".to_string(),
+                "python -m unittest".to_string(),
+                "go ".to_string(),
+                "mvn ".to_string(),
+                "gradle ".to_string(),
+                // Git read-only
+                "git status".to_string(),
+                "git log".to_string(),
+                "git diff".to_string(),
+                "git show".to_string(),
+                "git branch".to_string(),
+                "git remote".to_string(),
+                // Safe read commands
+                "ls".to_string(),
+                "pwd".to_string(),
+                "wc ".to_string(),
+                "cat ".to_string(),
+                "head ".to_string(),
+                "tail ".to_string(),
+                "find ".to_string(),
+                "which ".to_string(),
+                "echo ".to_string(),
+                "env".to_string(),
+                "printenv".to_string(),
+                "uname".to_string(),
+                "whoami".to_string(),
+                "date".to_string(),
+                "df ".to_string(),
+                "du ".to_string(),
+                "tree ".to_string(),
+                "file ".to_string(),
+            ];
+            engine.cfg.bash_allow_prefixes = Some(prefixes);
+        }
+        _ => {
+            // "full" or unknown: no restrictions
+        }
+    }
 }
 
 fn record_mission_run(

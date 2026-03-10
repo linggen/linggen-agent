@@ -38,7 +38,7 @@ use agent_api::{
     cancel_agent_run, cancel_tool_execution,
     run_agent, set_task,
 };
-use chat_api::{approve_plan_handler, ask_user_response_handler, chat_handler, clear_chat_history_api, edit_plan_handler, reject_plan_handler};
+use chat_api::{approve_plan_handler, ask_user_response_handler, chat_handler, clear_chat_history_api, compact_chat_api, edit_plan_handler, reject_plan_handler};
 use config_api::{get_config_api, get_credentials_api, get_models_health, update_config_api, update_credentials_api, get_codex_auth_status, start_codex_auth_login, codex_auth_logout};
 use projects_api::{
     add_project, create_session, delete_agent_file_api, delete_skill_file_api,
@@ -50,7 +50,8 @@ use projects_api::{
 };
 use marketplace_api::{builtin_skills_install, builtin_skills_install_all, builtin_skills_list, marketplace_install, marketplace_list, marketplace_move_to_global, marketplace_search, marketplace_uninstall};
 use missions_api::{
-    create_mission, delete_mission, get_mission, list_mission_runs, list_missions,
+    create_mission, delete_mission, delete_mission_session, get_mission,
+    get_mission_session_state, list_mission_runs, list_mission_sessions, list_missions,
     trigger_mission, update_mission,
 };
 use storage_api::{storage_roots, storage_tree, storage_read_file, storage_write_file, storage_delete_file};
@@ -63,6 +64,7 @@ struct Assets;
 pub struct ServerState {
     pub manager: Arc<AgentManager>,
     pub dev_mode: bool,
+    pub port: u16,
     pub events_tx: broadcast::Sender<ServerEvent>,
     pub skill_manager: Arc<crate::skills::SkillManager>,
     pub prompt_store: Arc<crate::prompts::PromptStore>,
@@ -196,6 +198,8 @@ pub enum ServerEvent {
         token: String,
         done: bool,
         thinking: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     PlanUpdate {
         agent_id: String,
@@ -231,6 +235,15 @@ pub enum ServerEvent {
     Resync {
         reason: String,
         lagged_count: Option<u64>,
+    },
+    /// An app-enabled skill was launched (web, bash, or url).
+    AppLaunched {
+        skill: String,
+        launcher: String,
+        url: String,
+        title: String,
+        width: Option<u32>,
+        height: Option<u32>,
     },
     /// A new content block started within the current assistant turn.
     ContentBlockStart {
@@ -570,6 +583,7 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
             token,
             done,
             thinking,
+            session_id,
         } => Some(UiSseMessage {
             id: format!("token-{agent_id}-{seq}"),
             seq,
@@ -579,7 +593,7 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
             phase: if done { Some(UI_PHASE_DONE.to_string()) } else { None },
             text: Some(token),
             agent_id: Some(agent_id),
-            session_id: None,
+            session_id,
             project_root: None,
             data: if thinking { Some(json!({ "thinking": true })) } else { None },
         }),
@@ -714,6 +728,33 @@ fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Option<UiSseM
             data: Some(json!({
                 "reason": reason,
                 "lagged_count": lagged_count,
+            })),
+        }),
+        ServerEvent::AppLaunched {
+            skill,
+            launcher,
+            url,
+            title,
+            width,
+            height,
+        } => Some(UiSseMessage {
+            id: format!("app-launched-{skill}-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: "app_launched".to_string(),
+            phase: None,
+            text: Some(format!("Launched app: {}", title)),
+            agent_id: None,
+            session_id: None,
+            project_root: None,
+            data: Some(json!({
+                "skill": skill,
+                "launcher": launcher,
+                "url": url,
+                "title": title,
+                "width": width,
+                "height": height,
             })),
         }),
         ServerEvent::ContentBlockStart {
@@ -915,6 +956,7 @@ pub async fn prepare_server(
     let state = Arc::new(ServerState {
         manager,
         dev_mode,
+        port,
         events_tx,
         skill_manager,
         prompt_store,
@@ -1034,11 +1076,15 @@ pub async fn prepare_server(
         .route("/api/agent-cancel", post(cancel_agent_run))
         .route("/api/tool-cancel", post(cancel_tool_execution))
         .route("/api/missions", get(list_missions).post(create_mission))
+        .route("/api/missions/sessions/state", get(get_mission_session_state))
         .route("/api/missions/{id}", get(get_mission).put(update_mission).delete(delete_mission))
         .route("/api/missions/{id}/runs", get(list_mission_runs))
+        .route("/api/missions/{id}/sessions", get(list_mission_sessions))
+        .route("/api/missions/{mission_id}/sessions/{session_id}", delete(delete_mission_session))
         .route("/api/missions/{id}/trigger", post(trigger_mission))
         .route("/api/chat", post(chat_handler))
         .route("/api/chat/clear", post(clear_chat_history_api))
+        .route("/api/chat/compact", post(compact_chat_api))
         .route("/api/plan/approve", post(approve_plan_handler))
         .route("/api/plan/edit", post(edit_plan_handler))
         .route("/api/plan/reject", post(reject_plan_handler))
@@ -1056,6 +1102,7 @@ pub async fn prepare_server(
         .route("/api/storage/roots", get(storage_roots))
         .route("/api/storage/tree", get(storage_tree))
         .route("/api/storage/file", get(storage_read_file).put(storage_write_file).delete(storage_delete_file))
+        .route("/apps/{skill_name}/{*file_path}", get(serve_app_file))
         .fallback(static_handler)
         .with_state(state.clone());
 
@@ -1090,6 +1137,73 @@ pub async fn start_server(
     let handle = prepare_server(manager, skill_manager, port, dev_mode, agent_events_rx).await?;
     handle.task.await??;
     Ok(())
+}
+
+/// Serve static files from an app-enabled skill's directory.
+/// Route: GET /apps/{skill_name}/{*file_path}
+async fn serve_app_file(
+    State(state): State<Arc<ServerState>>,
+    axum::extract::Path((skill_name, file_path)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let build_err = |status: u16, msg: &str| -> Response {
+        Response::builder()
+            .status(status)
+            .header("Content-Type", "text/plain")
+            .body(axum::body::Body::from(msg.to_string()))
+            .unwrap_or_else(|_| Response::new(axum::body::Body::from("internal server error")))
+    };
+
+    // Look up the skill.
+    let skill = state.skill_manager.get_skill(&skill_name).await;
+    let Some(skill) = skill else {
+        return build_err(404, &format!("Skill '{}' not found", skill_name));
+    };
+
+    // Verify it has app config with web launcher.
+    let Some(ref app) = skill.app else {
+        return build_err(403, &format!("Skill '{}' is not an app", skill_name));
+    };
+    if app.launcher != "web" {
+        return build_err(403, &format!("Skill '{}' app launcher is '{}', not 'web'", skill_name, app.launcher));
+    }
+
+    // Resolve the file within the skill directory.
+    let Some(ref skill_dir) = skill.skill_dir else {
+        return build_err(500, "Skill directory not available");
+    };
+
+    // Sanitize: reject path traversal.
+    let file_path_clean = file_path.trim_start_matches('/');
+    if file_path_clean.contains("..") {
+        return build_err(403, "Path traversal not allowed");
+    }
+
+    let full_path = skill_dir.join(file_path_clean);
+
+    // Canonicalize both paths to resolve symlinks and prevent escape.
+    let canonical_dir = match tokio::fs::canonicalize(skill_dir).await {
+        Ok(p) => p,
+        Err(_) => return build_err(500, "Skill directory not accessible"),
+    };
+    let canonical_full = match tokio::fs::canonicalize(&full_path).await {
+        Ok(p) => p,
+        Err(_) => return build_err(404, &format!("File not found: {}", file_path_clean)),
+    };
+    if !canonical_full.starts_with(&canonical_dir) {
+        return build_err(403, "Path traversal not allowed");
+    }
+
+    match tokio::fs::read(&canonical_full).await {
+        Ok(content) => {
+            let mime = mime_guess::from_path(&full_path).first_or_octet_stream();
+            Response::builder()
+                .header("Content-Type", mime.as_ref())
+                .header("X-Frame-Options", "ALLOWALL")
+                .body(axum::body::Body::from(content))
+                .unwrap_or_else(|_| Response::new(axum::body::Body::from("internal server error")))
+        }
+        Err(_) => build_err(404, &format!("File not found: {}", file_path_clean)),
+    }
 }
 
 async fn static_handler(State(state): State<Arc<ServerState>>, uri: Uri) -> Response {

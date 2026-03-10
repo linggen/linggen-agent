@@ -290,11 +290,14 @@ mod tests {
         AgentEngine::new(
             EngineConfig {
                 ws_root: tmp.to_path_buf(),
+                session_root: None,
                 max_iters: 1,
                 write_safety_mode: crate::config::WriteSafetyMode::Off,
                 tool_permission_mode: crate::config::ToolPermissionMode::Auto,
                 prompt_loop_breaker: None,
                 interface_mode: InterfaceMode::Both,
+                bash_allow_prefixes: None,
+                mission_allowed_tools: None,
             },
             model_manager,
             "test".to_string(),

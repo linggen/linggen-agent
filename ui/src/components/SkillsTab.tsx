@@ -68,9 +68,10 @@ export const SkillsTab: React.FC<{
   // Built-in skills state
   const [builtInSkills, setBuiltInSkills] = useState<BuiltInSkillInfo[]>([]);
   const [biInstalling, setBiInstalling] = useState<Set<string>>(new Set());
-  const fetchBuiltInSkills = useCallback(async () => {
+  const fetchBuiltInSkills = useCallback(async (refresh = false) => {
     try {
-      const resp = await fetch('/api/builtin-skills');
+      const url = refresh ? '/api/builtin-skills?refresh=true' : '/api/builtin-skills';
+      const resp = await fetch(url);
       if (resp.ok) setBuiltInSkills(await resp.json());
     } catch { /* ignore */ }
   }, []);
@@ -114,21 +115,21 @@ export const SkillsTab: React.FC<{
     } catch { /* ignore */ }
   }, [projectRoot]);
 
-  useEffect(() => {
-    fetchSkills();
-    fetchSkillFiles();
-    fetchBuiltInSkills();
-    fetchMarketplaceList();
-  }, [fetchSkills, fetchSkillFiles, fetchBuiltInSkills]);
-
-  const fetchMarketplaceList = async () => {
+  const fetchMarketplaceList = useCallback(async () => {
     setMpLoading(true);
     try {
       const resp = await fetch('/api/marketplace/list?limit=20');
       if (resp.ok) setMpResults(await resp.json());
     } catch { /* ignore */ }
     setMpLoading(false);
-  };
+  }, []);
+
+  useEffect(() => {
+    fetchSkills();
+    fetchSkillFiles();
+    fetchBuiltInSkills();
+    fetchMarketplaceList();
+  }, [fetchSkills, fetchSkillFiles, fetchBuiltInSkills, fetchMarketplaceList]);
 
   const searchMarketplace = async (q: string) => {
     if (!q.trim()) {
@@ -339,7 +340,7 @@ export const SkillsTab: React.FC<{
     }
   };
 
-  const deleteSkillFile = async (path: string) => {
+  const _deleteSkillFile = async (path: string) => {
     if (!confirm(`Delete skill file ${path}?`)) return;
     try {
       const resp = await fetch('/api/skill-file', {
@@ -366,7 +367,7 @@ export const SkillsTab: React.FC<{
 
   const refreshAll = async () => {
     setRefreshing(true);
-    await Promise.all([fetchSkills(), fetchSkillFiles(), fetchBuiltInSkills(), fetchMarketplaceList()]);
+    await Promise.all([fetchSkills(), fetchSkillFiles(), fetchBuiltInSkills(true), fetchMarketplaceList()]);
     setRefreshing(false);
   };
 

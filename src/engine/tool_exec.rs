@@ -351,6 +351,20 @@ impl AgentEngine {
             }
         }
 
+        // --- mission tool restriction gate ---
+        // Block tools not in mission_allowed_tools (set by permission tier).
+        if let Some(ref allowed) = self.cfg.mission_allowed_tools {
+            if !allowed.contains(&canonical_tool) {
+                let msg = format!(
+                    "Tool '{}' is not allowed by this mission's permission tier. Available tools: {}",
+                    canonical_tool,
+                    allowed.iter().cloned().collect::<Vec<_>>().join(", ")
+                );
+                messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
+                return PreExecOutcome::Blocked(LoopControl::Continue);
+            }
+        }
+
         // --- tool permission gate ---
         let is_destructive = permission::is_destructive_tool(&canonical_tool);
         let is_web = permission::is_web_tool(&canonical_tool);
@@ -413,6 +427,28 @@ impl AgentEngine {
             );
             messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
             return PreExecOutcome::Blocked(LoopControl::Continue);
+        }
+
+        // --- mission bash prefix restriction ---
+        // When bash_allow_prefixes is set, block bash commands not matching any prefix.
+        if canonical_tool == "Bash" {
+            if let Some(ref prefixes) = self.cfg.bash_allow_prefixes {
+                let cmd = bash_command.as_deref().unwrap_or("");
+                let cmd_trimmed = cmd.trim();
+                let allowed = prefixes.iter().any(|prefix| {
+                    cmd_trimmed.starts_with(prefix)
+                });
+                if !allowed {
+                    let msg = format!(
+                        "Bash command not allowed by this mission's permission tier. \
+                         Command: '{}'. Allowed prefixes: {}",
+                        cmd_trimmed,
+                        prefixes.join(", ")
+                    );
+                    messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
+                    return PreExecOutcome::Blocked(LoopControl::Continue);
+                }
+            }
         }
 
         if needs_permission {
@@ -703,7 +739,7 @@ impl AgentEngine {
             .to_string();
             manager
                 .add_chat_message(
-                    &self.cfg.ws_root,
+                    self.session_storage_root(),
                     session_id.unwrap_or("default"),
                     &crate::state_fs::sessions::ChatMsg {
                         agent_id: from.clone(),

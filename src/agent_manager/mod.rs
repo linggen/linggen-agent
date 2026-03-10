@@ -584,11 +584,14 @@ impl AgentManager {
         let mut engine = AgentEngine::new(
             EngineConfig {
                 ws_root: project_root.clone(),
+                session_root: None,
                 max_iters: config.agent.max_iters,
                 write_safety_mode: config.agent.write_safety_mode,
                 tool_permission_mode: config.agent.tool_permission_mode,
                 prompt_loop_breaker: config.agent.prompt_loop_breaker.clone(),
                 interface_mode: self.interface_mode,
+                bash_allow_prefixes: None,
+                mission_allowed_tools: None,
             },
             models,
             model_id,
@@ -669,11 +672,14 @@ impl AgentManager {
         let mut engine = AgentEngine::new(
             EngineConfig {
                 ws_root: project_root.clone(),
+                session_root: None,
                 max_iters: config.agent.max_iters,
                 write_safety_mode: config.agent.write_safety_mode,
                 tool_permission_mode: config.agent.tool_permission_mode,
                 prompt_loop_breaker: config.agent.prompt_loop_breaker.clone(),
                 interface_mode: self.interface_mode,
+                bash_allow_prefixes: None,
+                mission_allowed_tools: None,
             },
             models,
             model_id,
@@ -1055,13 +1061,28 @@ impl AgentManager {
         Ok(())
     }
 
+    /// Create a `SessionStore` for the global missions sessions directory.
+    pub fn missions_session_store(&self) -> SessionStore {
+        SessionStore::with_sessions_dir(crate::paths::missions_sessions_dir())
+    }
+
     /// Convenience: persist a chat message via the project's flat-file session store.
+    /// If `ws_root` points to the missions sessions directory, persists there directly.
     pub async fn add_chat_message(
         &self,
         ws_root: &std::path::Path,
         session_id: &str,
         msg: &crate::state_fs::sessions::ChatMsg,
     ) {
+        // Mission session roots live under `~/.linggen/missions/{id}/sessions/`.
+        let missions_base = crate::paths::global_missions_dir();
+        if ws_root.starts_with(&missions_base) {
+            let store = SessionStore::with_sessions_dir(ws_root.to_path_buf());
+            if let Err(e) = store.add_chat_message(session_id, msg) {
+                tracing::warn!("Failed to persist chat message to mission store: {}", e);
+            }
+            return;
+        }
         if let Ok(ctx) = self.get_or_create_project(ws_root.to_path_buf()).await {
             if let Err(e) = ctx.sessions.add_chat_message(session_id, msg) {
                 tracing::warn!("Failed to persist chat message: {}", e);

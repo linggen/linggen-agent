@@ -58,6 +58,16 @@ pub fn global_missions_dir() -> PathBuf {
     linggen_home().join("missions")
 }
 
+/// `~/.linggen/missions/sessions/` (legacy global dir — kept for migration)
+pub fn missions_sessions_dir() -> PathBuf {
+    global_missions_dir().join("sessions")
+}
+
+/// `~/.linggen/missions/{mission_id}/sessions/`
+pub fn mission_sessions_dir(mission_id: &str) -> PathBuf {
+    global_missions_dir().join(mission_id).join("sessions")
+}
+
 /// `~/.linggen/projects/`
 pub fn projects_dir() -> PathBuf {
     linggen_home().join("projects")
