@@ -448,8 +448,68 @@ impl ModelManager {
                     .await;
                 Ok(*value?)
             }
-            ProviderClient::OpenAi(_) => Ok(None),
+            ProviderClient::OpenAi(client) => {
+                let model_name = instance.config.model.clone();
+                let client = client.clone();
+                let value = instance
+                    .context_window
+                    .get_or_try_init(|| {
+                        let model_name = model_name.clone();
+                        async move {
+                            // Try dynamic API query first, fall back to guess.
+                            if let Some(cw) = client.get_context_window(&model_name).await {
+                                tracing::debug!("Got context window from API for {model_name}: {cw}");
+                                Ok::<_, anyhow::Error>(Some(cw))
+                            } else {
+                                let guess = Self::guess_context_window(&model_name);
+                                tracing::debug!("Using guessed context window for {model_name}: {guess}");
+                                Ok(Some(guess))
+                            }
+                        }
+                    })
+                    .await;
+                Ok(*value?)
+            }
         }
+    }
+
+    /// Guess context window size from model name for OpenAI-compatible providers.
+    /// Returns a conservative default (128K) if the model name is unrecognized.
+    fn guess_context_window(model_name: &str) -> usize {
+        let m = model_name.to_lowercase();
+        // Gemini models
+        if m.contains("gemini") {
+            if m.contains("flash") { return 1_048_576; } // 1M
+            if m.contains("pro") { return 1_048_576; }
+            return 1_048_576;
+        }
+        // Claude models
+        if m.contains("claude") {
+            return 200_000;
+        }
+        // GPT models
+        if m.contains("gpt-4o") || m.contains("gpt-5") || m.contains("gpt-4.1") {
+            return 128_000;
+        }
+        if m.contains("gpt-4-turbo") || m.contains("gpt-4-1106") {
+            return 128_000;
+        }
+        if m.contains("gpt-4") {
+            return 8_192;
+        }
+        if m.contains("gpt-3.5") {
+            return 16_385;
+        }
+        // DeepSeek
+        if m.contains("deepseek") {
+            return 128_000;
+        }
+        // Qwen
+        if m.contains("qwen") {
+            return 131_072;
+        }
+        // Conservative default for unknown models
+        128_000
     }
 
     /// Check if a model supports vision (image input).

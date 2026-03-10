@@ -891,7 +891,12 @@ export const ChatPanel: React.FC<{
                       ? `${tokensPerSec!.toFixed(1)} tok/s`
                       : '',
                     (agentContext?.[selectedAgent]?.tokens ?? 0) > 0
-                      ? `${((agentContext?.[selectedAgent]?.tokens ?? 0) / 1000).toFixed(1)}k ctx`
+                      ? (() => {
+                          const t = agentContext?.[selectedAgent]?.tokens ?? 0;
+                          const lim = agentContext?.[selectedAgent]?.tokenLimit;
+                          const tk = `${(t / 1000).toFixed(1)}k`;
+                          return lim ? `${tk}/${lim >= 1_000_000 ? `${(lim / 1_000_000).toFixed(lim % 1_000_000 === 0 ? 0 : 1)}M` : `${Math.round(lim / 1000)}K`} ctx (${Math.round(t / lim * 100)}%)` : `${tk} ctx`;
+                        })()
                       : '',
                   ].filter(Boolean).join(' · ')})
                 </span>

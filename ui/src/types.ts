@@ -190,6 +190,7 @@ export interface ModelHealthInfo {
   health: ModelHealthStatus;
   last_error?: string | null;
   since_secs?: number | null;
+  context_window?: number | null;
 }
 
 export interface ModelConfigUI {

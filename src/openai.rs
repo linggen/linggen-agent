@@ -71,6 +71,34 @@ impl OpenAiClient {
         self.chatgpt_account_id.is_some()
     }
 
+    /// Try to fetch context window size from the provider's models endpoint.
+    /// Works for: Gemini (`inputTokenLimit`), OpenAI (`context_window` if present).
+    /// Returns None if not available.
+    pub async fn get_context_window(&self, model: &str) -> Option<usize> {
+        // Try OpenAI-compatible /models/{id} endpoint
+        let url = format!("{}/models/{}", self.base_url, model);
+        let resp = self.apply_auth(self.http.get(&url))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let json: serde_json::Value = resp.json().await.ok()?;
+        // Gemini returns inputTokenLimit at top level
+        if let Some(limit) = json.get("inputTokenLimit").and_then(|v| v.as_u64()) {
+            return Some(limit as usize);
+        }
+        // Some OpenAI-compatible providers return context_window or context_length
+        if let Some(limit) = json.get("context_window").and_then(|v| v.as_u64()) {
+            return Some(limit as usize);
+        }
+        if let Some(limit) = json.get("context_length").and_then(|v| v.as_u64()) {
+            return Some(limit as usize);
+        }
+        None
+    }
+
     /// Streaming text chat completion (SSE format).
     /// Uses Responses API for ChatGPT OAuth, Chat Completions for standard API.
     pub async fn chat_text_stream(

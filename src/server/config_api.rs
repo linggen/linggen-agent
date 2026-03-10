@@ -70,27 +70,31 @@ pub(crate) async fn get_models_health(
 
     // Return health for all configured models
     let config = state.manager.get_config_snapshot().await;
-    let result: Vec<serde_json::Value> = config
-        .models
-        .iter()
-        .map(|m| {
-            if let Some(rec) = health_map.get(&m.id) {
-                serde_json::json!({
-                    "id": m.id,
-                    "health": rec.status,
-                    "last_error": rec.last_error,
-                    "since_secs": rec.since_secs,
-                })
-            } else {
-                serde_json::json!({
-                    "id": m.id,
-                    "health": ModelHealthStatus::Healthy,
-                    "last_error": null,
-                    "since_secs": null,
-                })
-            }
-        })
-        .collect();
+    let models_ref = &*models_guard;
+
+    let mut result: Vec<serde_json::Value> = Vec::new();
+    for m in &config.models {
+        let cw = models_ref.context_window(&m.id).await.ok().flatten();
+        let mut entry = if let Some(rec) = health_map.get(&m.id) {
+            serde_json::json!({
+                "id": m.id,
+                "health": rec.status,
+                "last_error": rec.last_error,
+                "since_secs": rec.since_secs,
+            })
+        } else {
+            serde_json::json!({
+                "id": m.id,
+                "health": ModelHealthStatus::Healthy,
+                "last_error": null,
+                "since_secs": null,
+            })
+        };
+        if let Some(cw) = cw {
+            entry.as_object_mut().unwrap().insert("context_window".to_string(), serde_json::json!(cw));
+        }
+        result.push(entry);
+    }
 
     Json(result).into_response()
 }

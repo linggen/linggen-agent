@@ -20,14 +20,16 @@ impl AgentEngine {
 
     pub(crate) fn context_soft_token_limit(&self) -> usize {
         self.context_window_tokens
-            .map(|cw| (cw as f64 * 0.75) as usize)
-            .unwrap_or(8_000)
+            .map(|cw| (cw as f64 * 0.95) as usize)
+            .unwrap_or(120_000)
     }
 
     pub(crate) fn context_soft_message_limit(&self) -> usize {
+        // Message-count limit is a safety net, not the primary trigger.
+        // Primary compaction should be token-driven (aligned with CC at 95%).
         self.context_window_tokens
-            .map(|cw| (cw / 500).clamp(72, 200))
-            .unwrap_or(72)
+            .map(|cw| (cw / 200).clamp(200, 800))
+            .unwrap_or(200)
     }
 
     pub(crate) fn context_keep_tail_messages(&self) -> usize {
@@ -490,12 +492,23 @@ impl AgentEngine {
             Self::estimate_tokens_for_messages(messages)
         };
 
+        tracing::debug!(
+            "[compact] stage={stage} msgs={} token_est={token_est} soft_token_limit={soft_token_limit} \
+             soft_msg_limit={soft_message_limit} context_window={:?}",
+            messages.len(), self.context_window_tokens,
+        );
+
         loop {
-            let over_budget =
-                token_est > soft_token_limit || messages.len() > soft_message_limit;
-            if !over_budget || summary_count >= max_summary_passes {
+            let over_tokens = token_est > soft_token_limit;
+            let over_messages = messages.len() > soft_message_limit;
+            if (!over_tokens && !over_messages) || summary_count >= max_summary_passes {
                 break;
             }
+            tracing::info!(
+                "[compact] triggered: over_tokens={over_tokens} over_messages={over_messages} \
+                 tokens={token_est}/{soft_token_limit} msgs={}/{soft_message_limit}",
+                messages.len(),
+            );
 
             if messages.len() <= keep_tail + 2 {
                 break;
