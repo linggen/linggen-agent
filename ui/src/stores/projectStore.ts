@@ -14,6 +14,7 @@ interface ProjectState {
   activeSessionId: string | null;
   isMissionSession: boolean;
   activeMissionId: string | null;
+  activeMissionProject: string | null;
   agentTreesByProject: Record<string, Record<string, AgentTreeItem>>;
   sessionCountsByProject: Record<string, number>;
   currentPath: string;
@@ -27,6 +28,7 @@ interface ProjectState {
   setActiveSessionId: (id: string | null) => void;
   setIsMissionSession: (val: boolean) => void;
   setActiveMissionId: (id: string | null) => void;
+  setActiveMissionProject: (project: string | null) => void;
   setNewProjectPath: (path: string) => void;
   setShowAddProject: (show: boolean) => void;
   setCurrentPath: (path: string) => void;
@@ -58,6 +60,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     : null,
   isMissionSession: false,
   activeMissionId: null,
+  activeMissionProject: null,
   agentTreesByProject: {},
   sessionCountsByProject: {},
   currentPath: '',
@@ -76,6 +79,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
   setIsMissionSession: (val) => set({ isMissionSession: val }),
   setActiveMissionId: (id) => set({ activeMissionId: id }),
+  setActiveMissionProject: (project) => set({ activeMissionProject: project }),
   setNewProjectPath: (path) => set({ newProjectPath: path }),
   setShowAddProject: (show) => set({ showAddProject: show }),
   setCurrentPath: (path) => set({ currentPath: path }),

@@ -271,6 +271,26 @@ const App: React.FC = () => {
     }
   }, [projects]);
 
+  // Fetch any pending AskUser/permission prompts from the server.
+  const fetchPendingAskUser = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/pending-ask-user');
+      if (!resp.ok) return;
+      const items = await resp.json();
+      if (Array.isArray(items) && items.length > 0) {
+        // Pick the first pending question (there's typically at most one active).
+        const item = items[0];
+        useUiStore.getState().setPendingAskUser({
+          questionId: item.question_id,
+          agentId: item.agent_id,
+          questions: item.questions,
+        });
+      } else {
+        useUiStore.getState().setPendingAskUser(null);
+      }
+    } catch { /* ignore */ }
+  }, []);
+
   // --- React to session changes ---
   useEffect(() => {
     if (selectedProjectRoot || isMissionSession) {
@@ -281,9 +301,12 @@ const App: React.FC = () => {
         useChatStore.getState().clear(false);
         useUiStore.getState().setQueuedMessages([]);
         useUiStore.getState().setActivePlan(null);
+        useUiStore.getState().setSessionModel(null);
       }
       useChatStore.getState().fetchWorkspaceState();
       useAgentStore.getState().fetchAgentRuns();
+      // Restore any pending AskUser/permission widget for this session.
+      fetchPendingAskUser();
     }
   }, [activeSessionId, selectedProjectRoot, isMissionSession]);
 
@@ -392,7 +415,7 @@ const App: React.FC = () => {
     const ui = useUiStore.getState();
     const chat = useChatStore.getState();
 
-    if (trimmed !== '/help' && trimmed !== '/status' && trimmed !== '/clear' && trimmed !== '/compact' && !trimmed.startsWith('/compact ') && !trimmed.startsWith('/model')) {
+    if (trimmed !== '/help' && trimmed !== '/status' && trimmed !== '/clear' && trimmed !== '/compact' && !trimmed.startsWith('/compact ') && !trimmed.startsWith('/model') && !trimmed.startsWith('!')) {
       chat.addMessage({
         role: 'user', from: 'user', to: agentToUse, text: userMessage,
         timestamp: now.toLocaleTimeString(), timestampMs: now.getTime(), isGenerating: false,
@@ -431,6 +454,7 @@ const App: React.FC = () => {
         '- `/compact [focus]` — Compact context (summarize old messages)',
         '- `/status` — Show project status', '- `/model` — List models; `/model <id>` — Switch default model',
         '- `/plan <task>` — Ask agent to create a plan (read-only)', '- `/image <path>` — Attach an image file',
+        '- `!command` — Run a shell command directly',
         '- `@path` — Mention a file', '- `@@agent message` — Send to specific agent', '', '**Skills:** Type `/` to see available skills.',
       ].join('\n'));
       return;
@@ -465,22 +489,78 @@ const App: React.FC = () => {
 
     if (trimmed === '/clear') { await clearChat(); return; }
 
+    // ! prefix — direct bash execution (CC-style)
+    if (trimmed.startsWith('!') && trimmed.length > 1) {
+      const cmd = trimmed.slice(1);
+      const ts = new Date();
+      chat.addMessage({
+        role: 'user', from: 'user', to: 'system', text: `\`$ ${cmd}\``,
+        timestamp: ts.toLocaleTimeString(), timestampMs: ts.getTime(), isGenerating: false,
+      });
+      scrollToBottom();
+      try {
+        const resp = await fetch('/api/bash', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ project_root: root, command: cmd }),
+        });
+        const data = await resp.json();
+        const output = [data.stdout, data.stderr].filter(Boolean).join('\n').trim();
+        const exitInfo = data.exit_code !== 0 ? `\n\n(exit code ${data.exit_code})` : '';
+        const resultTs = new Date();
+        chat.addMessage({
+          role: 'assistant', from: 'system', to: 'user',
+          text: output ? `\`\`\`\n${output}\n\`\`\`${exitInfo}` : `(no output)${exitInfo}`,
+          timestamp: resultTs.toLocaleTimeString(), timestampMs: resultTs.getTime(), isGenerating: false,
+        });
+        scrollToBottom();
+      } catch (e) {
+        console.error('Bash error:', e);
+      }
+      return;
+    }
+
     if (trimmed === '/compact' || trimmed.startsWith('/compact ')) {
       const focus = trimmed.slice('/compact'.length).trim() || undefined;
+      const { setAgentStatus, setAgentStatusText } = useAgentStore.getState();
+      setAgentStatus((s) => ({ ...s, [agentToUse]: 'thinking' as const }));
+      setAgentStatusText((s) => ({ ...s, [agentToUse]: 'Compacting conversation' }));
       try {
         const resp = await fetch('/api/chat/compact', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ project_root: root, session_id: sid, agent_id: agentToUse, focus }),
         });
         const data = await resp.json();
-        const resultText = data.compacted ? `Context compacted.\n\n${data.summary || ''}` : 'Nothing to compact.';
-        const ts = new Date();
-        useChatStore.getState().addMessage({
-          role: 'assistant', from: agentToUse, to: 'user', text: resultText,
-          timestamp: ts.toLocaleTimeString(), timestampMs: ts.getTime(), isGenerating: false,
-        });
+        const clearStatus = () => {
+          setAgentStatus((s) => ({ ...s, [agentToUse]: 'idle' as const }));
+          setAgentStatusText((s) => { const n = { ...s }; delete n[agentToUse]; return n; });
+        };
+        clearStatus();
+        if (data.compacted) {
+          // Clear UI and reload compacted state from rewritten session file.
+          useChatStore.getState().clear(false);
+          await useChatStore.getState().fetchWorkspaceState();
+          // Add CC-style "Conversation compacted" banner with referenced files.
+          const refs = (data.referenced_files || []) as string[];
+          const refsText = refs.length > 0
+            ? '\n\n' + refs.map((f: string) => `Referenced file ${f}`).join('\n')
+            : '';
+          const ts = new Date();
+          useChatStore.getState().addMessage({
+            role: 'assistant', from: 'system', to: 'user',
+            text: `Conversation compacted.${refsText}`,
+            timestamp: ts.toLocaleTimeString(), timestampMs: ts.getTime(), isGenerating: false,
+          });
+        } else {
+          const ts = new Date();
+          useChatStore.getState().addMessage({
+            role: 'assistant', from: agentToUse, to: 'user', text: 'Nothing to compact.',
+            timestamp: ts.toLocaleTimeString(), timestampMs: ts.getTime(), isGenerating: false,
+          });
+        }
         scrollToBottom();
       } catch (e) {
+        setAgentStatus((s) => ({ ...s, [agentToUse]: 'idle' as const }));
+        setAgentStatusText((s) => { const n = { ...s }; delete n[agentToUse]; return n; });
         console.error('Compact error:', e);
       }
       return;
@@ -495,11 +575,15 @@ const App: React.FC = () => {
     }
 
     try {
+      const { isMissionSession, activeMissionId } = useProjectStore.getState();
       const resp = await fetch('/api/chat', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           project_root: root, agent_id: agentToUse, message: userMessage,
-          session_id: sid, ...(images && images.length > 0 ? { images } : {}),
+          session_id: sid,
+          ...(isMissionSession && activeMissionId ? { mission_id: activeMissionId } : {}),
+          ...(useUiStore.getState().sessionModel ? { model_id: useUiStore.getState().sessionModel } : {}),
+          ...(images && images.length > 0 ? { images } : {}),
         }),
       });
       const data = await resp.json();

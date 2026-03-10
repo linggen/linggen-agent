@@ -130,15 +130,19 @@ pub async fn search_marketplace(query: &str) -> Result<Vec<MarketplaceSkill>> {
     let results = payload
         .skills
         .into_iter()
-        .map(|s| MarketplaceSkill {
-            skill_id: s.id.clone(),
-            name: s.id,
-            url: format!("https://github.com/{}", s.top_source),
-            description: None,
-            install_count: 0,
-            git_ref: Some("main".to_string()),
-            content: None,
-            updated_at: None,
+        .map(|s| {
+            let skill_name = s.skill_id.clone().or(s.name.clone()).unwrap_or_else(|| s.id.clone());
+            let source = s.source.as_deref().unwrap_or("");
+            MarketplaceSkill {
+                skill_id: s.id.clone(),
+                name: skill_name,
+                url: if source.is_empty() { String::new() } else { format!("https://github.com/{}", source) },
+                description: None,
+                install_count: s.installs.unwrap_or(0),
+                git_ref: Some("main".to_string()),
+                content: None,
+                updated_at: None,
+            }
         })
         .collect();
 
@@ -216,9 +220,10 @@ pub async fn install_skill(
             // If not found in default repo, try skills.sh fallback
             if e.to_string().contains("Could not find skill") && is_default_repo(&normalized) {
                 if let Some(fallback) = search_skills_sh(name).await? {
-                    if fallback.top_source != "linggen/skills" {
+                    let fallback_source = fallback.source.as_deref().unwrap_or("");
+                    if fallback_source != "linggen/skills" {
                         let fallback_repo =
-                            format!("https://github.com/{}", fallback.top_source);
+                            format!("https://github.com/{}", fallback_source);
                         // Recompute target_dir using fallback id if it differs from original name.
                         let fallback_target = if fallback.id != name {
                             target_dir.parent().unwrap_or(target_dir).join(&fallback.id)
@@ -684,8 +689,14 @@ struct SkillsShResponse {
 #[derive(Clone, Deserialize)]
 struct SkillsShSkill {
     id: String,
-    #[serde(rename = "topSource")]
-    top_source: String,
+    #[serde(default, alias = "skillId")]
+    skill_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default, alias = "topSource")]
+    source: Option<String>,
+    #[serde(default)]
+    installs: Option<u64>,
 }
 
 async fn search_skills_sh(query: &str) -> Result<Option<SkillsShSkill>> {

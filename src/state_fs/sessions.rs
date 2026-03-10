@@ -235,6 +235,22 @@ impl SessionStore {
         Ok(count)
     }
 
+    /// Replace the entire chat history for a session with the given messages.
+    pub fn rewrite_chat_history(&self, session_id: &str, msgs: &[ChatMsg]) -> Result<()> {
+        Self::validate_id(session_id)?;
+        let dir = self.session_dir(session_id);
+        fs::create_dir_all(&dir)?;
+        let msgs_path = dir.join("messages.jsonl");
+        let mut buf = String::new();
+        for msg in msgs {
+            let line = serde_json::to_string(msg)?;
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        fs::write(msgs_path, buf)?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------

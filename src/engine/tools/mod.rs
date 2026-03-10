@@ -144,6 +144,7 @@ pub struct AskUserBridge {
 
 pub struct PendingAskUser {
     pub agent_id: String,
+    pub questions: Vec<AskUserQuestion>,
     pub sender: tokio::sync::oneshot::Sender<Vec<AskUserAnswer>>,
 }
 
@@ -430,6 +431,7 @@ impl Tools {
                 let agent_id = self.agent_id.clone().unwrap_or_default();
 
                 // Emit SSE event to push the question to the UI.
+                let questions_clone = args.questions.clone();
                 let _ = bridge.events_tx.send(crate::server::ServerEvent::AskUser {
                     agent_id: agent_id.clone(),
                     question_id: question_id.clone(),
@@ -441,7 +443,7 @@ impl Tools {
                 block_on_async(async {
                     bridge.pending.lock().await.insert(
                         question_id.clone(),
-                        PendingAskUser { agent_id, sender: tx },
+                        PendingAskUser { agent_id, questions: questions_clone, sender: tx },
                     );
                 });
 

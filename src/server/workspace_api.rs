@@ -305,3 +305,96 @@ pub(crate) async fn get_agent_tree(
 
     Json(root_tree).into_response()
 }
+
+// ── Direct Bash execution (`!command` in UI) ────────────────────────────
+
+#[derive(Deserialize)]
+pub(crate) struct BashRequest {
+    pub project_root: String,
+    pub command: String,
+    #[serde(default = "default_bash_timeout")]
+    pub timeout_ms: u64,
+}
+
+fn default_bash_timeout() -> u64 {
+    30_000
+}
+
+/// POST /api/bash — run a shell command directly (CC `!` shortcut).
+pub(crate) async fn run_bash_api(
+    State(_state): State<Arc<ServerState>>,
+    Json(req): Json<BashRequest>,
+) -> impl IntoResponse {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let cwd = PathBuf::from(&req.project_root);
+    if !cwd.is_dir() {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("Directory does not exist: {}", req.project_root),
+        )
+            .into_response();
+    }
+
+    let timeout = Duration::from_millis(req.timeout_ms);
+
+    // Spawn the command
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg(&req.command)
+        .current_dir(&cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+
+    let child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": format!("Failed to spawn: {e}"),
+            }))
+            .into_response();
+        }
+    };
+
+    // Wait with timeout
+    let result = tokio::task::spawn_blocking(move || {
+        let output = child.wait_with_output();
+        output
+    });
+
+    match tokio::time::timeout(timeout, result).await {
+        Ok(Ok(Ok(output))) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let code = output.status.code().unwrap_or(-1);
+            Json(serde_json::json!({
+                "exit_code": code,
+                "stdout": stdout,
+                "stderr": stderr,
+            }))
+            .into_response()
+        }
+        Ok(Ok(Err(e))) => Json(serde_json::json!({
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": format!("Command error: {e}"),
+        }))
+        .into_response(),
+        Ok(Err(e)) => Json(serde_json::json!({
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": format!("Task error: {e}"),
+        }))
+        .into_response(),
+        Err(_) => Json(serde_json::json!({
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": "Command timed out",
+        }))
+        .into_response(),
+    }
+}

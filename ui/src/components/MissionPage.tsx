@@ -239,6 +239,8 @@ function miniChatReducer(state: ChatMessage[], action: MiniChatAction): ChatMess
 // ---- Mission Chat Panel (interactive) ---------------------------------------
 
 const MISSION_AGENT_ID = 'mission';
+/** Agent used for user-initiated messages in mission sessions (conversational, has AskUser). */
+const USER_CHAT_AGENT_ID = 'ling';
 
 const MissionChatPanel: React.FC<{
   sessionId: string;
@@ -364,7 +366,7 @@ const MissionChatPanel: React.FC<{
     const now = new Date();
     dispatch({
       type: 'ADD_USER_MESSAGE',
-      message: { role: 'user', from: 'user', to: MISSION_AGENT_ID, text, timestamp: now.toLocaleTimeString(), timestampMs: now.getTime() },
+      message: { role: 'user', from: 'user', to: USER_CHAT_AGENT_ID, text, timestamp: now.toLocaleTimeString(), timestampMs: now.getTime() },
     });
 
     setIsRunning(true);
@@ -374,9 +376,10 @@ const MissionChatPanel: React.FC<{
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           project_root: resolvedProject,
-          agent_id: MISSION_AGENT_ID,
+          agent_id: USER_CHAT_AGENT_ID,
           message: text,
           session_id: sessionId,
+          mission_id: mission.id,
         }),
       });
     } catch (e) {
@@ -385,14 +388,19 @@ const MissionChatPanel: React.FC<{
     }
   }, [inputValue, resolvedProject, sessionId]);
 
-  // Cancel
+  // Cancel — either the mission agent or the ling agent could be running.
   const cancelRun = useCallback(async () => {
     try {
-      await fetch('/api/agent-cancel', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_root: resolvedProject, agent_id: MISSION_AGENT_ID }),
-      });
+      await Promise.all([
+        fetch('/api/agent-cancel', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ project_root: resolvedProject, agent_id: MISSION_AGENT_ID }),
+        }),
+        fetch('/api/agent-cancel', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ project_root: resolvedProject, agent_id: USER_CHAT_AGENT_ID }),
+        }),
+      ]);
     } catch (e) { console.error('Failed to cancel:', e); }
   }, [resolvedProject]);
 
@@ -435,9 +443,15 @@ const MissionChatPanel: React.FC<{
             : phase === 'thinking' ? ''
               : msg.isThinking && !msg.isGenerating ? 'text-slate-500 dark:text-slate-400 italic opacity-60'
                 : 'text-slate-800 dark:text-slate-200';
+          const agentLabel = !isUser && msg.from && msg.from !== 'user' ? msg.from : null;
           return (
             <div key={`${msg.timestampMs}-${i}`} className={cn('w-full flex', isUser ? 'justify-end' : 'justify-start')}>
               <div className={cn(isUser ? 'max-w-[96%]' : 'max-w-full', 'text-[13px] leading-relaxed', messageClass)}>
+                {agentLabel && (
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500 mb-0.5">
+                    {agentLabel}
+                  </div>
+                )}
                 {isUser ? <span>{msg.text}</span> : (
                   <AgentMessage msg={msg} isExpanded={false} onToggle={() => {}} planProps={dummyPlanProps} />
                 )}

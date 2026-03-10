@@ -1,7 +1,7 @@
 use crate::agent_manager::AgentManager;
 use crate::server::chat_helpers::{
     emit_outcome_event, emit_queue_updated, persist_and_emit_message,
-    persist_message_only, queue_key, queue_preview,
+    persist_and_emit_to_store, persist_message_only, queue_key, queue_preview,
 };
 use crate::server::{AgentStatusKind, QueuedChatItem, ServerEvent, ServerState};
 use axum::{
@@ -23,6 +23,12 @@ pub(crate) struct ChatRequest {
     message: String,
     session_id: Option<String>,
     mode: Option<String>,
+    /// When set, this chat belongs to a mission session — persist messages
+    /// under `~/.linggen/missions/{mission_id}/sessions/` instead of
+    /// the project's session store.
+    mission_id: Option<String>,
+    /// Session-level model override. Takes priority over routing.default_models.
+    model_id: Option<String>,
     #[serde(default)]
     images: Vec<String>,
 }
@@ -151,7 +157,7 @@ pub(crate) async fn compact_chat_api(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CompactChatRequest>,
 ) -> impl IntoResponse {
-    let _session_id = req
+    let session_id = req
         .session_id
         .clone()
         .unwrap_or_else(|| "default".to_string());
@@ -180,6 +186,36 @@ pub(crate) async fn compact_chat_api(
             let mut engine = agent_mutex.lock().await;
             let mut messages = std::mem::take(&mut engine.chat_history);
             let result = engine.force_compact(&mut messages, focus).await;
+
+            // Extract referenced file paths from the compacted messages.
+            let referenced_files: Vec<String> = messages
+                .iter()
+                .flat_map(|m| extract_file_references(&m.content))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+
+            // Rewrite the persisted session file with the compacted messages.
+            if result.is_some() {
+                let chat_msgs: Vec<crate::state_fs::sessions::ChatMsg> = messages
+                    .iter()
+                    .map(|m| {
+                        let is_user = m.role == "user" || m.role == "system";
+                        crate::state_fs::sessions::ChatMsg {
+                            agent_id: agent_id.clone(),
+                            from_id: if is_user { "user".to_string() } else { agent_id.clone() },
+                            to_id: if is_user { agent_id.clone() } else { "user".to_string() },
+                            content: m.content.clone(),
+                            timestamp: crate::util::now_ts_secs(),
+                            is_observation: m.role == "tool",
+                        }
+                    })
+                    .collect();
+                if let Err(e) = ctx.sessions.rewrite_chat_history(&session_id, &chat_msgs) {
+                    tracing::warn!("Failed to rewrite session after compact: {e}");
+                }
+            }
+
             engine.chat_history = messages;
             drop(engine);
 
@@ -189,6 +225,7 @@ pub(crate) async fn compact_chat_api(
                 Some(summary) => Json(serde_json::json!({
                     "compacted": true,
                     "summary": summary,
+                    "referenced_files": referenced_files,
                 }))
                 .into_response(),
                 None => Json(serde_json::json!({
@@ -200,6 +237,36 @@ pub(crate) async fn compact_chat_api(
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// Extract file paths referenced in message content (e.g. from Read/Edit/Write tool calls).
+fn extract_file_references(content: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for line in content.lines() {
+        // Match patterns like "Reading file src/foo.rs", "Editing file src/bar.rs", etc.
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Reading file ").or_else(|| trimmed.strip_prefix("Editing file "))
+            .or_else(|| trimmed.strip_prefix("Writing file "))
+            .or_else(|| trimmed.strip_prefix("Read "))
+            .or_else(|| trimmed.strip_prefix("Edit "))
+            .or_else(|| trimmed.strip_prefix("Write "))
+        {
+            let path = rest.split_whitespace().next().unwrap_or("").trim_matches('`');
+            if !path.is_empty() {
+                files.push(path.to_string());
+            }
+        }
+        // Match file_path patterns from tool JSON
+        if let Some(start) = trimmed.find("file_path") {
+            if let Some(colon) = trimmed[start..].find(':') {
+                let after = trimmed[start + colon + 1..].trim().trim_matches('"').trim_matches(',');
+                if !after.is_empty() && (after.contains('/') || after.contains('.')) {
+                    files.push(after.to_string());
+                }
+            }
+        }
+    }
+    files
 }
 
 /// Generate a new plan file path in `~/.linggen/plans/`.
@@ -974,12 +1041,33 @@ pub(crate) async fn chat_handler(
     let root = PathBuf::from(&req.project_root);
     let project_root_str = root.to_string_lossy().to_string();
 
+    // Determine if this chat belongs to a mission — if so, route session
+    // persistence to the mission's session store, not the project's.
+    let mission_sessions_root: Option<std::path::PathBuf> = req.mission_id.as_ref().map(|mid| {
+        crate::paths::mission_sessions_dir(mid)
+    });
+
     // Auto-create a new session when none is provided, instead of falling
     // back to a hidden "default" session.
     // When a session_id IS provided (e.g. from TUI), ensure it exists in the
     // session store so the Web UI can list it.
     let session_id: Option<String> = if let Some(sid) = req.session_id.clone() {
-        if let Ok(ctx) = state.manager.get_or_create_project(root.clone()).await {
+        if let Some(ref missions_dir) = mission_sessions_root {
+            // Mission session — ensure it exists in the mission store.
+            let store = crate::state_fs::SessionStore::with_sessions_dir(missions_dir.clone());
+            let exists = store.list_sessions().ok()
+                .map(|ss| ss.iter().any(|s| s.id == sid))
+                .unwrap_or(false);
+            if !exists {
+                let now = crate::util::now_ts_secs();
+                let meta = crate::state_fs::sessions::SessionMeta {
+                    id: sid.clone(),
+                    title: auto_session_title(&req.message),
+                    created_at: now,
+                };
+                let _ = store.add_session(&meta);
+            }
+        } else if let Ok(ctx) = state.manager.get_or_create_project(root.clone()).await {
             let exists = ctx.sessions.list_sessions().ok()
                 .map(|ss| ss.iter().any(|s| s.id == sid))
                 .unwrap_or(false);
@@ -997,7 +1085,15 @@ pub(crate) async fn chat_handler(
     } else {
         let now = crate::util::now_ts_secs();
         let new_id = format!("sess-{}-{}", now, &uuid::Uuid::new_v4().to_string()[..8]);
-        if let Ok(ctx) = state.manager.get_or_create_project(root.clone()).await {
+        if let Some(ref missions_dir) = mission_sessions_root {
+            let store = crate::state_fs::SessionStore::with_sessions_dir(missions_dir.clone());
+            let meta = crate::state_fs::sessions::SessionMeta {
+                id: new_id.clone(),
+                title: auto_session_title(&req.message),
+                created_at: now,
+            };
+            let _ = store.add_session(&meta);
+        } else if let Ok(ctx) = state.manager.get_or_create_project(root.clone()).await {
             let meta = crate::state_fs::sessions::SessionMeta {
                 id: new_id.clone(),
                 title: auto_session_title(&req.message),
@@ -1083,38 +1179,66 @@ pub(crate) async fn chat_handler(
             let session_id_for_queue = effective_session_id.clone();
             let project_root_for_queue = project_root_str.clone();
             let req_mode = req.mode.clone();
+            let req_model_id = req.model_id.clone();
             let req_images = req.images.clone();
+            let mission_root_for_spawn = mission_sessions_root.clone();
 
             if was_busy {
                 // When queued, only persist to disk — don't emit via SSE.
-                // The frontend shows the message in the queue banner and removes
-                // the optimistic chat bubble. Emitting here would re-add it,
-                // causing duplication.
-                persist_message_only(
-                    &state.manager,
-                    &root,
-                    &target_id,
-                    "user",
-                    &target_id,
-                    &clean_msg,
-                    session_id.as_deref(),
-                    false,
-                )
-                .await;
+                if let Some(ref missions_dir) = mission_sessions_root {
+                    let store = crate::state_fs::SessionStore::with_sessions_dir(missions_dir.clone());
+                    let sid = session_id.as_deref().unwrap_or("default");
+                    let msg = crate::state_fs::sessions::ChatMsg {
+                        agent_id: target_id.to_string(),
+                        from_id: "user".to_string(),
+                        to_id: target_id.to_string(),
+                        content: clean_msg.clone(),
+                        timestamp: crate::util::now_ts_secs(),
+                        is_observation: false,
+                    };
+                    let _ = store.add_chat_message(sid, &msg);
+                } else {
+                    persist_message_only(
+                        &state.manager,
+                        &root,
+                        &target_id,
+                        "user",
+                        &target_id,
+                        &clean_msg,
+                        session_id.as_deref(),
+                        false,
+                    )
+                    .await;
+                }
             } else {
                 // Not queued — persist and emit so the UI shows the message.
-                persist_and_emit_message(
-                    &state.manager,
-                    &events_tx,
-                    &root,
-                    &target_id,
-                    "user",
-                    &target_id,
-                    &clean_msg,
-                    session_id.as_deref(),
-                    false,
-                )
-                .await;
+                if let Some(ref missions_dir) = mission_sessions_root {
+                    let store = crate::state_fs::SessionStore::with_sessions_dir(missions_dir.clone());
+                    persist_and_emit_to_store(
+                        &store,
+                        &events_tx,
+                        &target_id,
+                        "user",
+                        &target_id,
+                        &clean_msg,
+                        session_id.as_deref(),
+                        false,
+                    )
+                    .await;
+                } else {
+                    persist_and_emit_message(
+                        &state.manager,
+                        &events_tx,
+                        &root,
+                        &target_id,
+                        "user",
+                        &target_id,
+                        &clean_msg,
+                        session_id.as_deref(),
+                        false,
+                    )
+                    .await;
+                }
             }
 
             tokio::spawn(async move {
@@ -1157,8 +1281,26 @@ pub(crate) async fn chat_handler(
                         .insert(target_id_clone.clone(), sid.clone());
                 }
 
+                // Apply session-level model override if provided.
+                if let Some(ref mid) = req_model_id {
+                    if engine.model_manager.has_model(mid) {
+                        engine.model_id = mid.clone();
+                    }
+                }
+
                 // Set session_id on engine tools so subagent delegations inherit it.
                 engine.tools.builtins.set_session_id(session_id.clone());
+
+                // Route session persistence to mission directory when applicable.
+                if let Some(ref missions_dir) = mission_root_for_spawn {
+                    engine.cfg.session_root = Some(missions_dir.clone());
+                }
+
+                // Clear mission-only restrictions — user-initiated chats should
+                // never be restricted by permission tiers (those apply only to
+                // automated scheduler runs via apply_permission_tier).
+                engine.cfg.mission_allowed_tools = None;
+                engine.cfg.bash_allow_prefixes = None;
 
                 let model_label = &engine.model_id;
                 state_clone
@@ -1182,31 +1324,37 @@ pub(crate) async fn chat_handler(
                 // Restore chat history from session store when the engine was
                 // freshly created (e.g. after model change invalidated cache).
                 if engine.chat_history.is_empty() {
-                    if let Ok(proj_ctx) = ctx.manager.get_or_create_project(ctx.root.clone()).await {
-                        let sid = ctx.session_id.as_deref().unwrap_or("default");
-                        if let Ok(msgs) = proj_ctx.sessions.get_chat_history(sid, Some(&ctx.agent_id)) {
-                            for m in &msgs {
-                                if m.is_observation || m.from_id == "system" {
-                                    continue;
-                                }
-                                let role = if m.from_id == "user" {
-                                    "user"
-                                } else if m.from_id == ctx.agent_id {
-                                    "assistant"
-                                } else {
-                                    continue;
-                                };
-                                engine.chat_history.push(
-                                    crate::ollama::ChatMessage::new(role, &m.content),
-                                );
+                    let sid = ctx.session_id.as_deref().unwrap_or("default");
+                    let history_result = if let Some(ref missions_dir) = mission_root_for_spawn {
+                        let store = crate::state_fs::SessionStore::with_sessions_dir(missions_dir.clone());
+                        store.get_chat_history(sid, Some(&ctx.agent_id))
+                    } else if let Ok(proj_ctx) = ctx.manager.get_or_create_project(ctx.root.clone()).await {
+                        proj_ctx.sessions.get_chat_history(sid, Some(&ctx.agent_id))
+                    } else {
+                        Err(anyhow::anyhow!("no session store"))
+                    };
+                    if let Ok(msgs) = history_result {
+                        for m in &msgs {
+                            if m.is_observation || m.from_id == "system" {
+                                continue;
                             }
-                            engine.truncate_chat_history();
-                            if !engine.chat_history.is_empty() {
-                                tracing::info!(
-                                    "Restored {} chat_history messages from session store",
-                                    engine.chat_history.len()
-                                );
-                            }
+                            let role = if m.from_id == "user" {
+                                "user"
+                            } else if m.from_id == ctx.agent_id {
+                                "assistant"
+                            } else {
+                                continue;
+                            };
+                            engine.chat_history.push(
+                                crate::ollama::ChatMessage::new(role, &m.content),
+                            );
+                        }
+                        engine.truncate_chat_history();
+                        if !engine.chat_history.is_empty() {
+                            tracing::info!(
+                                "Restored {} chat_history messages from session store",
+                                engine.chat_history.len()
+                            );
                         }
                     }
                 }
@@ -1462,6 +1610,25 @@ pub(crate) async fn ask_user_response_handler(
             (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Unknown question_id" }))).into_response()
         }
     }
+}
+
+/// Return any pending AskUser questions so the UI can restore the widget
+/// after navigating away and back, or after a page refresh.
+pub(crate) async fn pending_ask_user_handler(
+    State(state): State<Arc<ServerState>>,
+) -> impl IntoResponse {
+    let pending = state.pending_ask_user.lock().await;
+    let items: Vec<serde_json::Value> = pending
+        .iter()
+        .map(|(qid, entry)| {
+            serde_json::json!({
+                "question_id": qid,
+                "agent_id": entry.agent_id,
+                "questions": entry.questions,
+            })
+        })
+        .collect();
+    Json(serde_json::json!(items))
 }
 
 #[cfg(test)]

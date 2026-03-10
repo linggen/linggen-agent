@@ -294,13 +294,6 @@ export const ModelsTab: React.FC<{
             return (
               <div key={i} className={`bg-slate-50 dark:bg-white/[0.02] rounded-lg p-4 border relative ${modelIsDefault ? 'border-amber-300 dark:border-amber-700' : 'border-slate-100 dark:border-white/5'}`}>
                 <div className="absolute top-3 right-3 flex items-center gap-3">
-                  {health?.context_window && (
-                    <span className="text-[10px] text-slate-400 tabular-nums">
-                      {health.context_window >= 1_000_000
-                        ? `${(health.context_window / 1_000_000).toFixed(health.context_window % 1_000_000 === 0 ? 0 : 1)}M ctx`
-                        : `${Math.round(health.context_window / 1_000)}K ctx`}
-                    </span>
-                  )}
                   <HealthDot health={health} ollamaStatus={getOllamaStatus(model)} />
                   {model.id && (
                     <button
@@ -404,13 +397,32 @@ export const ModelsTab: React.FC<{
                     )}
                   </div>
                   <div>
+                    <label className={labelCls}>
+                      Context Window
+                      {!model.context_window && health?.context_window && (
+                        <span className="font-normal text-slate-400 ml-1">
+                          (auto: {health.context_window >= 1_000_000
+                            ? `${(health.context_window / 1_000_000).toFixed(health.context_window % 1_000_000 === 0 ? 0 : 1)}M`
+                            : `${Math.round(health.context_window / 1_000)}K`})
+                        </span>
+                      )}
+                    </label>
+                    <input
+                      className={inputCls}
+                      type="number"
+                      value={model.context_window ?? ''}
+                      onChange={(e) => updateModel(i, 'context_window', e.target.value ? Number(e.target.value) : null)}
+                      placeholder={health?.context_window ? `${Math.round(health.context_window / 1_000)}K (auto-detected)` : 'e.g. 128000'}
+                    />
+                  </div>
+                  <div>
                     <label className={labelCls}>Keep Alive</label>
                     <input className={inputCls} value={model.keep_alive || ''} onChange={(e) => updateModel(i, 'keep_alive', e.target.value || null)} placeholder="e.g. 30m" />
                   </div>
-                  <div className="col-span-2">
+                  <div>
                     <label className={labelCls}>
                       Tags
-                      <span className="font-normal text-slate-400 ml-1">(comma-separated, e.g. vision)</span>
+                      <span className="font-normal text-slate-400 ml-1">(comma-separated)</span>
                     </label>
                     <input
                       className={inputCls}

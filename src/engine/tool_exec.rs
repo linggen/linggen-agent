@@ -60,10 +60,11 @@ impl AgentEngine {
 
         // Emit SSE event to push the permission question to the UI.
         info!("Permission: awaiting user approval for '{}'", tool);
+        let questions = vec![question];
         let _ = bridge.events_tx.send(crate::server::ServerEvent::AskUser {
             agent_id: agent_id.clone(),
             question_id: question_id.clone(),
-            questions: vec![question],
+            questions: questions.clone(),
         });
 
         // Create a oneshot channel and register it for the response endpoint.
@@ -72,6 +73,7 @@ impl AgentEngine {
             question_id.clone(),
             tools::PendingAskUser {
                 agent_id,
+                questions,
                 sender: tx,
             },
         );
@@ -127,10 +129,11 @@ impl AgentEngine {
         let agent_id = self.agent_id.clone().unwrap_or_default();
 
         info!("Permission: awaiting user approval for Bash '{}'", command);
+        let questions = vec![question];
         let _ = bridge.events_tx.send(crate::server::ServerEvent::AskUser {
             agent_id: agent_id.clone(),
             question_id: question_id.clone(),
-            questions: vec![question],
+            questions: questions.clone(),
         });
 
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -138,6 +141,7 @@ impl AgentEngine {
             question_id.clone(),
             tools::PendingAskUser {
                 agent_id,
+                questions,
                 sender: tx,
             },
         );
@@ -192,10 +196,11 @@ impl AgentEngine {
         let agent_id = self.agent_id.clone().unwrap_or_default();
 
         info!("Permission: awaiting user approval for {} '{}'", tool, file_path);
+        let questions = vec![question];
         let _ = bridge.events_tx.send(crate::server::ServerEvent::AskUser {
             agent_id: agent_id.clone(),
             question_id: question_id.clone(),
-            questions: vec![question],
+            questions: questions.clone(),
         });
 
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -203,6 +208,7 @@ impl AgentEngine {
             question_id.clone(),
             tools::PendingAskUser {
                 agent_id,
+                questions,
                 sender: tx,
             },
         );

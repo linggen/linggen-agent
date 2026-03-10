@@ -3,6 +3,8 @@ import { Sparkles, ArrowDown } from 'lucide-react';
 import 'highlight.js/styles/github.css';
 import { cn } from '../../lib/cn';
 import { useProjectStore } from '../../stores/projectStore';
+import { useUiStore } from '../../stores/uiStore';
+import { useAgentStore } from '../../stores/agentStore';
 import { AskUserCard } from '../AskUserCard';
 import { ToolPermissionCard } from '../ToolPermissionCard';
 import type {
@@ -133,6 +135,31 @@ const ChatMessageList = React.memo<{
     </>
   );
 });
+
+/** Compact per-session model selector shown in the run bar. */
+const SessionModelSelector: React.FC = () => {
+  const models = useAgentStore((s) => s.models);
+  const defaultModels = useAgentStore((s) => s.defaultModels);
+  const sessionModel = useUiStore((s) => s.sessionModel);
+  const setSessionModel = useUiStore((s) => s.setSessionModel);
+
+  const defaultLabel = defaultModels.length > 0 ? defaultModels[0] : 'default';
+
+  return (
+    <select
+      value={sessionModel ?? ''}
+      onChange={(e) => setSessionModel(e.target.value || null)}
+      onClick={(e) => e.stopPropagation()}
+      className="ml-auto text-[10px] bg-white dark:bg-black/30 border border-slate-200 dark:border-white/10 rounded px-1.5 py-0.5 outline-none max-w-[14rem] truncate"
+      title="Session model override"
+    >
+      <option value="">Default ({defaultLabel})</option>
+      {models.map((m) => (
+        <option key={m.id} value={m.id}>{m.id}</option>
+      ))}
+    </select>
+  );
+};
 
 export const ChatPanel: React.FC<{
   chatMessages: ChatMessage[];
@@ -291,6 +318,7 @@ export const ChatPanel: React.FC<{
   }, [chatMessages, chatEndRef]);
 
   // Track agent active state and elapsed time
+  const agentStatusText = useAgentStore((s) => s.agentStatusText);
   const currentStatus = agentStatus?.[selectedAgent];
   const isAgentActive = !!currentStatus && currentStatus !== 'idle';
   const _isThinking = currentStatus === 'thinking' || currentStatus === 'model_loading';
@@ -688,6 +716,7 @@ export const ChatPanel: React.FC<{
                   {selectedMainContext.run.status}
                 </span>
               )}
+              <SessionModelSelector />
             </summary>
             <div className="mt-1.5 flex flex-wrap items-center gap-2">
               {selectedMainRunOptions.length > 1 && (
@@ -880,7 +909,7 @@ export const ChatPanel: React.FC<{
           <div className="flex items-center gap-1.5 text-[12px] text-slate-500 dark:text-slate-400 font-medium animate-pulse">
             <span className="text-blue-500">✶</span>
             <span>
-              {currentStatus === 'model_loading' ? 'Loading model' : spinnerVerb || 'Thinking'}…
+              {agentStatusText?.[selectedAgent] || (currentStatus === 'model_loading' ? 'Loading model' : spinnerVerb || 'Thinking')}…
               {(thinkingElapsed > 0 || (agentContext?.[selectedAgent]?.tokens ?? 0) > 0) && (
                 <span className="font-normal text-slate-400 dark:text-slate-500 ml-1">
                   ({[

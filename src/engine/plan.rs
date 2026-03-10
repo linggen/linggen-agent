@@ -134,32 +134,33 @@ impl AgentEngine {
         let question_id = uuid::Uuid::new_v4().to_string();
         let agent_id = self.agent_id.clone().unwrap_or_default();
 
+        let questions = vec![tools::AskUserQuestion {
+            question: "Plan is ready for review. How would you like to proceed?".to_string(),
+            header: "Plan".to_string(),
+            options: vec![
+                tools::AskUserOption {
+                    label: "Start building".to_string(),
+                    description: Some("Start executing the plan".to_string()),
+                    preview: None,
+                },
+                tools::AskUserOption {
+                    label: "Reject".to_string(),
+                    description: Some("Discard the plan".to_string()),
+                    preview: None,
+                },
+            ],
+            multi_select: false,
+        }];
         let _ = bridge.events_tx.send(crate::server::ServerEvent::AskUser {
             agent_id: agent_id.clone(),
             question_id: question_id.clone(),
-            questions: vec![tools::AskUserQuestion {
-                question: "Plan is ready for review. How would you like to proceed?".to_string(),
-                header: "Plan".to_string(),
-                options: vec![
-                    tools::AskUserOption {
-                        label: "Start building".to_string(),
-                        description: Some("Start executing the plan".to_string()),
-                        preview: None,
-                    },
-                    tools::AskUserOption {
-                        label: "Reject".to_string(),
-                        description: Some("Discard the plan".to_string()),
-                        preview: None,
-                    },
-                ],
-                multi_select: false,
-            }],
+            questions: questions.clone(),
         });
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         bridge.pending.lock().await.insert(
             question_id.clone(),
-            tools::PendingAskUser { agent_id, sender: tx },
+            tools::PendingAskUser { agent_id, questions, sender: tx },
         );
 
         let response = tokio::time::timeout(

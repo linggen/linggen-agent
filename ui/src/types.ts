@@ -200,6 +200,7 @@ export interface ModelConfigUI {
   model: string;
   api_key?: string | null;
   keep_alive?: string | null;
+  context_window?: number | null;
   tags?: string[];
   auth_mode?: string | null;
 }

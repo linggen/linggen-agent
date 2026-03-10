@@ -38,7 +38,7 @@ use agent_api::{
     cancel_agent_run, cancel_tool_execution,
     run_agent, set_task,
 };
-use chat_api::{approve_plan_handler, ask_user_response_handler, chat_handler, clear_chat_history_api, compact_chat_api, edit_plan_handler, reject_plan_handler};
+use chat_api::{approve_plan_handler, ask_user_response_handler, chat_handler, clear_chat_history_api, compact_chat_api, edit_plan_handler, pending_ask_user_handler, reject_plan_handler};
 use config_api::{get_config_api, get_credentials_api, get_models_health, update_config_api, update_credentials_api, get_codex_auth_status, start_codex_auth_login, codex_auth_logout};
 use projects_api::{
     add_project, create_session, delete_agent_file_api, delete_skill_file_api,
@@ -55,7 +55,7 @@ use missions_api::{
     trigger_mission, update_mission,
 };
 use storage_api::{storage_roots, storage_tree, storage_read_file, storage_write_file, storage_delete_file};
-use workspace_api::{get_agent_tree, get_workspace_state, list_files, read_file_api, search_files};
+use workspace_api::{get_agent_tree, get_workspace_state, list_files, read_file_api, run_bash_api, search_files};
 
 #[derive(RustEmbed)]
 #[folder = "ui/dist/"]
@@ -1089,11 +1089,13 @@ pub async fn prepare_server(
         .route("/api/plan/edit", post(edit_plan_handler))
         .route("/api/plan/reject", post(reject_plan_handler))
         .route("/api/ask-user-response", post(ask_user_response_handler))
+        .route("/api/pending-ask-user", get(pending_ask_user_handler))
         .route("/api/workspace/tree", get(get_agent_tree))
         .route("/api/files", get(list_files))
         .route("/api/files/search", get(search_files))
         .route("/api/file", get(read_file_api))
         .route("/api/workspace/state", get(get_workspace_state))
+        .route("/api/bash", post(run_bash_api))
         .route("/api/events", get(events_handler))
         .route("/api/status", get(get_status_api))
         .route("/api/health", get(health_handler))

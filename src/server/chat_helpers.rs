@@ -520,8 +520,24 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
             continue;
         }
 
-        // Tool errors and permission denials — always keep.
-        if lower.starts_with("tool_error:") || lower.starts_with("tool_not_allowed:") {
+        // Suppress raw JSON objects/arrays that are internal structured data
+        // (e.g. plan items, finalize payloads) — not meant for display.
+        if (line.starts_with('{') && line.ends_with('}'))
+            || (line.starts_with('[') && line.ends_with(']'))
+        {
+            if serde_json::from_str::<serde_json::Value>(line).is_ok() {
+                continue;
+            }
+        }
+
+        // Tool errors — keep as compact summaries. Permission denials — suppress
+        // (internal diagnostics, not useful for the user).
+        if lower.starts_with("tool_not_allowed:") {
+            suppressed_tool_body = None;
+            // Skip — internal engine diagnostic, not user-facing.
+            continue;
+        }
+        if lower.starts_with("tool_error:") {
             suppressed_tool_body = None;
             cleaned_lines.push(raw_line.to_string());
             continue;
@@ -559,6 +575,9 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
                     .map(|s| s.trim().trim_matches('"'))
                     .filter(|s| !s.is_empty());
                 cleaned_lines.push(tool_target_line("WebSearch", query));
+            } else if lower.contains("tool_not_allowed:") || lower.contains("tool_error:") {
+                // Internal diagnostics from observation persistence — suppress.
+                suppressed_tool_body = None;
             } else {
                 suppressed_tool_body = None;
                 cleaned_lines.push(raw_line.to_string());
