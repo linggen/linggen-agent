@@ -93,16 +93,15 @@ Drop a markdown file in `agents/` with YAML frontmatter:
 
 ```markdown
 ---
-name: coder
-description: Implementation agent that writes and edits code.
+name: ling
+description: General-purpose coding assistant.
 tools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
-policy: [Patch, Finalize]
 ---
 
 You are a coding agent. Write clean, tested code.
 ```
 
-Frontmatter fields: `name`, `description`, `tools`, `model`, `skills`, `work_globs`, `policy`, `idle_prompt`, `idle_interval_secs`.
+Frontmatter fields: `name`, `description`, `tools`, `model`, `personality`.
 
 The agent is available immediately on the next startup — no code changes needed.
 
@@ -178,7 +177,7 @@ Agents interact with the workspace through a fixed set of Claude Code-style tool
 
 - Agents are spawned by delegation via `Task` — like `fork()`.
 - Delegation depth is configurable via `max_delegation_depth` (default 2).
-- All actions are policy-gated per agent: `Patch`, `Finalize`, `Delegate` capabilities are declared in frontmatter.
+- Capability = tool list: if a session has Write/Edit tools, it can patch. If it has Task, it can delegate.
 - Run lifecycle is persisted and cancellation cascades through the run tree.
 
 ### Real-time Events
@@ -223,13 +222,13 @@ Detailed design docs live in [`doc/`](doc/):
 | [Product Spec](doc/product-spec.md) | Vision, OS analogy, product goals, UX surface |
 | [Insight](doc/insight.md) | Market positioning, competitive landscape, strategic direction |
 | [Agentic Loop](doc/agentic-loop.md) | Kernel runtime loop — iteration, interrupts, cancellation |
-| [Agents](doc/agents.md) | Process management — lifecycle, delegation, scheduling |
-| [Skills](doc/skills.md) | Dynamic extensions — format, discovery, triggers |
-| [Tools](doc/tools.md) | Syscall interface — built-in tools, safety |
+| [Agents](doc/agent-spec.md) | Process management — lifecycle, delegation, scheduling |
+| [Skills](doc/skill-spec.md) | Dynamic extensions — format, discovery, triggers |
+| [Tools](doc/tool-spec.md) | Syscall interface — built-in tools, safety |
 | [Plan](doc/plan-spec.md) | Plan mode — research, approval, execution |
 | [Chat System](doc/chat-spec.md) | SSE events, message model, rendering, APIs |
 | [Models](doc/models.md) | Providers, routing, credentials, auto-fallback |
-| [Storage](doc/storage.md) | Filesystem layout, persistent state, data formats |
+| [Storage](doc/storage-spec.md) | Filesystem layout, persistent state, data formats |
 | [CLI](doc/cli.md) | CLI reference — commands, flags, modes |
 | [Code Style](doc/code-style.md) | Code style rules |
 | [Log Spec](doc/log-spec.md) | Logging — levels, throttling, output targets |

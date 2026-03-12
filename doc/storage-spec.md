@@ -12,11 +12,11 @@ Filesystem layout for all persistent state. No database — everything is files.
 
 ## Related docs
 
-- `agents.md`: agent lifecycle, delegation.
+- `agent-spec.md`: agent lifecycle, delegation.
 - `mission-spec.md`: cron-based mission system.
 - `agentic-loop.md`: plan persistence, context management.
 - `chat-spec.md`: API endpoints that read/write this state.
-- `skills.md`: skill discovery paths.
+- `skill-spec.md`: skill discovery paths.
 
 ## Root directories
 
@@ -26,6 +26,7 @@ Two-tier layout, aligned with Claude Code's `~/.claude/` + `{repo}/.claude/` con
 |-----------|---------|
 | `~/.linggen/` | Global home (override with `$LINGGEN_HOME`) |
 | `~/.linggen/missions/` | Global missions and their sessions |
+| `~/.linggen/skills/{name}/` | Per-skill state (sessions) |
 | `~/.linggen/projects/{encoded}/` | Per-project state (sessions, runs) |
 | `{workspace}/.linggen/` | Workspace-local settings (permissions, future config) |
 
@@ -43,7 +44,13 @@ Project path encoding: `/Users/foo/project` → `-Users-foo-project` (same conve
 │   └── {name}.md                     # Global agent specs (markdown + YAML frontmatter)
 ├── skills/
 │   ├── {name}.md                     # Flat skill files
-│   └── {name}/SKILL.md              # Nested skill directories
+│   └── {name}/
+│       ├── SKILL.md                  # Skill definition
+│       ├── scripts/                  # Skill assets (optional)
+│       └── sessions/                 # Skill-scoped sessions
+│           └── {session_id}/
+│               ├── session.yaml      # Session metadata (YAML)
+│               └── messages.jsonl    # Session messages (JSONL)
 ├── credentials.json                  # API keys for model providers (JSON)
 ├── missions/
 │   └── {mission_id}/
@@ -106,7 +113,7 @@ Stored at `~/.linggen/credentials.json`. Keyed by model `id` from `linggen.toml`
 { "tool_allows": ["Write", "Edit"] }
 ```
 
-Project-scoped tool permission allows, stored at `{workspace}/.linggen/permissions.json`. Created when user selects "Allow all {tool} for this project". See `tools.md` → Tool permission mode.
+Project-scoped tool permission allows, stored at `{workspace}/.linggen/permissions.json`. Created when user selects "Allow all {tool} for this project". See `tool-spec.md` → Tool permission mode.
 
 ### Session metadata (`session.yaml`)
 

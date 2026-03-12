@@ -45,6 +45,14 @@ pub(crate) async fn create_mission(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CreateMissionRequest>,
 ) -> impl IntoResponse {
+    // Missions require the "mission" skill to be installed.
+    if state.skill_manager.get_skill("mission").await.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "The \"mission\" skill is not installed. Run `ling init` to install default skills.".to_string(),
+        ).into_response();
+    }
+
     if let Err(e) = missions::validate_cron(&req.schedule) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -173,6 +181,13 @@ pub(crate) async fn trigger_mission(
     Path(id): Path<String>,
     Json(req): Json<TriggerMissionRequest>,
 ) -> impl IntoResponse {
+    if state.skill_manager.get_skill("mission").await.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "The \"mission\" skill is not installed. Run `ling init` to install default skills.".to_string(),
+        ).into_response();
+    }
+
     let mission = match state.manager.missions.get_mission(&id) {
         Ok(Some(m)) => m,
         Ok(None) => return (StatusCode::NOT_FOUND, "Mission not found".to_string()).into_response(),

@@ -24,6 +24,8 @@ pub mod keys {
     pub const SYSTEM_PROJECT_INSTRUCTIONS_FOOTER: &str =
         "system-prompt.project_instructions_footer";
     pub const SYSTEM_ENVIRONMENT_BLOCK: &str = "system-prompt.environment_block";
+    pub const SYSTEM_DELEGATION_HEADER: &str = "system-prompt.delegation_header";
+    pub const SYSTEM_DELEGATION_ENTRY: &str = "system-prompt.delegation_entry";
     pub const SYSTEM_MEMORY_BLOCK: &str = "system-prompt.memory_block";
     pub const SYSTEM_MEMORY_BLOCK_EMPTY: &str = "system-prompt.memory_block_empty";
 
@@ -312,6 +314,8 @@ mod tests {
             keys::SYSTEM_PROJECT_INSTRUCTIONS_ENTRY,
             keys::SYSTEM_PROJECT_INSTRUCTIONS_FOOTER,
             keys::SYSTEM_ENVIRONMENT_BLOCK,
+            keys::SYSTEM_DELEGATION_HEADER,
+            keys::SYSTEM_DELEGATION_ENTRY,
             keys::SYSTEM_MEMORY_BLOCK,
             keys::SYSTEM_MEMORY_BLOCK_EMPTY,
             keys::NUDGE_INVALID_JSON,

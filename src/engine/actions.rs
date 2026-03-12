@@ -1,38 +1,14 @@
-use crate::engine::TaskPacket;
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::de::Deserializer;
 use serde_json::Value;
 
+/// The only action a model can produce: a tool call.
+/// The loop stops when the model emits no tool calls (CC-aligned).
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-pub enum ModelAction {
-    #[serde(rename = "tool")]
-    Tool {
-        tool: String,
-        args: serde_json::Value,
-    },
-    #[serde(rename = "patch")]
-    Patch { diff: String },
-    #[serde(rename = "finalize_task")]
-    FinalizeTask { packet: TaskPacket },
-    #[serde(rename = "done")]
-    Done {
-        #[serde(default, alias = "summary")]
-        message: Option<String>,
-    },
-    #[serde(rename = "enter_plan_mode")]
-    EnterPlanMode {
-        #[serde(default)]
-        reason: Option<String>,
-    },
-    #[serde(rename = "update_plan")]
-    UpdatePlan {
-        #[serde(default)]
-        plan_text: Option<String>,
-        #[serde(default)]
-        items: Vec<serde_json::Value>,
-    },
+pub struct ModelAction {
+    pub tool: String,
+    pub args: serde_json::Value,
 }
 
 #[allow(dead_code)]
@@ -98,10 +74,6 @@ pub fn parse_all_actions(raw: &str) -> Result<Vec<ModelAction>> {
 }
 
 fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
-    if let Ok(action) = serde_json::from_value::<ModelAction>(value.clone()) {
-        return Some(action);
-    }
-
     let obj = value.as_object()?;
     let action_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let args = obj
@@ -132,64 +104,40 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
         .or_else(|| obj.get("name"))
         .and_then(|v| v.as_str())
     {
-        // Intercept "done"/"Done" — models sometimes emit {"name":"done","message":"..."}
-        // which should be a Done action, not a tool call.
+        // "done"/"Done" is no longer a special action — ignore it.
+        // The loop stops when the model has no tool calls.
         if tool.eq_ignore_ascii_case("done") {
-            let msg = obj
-                .get("message")
-                .or_else(|| obj.get("text"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            return Some(ModelAction::Done { message: msg });
-        }
-        if !is_supported_model_tool(tool) {
             return None;
         }
-        return Some(ModelAction::Tool {
+        return Some(ModelAction {
             tool: tool.to_string(),
             args,
         });
     }
 
+    // Legacy action type names that map directly to tools.
+    // Note: {"type":"tool","tool":"Read"} is already handled above (the "tool" key
+    // check at line 102 fires first), so we don't need a "tool" arm here.
     let tool_name = match action_type {
         "Read" | "Grep" | "Write" | "Edit" | "Glob" | "Bash" | "capture_screenshot"
-        | "lock_paths" | "unlock_paths" | "Task" | "delegate_to_agent" => action_type,
-        // Known non-tool action types that should not be treated as tool shorthands.
-        "" | "patch" | "finalize_task" | "done" | "enter_plan_mode" => {
-            // Handle {"type":"done","summary":"..."} or {"type":"done","message":"..."}
-            if action_type == "done" {
-                for key in &["message", "summary", "text", "content"] {
-                    if let Some(val) = obj.get(*key).and_then(|v| v.as_str()) {
-                        return Some(ModelAction::Done {
-                            message: Some(val.to_string()),
-                        });
-                    }
-                }
-                return Some(ModelAction::Done { message: None });
+        | "lock_paths" | "unlock_paths" | "Task" | "delegate_to_agent"
+        | "EnterPlanMode" | "enter_plan_mode" | "UpdatePlan" | "update_plan" => {
+            // Normalize legacy snake_case action types to PascalCase tool names.
+            match action_type {
+                "enter_plan_mode" => "EnterPlanMode",
+                "update_plan" => "UpdatePlan",
+                other => other,
             }
-            // Fallback: if the object has a text-like field but no action type,
-            // treat it as a Done message. This handles models that emit
-            // {"response":"..."} or {"message":"..."} instead of a proper action.
-            if action_type.is_empty() {
-                // Handle {"done":true,"summary":"..."} — a common model output format.
-                if obj.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    for key in &["summary", "message", "text", "content"] {
-                        if let Some(val) = obj.get(*key).and_then(|v| v.as_str()) {
-                            return Some(ModelAction::Done {
-                                message: Some(val.to_string()),
-                            });
-                        }
-                    }
-                    return Some(ModelAction::Done { message: None });
-                }
-                for key in &["response", "message", "summary", "text", "content", "answer"] {
-                    if let Some(val) = obj.get(*key).and_then(|v| v.as_str()) {
-                        return Some(ModelAction::Done {
-                            message: Some(val.to_string()),
-                        });
-                    }
-                }
+        }
+        // "done", "patch", "finalize_task" — no longer actions, ignore.
+        "done" | "patch" | "finalize_task" => return None,
+        // Empty type with text-like fields — not a tool call, ignore.
+        "" => {
+            // Handle {"done":true} — not a tool call.
+            if obj.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return None;
             }
+            // {"response":"..."} etc. — not a tool call.
             return None;
         }
         // Unknown type with args present: treat as a skill tool shorthand
@@ -198,16 +146,10 @@ fn value_to_action(value: serde_json::Value) -> Option<ModelAction> {
         _ => return None,
     };
 
-    Some(ModelAction::Tool {
+    Some(ModelAction {
         tool: tool_name.to_string(),
         args,
     })
-}
-
-fn is_supported_model_tool(_tool: &str) -> bool {
-    // Always accept: the ToolRegistry rejects unknown tools at execution time
-    // with a proper error message, which is better than silently dropping the action.
-    true
 }
 
 /// Try to parse the first complete JSON action from a buffer.
@@ -386,7 +328,6 @@ pub fn model_message_log_parts(
 mod tests {
     use super::{
         looks_like_final_answer, parse_all_actions, parse_first_action, text_before_first_json,
-        ModelAction,
     };
 
     #[test]
@@ -395,16 +336,11 @@ mod tests {
 {"type":"tool","tool":"Write","args":{"path":"src/logging.rs","content":"static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();\npub struct LoggingSettings<'a> { pub level: Option<&'a str>, pub retention_days: Option<u64>, }\n"}} "#;
 
         let action = parse_first_action(raw).expect("expected tool action");
-        match action {
-            ModelAction::Tool { tool, args } => {
-                assert_eq!(tool, "Write");
-                let content = args["content"].as_str().expect("content should be a string");
-                assert!(content.contains("OnceLock<WorkerGuard>"));
-                assert!(content.contains("Option<&'a str>"));
-                assert!(content.contains("Option<u64>"));
-            }
-            _ => panic!("expected tool action"),
-        }
+        assert_eq!(action.tool, "Write");
+        let content = action.args["content"].as_str().expect("content should be a string");
+        assert!(content.contains("OnceLock<WorkerGuard>"));
+        assert!(content.contains("Option<&'a str>"));
+        assert!(content.contains("Option<u64>"));
     }
 
     #[test]
@@ -412,28 +348,18 @@ mod tests {
         let raw =
             "<search_indexing>\n{\"type\":\"tool\",\"tool\":\"Read\",\"args\":{\"path\":\"src/logging.rs\"}}\n</search_indexing>";
         let action = parse_first_action(raw).expect("expected wrapped tool action");
-        match action {
-            ModelAction::Tool { tool, args } => {
-                assert_eq!(tool, "Read");
-                assert_eq!(args["path"], "src/logging.rs");
-            }
-            _ => panic!("expected tool action"),
-        }
+        assert_eq!(action.tool, "Read");
+        assert_eq!(action.args["path"], "src/logging.rs");
     }
 
     #[test]
     fn parse_first_action_accepts_edit_tool() {
         let raw = r#"{"type":"tool","tool":"Edit","args":{"path":"src/logging.rs","old_string":"foo","new_string":"bar","replace_all":false}}"#;
         let action = parse_first_action(raw).expect("expected Edit tool action");
-        match action {
-            ModelAction::Tool { tool, args } => {
-                assert_eq!(tool, "Edit");
-                assert_eq!(args["path"], "src/logging.rs");
-                assert_eq!(args["old_string"], "foo");
-                assert_eq!(args["new_string"], "bar");
-            }
-            _ => panic!("expected tool action"),
-        }
+        assert_eq!(action.tool, "Edit");
+        assert_eq!(action.args["path"], "src/logging.rs");
+        assert_eq!(action.args["old_string"], "foo");
+        assert_eq!(action.args["new_string"], "bar");
     }
 
     #[test]
@@ -441,10 +367,7 @@ mod tests {
         let raw = r#"{"type":"tool","tool":"Read","args":{"path":"src/main.rs"}}"#;
         let actions = parse_all_actions(raw).unwrap();
         assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            ModelAction::Tool { tool, .. } => assert_eq!(tool, "Read"),
-            _ => panic!("expected tool action"),
-        }
+        assert_eq!(actions[0].tool, "Read");
     }
 
     #[test]
@@ -455,30 +378,18 @@ Now let me also search:
 {"type":"tool","tool":"Grep","args":{"query":"fn main","globs":["src/**"]}}"#;
         let actions = parse_all_actions(raw).unwrap();
         assert_eq!(actions.len(), 2);
-        match &actions[0] {
-            ModelAction::Tool { tool, .. } => assert_eq!(tool, "Read"),
-            _ => panic!("expected Read tool"),
-        }
-        match &actions[1] {
-            ModelAction::Tool { tool, .. } => assert_eq!(tool, "Grep"),
-            _ => panic!("expected Grep tool"),
-        }
+        assert_eq!(actions[0].tool, "Read");
+        assert_eq!(actions[1].tool, "Grep");
     }
 
     #[test]
-    fn parse_all_actions_tool_then_finalize() {
+    fn parse_all_actions_finalize_task_is_ignored() {
+        // finalize_task is no longer a valid action — only the Read tool should parse.
         let raw = r#"{"type":"tool","tool":"Read","args":{"path":"src/main.rs"}}
 {"type":"finalize_task","packet":{"title":"test","user_stories":[],"acceptance_criteria":[],"mermaid_wireframe":null}}"#;
         let actions = parse_all_actions(raw).unwrap();
-        assert_eq!(actions.len(), 2);
-        match &actions[0] {
-            ModelAction::Tool { tool, .. } => assert_eq!(tool, "Read"),
-            _ => panic!("expected tool action"),
-        }
-        match &actions[1] {
-            ModelAction::FinalizeTask { packet } => assert_eq!(packet.title, "test"),
-            _ => panic!("expected finalize action"),
-        }
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].tool, "Read");
     }
 
     #[test]
@@ -488,30 +399,17 @@ Now let me also search:
 {"type":"tool","tool":"Grep","args":{"query":"hello"}}"#;
         let actions = parse_all_actions(raw).unwrap();
         assert_eq!(actions.len(), 3);
-        let tools: Vec<&str> = actions
-            .iter()
-            .filter_map(|a| match a {
-                ModelAction::Tool { tool, .. } => Some(tool.as_str()),
-                _ => None,
-            })
-            .collect();
+        let tools: Vec<&str> = actions.iter().map(|a| a.tool.as_str()).collect();
         assert_eq!(tools, vec!["Glob", "Read", "Grep"]);
     }
 
     #[test]
     fn parse_all_actions_name_field_as_tool() {
-        // Models sometimes emit {"name":"Read","args":{...}} instead of
-        // {"type":"tool","tool":"Read","args":{...}}.
         let raw = r#"The user wants me to review logging.rs.{"name":"Read","args":{"path":"src/logging.rs"}}"#;
         let actions = parse_all_actions(raw).unwrap();
         assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            ModelAction::Tool { tool, args } => {
-                assert_eq!(tool, "Read");
-                assert_eq!(args["path"], "src/logging.rs");
-            }
-            _ => panic!("expected tool action"),
-        }
+        assert_eq!(actions[0].tool, "Read");
+        assert_eq!(actions[0].args["path"], "src/logging.rs");
     }
 
     #[test]
@@ -519,47 +417,16 @@ Now let me also search:
         let raw = r#"{"name":"Glob","args":{"globs":["**/*.rs"]}}"#;
         let actions = parse_all_actions(raw).unwrap();
         assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            ModelAction::Tool { tool, .. } => assert_eq!(tool, "Glob"),
-            _ => panic!("expected tool action"),
-        }
+        assert_eq!(actions[0].tool, "Glob");
     }
 
     #[test]
-    fn parse_enter_plan_mode_without_reason() {
-        let raw = r#"{"type":"enter_plan_mode"}"#;
-        let action = parse_first_action(raw).expect("expected enter_plan_mode action");
-        match action {
-            ModelAction::EnterPlanMode { reason } => {
-                assert!(reason.is_none());
-            }
-            _ => panic!("expected EnterPlanMode, got {:?}", action),
-        }
-    }
-
-    #[test]
-    fn parse_enter_plan_mode_with_reason() {
+    fn parse_enter_plan_mode_as_tool() {
+        // enter_plan_mode is now parsed as a tool call to "EnterPlanMode".
         let raw = r#"{"type":"enter_plan_mode","reason":"complex refactoring needs research"}"#;
-        let action = parse_first_action(raw).expect("expected enter_plan_mode action");
-        match action {
-            ModelAction::EnterPlanMode { reason } => {
-                assert_eq!(reason.as_deref(), Some("complex refactoring needs research"));
-            }
-            _ => panic!("expected EnterPlanMode, got {:?}", action),
-        }
-    }
-
-    #[test]
-    fn parse_enter_plan_mode_not_treated_as_tool() {
-        // enter_plan_mode should be parsed as EnterPlanMode, not as a Tool action.
-        let raw = r#"{"type":"enter_plan_mode","reason":"planning needed"}"#;
-        let actions = parse_all_actions(raw).unwrap();
-        assert_eq!(actions.len(), 1);
-        assert!(
-            matches!(&actions[0], ModelAction::EnterPlanMode { .. }),
-            "expected EnterPlanMode, got {:?}",
-            actions[0]
-        );
+        let action = parse_first_action(raw).expect("expected EnterPlanMode tool action");
+        assert_eq!(action.tool, "EnterPlanMode");
+        assert_eq!(action.args["reason"], "complex refactoring needs research");
     }
 
     #[test]
@@ -568,158 +435,79 @@ Now let me also search:
 {"type":"enter_plan_mode","reason":"need to plan"}"#;
         let actions = parse_all_actions(raw).unwrap();
         assert_eq!(actions.len(), 2);
-        match &actions[0] {
-            ModelAction::Tool { tool, .. } => assert_eq!(tool, "Read"),
-            _ => panic!("expected tool action"),
-        }
-        match &actions[1] {
-            ModelAction::EnterPlanMode { reason } => {
-                assert_eq!(reason.as_deref(), Some("need to plan"));
-            }
-            _ => panic!("expected EnterPlanMode"),
-        }
+        assert_eq!(actions[0].tool, "Read");
+        assert_eq!(actions[1].tool, "EnterPlanMode");
+        assert_eq!(actions[1].args["reason"], "need to plan");
     }
 
     #[test]
-    fn parse_response_json_as_done() {
-        // Models sometimes emit {"response":"..."} instead of {"type":"done","message":"..."}.
-        // This should be treated as a Done action.
+    fn parse_response_json_is_not_tool() {
+        // {"response":"..."} is not a tool call — should fail to parse.
         let raw = r#"{"response":"Hi there! I can help you with that."}"#;
-        let actions = parse_all_actions(raw).unwrap();
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            ModelAction::Done { message } => {
-                assert_eq!(
-                    message.as_deref(),
-                    Some("Hi there! I can help you with that.")
-                );
-            }
-            _ => panic!("expected Done action, got {:?}", actions[0]),
-        }
+        assert!(parse_all_actions(raw).is_err());
     }
 
     #[test]
-    fn parse_name_done_as_done_action() {
-        // Models sometimes emit {"name":"done","message":"..."} which should be
-        // parsed as ModelAction::Done, not as a Tool call to "done".
+    fn parse_name_done_is_not_tool() {
+        // {"name":"done"} is not a tool call — should be ignored.
         let raw = r#"{"name":"done","message":"Acked the casual greeting."}"#;
-        let actions = parse_all_actions(raw).unwrap();
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], ModelAction::Done { message } if message.as_deref() == Some("Acked the casual greeting.")));
+        assert!(parse_all_actions(raw).is_err());
     }
 
     #[test]
-    fn parse_name_done_capitalized_as_done_action() {
-        let raw = r#"{"name":"Done","message":"All finished."}"#;
-        let actions = parse_all_actions(raw).unwrap();
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], ModelAction::Done { message } if message.as_deref() == Some("All finished.")));
-    }
-
-    #[test]
-    fn parse_message_json_as_done() {
-        let raw = r#"{"message":"Task complete."}"#;
-        let actions = parse_all_actions(raw).unwrap();
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], ModelAction::Done { message } if message.as_deref() == Some("Task complete.")));
-    }
-
-    #[test]
-    fn parse_done_with_summary_field() {
-        // GPT models sometimes emit "summary" instead of "message"
+    fn parse_done_type_is_not_tool() {
         let raw = r#"{"type":"done","summary":"Code review completed."}"#;
-        let actions = parse_all_actions(raw).unwrap();
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], ModelAction::Done { message } if message.as_deref() == Some("Code review completed.")));
-    }
-
-    #[test]
-    fn parse_text_json_as_done() {
-        let raw = r#"{"text":"Here is the answer."}"#;
-        let actions = parse_all_actions(raw).unwrap();
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], ModelAction::Done { message } if message.as_deref() == Some("Here is the answer.")));
+        assert!(parse_all_actions(raw).is_err());
     }
 
     #[test]
     fn parse_task_with_flat_args() {
-        // Models emit Task with args at top level instead of nested under "args".
         let raw = r#"{"type":"Task","target_agent_id":"linggen-guide","task":"Introduce Linggen"}"#;
         let actions = parse_all_actions(raw).unwrap();
         assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            ModelAction::Tool { tool, args } => {
-                assert_eq!(tool, "Task");
-                assert_eq!(args["target_agent_id"], "linggen-guide");
-                assert_eq!(args["task"], "Introduce Linggen");
-            }
-            _ => panic!("expected tool action, got {:?}", actions[0]),
-        }
+        assert_eq!(actions[0].tool, "Task");
+        assert_eq!(actions[0].args["target_agent_id"], "linggen-guide");
+        assert_eq!(actions[0].args["task"], "Introduce Linggen");
     }
 
     #[test]
     fn parse_task_with_nested_args() {
-        // Proper format with args nested should still work.
         let raw = r#"{"type":"Task","args":{"target_agent_id":"coder","task":"Fix the bug"}}"#;
         let actions = parse_all_actions(raw).unwrap();
         assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            ModelAction::Tool { tool, args } => {
-                assert_eq!(tool, "Task");
-                assert_eq!(args["target_agent_id"], "coder");
-                assert_eq!(args["task"], "Fix the bug");
-            }
-            _ => panic!("expected tool action, got {:?}", actions[0]),
-        }
+        assert_eq!(actions[0].tool, "Task");
+        assert_eq!(actions[0].args["target_agent_id"], "coder");
+        assert_eq!(actions[0].args["task"], "Fix the bug");
     }
 
     #[test]
     fn parse_delegate_to_agent_backward_compat_flat() {
-        // Backward compat: old "delegate_to_agent" format still parses.
         let raw = r#"{"type":"delegate_to_agent","target_agent_id":"linggen-guide","task":"Introduce Linggen"}"#;
         let actions = parse_all_actions(raw).unwrap();
         assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            ModelAction::Tool { tool, args } => {
-                assert_eq!(tool, "delegate_to_agent");
-                assert_eq!(args["target_agent_id"], "linggen-guide");
-                assert_eq!(args["task"], "Introduce Linggen");
-            }
-            _ => panic!("expected tool action, got {:?}", actions[0]),
-        }
+        assert_eq!(actions[0].tool, "delegate_to_agent");
+        assert_eq!(actions[0].args["target_agent_id"], "linggen-guide");
     }
 
     #[test]
     fn parse_delegate_to_agent_backward_compat_nested() {
-        // Backward compat: old "delegate_to_agent" format with nested args still parses.
         let raw = r#"{"type":"delegate_to_agent","args":{"target_agent_id":"coder","task":"Fix the bug"}}"#;
         let actions = parse_all_actions(raw).unwrap();
         assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            ModelAction::Tool { tool, args } => {
-                assert_eq!(tool, "delegate_to_agent");
-                assert_eq!(args["target_agent_id"], "coder");
-                assert_eq!(args["task"], "Fix the bug");
-            }
-            _ => panic!("expected tool action, got {:?}", actions[0]),
-        }
+        assert_eq!(actions[0].tool, "delegate_to_agent");
+        assert_eq!(actions[0].args["target_agent_id"], "coder");
     }
 
     #[test]
-    fn parse_update_plan_action() {
+    fn parse_update_plan_as_tool() {
         let raw = r#"I need to create a plan.
 {"type":"update_plan","items":[{"id":"1","title":"Step one","status":"completed"},{"id":"2","title":"Step two","status":"in_progress"},{"id":"3","title":"Step three","status":"pending"}]}"#;
         let actions = parse_all_actions(raw).unwrap();
         assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            ModelAction::UpdatePlan { plan_text, items } => {
-                assert!(plan_text.is_none());
-                assert_eq!(items.len(), 3);
-                assert_eq!(items[0]["title"], "Step one");
-                assert_eq!(items[1]["status"], "in_progress");
-            }
-            _ => panic!("expected UpdatePlan, got {:?}", actions[0]),
-        }
+        assert_eq!(actions[0].tool, "UpdatePlan");
+        let items = actions[0].args["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["title"], "Step one");
     }
 
     #[test]
@@ -768,10 +556,8 @@ Now let me also search:
     }
 
     #[test]
-    fn parse_done_bool_with_summary() {
+    fn parse_done_bool_is_not_tool() {
         let raw = r#"{"done":true,"summary":"Reviewed the codebase and found issues."}"#;
-        let actions = parse_all_actions(raw).unwrap();
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], ModelAction::Done { message } if message.as_deref() == Some("Reviewed the codebase and found issues.")));
+        assert!(parse_all_actions(raw).is_err());
     }
 }

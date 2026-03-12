@@ -1,12 +1,11 @@
 use crate::agent_manager::locks::LockManager;
 use crate::agent_manager::models::ModelManager;
-use crate::config::{AgentPolicyCapability, AgentSpec, Config};
+use crate::config::{AgentSpec, Config};
 use crate::engine::{AgentEngine, AgentOutcome, AgentRole, EngineConfig, InterfaceMode, Plan};
 use crate::project_store::ProjectStore;
 use crate::skills::SkillManager;
 use crate::state_fs::{SessionStore, StateFile, StateFs};
 use anyhow::Result;
-use globset::Glob;
 use ignore::gitignore::GitignoreBuilder;
 use notify::{EventKind, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -570,16 +569,8 @@ impl AgentManager {
             agent_spec.spec.model.clone(),
         )?;
 
-        let role = if agent_spec
-            .spec
-            .allows_policy(AgentPolicyCapability::Finalize)
-        {
-            AgentRole::Lead
-        } else if agent_spec.spec.allows_policy(AgentPolicyCapability::Patch) {
-            AgentRole::Coder
-        } else {
-            AgentRole::Operator
-        };
+        // All agents use Lead role (single-agent architecture).
+        let role = AgentRole::Lead;
 
         let mut engine = AgentEngine::new(
             EngineConfig {
@@ -658,16 +649,8 @@ impl AgentManager {
             agent_spec.spec.model.clone(),
         )?;
 
-        let role = if agent_spec
-            .spec
-            .allows_policy(AgentPolicyCapability::Finalize)
-        {
-            AgentRole::Lead
-        } else if agent_spec.spec.allows_policy(AgentPolicyCapability::Patch) {
-            AgentRole::Coder
-        } else {
-            AgentRole::Operator
-        };
+        // All agents use Lead role (single-agent architecture).
+        let role = AgentRole::Lead;
 
         let mut engine = AgentEngine::new(
             EngineConfig {
@@ -718,23 +701,9 @@ impl AgentManager {
         // Important: do NOT lock a live agent engine here.
         // `write_file` is called while the engine mutex is already held by run_agent_loop,
         // and re-locking that same engine causes a deadlock.
-        let project_root = Self::canonical_project_root(project_root);
-        let Ok(Some(agent_spec)) = self.find_agent_spec_for_project(&project_root, agent_id) else {
-            return true;
-        };
-
-        if agent_spec.spec.work_globs.is_empty() {
-            return true;
-        }
-
-        for glob_str in &agent_spec.spec.work_globs {
-            if let Ok(glob) = Glob::new(glob_str) {
-                if glob.compile_matcher().is_match(path) {
-                    return true;
-                }
-            }
-        }
-        false
+        // All paths are currently allowed (no per-agent path restrictions).
+        let _ = (project_root, agent_id, path);
+        true
     }
 
     pub async fn list_agent_specs(&self, project_root: &PathBuf) -> Result<Vec<AgentSpecFile>> {
@@ -1135,13 +1104,12 @@ impl AgentManager {
             .unwrap_or_else(|_| project_root.clone());
         let ctx = self.get_or_create_project(project_root.clone()).await?;
         let tasks = ctx.state_fs.list_tasks()?;
+        // All agents are patch-capable; pick the first.
         let patch_agent_id = self
             .list_agent_specs(&project_root)
             .await?
             .into_iter()
-            .find(|entry| {
-                entry.spec.allows_policy(AgentPolicyCapability::Patch)
-            })
+            .next()
             .map(|entry| entry.agent_id);
 
         let active_patch_task = tasks.iter().find(|(meta, _)| match meta {

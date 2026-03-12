@@ -55,96 +55,12 @@ pub struct AgentSpec {
     pub name: String,
     pub description: String,
     pub tools: Vec<String>,
+    #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
-    pub skills: Vec<String>,
-    #[serde(default)]
-    pub work_globs: Vec<String>,
-    #[serde(default)]
-    pub default_lock_globs: Vec<String>,
-    #[serde(default)]
-    pub policy: AgentPolicy,
+    pub personality: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AgentPolicyCapability {
-    #[serde(alias = "patch", alias = "PATCH")]
-    Patch,
-    #[serde(alias = "finalize", alias = "FINALIZE", alias = "FinalizeTask")]
-    Finalize,
-    #[serde(alias = "delegate", alias = "DELEGATE", alias = "Task")]
-    Delegate,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
-struct AgentPolicyObject {
-    #[serde(default)]
-    allow: Vec<AgentPolicyCapability>,
-    #[serde(default)]
-    delegate_targets: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct AgentPolicy {
-    pub allow: Vec<AgentPolicyCapability>,
-    pub delegate_targets: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum AgentPolicyWire {
-    List(Vec<AgentPolicyCapability>),
-    Object(AgentPolicyObject),
-}
-
-impl<'de> Deserialize<'de> for AgentPolicy {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let wire = AgentPolicyWire::deserialize(deserializer)?;
-        let mut policy = match wire {
-            AgentPolicyWire::List(allow) => AgentPolicy {
-                allow,
-                delegate_targets: Vec::new(),
-            },
-            AgentPolicyWire::Object(obj) => AgentPolicy {
-                allow: obj.allow,
-                delegate_targets: obj.delegate_targets,
-            },
-        };
-        policy.normalize();
-        Ok(policy)
-    }
-}
-
-impl AgentPolicy {
-    fn normalize(&mut self) {
-        let mut seen_allow = std::collections::HashSet::new();
-        self.allow.retain(|cap| seen_allow.insert(*cap));
-
-        let mut seen_targets = std::collections::HashSet::new();
-        self.delegate_targets = self
-            .delegate_targets
-            .iter()
-            .map(|target| target.trim().to_lowercase())
-            .filter(|target| !target.is_empty())
-            .filter(|target| seen_targets.insert(target.clone()))
-            .collect();
-    }
-
-    pub fn allows(&self, capability: AgentPolicyCapability) -> bool {
-        self.allow.contains(&capability)
-    }
-
-    pub fn allows_delegate_target(&self, target_agent_id: &str) -> bool {
-        if self.delegate_targets.is_empty() {
-            return true;
-        }
-        let target = target_agent_id.trim().to_lowercase();
-        self.delegate_targets.iter().any(|item| item == &target)
-    }
-}
 
 impl AgentSpec {
     pub fn from_markdown_content(content: &str) -> Result<(Self, String)> {
@@ -166,9 +82,6 @@ impl AgentSpec {
             .map_err(|e| anyhow::anyhow!("Agent spec at {:?} is invalid: {}", path, e))
     }
 
-    pub fn allows_policy(&self, capability: AgentPolicyCapability) -> bool {
-        self.policy.allows(capability)
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -497,82 +410,6 @@ mod tests {
         cfg.validate().unwrap();
     }
 
-    // ---- AgentPolicy tests ----
-
-    #[test]
-    fn test_agent_policy_allows() {
-        let policy = AgentPolicy {
-            allow: vec![AgentPolicyCapability::Patch, AgentPolicyCapability::Finalize],
-            delegate_targets: vec![],
-        };
-        assert!(policy.allows(AgentPolicyCapability::Patch));
-        assert!(policy.allows(AgentPolicyCapability::Finalize));
-        assert!(!policy.allows(AgentPolicyCapability::Delegate));
-    }
-
-    #[test]
-    fn test_agent_policy_delegate_targets_empty_allows_all() {
-        let policy = AgentPolicy {
-            allow: vec![],
-            delegate_targets: vec![],
-        };
-        assert!(policy.allows_delegate_target("any_agent"));
-        assert!(policy.allows_delegate_target("CODER"));
-    }
-
-    #[test]
-    fn test_agent_policy_delegate_targets_restrict() {
-        let policy = AgentPolicy {
-            allow: vec![],
-            delegate_targets: vec!["coder".to_string()],
-        };
-        assert!(policy.allows_delegate_target("coder"));
-        assert!(policy.allows_delegate_target("CODER")); // case insensitive
-        assert!(!policy.allows_delegate_target("reviewer"));
-    }
-
-    #[test]
-    fn test_agent_policy_deserialize_list() {
-        let yaml = "[Patch, Finalize]";
-        let policy: AgentPolicy = serde_yml::from_str(yaml).unwrap();
-        assert!(policy.allows(AgentPolicyCapability::Patch));
-        assert!(policy.allows(AgentPolicyCapability::Finalize));
-        assert!(policy.delegate_targets.is_empty());
-    }
-
-    #[test]
-    fn test_agent_policy_deserialize_object() {
-        let yaml = r#"
-allow: [Patch, Delegate]
-delegate_targets: [coder, reviewer]
-"#;
-        let policy: AgentPolicy = serde_yml::from_str(yaml).unwrap();
-        assert!(policy.allows(AgentPolicyCapability::Patch));
-        assert!(policy.allows(AgentPolicyCapability::Delegate));
-        assert!(policy.allows_delegate_target("coder"));
-        assert!(policy.allows_delegate_target("reviewer"));
-    }
-
-    #[test]
-    fn test_agent_policy_normalize_dedup() {
-        let yaml = "[Patch, Patch, Finalize]";
-        let policy: AgentPolicy = serde_yml::from_str(yaml).unwrap();
-        assert_eq!(policy.allow.len(), 2);
-    }
-
-    #[test]
-    fn test_agent_policy_normalize_delegate_targets() {
-        let yaml = r#"
-allow: []
-delegate_targets: ["  Coder  ", "coder", "REVIEWER", ""]
-"#;
-        let policy: AgentPolicy = serde_yml::from_str(yaml).unwrap();
-        // Should deduplicate, lowercase, trim, and remove empty
-        assert_eq!(policy.delegate_targets.len(), 2);
-        assert!(policy.delegate_targets.contains(&"coder".to_string()));
-        assert!(policy.delegate_targets.contains(&"reviewer".to_string()));
-    }
-
     // ---- AgentSpec::from_markdown_content tests ----
 
     #[test]
@@ -608,40 +445,48 @@ You are a helpful assistant."#;
     }
 
     #[test]
-    fn test_agent_spec_with_policy() {
+    fn test_agent_spec_ignores_unknown_fields() {
+        // serde should ignore unknown fields gracefully — this test
+        // verifies that basic specs still parse.
         let md = r#"---
 name: coder
 description: Implementation agent
 tools: [Read, Write, Edit]
-policy:
-  allow: [Patch, Finalize]
-  delegate_targets: [reviewer]
 ---
 Write code."#;
         let (spec, _) = AgentSpec::from_markdown_content(md).unwrap();
-        assert!(spec.allows_policy(AgentPolicyCapability::Patch));
-        assert!(!spec.allows_policy(AgentPolicyCapability::Delegate));
-        assert!(spec.policy.allows_delegate_target("reviewer"));
+        assert_eq!(spec.name, "coder");
+        assert_eq!(spec.tools, vec!["Read", "Write", "Edit"]);
     }
 
     #[test]
-    fn test_agent_spec_with_optional_fields() {
+    fn test_agent_spec_with_personality() {
+        let md = r#"---
+name: ling
+description: Personal assistant
+tools: ["*"]
+personality: |
+  Concise and direct.
+  Confident but honest.
+---
+You are Ling."#;
+        let (spec, prompt) = AgentSpec::from_markdown_content(md).unwrap();
+        assert_eq!(spec.name, "ling");
+        assert!(spec.personality.is_some());
+        assert!(spec.personality.as_ref().unwrap().contains("Concise and direct"));
+        assert_eq!(prompt, "You are Ling.");
+    }
+
+    #[test]
+    fn test_agent_spec_without_personality() {
         let md = r#"---
 name: test
-description: Test agent
-tools: []
-skills:
-  - memory
-work_globs:
-  - "src/**/*.rs"
-default_lock_globs:
-  - "Cargo.lock"
+description: No personality
+tools: [Read]
 ---
 Prompt."#;
         let (spec, _) = AgentSpec::from_markdown_content(md).unwrap();
-        assert_eq!(spec.skills, vec!["memory"]);
-        assert_eq!(spec.work_globs, vec!["src/**/*.rs"]);
-        assert_eq!(spec.default_lock_globs, vec!["Cargo.lock"]);
+        assert!(spec.personality.is_none());
     }
 
     #[test]

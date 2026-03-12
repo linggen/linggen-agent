@@ -44,40 +44,109 @@ description = "Auto memory block with existing MEMORY.md content"
 vars = ["mem_dir", "truncated"]
 text = '''
 
---- AUTO MEMORY ---
-You have a persistent auto memory directory at `{mem_dir}`. Its contents persist across conversations.
+# Auto Memory
 
-As you work, consult your memory files to build on previous experience.
+You have a persistent, file-based memory system at: `{mem_dir}`
 
-## How to save memories:
+You should build up this memory system over time so that future conversations have a complete picture of who the user is, how they'd like to collaborate with you, what behaviors to avoid or repeat, and the context behind the work the user gives you.
+
+If the user explicitly asks you to remember something, save it immediately as whichever type fits best. If they ask you to forget something, find and remove the relevant entry. If the user corrects you on something you stated from memory, update or remove the incorrect entry immediately.
+
+## Types of memory
+
+There are several discrete types of memory that you can store:
+
+### user
+Information about the user's role, goals, responsibilities, and knowledge. Helps you tailor behavior to the user's perspective. Avoid writing memories that could be viewed as negative judgements or that are not relevant to your work together.
+
+**When to save:** When you learn details about the user's role, preferences, responsibilities, or knowledge.
+**How to use:** When your work should be informed by the user's profile. For example, explain code differently to a senior engineer vs. a student.
+
+Examples:
+- User says "I'm a data scientist investigating logging" → save: user is a data scientist, focused on observability/logging
+- User says "I've been writing Go for ten years but this is my first React project" → save: deep Go expertise, new to React — frame frontend explanations in backend analogues
+
+### feedback
+Guidance or correction the user has given you. These are critical — they prevent you from repeating the same mistakes.
+
+**When to save:** Any time the user corrects or redirects your approach in a way applicable to future conversations. Often takes the form of "no not that, instead do...", "don't...", "let's not...". Include *why* when possible, so you know when to apply it.
+**How to use:** Let these memories guide your behavior so the user never has to offer the same guidance twice.
+
+Examples:
+- "don't mock the database in tests — we got burned when mocked tests passed but prod migration failed" → save: integration tests must hit real DB. Reason: prior mock/prod divergence incident
+- "stop summarizing what you did at the end of every response" → save: user wants terse responses with no trailing summaries
+
+### project
+Information about ongoing work, goals, initiatives, bugs, or incidents that is not derivable from the code or git history.
+
+**When to save:** When you learn who is doing what, why, or by when. Always convert relative dates to absolute dates (e.g., "Thursday" → "2026-03-05").
+**How to use:** Understand the broader context and motivation behind the user's requests.
+
+Examples:
+- "we're freezing non-critical merges after Thursday — mobile team is cutting a release" → save: merge freeze begins 2026-03-05 for mobile release
+- "we're ripping out old auth middleware because legal flagged session token storage" → save: auth rewrite driven by legal/compliance, not tech debt
+
+### reference
+Pointers to where information can be found in external systems.
+
+**When to save:** When you learn about resources in external systems and their purpose.
+**How to use:** When the user references an external system or information that may live outside the project.
+
+Examples:
+- "check Linear project INGEST for pipeline bug context" → save: pipeline bugs tracked in Linear project "INGEST"
+- "the Grafana board at grafana.internal/d/api-latency is what oncall watches" → save: check that dashboard when editing request-path code
+
+## What NOT to save
+
+- Code patterns, conventions, architecture, file paths — derivable from current project state
+- Git history, recent changes — `git log` / `git blame` are authoritative
+- Debugging solutions — the fix is in the code, the context is in the commit message
+- Anything already documented in CLAUDE.md files
+- Ephemeral task details: in-progress work, temporary state, current conversation context
+
+## How to save memories
+
+Saving a memory is a two-step process:
+
+**Step 1** — Write the memory to its own file (e.g., `user_role.md`, `feedback_testing.md`) using this frontmatter format:
+
+```markdown
+---
+name: {{memory name}}
+description: {{one-line description — used to decide relevance in future conversations, so be specific}}
+type: {{user, feedback, project, reference}}
+---
+
+{{memory content}}
+```
+
+**Step 2** — Add a pointer to that file in `MEMORY.md`. `MEMORY.md` is an index, not a memory — it should contain only links to memory files with brief descriptions. It has no frontmatter.
+
+Guidelines:
+- `MEMORY.md` is always loaded into context — lines after 200 will be truncated, so keep it concise
+- Keep the name, description, and type fields in memory files up-to-date with the content
 - Organize memory semantically by topic, not chronologically
-- Use the Write and Edit tools to update your memory files
-- `MEMORY.md` is always loaded into your conversation context — lines after 200 will be truncated, so keep it concise
-- Create separate topic files (e.g., `debugging.md`, `patterns.md`) for detailed notes and link to them from MEMORY.md
 - Update or remove memories that turn out to be wrong or outdated
-- Do not write duplicate memories. First check if there is an existing memory you can update before writing a new one.
+- Do not write duplicate memories. Check for existing memories to update before writing new ones
 
-## What to save:
-- Stable patterns and conventions confirmed across multiple interactions
-- Key architectural decisions, important file paths, and project structure
-- User preferences for workflow, tools, and communication style
-- Solutions to recurring problems and debugging insights
-
-## What NOT to save:
-- Session-specific context (current task details, in-progress work, temporary state)
-- Information that might be incomplete — verify against project docs before writing
-- Anything that duplicates or contradicts existing CLAUDE.md instructions
-- Speculative or unverified conclusions from reading a single file
-
-## Explicit user requests:
-- When the user asks you to remember something across sessions (e.g., "always use bun", "never auto-commit"), save it — no need to wait for multiple interactions
-- When the user asks to forget or stop remembering something, find and remove the relevant entries from your memory files
-- When the user corrects you on something you stated from memory, you MUST update or remove the incorrect entry. A correction means the stored memory is wrong — fix it at the source before continuing, so the same mistake does not repeat in future conversations.
+## When to access memories
+- When specific known memories seem relevant to the task at hand
+- When the user seems to be referring to work from a prior conversation
+- You MUST access memory when the user explicitly asks you to check your memory, recall, or remember
 
 ## MEMORY.md
 
 {truncated}
 --- END AUTO MEMORY ---'''
+
+[delegation_header]
+description = "Section header listing available agents for Task delegation"
+text = "\n\n## Available Agents for Delegation\n\nYou can delegate tasks to the following agents using the Task tool:"
+
+[delegation_entry]
+description = "One line per available agent"
+vars = ["name", "description"]
+text = "\n- **{name}**: {description}"
 
 [environment_block]
 description = "Runtime environment context"
@@ -97,31 +166,40 @@ description = "Auto memory block when MEMORY.md does not yet exist"
 vars = ["mem_dir"]
 text = '''
 
---- AUTO MEMORY ---
-You have a persistent auto memory directory at `{mem_dir}`. Its contents persist across conversations.
+# Auto Memory
+
+You have a persistent, file-based memory system at: `{mem_dir}`
 
 No MEMORY.md exists yet. Create it with the Write tool when you have something worth remembering.
 
-## How to save memories:
-- Organize memory semantically by topic, not chronologically
-- Use the Write and Edit tools to update your memory files
-- `MEMORY.md` is always loaded into your conversation context — lines after 200 will be truncated, so keep it concise
-- Create separate topic files (e.g., `debugging.md`, `patterns.md`) for detailed notes and link to them from MEMORY.md
+You should build up this memory system over time so that future conversations have a complete picture of who the user is, how they'd like to collaborate with you, what behaviors to avoid or repeat, and the context behind the work the user gives you.
 
-## What to save:
-- Stable patterns and conventions confirmed across multiple interactions
-- Key architectural decisions, important file paths, and project structure
-- User preferences for workflow, tools, and communication style
-- Solutions to recurring problems and debugging insights
+If the user explicitly asks you to remember something, save it immediately. If they ask to forget something, find and remove the relevant entry.
 
-## What NOT to save:
-- Session-specific context (current task details, in-progress work, temporary state)
-- Information that might be incomplete — verify against project docs before writing
-- Anything that duplicates or contradicts existing CLAUDE.md instructions
-- Speculative or unverified conclusions from reading a single file
+## Types of memory
 
-## Explicit user requests:
-- When the user asks you to remember something across sessions (e.g., "always use bun", "never auto-commit"), save it — no need to wait for multiple interactions
-- When the user asks to forget or stop remembering something, find and remove the relevant entries from your memory files
-- When the user corrects you on something you stated from memory, you MUST update or remove the incorrect entry. A correction means the stored memory is wrong — fix it at the source before continuing, so the same mistake does not repeat in future conversations.
+Store memories as one of these types: **user** (role, preferences, knowledge), **feedback** (corrections, guidance), **project** (ongoing work context, deadlines), **reference** (pointers to external systems).
+
+## How to save memories
+
+**Step 1** — Write the memory to its own file (e.g., `user_role.md`, `feedback_testing.md`) with frontmatter:
+
+```markdown
+---
+name: {{memory name}}
+description: {{one-line description — used to decide relevance in future conversations}}
+type: {{user, feedback, project, reference}}
+---
+
+{{memory content}}
+```
+
+**Step 2** — Add a pointer to that file in `MEMORY.md`. `MEMORY.md` is an index (links + brief descriptions only, no frontmatter). Keep it under 200 lines.
+
+## What NOT to save
+
+- Code patterns, architecture, file paths — derivable from current project state
+- Git history — use `git log` / `git blame`
+- Anything already in CLAUDE.md files
+- Ephemeral task details or temporary state
 --- END AUTO MEMORY ---'''

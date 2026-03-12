@@ -53,8 +53,6 @@ pub fn render_tool_result(r: &ToolResult) -> String {
         }
         ToolResult::AgentOutcome(outcome) => match outcome {
             crate::engine::AgentOutcome::None => "agent completed (no structured result)".to_string(),
-            crate::engine::AgentOutcome::Task(t) => format!("agent produced task: {}", t.title),
-            crate::engine::AgentOutcome::Patch(diff) => format!("agent produced patch ({} bytes)", diff.len()),
             crate::engine::AgentOutcome::Plan(p) => format!("agent produced plan: {}, status={:?}", p.summary, p.status),
             crate::engine::AgentOutcome::PlanApproved(p) => format!("agent plan approved: {}", p.summary),
             crate::engine::AgentOutcome::PlanModeRequested { reason } => format!("agent requested plan mode: {}", reason.as_deref().unwrap_or("(no reason)")),

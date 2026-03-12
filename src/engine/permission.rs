@@ -656,7 +656,7 @@ mod tests {
         assert!(is_destructive_tool("Write"));
         assert!(is_destructive_tool("Edit"));
         assert!(is_destructive_tool("Bash"));
-        // Patch is gated by agent policy, not user permissions.
+        // Patch is not a destructive user-facing tool.
         assert!(!is_destructive_tool("Patch"));
         assert!(!is_destructive_tool("Read"));
         assert!(!is_destructive_tool("Glob"));

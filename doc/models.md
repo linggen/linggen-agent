@@ -12,9 +12,9 @@ Hardware abstraction: model providers, routing policies, credentials, and auto-f
 
 ## Related docs
 
-- `agents.md`: per-agent model override.
+- `agent-spec.md`: per-agent model override.
 - `product-spec.md`: multi-model design principle.
-- `storage.md`: credentials file location.
+- `storage-spec.md`: credentials file location.
 
 ## Providers
 

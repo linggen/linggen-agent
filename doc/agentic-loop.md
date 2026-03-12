@@ -13,8 +13,8 @@ The kernel of linggen. Every agent run — chat, idle prompt, delegation — is 
 ## Related docs
 
 - `product-spec.md`: vision, OS analogy.
-- `agents.md`: process management, delegation.
-- `tools.md`: syscall interface.
+- `agent-spec.md`: process management, delegation.
+- `tool-spec.md`: syscall interface.
 - `chat-spec.md`: IPC, message queue.
 
 ## Loop iteration
@@ -76,7 +76,7 @@ Messages are queued per-agent and checked at each iteration boundary via an inte
 
 The loop includes gates and streak detection:
 
-- **Permission gate** — destructive tools (`Write`, `Edit`, `Bash`, `Patch`) require user approval when `tool_permission_mode = "ask"`. See `tools.md`.
+- **Permission gate** — destructive tools (`Write`, `Edit`, `Bash`, `Patch`) require user approval when `tool_permission_mode = "ask"`. See `tool-spec.md`.
 - Empty search results → nudge to broaden query.
 - Redundant tool calls → nudge to try different approach.
 - Invalid JSON parsing → retry hint.

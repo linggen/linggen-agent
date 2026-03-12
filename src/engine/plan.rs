@@ -1,63 +1,7 @@
 use super::types::*;
-use crate::config::AgentPolicyCapability;
-use crate::engine::patch::validate_unified_diff;
-use crate::ollama::ChatMessage;
-use tracing::{info, warn};
+use tracing::info;
 
 impl AgentEngine {
-    pub(crate) async fn handle_patch_action(
-        &mut self,
-        diff: String,
-        messages: &mut Vec<ChatMessage>,
-    ) -> LoopControl {
-        info!("Patch proposed");
-        if !self.agent_allows_policy(AgentPolicyCapability::Patch) {
-            warn!("Patch blocked: agent lacks Patch policy");
-            self.push_context_record(
-                ContextType::Error,
-                Some("patch_not_allowed".to_string()),
-                self.agent_id.clone(),
-                None,
-                "Agent policy does not allow Patch.".to_string(),
-                serde_json::json!({
-                    "required_policy": "Patch",
-                    "agent": self.agent_id.clone(),
-                }),
-            );
-            messages.push(self.tool_result_msg(
-                self.prompt_store.render_or_fallback(
-                    crate::prompts::keys::PATCH_NOT_ALLOWED,
-                    &[],
-                ),
-            ));
-            return LoopControl::Continue;
-        }
-        let errs = validate_unified_diff(&diff);
-        if !errs.is_empty() {
-            warn!("Patch invalid: {} errors", errs.len());
-            self.push_context_record(
-                ContextType::Error,
-                Some("patch_validation".to_string()),
-                self.agent_id.clone(),
-                None,
-                errs.join("\n"),
-                serde_json::json!({ "error_count": errs.len() }),
-            );
-            messages.push(self.tool_result_msg(
-                self.prompt_store.render_or_fallback(
-                    crate::prompts::keys::PATCH_VALIDATION_FAILED,
-                    &[("errors", &errs.join("\n"))],
-                ),
-            ));
-            return LoopControl::Continue;
-        }
-
-        info!("Patch validated OK");
-
-        self.active_skill = None;
-        LoopControl::Return(AgentOutcome::Patch(diff))
-    }
-
     /// Called when the model signals plan completion (via ExitPlanMode tool or
     /// fallback: done in plan_mode). Emits a PlanUpdate SSE event so the
     /// PlanBlock renders in the UI, and returns `AgentOutcome::Plan` for the
@@ -65,18 +9,24 @@ impl AgentEngine {
     /// buttons (CC-aligned — no modal AskUser dialog).
     pub(crate) async fn finalize_plan_mode(&mut self, plan_text: String) -> AgentOutcome {
         let summary = Self::extract_plan_summary(&plan_text);
+        // Preserve items from any prior UpdatePlan call during plan mode.
+        let items = self.plan.as_ref()
+            .map(|p| p.items.clone())
+            .unwrap_or_default();
         let plan = Plan {
             summary,
             status: PlanStatus::Planned,
             plan_text,
-            items: Vec::new(),
+            items,
         };
+        info!("finalize_plan_mode: status={:?} items={}", plan.status, plan.items.len());
         self.persist_and_emit_plan(plan.clone()).await;
         AgentOutcome::Plan(plan)
     }
 
     /// Store the plan in memory and emit a PlanUpdate SSE event.
     pub(crate) async fn persist_and_emit_plan(&mut self, plan: Plan) {
+        info!("persist_and_emit_plan: status={:?} items={}", plan.status, plan.items.len());
         self.plan = Some(plan);
 
         if let Some(manager) = self.tools.get_manager() {
@@ -106,31 +56,6 @@ impl AgentEngine {
             }
         }
         "Plan".to_string()
-    }
-
-    pub(crate) async fn handle_finalize_action(
-        &mut self,
-        packet: TaskPacket,
-        _messages: &mut Vec<ChatMessage>,
-        session_id: Option<&str>,
-    ) -> LoopControl {
-        info!("Task finalized: {}", packet.title);
-        // Persist the structured final answer to session files for the UI.
-        let msg = serde_json::json!({ "type": "finalize_task", "packet": packet }).to_string();
-        let _ = self
-            .persist_assistant_message(&msg, session_id)
-            .await;
-        self.chat_history.push(ChatMessage::new("assistant", msg.clone()));
-        self.push_context_record(
-            ContextType::AssistantReply,
-            Some("finalize_task".to_string()),
-            self.agent_id.clone(),
-            Some("user".to_string()),
-            msg,
-            serde_json::json!({ "kind": "finalize_task" }),
-        );
-        self.active_skill = None;
-        LoopControl::Return(AgentOutcome::Task(packet))
     }
 }
 

@@ -98,6 +98,29 @@ function mutate(fn: (msgs: ChatMessage[]) => ChatMessage[]): (s: ChatState) => P
   };
 }
 
+// Client-side image cache: images are ephemeral (never persisted to disk),
+// so we cache them here keyed by "from::normalizedText" to survive merges
+// and state reloads. Cleared on /clear.
+const _imageCache = new Map<string, string[]>();
+
+function imageCacheKey(from: string, text: string): string {
+  return `${from}::${normalizeMessageTextForDedup(text)}`;
+}
+
+/** Store images from a message into the cache. */
+function cacheImages(msg: ChatMessage): void {
+  if (msg.images && msg.images.length > 0) {
+    _imageCache.set(imageCacheKey(msg.from || msg.role || '', msg.text), msg.images);
+  }
+}
+
+/** Restore images from the cache onto a message if it's missing them. */
+function restoreImages(msg: ChatMessage): ChatMessage {
+  if (msg.images && msg.images.length > 0) return msg;
+  const cached = _imageCache.get(imageCacheKey(msg.from || msg.role || '', msg.text));
+  return cached ? { ...msg, images: cached } : msg;
+}
+
 export const useChatStore = create<ChatState>((set, get) => ({
   messages: [],
   workspaceState: null,
@@ -105,12 +128,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
   displayMessages: [],
 
   clear: (withCooldown = true) => {
+    _imageCache.clear();
     set({ messages: [], displayMessages: [], ...(withCooldown ? { _chatClearTs: Date.now() } : {}) });
   },
 
-  syncPersisted: (persisted) => set(mutate((msgs) => mergeChatMessages(persisted, msgs))),
+  syncPersisted: (persisted) => set(mutate((msgs) => {
+    const merged = mergeChatMessages(persisted, msgs);
+    return merged.map(restoreImages);
+  })),
 
-  addMessage: (message) => set(mutate((msgs) => [...msgs, message])),
+  addMessage: (message) => {
+    cacheImages(message);
+    set(mutate((msgs) => [...msgs, message]));
+  },
 
   removeLastUserMessage: (text, agentId) => set(mutate((msgs) => {
     const idx = msgs.findLastIndex((m) => m.role === 'user' && m.text === text && m.to === agentId);
@@ -576,7 +606,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                   role: 'agent' as const,
                   from: meta.from,
                   to: meta.to,
-                  text: bodyStr,
+                  text: String(body || ''),
                   timestamp: new Date(meta.ts * 1000).toLocaleTimeString(),
                   timestampMs: Number(meta.ts || 0) * 1000,
                 }];

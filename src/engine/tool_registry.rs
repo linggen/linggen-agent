@@ -1,7 +1,6 @@
 use super::skill_tool::SkillToolDef;
 use super::tools::{self, ToolCall, ToolResult, Tools};
 use crate::agent_manager::AgentManager;
-use crate::config::AgentPolicy;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -109,10 +108,6 @@ impl ToolRegistry {
         agent_id: String,
     ) {
         self.builtins.set_context(manager, agent_id);
-    }
-
-    pub fn set_policy(&mut self, policy: Option<AgentPolicy>) {
-        self.builtins.set_policy(policy);
     }
 
     pub fn set_run_id(&mut self, run_id: Option<String>) {

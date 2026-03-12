@@ -17,11 +17,25 @@ pub struct SessionStore {
     sessions_dir: PathBuf,
 }
 
+fn default_creator() -> String {
+    "user".to_string()
+}
+
+fn is_default_creator(s: &str) -> bool {
+    s == "user"
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub id: String,
     pub title: String,
     pub created_at: u64,
+    /// When set, this skill is bound to the session and activated on every message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
+    /// Who created this session: "user", "skill", "mission", "agent"
+    #[serde(default = "default_creator", skip_serializing_if = "is_default_creator")]
+    pub creator: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +70,16 @@ impl SessionStore {
             fs::write(&msgs_path, "")?;
         }
         Ok(())
+    }
+
+    pub fn get_session_meta(&self, session_id: &str) -> Result<Option<SessionMeta>> {
+        let yaml_path = self.session_dir(session_id).join("session.yaml");
+        if !yaml_path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(&yaml_path)?;
+        let meta: SessionMeta = serde_yml::from_str(&content)?;
+        Ok(Some(meta))
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionMeta>> {
@@ -249,7 +273,7 @@ impl SessionStore {
     // Helpers
     // ------------------------------------------------------------------
 
-    fn session_dir(&self, session_id: &str) -> PathBuf {
+    pub fn session_dir(&self, session_id: &str) -> PathBuf {
         self.sessions_dir.join(session_id)
     }
 
@@ -281,6 +305,8 @@ mod tests {
             id: "sess-1000-abcd1234".into(),
             title: "Test Session".into(),
             created_at: 1000,
+            skill: None,
+            creator: "user".into(),
         };
         store.add_session(&meta).unwrap();
 
@@ -308,6 +334,8 @@ mod tests {
                     id: id.into(),
                     title: id.into(),
                     created_at: ts,
+                    skill: None,
+                    creator: "user".into(),
                 })
                 .unwrap();
         }
@@ -323,6 +351,8 @@ mod tests {
             id: "s1".into(),
             title: "t".into(),
             created_at: 1000,
+            skill: None,
+            creator: "user".into(),
         };
         store.add_session(&meta).unwrap();
 
@@ -359,6 +389,8 @@ mod tests {
                 id: "s1".into(),
                 title: "t".into(),
                 created_at: 1000,
+                skill: None,
+                creator: "user".into(),
             })
             .unwrap();
 
@@ -404,6 +436,8 @@ mod tests {
                 id: "s1".into(),
                 title: "t".into(),
                 created_at: 1000,
+                skill: None,
+                creator: "user".into(),
             })
             .unwrap();
         store
@@ -433,6 +467,8 @@ mod tests {
                 id: "s1".into(),
                 title: "t".into(),
                 created_at: 1000,
+                skill: None,
+                creator: "user".into(),
             })
             .unwrap();
         store
@@ -462,6 +498,8 @@ mod tests {
                 id: "../escape".into(),
                 title: "t".into(),
                 created_at: 1000,
+                skill: None,
+                creator: "user".into(),
             })
             .is_err());
         assert!(store
@@ -469,6 +507,8 @@ mod tests {
                 id: "a/b".into(),
                 title: "t".into(),
                 created_at: 1000,
+                skill: None,
+                creator: "user".into(),
             })
             .is_err());
         assert!(store
@@ -476,6 +516,8 @@ mod tests {
                 id: "".into(),
                 title: "t".into(),
                 created_at: 1000,
+                skill: None,
+                creator: "user".into(),
             })
             .is_err());
     }

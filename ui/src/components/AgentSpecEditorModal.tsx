@@ -8,9 +8,6 @@ name: ${agentName}
 description: ${agentName} agent.
 tools: [Read]
 model: inherit
-kind: main
-work_globs: ["**/*"]
-policy: []
 ---
 
 You are linggen '${agentName}'.

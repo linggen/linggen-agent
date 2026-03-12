@@ -125,10 +125,7 @@ impl OpenAiClient {
                     }
                     instructions.push_str(&msg.content);
                 } else {
-                    input_items.push(serde_json::json!({
-                        "role": msg.role,
-                        "content": msg.content,
-                    }));
+                    input_items.push(responses_api_input_item(msg));
                 }
             }
             let mut req = serde_json::json!({
@@ -334,10 +331,7 @@ impl OpenAiClient {
                         }));
                     }
                 } else {
-                    input_items.push(serde_json::json!({
-                        "role": msg.role,
-                        "content": msg.content,
-                    }));
+                    input_items.push(responses_api_input_item(msg));
                 }
             }
 
@@ -425,6 +419,7 @@ impl OpenAiClient {
                         Err(_) => return vec![],
                     };
                     let event_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    tracing::debug!("Responses API event: {}", event_type);
                     match event_type {
                         "response.output_text.delta" => {
                             let delta = val.get("delta").and_then(|v| v.as_str()).unwrap_or("");
@@ -541,6 +536,34 @@ impl OpenAiClient {
             .flat_map(futures_util::stream::iter);
 
         Ok(token_stream)
+    }
+}
+
+// --- Responses API helpers ---
+
+/// Build a Responses API input item from a ChatMessage, including images if present.
+/// Responses API uses `input_image` content parts (not `image_url` like Chat Completions).
+fn responses_api_input_item(msg: &crate::ollama::ChatMessage) -> serde_json::Value {
+    if msg.images.is_empty() {
+        serde_json::json!({
+            "role": msg.role,
+            "content": msg.content,
+        })
+    } else {
+        let mut content_parts = vec![serde_json::json!({
+            "type": "input_text",
+            "text": msg.content,
+        })];
+        for img in &msg.images {
+            content_parts.push(serde_json::json!({
+                "type": "input_image",
+                "image_url": format!("data:image/png;base64,{}", img),
+            }));
+        }
+        serde_json::json!({
+            "role": msg.role,
+            "content": content_parts,
+        })
     }
 }
 

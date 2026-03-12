@@ -659,6 +659,8 @@ pub(crate) async fn list_sessions(
                                 "repo_path": query.project_root,
                                 "title": s.title,
                                 "created_at": s.created_at,
+                                "skill": s.skill,
+                                "creator": s.creator,
                             })
                         })
                         .collect();
@@ -677,8 +679,12 @@ pub(crate) async fn list_sessions(
 
 #[derive(Deserialize)]
 pub(crate) struct CreateSessionRequest {
-    project_root: String,
+    /// Required for user/project sessions, optional for skill sessions.
+    #[serde(default)]
+    project_root: Option<String>,
     title: String,
+    #[serde(default)]
+    skill: Option<String>,
 }
 
 pub(crate) async fn create_session(
@@ -690,14 +696,31 @@ pub(crate) async fn create_session(
         crate::util::now_ts_secs(),
         &uuid::Uuid::new_v4().to_string()[..8]
     );
-    let root = canonical_project_root(&req.project_root);
+    let meta = crate::state_fs::sessions::SessionMeta {
+        id: id.clone(),
+        title: req.title,
+        created_at: crate::util::now_ts_secs(),
+        skill: req.skill.clone(),
+        creator: if req.skill.is_some() { "skill".into() } else { "user".into() },
+    };
+
+    // Skill sessions go under ~/.linggen/skills/{name}/sessions/
+    if let Some(ref skill_name) = req.skill {
+        let sessions_dir = crate::paths::skill_sessions_dir(skill_name);
+        let store = crate::state_fs::sessions::SessionStore::with_sessions_dir(sessions_dir);
+        return match store.add_session(&meta) {
+            Ok(_) => Json(serde_json::json!({ "id": id })).into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    }
+
+    // Project sessions go under ~/.linggen/projects/{encoded}/sessions/
+    let Some(ref project_root) = req.project_root else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let root = canonical_project_root(project_root);
     match state.manager.get_or_create_project(root).await {
         Ok(ctx) => {
-            let meta = crate::state_fs::sessions::SessionMeta {
-                id: id.clone(),
-                title: req.title,
-                created_at: crate::util::now_ts_secs(),
-            };
             match ctx.sessions.add_session(&meta) {
                 Ok(_) => Json(serde_json::json!({ "id": id })).into_response(),
                 Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -746,6 +769,8 @@ pub(crate) async fn resolve_session_api(
                 id: new_id.clone(),
                 title: "New Chat".to_string(),
                 created_at: now,
+                skill: None,
+                creator: "user".into(),
             };
             let _ = ctx.sessions.add_session(&meta);
             Json(serde_json::json!({
@@ -775,6 +800,57 @@ pub(crate) async fn remove_session_api(
             Ok(_) => StatusCode::OK,
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
         },
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Skill session endpoints (sessions stored under ~/.linggen/skills/{name}/sessions/)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub(crate) struct SkillSessionQuery {
+    skill: String,
+}
+
+pub(crate) async fn list_skill_sessions(
+    Query(query): Query<SkillSessionQuery>,
+) -> impl IntoResponse {
+    let sessions_dir = crate::paths::skill_sessions_dir(&query.skill);
+    let store = crate::state_fs::sessions::SessionStore::with_sessions_dir(sessions_dir);
+    match store.list_sessions() {
+        Ok(sessions) => {
+            let api_sessions: Vec<serde_json::Value> = sessions
+                .into_iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "id": s.id,
+                        "title": s.title,
+                        "created_at": s.created_at,
+                        "skill": s.skill,
+                        "creator": s.creator,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "sessions": api_sessions })).into_response()
+        }
+        Err(_) => Json(serde_json::json!({ "sessions": [] })).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RemoveSkillSessionRequest {
+    skill: String,
+    session_id: String,
+}
+
+pub(crate) async fn remove_skill_session_api(
+    Json(req): Json<RemoveSkillSessionRequest>,
+) -> impl IntoResponse {
+    let sessions_dir = crate::paths::skill_sessions_dir(&req.skill);
+    let store = crate::state_fs::sessions::SessionStore::with_sessions_dir(sessions_dir);
+    match store.remove_session(&req.session_id) {
+        Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

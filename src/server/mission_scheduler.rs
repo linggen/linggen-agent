@@ -87,6 +87,12 @@ pub async fn mission_scheduler_loop(state: Arc<ServerState>) {
                 continue;
             }
 
+            // Missions require the "mission" skill.
+            if state.skill_manager.get_skill("mission").await.is_none() {
+                warn!("Mission scheduler: \"mission\" skill not installed, skipping '{}'. Run `ling init` to install.", mission.id);
+                continue;
+            }
+
             // Determine project root for this mission
             let project_path = mission
                 .project
@@ -209,6 +215,8 @@ pub fn create_mission_session(mission: &Mission) -> Option<String> {
         id: session_id.clone(),
         title: mission_session_title(mission),
         created_at: crate::util::now_ts_secs(),
+        skill: Some("mission".to_string()),
+        creator: "mission".into(),
     };
     match store.add_session(&meta) {
         Ok(_) => Some(session_id),

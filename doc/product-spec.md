@@ -36,10 +36,11 @@ For vision, landscape, and roadmap, see [`insight.md`](insight.md).
 | Doc | OS Layer |
 |:----|:---------|
 | `agentic-loop.md` | Kernel — loop, interrupts, cancellation |
-| `agents.md` | Process management — lifecycle, delegation, scheduling |
-| `skills.md` | Dynamic extensions — format, discovery, triggers |
-| `tools.md` | Syscall interface — built-in tools, safety |
+| `agent-spec.md` | Process management — lifecycle, delegation, scheduling |
+| `skill-spec.md` | Dynamic extensions — format, discovery, triggers |
+| `tool-spec.md` | Syscall interface — built-in tools, safety |
 | `chat-spec.md` | Chat system — SSE events, message model, rendering, APIs |
+| `session-spec.md` | Session/context — creators, effective tools, prompt assembly |
 | `models.md` | Hardware abstraction — providers, routing |
 | `cli.md` | Shell — CLI reference |
 | `insight.md` | Vision, landscape, roadmap |
@@ -59,8 +60,8 @@ Skills are the primary extension mechanism. Built-in tools only for core operati
 ### 2. Multi-agent management
 
 - Framework ships with default agents; users create more by dropping `agents/*.md` files.
-- Each agent has its own context, skill set, model preference, and policy.
-- Agents range from general-purpose to specialized (coding, social chat, research).
+- Each session has its own context, effective tools, model, and optional bound skill.
+- Two default agents: `ling` (versatile, adapts via skills) and `mission` (autonomous scheduled tasks).
 - Switch via `/agent <name>` or tab views in web UI.
 
 ### 3. Unified CLI and shared sessions
@@ -120,7 +121,7 @@ A project can have **multiple active missions**. Each mission defines a cron sch
 - Allowlisted command execution.
 - Persisted chat/run records.
 - Cancellation cascades through run trees.
-- See `tools.md` for details.
+- See `tool-spec.md` for details.
 
 ## Non-goals (early stage)
 

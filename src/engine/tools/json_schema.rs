@@ -275,6 +275,24 @@ fn builtin_tool_schemas() -> Vec<Value> {
             }),
         ),
         tool_def(
+            "RunApp",
+            "Launch an app-enabled skill. The skill must have an 'app' config with a launcher (web/bash/url). For web apps, returns the URL to open in the UI.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "skill": {
+                        "type": "string",
+                        "description": "Name of the skill to launch"
+                    },
+                    "args": {
+                        "type": "string",
+                        "description": "Optional arguments for the skill"
+                    }
+                },
+                "required": ["skill"]
+            }),
+        ),
+        tool_def(
             "ExitPlanMode",
             "Submit your plan for user approval. You MUST include the full plan text in the plan_text parameter. The system will prompt the user to approve, reject, or give feedback — do NOT ask for confirmation in your response text. Just call this tool when the plan is ready.",
             json!({
@@ -286,21 +304,6 @@ fn builtin_tool_schemas() -> Vec<Value> {
                     }
                 },
                 "required": ["plan_text"]
-            }),
-        ),
-        // Non-tool actions promoted to tools for native function calling
-        tool_def(
-            "Done",
-            "Signal task completion with a summary. Format the message using Markdown (headings, bullets, code blocks). For conversational replies, just respond with text content instead.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "Markdown-formatted summary of what was accomplished"
-                    }
-                },
-                "required": []
             }),
         ),
         tool_def(
@@ -346,40 +349,6 @@ fn builtin_tool_schemas() -> Vec<Value> {
                 "required": []
             }),
         ),
-        tool_def(
-            "Patch",
-            "Apply a unified diff patch to the workspace.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "diff": {
-                        "type": "string",
-                        "description": "Unified diff content"
-                    }
-                },
-                "required": ["diff"]
-            }),
-        ),
-        tool_def(
-            "FinalizeTask",
-            "Finalize a delegated task with a structured task packet.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "packet": {
-                        "type": "object",
-                        "properties": {
-                            "title": {"type": "string"},
-                            "user_stories": {"type": "array", "items": {"type": "string"}},
-                            "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
-                            "mermaid_wireframe": {"type": "string"}
-                        },
-                        "required": ["title", "user_stories", "acceptance_criteria"]
-                    }
-                },
-                "required": ["packet"]
-            }),
-        ),
     ]
 }
 
@@ -401,7 +370,7 @@ mod tests {
     #[test]
     fn test_oai_tool_definitions_returns_all() {
         let defs = oai_tool_definitions(None);
-        assert!(defs.len() >= 13, "expected at least 13 tool definitions, got {}", defs.len());
+        assert!(defs.len() >= 10, "expected at least 10 tool definitions, got {}", defs.len());
         // Check all have the required structure
         for def in &defs {
             assert_eq!(def["type"], "function");

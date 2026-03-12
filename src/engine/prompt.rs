@@ -1,5 +1,4 @@
 use super::types::*;
-use crate::config::AgentPolicyCapability;
 use crate::engine::tools;
 use crate::ollama::ChatMessage;
 use std::collections::HashSet;
@@ -60,7 +59,14 @@ impl AgentEngine {
     pub(crate) fn system_prompt(&self) -> String {
         use crate::prompts::keys;
 
-        let mut prompt = self
+        // Personality is injected first — it's the agent's voice regardless of context.
+        let personality = self
+            .spec
+            .as_ref()
+            .and_then(|s| s.personality.as_deref())
+            .unwrap_or("");
+
+        let body = self
             .spec_system_prompt
             .as_deref()
             .map(str::trim)
@@ -69,6 +75,12 @@ impl AgentEngine {
             .unwrap_or_else(|| {
                 self.prompt_store.render_or_fallback(keys::SYSTEM_FALLBACK_IDENTITY, &[])
             });
+
+        let mut prompt = if personality.is_empty() {
+            body
+        } else {
+            format!("{}\n\n{}", personality.trim(), body)
+        };
 
         if !self.available_skills_metadata.is_empty() {
             prompt.push_str(&self.prompt_store.render_or_fallback(
@@ -92,15 +104,6 @@ impl AgentEngine {
                     ("content", skill.content.as_str()),
                 ],
             ));
-        }
-
-        // Inject available agents for Task delegation
-        if !self.available_agents_metadata.is_empty() {
-            prompt.push_str("\n\n## Available Agents for Delegation\n\nYou can delegate tasks to the following agents using the Task tool:\n");
-            for (name, description) in &self.available_agents_metadata {
-                prompt.push_str(&format!("\n- **{}**: {}", name, description));
-            }
-            prompt.push('\n');
         }
 
         prompt
@@ -257,31 +260,57 @@ impl AgentEngine {
 
         // Dynamic content appended after cached stable prefix.
 
+        // Check if tools are available — skip all tool-related prompt sections when empty.
+        let has_tools = allowed_tools.as_ref().map_or(true, |s| !s.is_empty());
+
         // --- Response Format ---
-        if native_tools {
-            // Native tool calling: model gets tool schemas via the API `tools` parameter.
-            // Use a lightweight prompt with usage guidelines only (no JSON format instructions).
-            if let Some(content) = self.prompt_store.get(crate::prompts::RESPONSE_FORMAT_NATIVE) {
-                system.push_str("\n\n");
-                system.push_str(content);
-            }
-        } else {
-            // Legacy mode: inject JSON action format + inline tool schemas.
-            let tools_json = self.tools.tool_schema_json(allowed_tools.as_ref());
-            if let Some(rendered) = self.prompt_store.render(
-                crate::prompts::RESPONSE_FORMAT,
-                &[("tools", &tools_json)],
-            ) {
-                system.push_str("\n\n");
-                system.push_str(&rendered);
+        if has_tools {
+            if native_tools {
+                // Native tool calling: model gets tool schemas via the API `tools` parameter.
+                // Use a lightweight prompt with usage guidelines only (no JSON format instructions).
+                if let Some(content) = self.prompt_store.get(crate::prompts::RESPONSE_FORMAT_NATIVE) {
+                    system.push_str("\n\n");
+                    system.push_str(content);
+                }
+            } else {
+                // Legacy mode: inject JSON action format + inline tool schemas.
+                let tools_json = self.tools.tool_schema_json(allowed_tools.as_ref());
+                if let Some(rendered) = self.prompt_store.render(
+                    crate::prompts::RESPONSE_FORMAT,
+                    &[("tools", &tools_json)],
+                ) {
+                    system.push_str("\n\n");
+                    system.push_str(&rendered);
+                }
             }
         }
 
         // Plan mode: restrict to read-only tools and instruct the model to produce a plan.
-        if self.plan_mode {
+        if has_tools && self.plan_mode {
             if let Some(content) = self.prompt_store.get(crate::prompts::PLAN_MODE) {
                 system.push_str("\n\n");
                 system.push_str(content);
+            }
+        }
+
+        // Inject available agents for Task delegation — only when tools are available
+        // and the Task tool is in the allowed set.
+        if has_tools && !self.available_agents_metadata.is_empty() {
+            let task_available = allowed_tools
+                .as_ref()
+                .map_or(true, |s| s.contains("Task"));
+            if task_available {
+                system.push_str(&self.prompt_store.render_or_fallback(
+                    crate::prompts::keys::SYSTEM_DELEGATION_HEADER,
+                    &[],
+                ));
+                for (name, description) in &self.available_agents_metadata {
+                    system.push_str(&self.prompt_store.render_or_fallback(
+                        crate::prompts::keys::SYSTEM_DELEGATION_ENTRY,
+                        &[("name", name.as_str()), ("description", description.as_str())],
+                    ));
+                }
+                system.push('\n');
             }
         }
 
@@ -334,6 +363,11 @@ impl AgentEngine {
         let task_msg = ChatMessage::new("user", task_content);
         // Attach any pending images to the task message, then clear them.
         let images = std::mem::take(&mut self.pending_images);
+        if !images.is_empty() {
+            tracing::info!("Attaching {} inline image(s) to task message ({} bytes total)",
+                images.len(),
+                images.iter().map(|i| i.len()).sum::<usize>());
+        }
         let task_msg = if images.is_empty() { task_msg } else { task_msg.with_images(images) };
         messages.push(task_msg);
         self.push_context_record(
@@ -397,9 +431,12 @@ impl AgentEngine {
         // When a skill is active and declares allowed-tools, those take
         // precedence — the agent can only use the tools the skill permits.
         if let Some(skill) = &self.active_skill {
-            if !skill.allowed_tools.is_empty() {
-                let mut allowed = skill
-                    .allowed_tools
+            if let Some(ref tools_list) = skill.allowed_tools {
+                if tools_list.is_empty() {
+                    // allowed-tools: [] → no tools at all (not even Skill)
+                    return Some(HashSet::new());
+                }
+                let mut allowed = tools_list
                     .iter()
                     .filter_map(|tool| {
                         if let Some(name) = tools::canonical_tool_name(tool) {
@@ -455,13 +492,6 @@ impl AgentEngine {
         }
         // Skill tools: check by exact name.
         allowed.contains(requested_tool)
-    }
-
-    pub(crate) fn agent_allows_policy(&self, capability: AgentPolicyCapability) -> bool {
-        self.spec
-            .as_ref()
-            .map(|spec| spec.allows_policy(capability))
-            .unwrap_or(false)
     }
 
     pub(crate) fn render_loop_breaker_prompt(template: &str, tool: &str) -> String {

@@ -12,9 +12,9 @@ Cron-based scheduled agent work. A project can have **multiple active missions**
 
 ## Related docs
 
-- `agents.md`: agent types, lifecycle, delegation.
+- `agent-spec.md`: agent types, lifecycle, delegation.
 - `product-spec.md`: mission system overview, OS analogy.
-- `storage.md`: mission JSON format, filesystem layout.
+- `storage-spec.md`: mission JSON format, filesystem layout.
 
 ## Core concepts
 
@@ -30,18 +30,15 @@ A **mission** is a cron job:
 | `enabled` | yes | Whether this mission is active |
 | `created_at` | yes | Timestamp |
 
-### Mission agent
+### Mission skill
 
-All missions run the **`mission` agent** (`agents/mission.md`). This is not user-configurable — the UI shows "mission" as a readonly label.
+All missions run the **`ling` agent** with the **`mission` skill** bound to the session (`skills/mission/SKILL.md`). The mission skill sets autonomous execution mode:
 
-The mission agent is designed for **autonomous execution** — no human in the loop:
-
-- **No interactive tools**: no `AskUser`, `UpdatePlan`, `EnterPlanMode`.
-- **Work tools**: `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `WebSearch`, `WebFetch`.
-- **Delegation**: can use `Task` to spawn `coder`, `explorer`, `debugger` for heavy work.
+- **No interactive tools**: `allowed-tools` excludes `AskUser`, `EnterPlanMode`.
+- **Work tools**: `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `Task`, `WebSearch`, `WebFetch`.
+- **Delegation**: can use `Task` to spawn sub-tasks for focused work.
 - **Self-documenting**: the agent's final message serves as the run report.
-
-Users can view the mission agent definition (readonly) in the mission UI.
+- **Auto permissions**: `tool_permission_mode` forced to `Auto` — no human approval gates.
 
 ### Cron syntax
 
@@ -91,7 +88,7 @@ Background task evaluates all enabled missions against their cron schedules:
 3. **Create session**: create a new session for this run.
 4. **Spawn mission agent**: run the `mission` agent in that session with the mission prompt.
 5. **Busy skip**: if the mission agent is already running, skip this trigger and log it.
-6. **Run record**: each trigger creates a standard `AgentRunRecord` (see `agents.md`) + a `MissionRunEntry`.
+6. **Run record**: each trigger creates a standard `AgentRunRecord` (see `agent-spec.md`) + a `MissionRunEntry`.
 
 ### Deduplication
 

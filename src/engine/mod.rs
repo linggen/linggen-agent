@@ -18,7 +18,7 @@ pub mod web_search;
 // Re-export public API types
 pub use types::{
     AgentEngine, AgentOutcome, AgentRole, ContextRecord, ContextType, EngineConfig,
-    InterfaceMode, Plan, PlanStatus, TaskPacket, ThinkingEvent,
+    InterfaceMode, Plan, PlanStatus, ThinkingEvent,
 };
 
 pub use actions::{
@@ -38,50 +38,23 @@ use tracing::{debug, info};
 
 impl AgentEngine {
     /// Convert native ParsedToolCalls into ModelActions for dispatch.
-    /// Non-tool actions (Done, EnterPlanMode, UpdatePlan, Patch, FinalizeTask)
-    /// are recognized by name and converted to the appropriate variant.
+    /// "Done" calls are filtered out — the loop stops when no tool calls remain.
     fn tool_calls_to_actions(tool_calls: &[ParsedToolCall]) -> Vec<ModelAction> {
         tool_calls
             .iter()
             .filter_map(|tc| {
                 match tc.name.as_str() {
-                    "Done" => {
-                        let message = tc.arguments.get("message").and_then(|v| v.as_str()).map(|s| s.to_string());
-                        Some(ModelAction::Done { message })
-                    }
-                    "EnterPlanMode" => {
-                        let reason = tc.arguments.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string());
-                        Some(ModelAction::EnterPlanMode { reason })
-                    }
-                    "UpdatePlan" => {
-                        let plan_text = tc.arguments.get("plan_text")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        let items = tc.arguments.get("items")
-                            .and_then(|v| v.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        Some(ModelAction::UpdatePlan { plan_text, items })
-                    }
-                    "Patch" => {
-                        let diff = tc.arguments.get("diff").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        Some(ModelAction::Patch { diff })
-                    }
-                    "FinalizeTask" => {
-                        let packet = tc.arguments.get("packet").cloned().unwrap_or(serde_json::json!({}));
-                        match serde_json::from_value(packet) {
-                            Ok(p) => Some(ModelAction::FinalizeTask { packet: p }),
-                            Err(_) => None,
-                        }
-                    }
                     "" => {
                         // Empty tool name — skip (some models produce phantom calls)
                         tracing::warn!("Skipping native tool call with empty name");
                         None
                     }
+                    "Done" => {
+                        // No longer a real tool — ignore. Loop stops when no tool calls.
+                        None
+                    }
                     _ => {
-                        // Regular tool call
-                        Some(ModelAction::Tool {
+                        Some(ModelAction {
                             tool: tc.name.clone(),
                             args: tc.arguments.clone(),
                         })
@@ -343,6 +316,18 @@ impl AgentEngine {
 
                 // Convert ParsedToolCalls to ModelActions
                 let actions: Vec<ModelAction> = Self::tool_calls_to_actions(&native_tool_calls);
+
+                // All native tool calls were filtered (e.g. all were "Done") →
+                // treat as text-only response and end the loop.
+                if actions.is_empty() {
+                    let _ = self.persist_assistant_message(&raw, session_id).await;
+                    self.chat_history.push(ChatMessage::new("assistant", raw.clone()));
+                    self.truncate_chat_history();
+                    self.last_assistant_text = Some(raw);
+                    self.active_skill = None;
+                    return Ok(AgentOutcome::None);
+                }
+
                 state.invalid_json_streak = 0;
                 // Track latest response so plan mode can read it (ExitPlanMode
                 // uses last_assistant_response as plan text).  Only update
@@ -352,127 +337,9 @@ impl AgentEngine {
                     state.last_assistant_response = raw.clone();
                 }
 
-                // Execute actions (reusing existing dispatch logic)
-                let mut early_return: Option<AgentOutcome> = None;
-                let mut actions = actions;
-                // Track tool_call_ids for result messages
+                // Execute actions (reusing shared dispatch logic)
                 let tc_ids: Vec<String> = native_tool_calls.iter().map(|tc| tc.id.clone()).collect();
-                let mut action_idx = 0;
-
-                while !actions.is_empty() && early_return.is_none() {
-                    let front_is_delegation = match &actions[0] {
-                        ModelAction::Tool { tool, .. } => {
-                            self.tools
-                                .canonical_tool_name(tool)
-                                .unwrap_or(tool.as_str())
-                                == "Task"
-                        }
-                        _ => false,
-                    };
-
-                    let parallel_batch_size = if !front_is_delegation {
-                        let candidate_count = actions
-                            .iter()
-                            .take_while(|a| match a {
-                                ModelAction::Tool { tool, .. } => {
-                                    let c = self
-                                        .tools
-                                        .canonical_tool_name(tool)
-                                        .unwrap_or(tool.as_str());
-                                    can_parallel_tool(c)
-                                }
-                                _ => false,
-                            })
-                            .count()
-                            .min(8);
-                        if candidate_count >= 2 {
-                            let pairs: Vec<(&str, &JsonValue)> = actions[..candidate_count]
-                                .iter()
-                                .filter_map(|a| match a {
-                                    ModelAction::Tool { tool, args } => {
-                                        let c = self.tools.canonical_tool_name(tool).unwrap_or(tool.as_str());
-                                        Some((c, args))
-                                    }
-                                    _ => None,
-                                })
-                                .collect();
-                            if has_write_path_conflicts(&pairs, &self.cfg.ws_root) {
-                                1
-                            } else {
-                                candidate_count
-                            }
-                        } else {
-                            candidate_count
-                        }
-                    } else {
-                        0
-                    };
-
-                    if front_is_delegation {
-                        let batch_size = actions
-                            .iter()
-                            .take_while(|a| match a {
-                                ModelAction::Tool { tool, .. } => {
-                                    self.tools
-                                        .canonical_tool_name(tool)
-                                        .unwrap_or(tool.as_str())
-                                        == "Task"
-                                }
-                                _ => false,
-                            })
-                            .count();
-                        let batch: Vec<ModelAction> = actions.drain(..batch_size).collect();
-                        let batch_start = action_idx;
-                        action_idx += batch_size;
-
-                        if let Some(outcome) = self
-                            .handle_delegation_batch(
-                                batch,
-                                &state.allowed_tools,
-                                &mut state.messages,
-                                session_id,
-                                &tc_ids,
-                                batch_start,
-                            )
-                            .await
-                        {
-                            early_return = Some(outcome);
-                        }
-                    } else if parallel_batch_size >= 2 {
-                        let batch: Vec<ModelAction> =
-                            actions.drain(..parallel_batch_size).collect();
-                        let batch_start = action_idx;
-                        action_idx += parallel_batch_size;
-
-                        if let Some(outcome) = self
-                            .handle_parallel_batch(batch, &mut state, session_id, &tc_ids, batch_start)
-                            .await
-                        {
-                            early_return = Some(outcome);
-                        }
-                    } else {
-                        let action = actions.remove(0);
-                        let tc_id = tc_ids.get(action_idx).cloned();
-                        action_idx += 1;
-                        let actions_remaining = !actions.is_empty();
-                        if let Some(outcome) = self
-                            .dispatch_sequential_action(
-                                action,
-                                &mut state,
-                                actions_remaining,
-                                session_id,
-                                tc_id,
-                            )
-                            .await
-                        {
-                            early_return = Some(outcome);
-                        }
-                    }
-                }
-
-                self.drain_tool_progress(&mut state.progress_rx).await;
-
-                if let Some(outcome) = early_return {
+                if let Some(outcome) = self.execute_action_loop(actions, &mut state, session_id, &tc_ids).await {
                     return Ok(outcome);
                 }
                 continue;
@@ -495,6 +362,9 @@ impl AgentEngine {
                     if self.plan_mode {
                         info!("Text-only response in plan mode → implicit ExitPlanMode");
                         let plan_text = raw.trim().to_string();
+                        if !plan_text.is_empty() {
+                            self.last_assistant_text = Some(plan_text.clone());
+                        }
                         let outcome = self.finalize_plan_mode(plan_text).await;
                         return Ok(outcome);
                     }
@@ -642,121 +512,7 @@ impl AgentEngine {
             state.invalid_json_streak = 0;
 
             // Execute actions with parallel delegation support.
-            let mut early_return: Option<AgentOutcome> = None;
-            let mut actions = actions;
-
-            while !actions.is_empty() && early_return.is_none() {
-                // Check if the front action is a Task (delegation) tool call.
-                let front_is_delegation = match &actions[0] {
-                    ModelAction::Tool { tool, .. } => {
-                        self.tools
-                            .canonical_tool_name(tool)
-                            .unwrap_or(tool.as_str())
-                            == "Task"
-                    }
-                    _ => false,
-                };
-
-                // Check for a batch of consecutive parallelizable tool calls (cap at 8).
-                let parallel_batch_size = if !front_is_delegation {
-                    let candidate_count = actions
-                        .iter()
-                        .take_while(|a| match a {
-                            ModelAction::Tool { tool, .. } => {
-                                let c = self
-                                    .tools
-                                    .canonical_tool_name(tool)
-                                    .unwrap_or(tool.as_str());
-                                can_parallel_tool(c)
-                            }
-                            _ => false,
-                        })
-                        .count()
-                        .min(8);
-                    if candidate_count >= 2 {
-                        let pairs: Vec<(&str, &JsonValue)> = actions[..candidate_count]
-                            .iter()
-                            .filter_map(|a| match a {
-                                ModelAction::Tool { tool, args } => {
-                                    let c = self.tools.canonical_tool_name(tool).unwrap_or(tool.as_str());
-                                    Some((c, args))
-                                }
-                                _ => None,
-                            })
-                            .collect();
-                        if has_write_path_conflicts(&pairs, &self.cfg.ws_root) {
-                            1
-                        } else {
-                            candidate_count
-                        }
-                    } else {
-                        candidate_count
-                    }
-                } else {
-                    0
-                };
-
-                if front_is_delegation {
-                    // Collect a run of consecutive Task (delegation) actions.
-                    let batch_size = actions
-                        .iter()
-                        .take_while(|a| match a {
-                            ModelAction::Tool { tool, .. } => {
-                                self.tools
-                                    .canonical_tool_name(tool)
-                                    .unwrap_or(tool.as_str())
-                                    == "Task"
-                            }
-                            _ => false,
-                        })
-                        .count();
-                    let batch: Vec<ModelAction> = actions.drain(..batch_size).collect();
-
-                    if let Some(outcome) = self
-                        .handle_delegation_batch(
-                            batch,
-                            &state.allowed_tools,
-                            &mut state.messages,
-                            session_id,
-                            &[], // No tc_ids in text-based path
-                            0,
-                        )
-                        .await
-                    {
-                        early_return = Some(outcome);
-                    }
-                } else if parallel_batch_size >= 2 {
-                    let batch: Vec<ModelAction> =
-                        actions.drain(..parallel_batch_size).collect();
-
-                    if let Some(outcome) = self
-                        .handle_parallel_batch(batch, &mut state, session_id, &[], 0)
-                        .await
-                    {
-                        early_return = Some(outcome);
-                    }
-                } else {
-                    let action = actions.remove(0);
-                    let actions_remaining = !actions.is_empty();
-                    if let Some(outcome) = self
-                        .dispatch_sequential_action(
-                            action,
-                            &mut state,
-                            actions_remaining,
-                            session_id,
-                            None,
-                        )
-                        .await
-                    {
-                        early_return = Some(outcome);
-                    }
-                }
-            }
-
-            // Drain any tool progress lines accumulated during this iteration.
-            self.drain_tool_progress(&mut state.progress_rx).await;
-
-            if let Some(outcome) = early_return {
+            if let Some(outcome) = self.execute_action_loop(actions, &mut state, session_id, &[]).await {
                 return Ok(outcome);
             }
         }
@@ -784,5 +540,125 @@ impl AgentEngine {
                 .await;
         }
         Ok(AgentOutcome::None)
+    }
+
+    /// Execute a list of model actions with batching (delegation, parallel, sequential).
+    /// Shared by both native tool-call and legacy JSON paths.
+    /// Returns `Some(outcome)` if the loop should exit early.
+    async fn execute_action_loop(
+        &mut self,
+        actions: Vec<ModelAction>,
+        state: &mut LoopState,
+        session_id: Option<&str>,
+        tc_ids: &[String],
+    ) -> Option<AgentOutcome> {
+        let mut actions = actions;
+        let mut action_idx: usize = 0;
+
+        while !actions.is_empty() {
+            let front_is_delegation = {
+                let tool = &actions[0].tool;
+                self.tools
+                    .canonical_tool_name(tool)
+                    .unwrap_or(tool.as_str())
+                    == "Task"
+            };
+
+            let parallel_batch_size = if !front_is_delegation {
+                let candidate_count = actions
+                    .iter()
+                    .take_while(|a| {
+                        let c = self
+                            .tools
+                            .canonical_tool_name(&a.tool)
+                            .unwrap_or(a.tool.as_str());
+                        can_parallel_tool(c)
+                    })
+                    .count()
+                    .min(8);
+                if candidate_count >= 2 {
+                    let pairs: Vec<(&str, &JsonValue)> = actions[..candidate_count]
+                        .iter()
+                        .map(|a| {
+                            let c = self.tools.canonical_tool_name(&a.tool).unwrap_or(a.tool.as_str());
+                            (c, &a.args)
+                        })
+                        .collect();
+                    if has_write_path_conflicts(&pairs, &self.cfg.ws_root) {
+                        1
+                    } else {
+                        candidate_count
+                    }
+                } else {
+                    candidate_count
+                }
+            } else {
+                0
+            };
+
+            if front_is_delegation {
+                let batch_size = actions
+                    .iter()
+                    .take_while(|a| {
+                        self.tools
+                            .canonical_tool_name(&a.tool)
+                            .unwrap_or(a.tool.as_str())
+                            == "Task"
+                    })
+                    .count();
+                let batch: Vec<ModelAction> = actions.drain(..batch_size).collect();
+                let batch_start = action_idx;
+                action_idx += batch_size;
+
+                if let Some(outcome) = self
+                    .handle_delegation_batch(
+                        batch,
+                        &state.allowed_tools,
+                        &mut state.messages,
+                        session_id,
+                        tc_ids,
+                        batch_start,
+                    )
+                    .await
+                {
+                    self.drain_tool_progress(&mut state.progress_rx).await;
+                    return Some(outcome);
+                }
+            } else if parallel_batch_size >= 2 {
+                let batch: Vec<ModelAction> =
+                    actions.drain(..parallel_batch_size).collect();
+                let batch_start = action_idx;
+                action_idx += parallel_batch_size;
+
+                if let Some(outcome) = self
+                    .handle_parallel_batch(batch, state, session_id, tc_ids, batch_start)
+                    .await
+                {
+                    self.drain_tool_progress(&mut state.progress_rx).await;
+                    return Some(outcome);
+                }
+            } else {
+                let action = actions.remove(0);
+                let tc_id = tc_ids.get(action_idx).cloned();
+                action_idx += 1;
+                let actions_remaining = !actions.is_empty();
+                if let Some(outcome) = self
+                    .dispatch_sequential_action(
+                        action,
+                        state,
+                        actions_remaining,
+                        session_id,
+                        tc_id,
+                    )
+                    .await
+                {
+                    self.drain_tool_progress(&mut state.progress_rx).await;
+                    return Some(outcome);
+                }
+            }
+        }
+
+        self.drain_tool_progress(&mut state.progress_rx).await;
+        None
     }
 }

@@ -1,7 +1,6 @@
 use super::block_on_async;
 use super::{AskUserBridge, ToolResult, Tools};
 use crate::agent_manager::AgentManager;
-use crate::config::AgentPolicyCapability;
 use anyhow::Result;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -45,7 +44,7 @@ impl Tools {
     /// Returns the manager and caller agent id on success.
     pub(crate) fn validate_delegation(
         &self,
-        args: &TaskArgs,
+        _args: &TaskArgs,
     ) -> Result<(Arc<AgentManager>, String)> {
         let manager = self
             .manager
@@ -60,29 +59,6 @@ impl Tools {
             anyhow::bail!(
                 "Delegation denied: max delegation depth ({}) reached",
                 self.max_delegation_depth
-            );
-        }
-        let policy = self
-            .agent_policy
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Delegation denied: missing agent policy"))?;
-        if !policy.allows(AgentPolicyCapability::Delegate) {
-            anyhow::bail!(
-                "Delegation denied: agent '{}' policy does not allow Delegate",
-                caller_id
-            );
-        }
-        if !policy.allows_delegate_target(&args.target_agent_id) {
-            let allowed = if policy.delegate_targets.is_empty() {
-                "(none)".to_string()
-            } else {
-                policy.delegate_targets.join(", ")
-            };
-            anyhow::bail!(
-                "Delegation denied: target '{}' is not allowed by policy for '{}'. Allowed: {}",
-                args.target_agent_id,
-                caller_id,
-                allowed
             );
         }
 

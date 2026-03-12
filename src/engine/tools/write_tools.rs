@@ -52,7 +52,7 @@ pub(super) struct UnlockPathsArgs {
 impl Tools {
     pub(super) fn enforce_write_access(&self, rel: &str) -> Result<()> {
         if let (Some(manager), Some(agent_id)) = (&self.manager, &self.agent_id) {
-            // 1. Check work_globs
+            // 1. Check path access
             let allowed = block_on_async(async {
                 manager.is_path_allowed(&self.root, agent_id, rel).await
             });

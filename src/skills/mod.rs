@@ -171,7 +171,7 @@ pub struct Skill {
     #[serde(default = "default_user_invocable")]
     pub user_invocable: bool,
     #[serde(default)]
-    pub allowed_tools: Vec<String>,
+    pub allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -212,7 +212,7 @@ struct SkillFrontmatter {
     #[serde(default = "default_user_invocable", rename = "user-invocable")]
     user_invocable: bool,
     #[serde(default, rename = "allowed-tools")]
-    allowed_tools: Vec<String>,
+    allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -464,7 +464,7 @@ Content."#;
         assert!(!skill.user_invocable);
         assert!(skill.disable_model_invocation);
         assert_eq!(skill.argument_hint.as_deref(), Some("project name"));
-        assert_eq!(skill.allowed_tools, vec!["Read", "Write"]);
+        assert_eq!(skill.allowed_tools, Some(vec!["Read".to_string(), "Write".to_string()]));
         assert_eq!(skill.model.as_deref(), Some("gpt-4"));
         assert_eq!(skill.context.as_deref(), Some("my-context"));
         assert_eq!(skill.agent.as_deref(), Some("coder"));

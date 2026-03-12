@@ -5,7 +5,7 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 /// The agent that always runs missions.
-pub const MISSION_AGENT_ID: &str = "mission";
+pub const MISSION_AGENT_ID: &str = "ling";
 
 /// YAML frontmatter fields for a mission `.md` file.
 #[derive(Debug, Serialize, Deserialize, Clone)]

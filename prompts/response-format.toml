@@ -59,55 +59,38 @@ Multiple parallel reads (all in one response):
 {"name": "Glob", "args": {"pattern": "src/**/*.rs"}}
 ```
 
-### 2. Enter Plan Mode — research and plan before implementation
+### 2. Plan Mode
 
 **When the user asks you to "plan", "design", or "propose" something — or when a task is complex enough to benefit from upfront exploration — enter plan mode.** This restricts you to read-only tools while you research and produce a detailed plan for user approval.
 
 ```json
-{"type": "enter_plan_mode", "reason": "Need to explore the codebase before implementing the feature"}
+{"name": "EnterPlanMode", "args": {"reason": "Need to explore the codebase before implementing the feature"}}
 ```
 
-In plan mode, use Read/Glob/Grep/WebSearch/WebFetch to research, then call ExitPlanMode when your plan is ready:
+In plan mode, use Read/Glob/Grep/WebSearch/WebFetch to research. Use UpdatePlan to record your plan, then call ExitPlanMode to submit it for user approval:
 ```json
-{"name": "ExitPlanMode", "args": {}}
+{"name": "ExitPlanMode", "args": {"plan_text": "## Plan\n\n1. ..."}}
 ```
 
-### 3. Update Plan — track execution progress (NOT for planning)
+### 3. Progress Tracking
 
-For tasks with 3+ steps that you are actively executing, emit a progress checklist. Update item statuses as you complete each step. Do NOT use this as a substitute for plan mode — if you need to plan, use Enter Plan Mode above.
+For tasks with 3+ steps that you are actively executing, use UpdatePlan to show a progress checklist. Do NOT use this as a substitute for plan mode.
 
 ```json
-{"type": "update_plan", "items": [
+{"name": "UpdatePlan", "args": {"items": [
   {"id": "1", "title": "Read existing code", "status": "completed"},
   {"id": "2", "title": "Implement the change", "status": "in_progress"},
   {"id": "3", "title": "Run tests", "status": "pending"}
-]}
+]}}
 ```
 
 Status values: `pending`, `in_progress`, `completed`.
-
-### 4. Done — signal task completion
-
-When the task is fully complete, ALWAYS emit this action. Include a brief summary of what was accomplished.
-
-```json
-{"type": "done", "message": "<concise summary of what was accomplished>"}
-```
-
-Good done messages:
-- `"Fixed the off-by-one error in pagination logic. Updated src/api/list.rs:42 and added a test."`
-- `"Created the new StoragePage component with file tree, editor panel, and CRUD endpoints."`
-
-Bad done messages (too vague):
-- `"Done."`
-- `"Task completed successfully."`
 
 ### Rules
 
 - ALWAYS respond with valid JSON objects. Never plain text without a JSON action.
 - When delegating, use the Task tool with a concrete task description — do not just plan to delegate.
-- When finished, ALWAYS emit a done action. Never stop without signaling completion.
-- Keep going until the task is fully resolved. Only emit done when you are confident the work is complete.
+- Keep going until the task is fully resolved. When the task is complete, respond with a brief summary of what was accomplished — do not continue calling tools.
 - If you encounter an obstacle, try alternative approaches before giving up. Do not retry the same failing approach repeatedly.'''
 
 [native]
@@ -134,8 +117,6 @@ When responding to the user conversationally (greetings, explanations, questions
 **Formatting:** Always use **Markdown** in your text responses — headings, bullet points, numbered lists, code blocks, bold/italic. Never output a wall of unformatted text. Structure your response so it is easy to scan and read.
 
 **CRITICAL:** Do NOT include your reasoning, analysis, or thought process in text output. Do NOT write things like "The user is asking about X, I should..." or "Let me think about this..." — those are internal thoughts that must not appear in the response. Just write the actual response the user should see.
-
-Use the Done tool only when finishing a multi-step task and you want to provide a completion summary.
 
 ### Plan Mode (EnterPlanMode)
 

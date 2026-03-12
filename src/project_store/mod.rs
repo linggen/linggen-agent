@@ -148,6 +148,8 @@ mod tests {
             id: "s1".into(),
             title: "test".into(),
             created_at: 1000,
+            skill: None,
+            creator: "user".into(),
         }).unwrap();
         let list = sessions.list_sessions().unwrap();
         assert_eq!(list.len(), 1);

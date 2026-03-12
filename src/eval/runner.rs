@@ -147,8 +147,6 @@ pub async fn run_single_task(
         let engine = agent.lock().await;
         let iters = engine.context_records.len();
         match &outcome {
-            Ok(Ok(crate::engine::AgentOutcome::Patch(_))) => ("patch".to_string(), iters),
-            Ok(Ok(crate::engine::AgentOutcome::Task(_))) => ("task".to_string(), iters),
             Ok(Ok(crate::engine::AgentOutcome::Plan(_))) => ("plan".to_string(), iters),
             Ok(Ok(crate::engine::AgentOutcome::PlanApproved(_))) => ("plan_approved".to_string(), iters),
             Ok(Ok(crate::engine::AgentOutcome::PlanModeRequested { .. })) => ("plan_mode_requested".to_string(), iters),

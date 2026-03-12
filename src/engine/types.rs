@@ -64,19 +64,8 @@ pub enum ThinkingEvent {
 pub enum AgentRole {
     #[serde(rename = "lead")]
     Lead,
-    #[serde(rename = "coder")]
-    Coder,
-    #[serde(rename = "operator")]
-    Operator,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskPacket {
-    pub title: String,
-    pub user_stories: Vec<String>,
-    pub acceptance_criteria: Vec<String>,
-    pub mermaid_wireframe: Option<String>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterfaceMode {
@@ -199,7 +188,8 @@ pub struct AgentEngine {
     /// Reset after compaction. Avoids re-scanning all messages each iteration.
     pub(crate) accumulated_token_estimate: usize,
     /// Last assistant message text emitted during the agent loop.
-    /// Set by `Done` dispatch; used by delegation callers to surface the sub-agent's response.
+    /// Set when the loop ends with a text-only response or ExitPlanMode;
+    /// used by delegation callers to surface the sub-agent's response.
     pub(crate) last_assistant_text: Option<String>,
     /// When true, tool result messages use `role: "tool"` instead of `role: "user"`.
     /// Required by Ollama native tool calling — Ollama expects tool results
@@ -213,10 +203,6 @@ pub struct AgentEngine {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum AgentOutcome {
-    #[serde(rename = "task")]
-    Task(TaskPacket),
-    #[serde(rename = "patch")]
-    Patch(String),
     #[serde(rename = "plan")]
     Plan(Plan),
     /// User approved the plan inline via AskUser — ready for immediate execution.
@@ -388,11 +374,9 @@ impl AgentEngine {
     }
 
     pub fn set_spec(&mut self, agent_id: String, spec: AgentSpec, system_prompt: String) {
-        let policy = spec.policy.clone();
         self.agent_id = Some(agent_id);
         self.spec = Some(spec);
         self.spec_system_prompt = Some(system_prompt);
-        self.tools.set_policy(Some(policy));
     }
 
     pub fn set_manager_context(&mut self, manager: Arc<AgentManager>) {
@@ -435,16 +419,14 @@ impl AgentEngine {
     /// Skills with `disable_model_invocation == true` are skipped (their tools are not
     /// registered in the model-facing tool schema).
     pub async fn load_skill_tools(&mut self, skill_manager: &crate::skills::SkillManager) {
-        let Some(spec) = &self.spec else { return };
-        let skill_names = spec.skills.clone();
-        for skill_name in &skill_names {
-            if let Some(skill) = skill_manager.get_skill(skill_name).await {
-                if skill.disable_model_invocation {
-                    continue;
-                }
-                for tool_def in skill.tool_defs {
-                    self.tools.register_skill_tool(tool_def);
-                }
+        if self.spec.is_none() { return };
+        // Skills are no longer listed per-agent; load all available skills.
+        for skill in skill_manager.list_skills().await {
+            if skill.disable_model_invocation {
+                continue;
+            }
+            for tool_def in skill.tool_defs {
+                self.tools.register_skill_tool(tool_def);
             }
         }
     }

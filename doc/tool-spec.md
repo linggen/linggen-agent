@@ -12,9 +12,10 @@ Syscall interface: built-in tools, safety rules, and the two-tier model.
 
 ## Related docs
 
-- `skills.md`: dynamic extensions (skill tools).
+- `session-spec.md`: effective tools, capability model.
+- `skill-spec.md`: dynamic extensions (skill tools).
 - `agentic-loop.md`: how tools are dispatched in the loop.
-- `agents.md`: per-agent tool access control.
+- `agent-spec.md`: agent tool declarations.
 
 ## Two-tier model
 
@@ -67,7 +68,7 @@ Lets the agent pause mid-loop to ask the user structured questions. Aligned with
 
 ## RunApp
 
-Launches an app-enabled skill. The skill must have an `app` section in its frontmatter with a `launcher` type. See `skills.md` → App skills.
+Launches an app-enabled skill. The skill must have an `app` section in its frontmatter with a `launcher` type. See `skill-spec.md` → App skills.
 
 - **`web`**: serves the skill directory as static files at `/apps/{skill-name}/`, emits `AppLaunched` SSE event, UI opens an iframe panel.
 - **`bash`**: executes the entry script in the skill directory, returns stdout/stderr.
@@ -94,7 +95,7 @@ Dispatch order in `ToolRegistry.execute()`:
 ## Access control
 
 - Per-agent via `spec.tools` in frontmatter. Wildcard `tools: ["*"]` = unrestricted.
-- Action gates via policy: `Patch`, `Finalize`, `Delegate`.
+- Capabilities determined by effective tool set (see `session-spec.md`): Write/Edit = can patch, Task = can delegate.
 - Write-safety mode: checks that file was Read before Write/Edit.
 - Tool permission mode: user approval for destructive tools (`Write`, `Edit`, `Bash`, `Patch`).
 - Redundancy detection: cache + loop-breaker for repeated calls.

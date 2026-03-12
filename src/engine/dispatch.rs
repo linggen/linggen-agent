@@ -33,19 +33,17 @@ impl AgentEngine {
         // Parse TaskArgs from each action, tracking original index.
         let mut delegation_args: Vec<(usize, tools::TaskArgs)> = Vec::new();
         for (i, action) in batch.into_iter().enumerate() {
-            if let ModelAction::Tool { tool, args } = action {
-                let normalized = tools::normalize_tool_args(&tool, args.clone());
-                match serde_json::from_value::<tools::TaskArgs>(normalized) {
-                    Ok(da) => delegation_args.push((i, da)),
-                    Err(e) => {
-                        messages.push(tool_msg(self,
-                            self.prompt_store.render_or_fallback(
-                                crate::prompts::keys::INVALID_TASK_ARGS,
-                                &[("error", &e.to_string())],
-                            ),
-                            i,
-                        ));
-                    }
+            let normalized = tools::normalize_tool_args(&action.tool, action.args.clone());
+            match serde_json::from_value::<tools::TaskArgs>(normalized) {
+                Ok(da) => delegation_args.push((i, da)),
+                Err(e) => {
+                    messages.push(tool_msg(self,
+                        self.prompt_store.render_or_fallback(
+                            crate::prompts::keys::INVALID_TASK_ARGS,
+                            &[("error", &e.to_string())],
+                        ),
+                        i,
+                    ));
                 }
             }
         }
@@ -220,24 +218,22 @@ impl AgentEngine {
         // Phase 1: pre-execute each tool sequentially (needs &mut self).
         let mut ready: Vec<(usize, ToolCall, ReadyExec)> = Vec::new();
         for (idx, action) in batch.into_iter().enumerate() {
-            if let ModelAction::Tool { tool, args } = action {
-                let tc_id = tc_ids.get(action_idx_start + idx).cloned();
-                match self
-                    .pre_execute_tool(
-                        tool, args, &state.allowed_tools, &mut state.messages,
-                        &mut state.tool_cache, &mut state.read_paths,
-                        &mut state.last_tool_sig, &mut state.redundant_tool_streak,
-                        session_id, tc_id,
-                    )
-                    .await
-                {
-                    PreExecOutcome::Blocked(LoopControl::Return(outcome)) => {
-                        return Some(outcome);
-                    }
-                    PreExecOutcome::Blocked(LoopControl::Continue) => {}
-                    PreExecOutcome::Ready(call, exec) => {
-                        ready.push((idx, call, exec));
-                    }
+            let tc_id = tc_ids.get(action_idx_start + idx).cloned();
+            match self
+                .pre_execute_tool(
+                    action.tool, action.args, &state.allowed_tools, &mut state.messages,
+                    &mut state.tool_cache, &mut state.read_paths,
+                    &mut state.last_tool_sig, &mut state.redundant_tool_streak,
+                    session_id, tc_id,
+                )
+                .await
+            {
+                PreExecOutcome::Blocked(LoopControl::Return(outcome)) => {
+                    return Some(outcome);
+                }
+                PreExecOutcome::Blocked(LoopControl::Continue) => {}
+                PreExecOutcome::Ready(call, exec) => {
+                    ready.push((idx, call, exec));
                 }
             }
         }
@@ -327,14 +323,14 @@ impl AgentEngine {
         session_id: Option<&str>,
         tc_id: Option<String>,
     ) -> Option<AgentOutcome> {
-        match action {
-            ModelAction::Tool { ref tool, ref args } if tool == "ExitPlanMode" => {
+        let tool_name = action.tool.as_str();
+
+        // Handle plan-mode tools as special dispatches.
+        match tool_name {
+            "ExitPlanMode" => {
                 if self.plan_mode {
-                    info!("ExitPlanMode → submitting plan for review");
-                    // Primary: plan_text from tool args (required for models like
-                    // GPT 5.4 that put everything in tool args, not response text).
-                    // Fallback: extract from last_assistant_response text.
-                    let plan_text = args.get("plan_text")
+                    tracing::info!("ExitPlanMode → submitting plan for review");
+                    let plan_text = action.args.get("plan_text")
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.trim().is_empty())
                         .map(|s| s.to_string())
@@ -343,112 +339,67 @@ impl AgentEngine {
                                 &state.last_assistant_response,
                             )
                         });
-
-                    // Capture the assistant text so the outer chat handler can
-                    // persist and emit it as a Message.
                     if !plan_text.is_empty() {
                         self.last_assistant_text = Some(plan_text.clone());
                     }
-
-                    // Acknowledge ExitPlanMode so the model knows it was processed.
                     state.messages.push(self.tool_result_msg_for(
                         self.prompt_store.render_or_fallback(
-                            crate::prompts::keys::PLAN_SUBMITTED,
-                            &[],
+                            crate::prompts::keys::PLAN_SUBMITTED, &[],
                         ),
                         &tc_id, "ExitPlanMode",
                     ));
-
-                    // Persist plan + emit PlanUpdate SSE. The PlanBlock in the
-                    // UI handles approval (no AskUser dialog — CC-aligned).
                     let outcome = self.finalize_plan_mode(plan_text).await;
                     return Some(outcome);
                 } else {
                     state.messages.push(self.tool_result_msg_for(
                         self.prompt_store.render_or_fallback(
-                            crate::prompts::keys::EXIT_PLAN_MODE_OUTSIDE_PLAN,
-                            &[],
+                            crate::prompts::keys::EXIT_PLAN_MODE_OUTSIDE_PLAN, &[],
                         ),
                         &tc_id, "ExitPlanMode",
                     ));
                 }
+                return None;
             }
-            ModelAction::Tool { tool, args } => {
-                match self
-                    .handle_tool_action(
-                        tool, args, &state.allowed_tools, &mut state.messages,
-                        &mut state.tool_cache, &mut state.read_paths,
-                        &mut state.last_tool_sig, &mut state.redundant_tool_streak,
-                        &mut state.empty_search_streak, &mut state.progress_rx, session_id,
-                        tc_id,
-                    )
-                    .await
-                {
-                    LoopControl::Return(outcome) => return Some(outcome),
-                    LoopControl::Continue => {}
-                }
-            }
-            ModelAction::Patch { diff } => {
-                match self.handle_patch_action(diff, &mut state.messages).await {
-                    LoopControl::Return(outcome) => return Some(outcome),
-                    LoopControl::Continue => {}
-                }
-            }
-            ModelAction::FinalizeTask { packet } => {
-                match self.handle_finalize_action(packet, &mut state.messages, session_id).await {
-                    LoopControl::Return(outcome) => return Some(outcome),
-                    LoopControl::Continue => {}
-                }
-            }
-            ModelAction::Done { message } => {
-                let msg = message.unwrap_or_else(|| {
-                    self.prompt_store.render_or_fallback(
-                        crate::prompts::keys::DONE_DEFAULT,
-                        &[],
-                    )
-                });
-                info!("Done: {}", crate::engine::render::truncate_for_log(&msg, 200));
-                self.push_context_record(
-                    ContextType::Status, Some("done".to_string()),
-                    self.agent_id.clone(), Some("user".to_string()),
-                    msg.clone(), serde_json::json!({ "kind": "done" }),
-                );
-                // Persist the full model response text (before JSON actions) so
-                // follow-up messages in the same session have the detailed findings.
-                let response_text = crate::engine::actions::text_before_first_json(
-                    &state.last_assistant_response,
-                );
-                let full_msg = if response_text.is_empty() {
-                    msg.clone()
-                } else {
-                    format!("{}\n\n{}", response_text, msg)
-                };
-                let _ = self.persist_assistant_message(&full_msg, session_id).await;
-                self.chat_history.push(ChatMessage::new("assistant", full_msg.clone()));
-                self.truncate_chat_history();
-                self.last_assistant_text = Some(full_msg.clone());
-                self.active_skill = None;
-                if self.plan_mode {
-                    // Fallback: model emitted done in plan mode without calling ExitPlanMode.
-                    // Treat the last response as the plan text (strip JSON).
-                    info!("Done in plan mode → implicit ExitPlanMode");
-                    let plan_text = crate::engine::actions::text_before_first_json(
-                        &state.last_assistant_response,
-                    );
-                    let outcome = self.finalize_plan_mode(plan_text).await;
-                    return Some(outcome);
-                }
-                return Some(AgentOutcome::None);
-            }
-            ModelAction::EnterPlanMode { reason } => {
-                info!("EnterPlanMode: {:?}", reason);
+            "EnterPlanMode" => {
+                let reason = action.args.get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                tracing::info!("EnterPlanMode: {:?}", reason);
+                // Push tool result so native tool calling APIs see a matching response.
+                state.messages.push(self.tool_result_msg_for(
+                    "Entering plan mode.".to_string(),
+                    &tc_id, "EnterPlanMode",
+                ));
                 return Some(AgentOutcome::PlanModeRequested { reason });
             }
-            ModelAction::UpdatePlan { plan_text, items } => {
+            "UpdatePlan" => {
+                let plan_text = action.args.get("plan_text")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let items = action.args.get("items")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
                 self.handle_update_plan_action(plan_text, items, &mut state.messages, session_id, &tc_id).await;
+                return None;
             }
+            _ => {}
         }
-        None
+
+        // Regular tool dispatch.
+        match self
+            .handle_tool_action(
+                action.tool, action.args, &state.allowed_tools, &mut state.messages,
+                &mut state.tool_cache, &mut state.read_paths,
+                &mut state.last_tool_sig, &mut state.redundant_tool_streak,
+                &mut state.empty_search_streak, &mut state.progress_rx, session_id,
+                tc_id,
+            )
+            .await
+        {
+            LoopControl::Return(outcome) => Some(outcome),
+            LoopControl::Continue => None,
+        }
     }
 
     /// Handle an `update_plan` action from the model: convert task items into
@@ -490,10 +441,20 @@ impl AgentEngine {
         let summary = Self::extract_plan_summary(&plan_text);
 
         // Preserve pre-approval status — don't promote Planned to Executing.
-        let status = self.plan.as_ref()
-            .map(|p| p.status.clone())
-            .filter(|s| *s == PlanStatus::Planned || *s == PlanStatus::Approved)
-            .unwrap_or(PlanStatus::Executing);
+        // During plan mode (self.plan is None), stay in Planned so the UI
+        // doesn't flash Executing → Planned when ExitPlanMode fires.
+        let status = if self.plan_mode && self.plan.is_none() {
+            PlanStatus::Planned
+        } else {
+            self.plan.as_ref()
+                .map(|p| p.status.clone())
+                .filter(|s| *s == PlanStatus::Planned || *s == PlanStatus::Approved)
+                .unwrap_or(PlanStatus::Executing)
+        };
+        info!("UpdatePlan: plan_mode={} existing_status={:?} → new_status={:?}",
+            self.plan_mode,
+            self.plan.as_ref().map(|p| &p.status),
+            status);
         let plan = Plan {
             summary,
             status,

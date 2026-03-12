@@ -13,9 +13,9 @@ Redesign of the plan feature, aligned with Claude Code. Separates planning (read
 ## Related docs
 
 - `agentic-loop.md`: kernel loop, termination.
-- `tools.md`: syscall interface, permissions.
+- `tool-spec.md`: syscall interface, permissions.
 - `chat-spec.md`: SSE events, APIs.
-- `storage.md`: session message persistence.
+- `storage-spec.md`: session message persistence.
 
 ## Design principles
 

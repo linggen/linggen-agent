@@ -318,9 +318,21 @@ pub(crate) fn full_tool_schema_entries() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "ExitPlanMode",
-            "args": {},
+            "args": {"plan_text": "string"},
             "returns": "success",
-            "notes": "Signal that your plan is complete and ready for user review. Call this after researching the codebase and writing your plan in your response text."
+            "notes": "Submit your plan for user approval. Include the full plan text. The system will prompt the user to approve, reject, or give feedback."
+        }),
+        serde_json::json!({
+            "name": "EnterPlanMode",
+            "args": {"reason": "string?"},
+            "returns": "success",
+            "notes": "Enter plan mode to research and produce a detailed implementation plan. Restricts you to read-only tools until you call ExitPlanMode."
+        }),
+        serde_json::json!({
+            "name": "UpdatePlan",
+            "args": {"plan_text": "string?", "items": "[{id: string, title: string, status: string}]?"},
+            "returns": "success",
+            "notes": "Update plan content and/or progress checklist. Use plan_text for detailed plan, items for progress tracking. Status values: pending, in_progress, completed."
         }),
     ]
 }

@@ -63,7 +63,7 @@ const ChatMessageRow = React.memo<{
             {msg.images && msg.images.length > 0 && (
               <div className="flex gap-1.5 mt-1.5 flex-wrap">
                 {msg.images.map((img, imgIdx) => (
-                  <img key={imgIdx} src={`data:image/png;base64,${img}`} alt={`Image ${imgIdx + 1}`}
+                  <img key={`b64-${imgIdx}`} src={`data:image/png;base64,${img}`} alt={`Image ${imgIdx + 1}`}
                     className="max-w-[200px] max-h-[200px] rounded-md border border-slate-200 dark:border-white/10 object-contain" />
                 ))}
               </div>
@@ -301,7 +301,9 @@ export const ChatPanel: React.FC<{
       const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
       const nearBottom = distanceFromBottom <= scrollHeight * 0.1;
       isNearBottomRef.current = nearBottom;
-      setShowScrollButton(!nearBottom && distanceFromBottom > 100);
+      // Only show when content is tall enough to scroll meaningfully (> 1.5x viewport)
+      const contentOverflows = scrollHeight > clientHeight * 1.5;
+      setShowScrollButton(!nearBottom && distanceFromBottom > 100 && contentOverflows);
     };
     container.addEventListener('scroll', onScroll, { passive: true });
     return () => container.removeEventListener('scroll', onScroll);

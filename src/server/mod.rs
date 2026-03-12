@@ -45,7 +45,8 @@ use projects_api::{
     get_agent_context_api, get_agent_file_api, get_skill_file_api, list_agent_children_api,
     get_status_api,
     list_agent_files_api, list_agent_runs_api, list_agents_api, list_models_api, list_projects,
-    list_sessions, list_skill_files_api, list_skills, reload_skills, remove_project, remove_session_api,
+    list_sessions, list_skill_files_api, list_skill_sessions, list_skills, reload_skills,
+    remove_project, remove_session_api, remove_skill_session_api,
     rename_session_api, resolve_session_api, upsert_agent_file_api, upsert_skill_file_api,
 };
 use marketplace_api::{builtin_skills_install, builtin_skills_install_all, builtin_skills_list, community_search, marketplace_install, marketplace_move_to_global, marketplace_uninstall};
@@ -1101,6 +1102,8 @@ pub async fn prepare_server(
         .route("/api/sessions", post(create_session))
         .route("/api/sessions", patch(rename_session_api))
         .route("/api/sessions", delete(remove_session_api))
+        .route("/api/skill-sessions", get(list_skill_sessions))
+        .route("/api/skill-sessions", delete(remove_skill_session_api))
         .route("/api/sessions/resolve", post(resolve_session_api))
         .route("/api/task", post(set_task))
         .route("/api/run", post(run_agent))

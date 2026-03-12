@@ -9,14 +9,17 @@ Read files under `doc/` and follow them. If you find wrong content in any doc fi
 
 - `doc/product-spec.md` — vision, OS analogy, product goals, UX surface
 - `doc/agentic-loop.md` — kernel: loop, interrupts, PTC, cancellation
-- `doc/agents.md` — process management: lifecycle, delegation, scheduling
-- `doc/skills.md` — dynamic extensions: format, discovery, triggers
-- `doc/tools.md` — syscall interface: built-in tools, safety
+- `doc/agent-spec.md` — process management: lifecycle, delegation, scheduling
+- `doc/skill-spec.md` — dynamic extensions: format, discovery, triggers
+- `doc/tool-spec.md` — syscall interface: built-in tools, safety
 - `doc/chat-spec.md` — chat system: SSE events, message model, rendering, APIs
 - `doc/models.md` — hardware abstraction: providers, routing
-- `doc/storage.md` — filesystem layout: all persistent state, data formats
+- `doc/storage-spec.md` — filesystem layout: all persistent state, data formats
 - `doc/cli.md` — CLI reference
 - `doc/code-style.md` — code style rules (flat logic, small files/functions, clean code)
+- `doc/session-spec.md` — session/context: creators, effective tools, prompt assembly
+- `doc/mission-spec.md` — cron mission system
+- `doc/plan-spec.md` — plan mode feature
 - `doc/log-spec.md` — logging levels, throttling, output targets
 
 ## Build, Test, Run
@@ -60,7 +63,7 @@ Linggen is a local-first, multi-agent coding assistant. The binary is `ling`. De
 ### Rust Backend (`src/`)
 
 - **`main.rs`** — CLI entry point (clap). Subcommands: `stop`, `status`, `doctor`, `eval`, `init`, `install`, `update`, `skills`. No subcommand → TUI + server.
-- **`config.rs`** — Config loading from `linggen.toml` (TOML). Defines `Config`, `ModelConfig`, `AgentSpec` (parsed from markdown frontmatter), `AgentPolicy`.
+- **`config.rs`** — Config loading from `linggen.toml` (TOML). Defines `Config`, `ModelConfig`, `AgentSpec` (parsed from markdown frontmatter).
 - **`engine/`** — Core agent execution engine. `mod.rs` is the main loop. `tools.rs` implements all model-facing tools (Read, Write, Edit, Bash, Glob, Grep, capture_screenshot, lock_paths, unlock_paths, Task, WebSearch, WebFetch, Skill, AskUser). `actions.rs` parses JSON actions from model output. `streaming.rs` handles streaming responses. `context.rs` manages token counting and compaction. `permission.rs` enforces tool permissions. `plan.rs` manages plan mode.
 - **`server/`** — Axum HTTP server. `chat_api.rs` handles chat/run endpoints + SSE streaming. `projects_api.rs` for project/session CRUD. `workspace_api.rs` serves file tree. `config_api.rs` for runtime config. `idle_scheduler.rs` for mission idle prompts.
 - **`agent_manager/`** — Agent lifecycle, run records, cancellation. `models.rs` handles multi-provider dispatch (Ollama, OpenAI-compatible). `routing.rs` implements model selection policies with fallback chains.
@@ -87,9 +90,9 @@ React 19 + TypeScript + Tailwind CSS v4 + Vite.
 
 Agent specs are markdown files with YAML frontmatter. Adding a `.md` file registers a new agent at startup.
 
-Frontmatter fields: `name`, `description`, `tools`, `model`, `work_globs`, `policy`.
+Frontmatter fields: `name`, `description`, `tools`, `model`, `personality`.
 
-Current agents: `ling` (lead, delegates), `coder` (writes code), `explorer` (read-only analysis), `debugger` (read-only debugging), `linggen-guide` (docs guide).
+Current agents: `ling` (the only agent — adapts to any context via skills).
 
 ### Configuration
 
@@ -109,7 +112,7 @@ Follow `doc/code-style.md`:
 
 - **Tool names are Claude Code-style**: `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep` (capitalized).
 - **Workspace-scoped file operations**: all paths are sandboxed to workspace root; parent traversal (`..`) is rejected.
-- **Agent policy enforcement**: tools and actions (Patch, Finalize, Delegate) are hard-gated per agent via frontmatter policy, not just prompt guidance.
+- **Capability = tool list**: no separate policy system. If a session has Write/Edit tools, it can patch. If it has Task, it can delegate. See `session-spec.md`.
 - **SSE events**: server publishes real-time events (`Token`, `Message`, `AgentStatus`, `SubagentSpawned`, `ToolStatus`, `PlanUpdate`, `AppLaunched`, etc.) consumed by the web UI.
 - **App skills**: skills with `app` frontmatter section run directly (no model). Launcher types: `web` (static files served at `/apps/{name}/`), `bash` (script execution), `url` (external link). Model can also call `RunApp` tool.
 - **Delegation depth**: configurable via `max_delegation_depth` (default 2). Any agent can delegate to any other agent.

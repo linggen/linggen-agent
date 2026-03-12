@@ -8,72 +8,11 @@ name: ${agentName}
 description: ${agentName} agent.
 tools: [Read]
 model: inherit
-kind: main
-work_globs: ["**/*"]
-policy: []
 ---
 
 You are linggen '${agentName}'.
 `;
 
-const policyBadges: { key: string; label: string; cls: string }[] = [
-  { key: 'Patch', label: 'P', cls: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400' },
-  { key: 'Finalize', label: 'F', cls: 'bg-violet-500/10 text-violet-700 dark:text-violet-400' },
-  { key: 'Delegate', label: 'D', cls: 'bg-amber-500/10 text-amber-700 dark:text-amber-400' },
-];
-
-// Kind badges removed — all agents are equal.
-
-const parsePolicyFromContent = (content: string): string[] => {
-  const match = content.match(/^policy:\s*\[([^\]]*)\]/m);
-  if (!match) return [];
-  return match[1]
-    .split(',')
-    .map((s) => s.trim().replace(/['"]/g, ''))
-    .filter(Boolean);
-};
-
-const parseDelegateTargets = (content: string): string => {
-  const match = content.match(/^delegate_targets:\s*\[([^\]]*)\]/m);
-  if (!match) return '';
-  return match[1]
-    .split(',')
-    .map((s) => s.trim().replace(/['"]/g, ''))
-    .filter(Boolean)
-    .join(', ');
-};
-
-const updatePolicyInContent = (content: string, policies: string[]): string => {
-  const policyStr = policies.length > 0 ? `[${policies.join(', ')}]` : '[]';
-  if (content.match(/^policy:\s*\[/m)) {
-    return content.replace(/^policy:\s*\[[^\]]*\]/m, `policy: ${policyStr}`);
-  }
-  // Insert before closing ---
-  const parts = content.split('---');
-  if (parts.length >= 3) {
-    const frontmatter = parts[1].trimEnd();
-    return `---${frontmatter}\npolicy: ${policyStr}\n---${parts.slice(2).join('---')}`;
-  }
-  return content;
-};
-
-const updateDelegateTargetsInContent = (content: string, targets: string): string => {
-  const arr = targets
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const val = arr.length > 0 ? `[${arr.join(', ')}]` : '[]';
-  if (content.match(/^delegate_targets:\s*\[/m)) {
-    return content.replace(/^delegate_targets:\s*\[[^\]]*\]/m, `delegate_targets: ${val}`);
-  }
-  if (!targets.trim()) return content;
-  const parts = content.split('---');
-  if (parts.length >= 3) {
-    const frontmatter = parts[1].trimEnd();
-    return `---${frontmatter}\ndelegate_targets: ${val}\n---${parts.slice(2).join('---')}`;
-  }
-  return content;
-};
 
 export const AgentsTab: React.FC<{
   projectRoot: string;
@@ -90,8 +29,6 @@ export const AgentsTab: React.FC<{
 
   const dirty = useMemo(() => content !== savedContent, [content, savedContent]);
 
-  const currentPolicies = useMemo(() => parsePolicyFromContent(content), [content]);
-  const delegateTargets = useMemo(() => parseDelegateTargets(content), [content]);
 
   const fetchList = useCallback(async () => {
     if (!projectRoot) return;
@@ -211,16 +148,6 @@ export const AgentsTab: React.FC<{
     onChanged?.();
   };
 
-  const togglePolicy = (key: string) => {
-    const next = currentPolicies.includes(key)
-      ? currentPolicies.filter((p) => p !== key)
-      : [...currentPolicies, key];
-    setContent(updatePolicyInContent(content, next));
-  };
-
-  const setDelegateTargetsValue = (val: string) => {
-    setContent(updateDelegateTargetsInContent(content, val));
-  };
 
   return (
     <div className="flex h-full min-h-0">
@@ -291,36 +218,6 @@ export const AgentsTab: React.FC<{
 
         {validationError && (
           <div className="px-3 py-2 text-xs bg-red-50 text-red-700 border-b border-red-100">{validationError}</div>
-        )}
-
-        {/* Policy editor */}
-        {selectedPath && (
-          <div className="px-3 py-2 border-b border-slate-200 dark:border-white/10 flex items-center gap-4 bg-slate-50/50 dark:bg-white/[0.02]">
-            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Policy</span>
-            {policyBadges.map(({ key, label, cls }) => (
-              <label key={key} className="inline-flex items-center gap-1.5 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={currentPolicies.includes(key)}
-                  onChange={() => togglePolicy(key)}
-                  className="w-3 h-3 rounded border-slate-300 text-blue-600"
-                />
-                <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${cls}`}>{label}</span>
-                <span className="text-[10px] text-slate-500">{key}</span>
-              </label>
-            ))}
-            {currentPolicies.includes('Delegate') && (
-              <div className="flex items-center gap-1.5 ml-2">
-                <span className="text-[10px] text-slate-500">Targets:</span>
-                <input
-                  className="bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded px-2 py-0.5 text-[10px] w-40 outline-none focus:ring-1 focus:ring-blue-500/50"
-                  value={delegateTargets}
-                  onChange={(e) => setDelegateTargetsValue(e.target.value)}
-                  placeholder="coder, search"
-                />
-              </div>
-            )}
-          </div>
         )}
 
         {/* Live preview editor */}

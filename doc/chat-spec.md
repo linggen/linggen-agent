@@ -12,9 +12,11 @@ Real-time messaging between users and agents, with streaming output, live activi
 
 ## Related docs
 
+- `session-spec.md`: session/context model, effective tools, prompt assembly.
 - `agentic-loop.md`: how interrupts work in the loop.
-- `agents.md`: agent lifecycle events.
-- `tools.md`: tool definitions and safety.
+- `agent-spec.md`: agent lifecycle events.
+- `tool-spec.md`: tool definitions and safety.
+- `plan-spec.md`: plan mode, approval flow.
 
 ## Architecture overview
 
@@ -157,9 +159,21 @@ Linggen supports multiple active sessions simultaneously. Each client creates it
 - **VS Code extension**: same pattern — auto-creates a session per workspace on first chat.
 - **Web UI**: can view and switch between all sessions for a project. "New Chat" creates a new session.
 
+### Session-bound skills
+
+A session can optionally bind to a skill at creation time via the `skill` field in `POST /api/sessions`. When bound:
+
+- The skill is active for **every message** in the session (not just one invocation).
+- `effective_tools = intersection(agent.tools, skill.allowed-tools)`.
+- The skill body is injected into the system prompt on every turn.
+- Tool-related prompt sections are skipped when effective tools is empty.
+
+This enables interactive app skills (e.g., a game UI that creates a session bound to `game-table`). The session stays skill-scoped for its entire lifetime. No "recovery" mechanism — other sessions are unaffected.
+
 ### Session isolation
 
 - Different sessions can use the **same agent** (e.g. both use "ling") — the agent engine instance is shared per-project, but chat history is loaded from the session's own message file on each run.
+- Different sessions can have **different bound skills** — one session can be a game, another can be coding, both using ling.
 - Different sessions can use the **same model** — model access is controlled by a per-model semaphore (capacity 1). When a model is busy serving one session, other sessions block until the model is free.
 - **Context is per-session**: each session has independent message history. Compaction, token counting, and context window management all operate on the session's own messages.
 
@@ -203,6 +217,7 @@ When a user sends a message to a busy agent, it queues. The agent picks it up at
 - `POST /api/plan/approve` — approve a pending plan.
 - `POST /api/plan/reject` — reject a pending plan.
 - `POST /api/plan/edit` — edit a pending plan.
+- `GET /api/system-prompt` — returns the composed system prompt for a session, broken into layers (agent, skill, environment, tools, etc.) with token counts. Used by the System Prompt Inspector UI.
 
 ## Slash commands
 

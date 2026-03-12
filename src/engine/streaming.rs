@@ -270,11 +270,13 @@ impl AgentEngine {
                     if in_think_block && accumulated_text.contains("</think>") {
                         in_think_block = false;
                     }
-                    // Do NOT stream content tokens here. Some models (e.g. GPT 5.4)
-                    // emit tool call JSON as plain text instead of native function
-                    // calls. Streaming tokens would show raw JSON to the user.
-                    // Text content is emitted as a complete block by the engine's
-                    // main loop after confirming it's not a JSON action.
+                    // Stream content tokens so the UI shows progress in real time.
+                    // Skip tokens inside <think> blocks.
+                    if !in_think_block {
+                        if let Some(tx) = &self.thinking_tx {
+                            let _ = tx.send(ThinkingEvent::ContentToken(token));
+                        }
+                    }
                 }
                 StreamChunk::Usage(usage) => {
                     token_usage = Some(usage);

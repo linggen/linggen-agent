@@ -63,6 +63,11 @@ pub fn mission_sessions_dir(mission_id: &str) -> PathBuf {
     global_missions_dir().join(mission_id).join("sessions")
 }
 
+/// `~/.linggen/skills/{skill_name}/sessions/`
+pub fn skill_sessions_dir(skill_name: &str) -> PathBuf {
+    global_skills_dir().join(skill_name).join("sessions")
+}
+
 /// `~/.linggen/projects/`
 pub fn projects_dir() -> PathBuf {
     linggen_home().join("projects")

@@ -20,8 +20,9 @@ Linggen skills follow the [Agent Skills](https://agentskills.io) open standard (
 
 ## Related docs
 
-- `tools.md`: built-in tools (syscall interface).
-- `agents.md`: how agents use skills.
+- `session-spec.md`: session-bound skills, effective tools.
+- `tool-spec.md`: built-in tools (syscall interface).
+- `agent-spec.md`: how agents use skills.
 - `product-spec.md`: skills-first design principle.
 
 ## Format
@@ -87,27 +88,16 @@ These fields are Linggen-specific extensions.
 
 ## App skills
 
-Skills can act as **apps** — directly executable without model involvement. When a skill has an `app` section in frontmatter, invoking it (via `/skill-name` or clicking "Launch" in the UI) runs it immediately, bypassing the model entirely.
+Skills can act as **apps** — directly executable with a custom UI. When a skill has an `app` section in frontmatter, invoking it opens the UI.
 
-```yaml
----
-name: arcade-game
-description: Retro arcade games
-app:
-  launcher: web
-  entry: scripts/index.html
-  width: 800
-  height: 600
----
-```
+### Two kinds of app skills
 
-### Launcher types
+| Kind | `allowed-tools` | Model involvement | Example |
+|:-----|:-----------------|:------------------|:--------|
+| **Standalone** | n/a | None — pure frontend | `arcade-game` (Snake, Pong, Tetris) |
+| **Interactive** | any (often `[]`) | App UI talks to ling via session API | `game-table` (chess, poker vs AI) |
 
-| Launcher | Behavior |
-|:---------|:---------|
-| `web` | Serve skill directory as static files, open in embedded panel (iframe) |
-| `bash` | Execute `entry` script, stream output |
-| `url` | Open external URL in browser or panel |
+Standalone apps bypass the model entirely. Interactive apps create a **session-bound skill** — the app UI creates a session with `skill: "game-table"`, and every message in that session activates the skill (tool restrictions, skill body injection).
 
 ### App fields
 
@@ -118,16 +108,39 @@ app:
 | `width` | no | Suggested panel width in pixels |
 | `height` | no | Suggested panel height in pixels |
 
-### Invocation
+### Launcher types
 
-- **User**: `/skill-name` or click "Launch" button on the skill card in the Web UI.
-- **Model**: call the `RunApp` built-in tool (see `tools.md`).
+| Launcher | Behavior |
+|:---------|:---------|
+| `web` | Serve skill directory as static files, open in embedded panel (iframe) |
+| `bash` | Execute `entry` script, stream output |
+| `url` | Open external URL in browser or panel |
 
-Both paths skip the model for the launch itself. The model can call `RunApp` during a conversation to open an app for the user.
+### Interactive app pattern
+
+Interactive app skills use the existing linggen API from within the iframe (same-origin):
+
+1. `GET /api/models` — populate model picker
+2. `POST /api/sessions` with `skill` field — create skill-bound session
+3. `POST /api/run` — send messages to ling (shaped by skill)
+4. `GET /api/events?session_id=` — SSE stream for responses
+
+The skill's `allowed-tools` restricts ling's tools for the session. The skill body is injected into every system prompt. No custom endpoints needed.
 
 ### Static file serving
 
-Web apps are served at `/apps/{skill-name}/`. The server resolves the skill's directory and serves files statically, scoped to the skill directory (no path traversal).
+Web apps are served at `/apps/{skill-name}/`. Scoped to skill directory (no path traversal).
+
+## Skill activation modes
+
+| Mode | Trigger | Scope | Tool restriction |
+|:-----|:--------|:------|:-----------------|
+| **Transient** | `/skill-name` in chat | Single invocation | During that run, then restored |
+| **Session-bound** | Session created with `skill` field | Entire session | Every message in session |
+
+App skills with interactive UIs are session-bound. The iframe creates the session with the skill binding. All messages in that session get the skill's tool restrictions and instructions.
+
+Session-bound skills combine with the agent's system prompt: `effective_tools = intersection(agent.tools, skill.allowed-tools)`. When effective tools is empty, tool-related prompt sections (schemas, usage guidelines, delegation, plan mode) are skipped entirely.
 
 ## Discovery
 

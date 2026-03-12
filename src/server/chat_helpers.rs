@@ -91,6 +91,7 @@ pub(crate) async fn persist_message_only(
     }
 }
 
+
 // ---------------------------------------------------------------------------
 // Queue management
 // ---------------------------------------------------------------------------
@@ -143,9 +144,6 @@ fn parse_tool_call_from_json_line(line: &str) -> Option<ToolCallForUi> {
         });
     }
     let kind = parsed.get("type").and_then(|v| v.as_str())?;
-    if matches!(kind, "finalize_task") {
-        return None;
-    }
     if parsed.get("args").and_then(|v| v.as_object()).is_some() {
         return Some(ToolCallForUi {
             name: kind.to_string(),
@@ -521,15 +519,14 @@ pub(crate) fn sanitize_message_for_ui(from: &str, content: &str) -> Option<Strin
         }
 
         // Suppress raw JSON objects/arrays that are internal structured data
-        // (e.g. finalize payloads) — not meant for display.
-        // Exception: plan and finalize_task JSON are rendered as special blocks
-        // by the UI (PlanBlock, TaskBlock) so they must pass through.
+        // — not meant for display.
+        // Exception: plan JSON is rendered as a PlanBlock by the UI.
         if (line.starts_with('{') && line.ends_with('}'))
             || (line.starts_with('[') && line.ends_with(']'))
         {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                 let is_special_block = val.get("type").and_then(|t| t.as_str())
-                    .map(|t| t == "plan" || t == "finalize_task")
+                    .map(|t| t == "plan")
                     .unwrap_or(false);
                 if !is_special_block {
                     continue;
@@ -652,30 +649,6 @@ pub(crate) fn emit_outcome_event(
     from_id: &str,
 ) {
     match outcome {
-        AgentOutcome::Task(packet) => {
-            let _ = events_tx.send(ServerEvent::Message {
-                from: from_id.to_string(),
-                to: "user".to_string(),
-                content: serde_json::json!({
-                    "type": "finalize_task",
-                    "packet": packet
-                })
-                .to_string(),
-                session_id: None, // enriched via agent_sessions map
-            });
-        }
-        AgentOutcome::Patch(diff) => {
-            let _ = events_tx.send(ServerEvent::Message {
-                from: from_id.to_string(),
-                to: "user".to_string(),
-                content: serde_json::json!({
-                    "type": "patch",
-                    "diff": diff
-                })
-                .to_string(),
-                session_id: None,
-            });
-        }
         AgentOutcome::Plan(plan) => {
             // Emit plan as a Message so it persists in chat history and
             // renders as a PlanBlock via tryRenderSpecialBlock.
@@ -724,9 +697,9 @@ mod tests {
 
     #[test]
     fn sanitize_hides_read_body_and_keeps_file_status() {
-        let input = "Tool Read: Read: doc/storage.md (truncated: false)\n\nFilesystem layout for all persistent state.\nNo database — everything is files.\n\n(content omitted in chat; open the file viewer for full text)";
+        let input = "Tool Read: Read: doc/storage-spec.md (truncated: false)\n\nFilesystem layout for all persistent state.\nNo database — everything is files.\n\n(content omitted in chat; open the file viewer for full text)";
         let cleaned = sanitize_message_for_ui("system", input).expect("expected sanitized output");
-        assert_eq!(cleaned, "Used tool: Read · target=storage.md");
+        assert_eq!(cleaned, "Used tool: Read · target=storage-spec.md");
     }
 
     #[test]

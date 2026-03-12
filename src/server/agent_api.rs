@@ -1,4 +1,3 @@
-use crate::config::AgentPolicyCapability;
 use crate::server::{AgentStatusKind, ServerEvent, ServerState};
 use crate::state_fs::StateFile;
 use axum::{
@@ -11,28 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-async fn agent_allows_policy(
-    state: &Arc<ServerState>,
-    root: &PathBuf,
-    agent_id: &str,
-    capability: AgentPolicyCapability,
-) -> bool {
-    match state.manager.list_agent_specs(root).await {
-        Ok(entries) => entries
-            .into_iter()
-            .find(|entry| entry.agent_id.eq_ignore_ascii_case(agent_id))
-            .map(|entry| entry.spec.allows_policy(capability))
-            .unwrap_or(false),
-        Err(_) => false,
-    }
-}
-
 async fn first_patch_agent(state: &Arc<ServerState>, root: &PathBuf) -> Option<String> {
+    // All agents are patch-capable; pick the first.
     let entries = state.manager.list_agent_specs(root).await.ok()?;
-    entries
-        .into_iter()
-        .find(|entry| entry.spec.allows_policy(AgentPolicyCapability::Patch))
-        .map(|entry| entry.agent_id)
+    entries.into_iter().next().map(|entry| entry.agent_id)
 }
 
 #[derive(Deserialize)]
@@ -57,14 +38,7 @@ pub(crate) async fn set_task(
             let mut engine = agent.lock().await;
             engine.set_task(req.task.clone());
 
-            // Persist planning task when this main agent is allowed to finalize.
-            if agent_allows_policy(
-                &state,
-                &root,
-                &req.agent_id,
-                AgentPolicyCapability::Finalize,
-            )
-            .await
+            // Persist planning task — all agents can finalize now.
             {
                 if let Ok(ctx) = state.manager.get_or_create_project(root).await {
                     let planning_task = StateFile::PmTask {
@@ -168,43 +142,6 @@ pub(crate) async fn run_agent(
                         crate::engine::AgentOutcome::None
                     }
                 };
-
-                // If a Finalize-capable agent finalized a task, persist and queue for Patch-capable main agent.
-                let is_finalize_agent = agent_allows_policy(
-                    &state_clone,
-                    &root,
-                    &agent_id,
-                    AgentPolicyCapability::Finalize,
-                )
-                .await;
-                if is_finalize_agent {
-                    if let crate::engine::AgentOutcome::Task(packet) = &outcome {
-                        if let Ok(ctx) = manager.get_or_create_project(root.clone()).await {
-                            let assignee = first_patch_agent(&state_clone, &root)
-                                .await
-                                .unwrap_or_else(|| "unassigned".to_string());
-                            let task_id = format!("task-{}", crate::util::now_ts_secs());
-                            let coder_task = StateFile::CoderTask {
-                                id: task_id.clone(),
-                                status: "queued".to_string(),
-                                story_id: None,
-                                assigned_to: assignee,
-                            };
-                            let body = format!(
-                                "## {}\n\n### User Stories\n{}\n\n### Acceptance Criteria\n{}",
-                                packet.title,
-                                packet.user_stories.join("\n"),
-                                packet.acceptance_criteria.join("\n")
-                            );
-                            let _ = ctx.state_fs.write_file(
-                                &format!("tasks/{}.md", task_id),
-                                &coder_task,
-                                &body,
-                            );
-                            let _ = events_tx.send(ServerEvent::StateUpdated);
-                        }
-                    }
-                }
 
                 let _ = events_tx.send(ServerEvent::Outcome {
                     agent_id: agent_id.clone(),

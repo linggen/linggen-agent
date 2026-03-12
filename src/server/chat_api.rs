@@ -27,6 +27,10 @@ pub(crate) struct ChatRequest {
     /// under `~/.linggen/missions/{mission_id}/sessions/` instead of
     /// the project's session store.
     mission_id: Option<String>,
+    /// When set, this chat belongs to a skill session — persist messages
+    /// under `~/.linggen/skills/{skill_name}/sessions/` instead of
+    /// the project's session store.
+    skill_name: Option<String>,
     /// Session-level model override. Takes priority over routing.default_models.
     model_id: Option<String>,
     #[serde(default)]
@@ -566,6 +570,11 @@ async fn run_plan_dispatch(
     engine.plan = None;
     engine.observations.clear();
     engine.task = Some(task_text.to_string());
+    // Forward images so the plan-mode sub-loop can see them (pending_images
+    // was consumed by std::mem::take in the previous loop's prepare_loop_messages).
+    if engine.pending_images.is_empty() && !ctx.images.is_empty() {
+        engine.pending_images = ctx.images.clone();
+    }
     // Add user message to chat history so subsequent turns have conversational context.
     engine.chat_history.push(crate::ollama::ChatMessage::new("user", ctx.clean_msg.clone()));
     engine.truncate_chat_history();
@@ -1018,32 +1027,48 @@ pub(crate) async fn chat_handler(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
-    let root = PathBuf::from(&req.project_root);
+    let root = if req.project_root.is_empty() {
+        std::env::current_dir().unwrap_or_default()
+    } else {
+        PathBuf::from(&req.project_root)
+    };
     let project_root_str = root.to_string_lossy().to_string();
 
-    // Determine if this chat belongs to a mission — if so, route session
-    // persistence to the mission's session store, not the project's.
-    let mission_sessions_root: Option<std::path::PathBuf> = req.mission_id.as_ref().map(|mid| {
-        crate::paths::mission_sessions_dir(mid)
-    });
+    // Determine if this chat belongs to a mission or skill — if so, route session
+    // persistence to their session store, not the project's.
+    let sessions_root_override: Option<std::path::PathBuf> = if let Some(ref mid) = req.mission_id {
+        Some(crate::paths::mission_sessions_dir(mid))
+    } else if let Some(ref skill) = req.skill_name {
+        Some(crate::paths::skill_sessions_dir(skill))
+    } else {
+        None
+    };
+
+    // Session creator type — computed once, used when creating new sessions.
+    let session_creator: &str = if req.mission_id.is_some() { "mission" }
+        else if req.skill_name.is_some() { "skill" }
+        else { "user" };
 
     // Auto-create a new session when none is provided, instead of falling
     // back to a hidden "default" session.
     // When a session_id IS provided (e.g. from TUI), ensure it exists in the
     // session store so the Web UI can list it.
     let session_id: Option<String> = if let Some(sid) = req.session_id.clone() {
-        if let Some(ref missions_dir) = mission_sessions_root {
+        if let Some(ref alt_dir) = sessions_root_override {
             // Mission session — ensure it exists in the mission store.
-            let store = crate::state_fs::SessionStore::with_sessions_dir(missions_dir.clone());
+            let store = crate::state_fs::SessionStore::with_sessions_dir(alt_dir.clone());
             let exists = store.list_sessions().ok()
                 .map(|ss| ss.iter().any(|s| s.id == sid))
                 .unwrap_or(false);
             if !exists {
                 let now = crate::util::now_ts_secs();
+
                 let meta = crate::state_fs::sessions::SessionMeta {
                     id: sid.clone(),
                     title: auto_session_title(&req.message),
                     created_at: now,
+                    skill: None,
+                    creator: session_creator.into(),
                 };
                 let _ = store.add_session(&meta);
             }
@@ -1053,10 +1078,13 @@ pub(crate) async fn chat_handler(
                 .unwrap_or(false);
             if !exists {
                 let now = crate::util::now_ts_secs();
+
                 let meta = crate::state_fs::sessions::SessionMeta {
                     id: sid.clone(),
                     title: auto_session_title(&req.message),
                     created_at: now,
+                    skill: None,
+                    creator: session_creator.into(),
                 };
                 let _ = ctx.sessions.add_session(&meta);
             }
@@ -1065,12 +1093,15 @@ pub(crate) async fn chat_handler(
     } else {
         let now = crate::util::now_ts_secs();
         let new_id = format!("sess-{}-{}", now, &uuid::Uuid::new_v4().to_string()[..8]);
-        if let Some(ref missions_dir) = mission_sessions_root {
-            let store = crate::state_fs::SessionStore::with_sessions_dir(missions_dir.clone());
+        let creator = if req.mission_id.is_some() { "mission" } else if req.skill_name.is_some() { "skill" } else { "user" };
+        if let Some(ref alt_dir) = sessions_root_override {
+            let store = crate::state_fs::SessionStore::with_sessions_dir(alt_dir.clone());
             let meta = crate::state_fs::sessions::SessionMeta {
                 id: new_id.clone(),
                 title: auto_session_title(&req.message),
                 created_at: now,
+                skill: None,
+                creator: session_creator.into(),
             };
             let _ = store.add_session(&meta);
         } else if let Ok(ctx) = state.manager.get_or_create_project(root.clone()).await {
@@ -1078,6 +1109,8 @@ pub(crate) async fn chat_handler(
                 id: new_id.clone(),
                 title: auto_session_title(&req.message),
                 created_at: now,
+                skill: None,
+                creator: session_creator.into(),
             };
             let _ = ctx.sessions.add_session(&meta);
         }
@@ -1161,12 +1194,12 @@ pub(crate) async fn chat_handler(
             let _req_mode = req.mode.clone();
             let req_model_id = req.model_id.clone();
             let req_images = req.images.clone();
-            let mission_root_for_spawn = mission_sessions_root.clone();
+            let sessions_override_for_spawn = sessions_root_override.clone();
 
             if was_busy {
                 // When queued, only persist to disk — don't emit via SSE.
-                if let Some(ref missions_dir) = mission_sessions_root {
-                    let store = crate::state_fs::SessionStore::with_sessions_dir(missions_dir.clone());
+                if let Some(ref alt_dir) = sessions_root_override {
+                    let store = crate::state_fs::SessionStore::with_sessions_dir(alt_dir.clone());
                     let sid = session_id.as_deref().unwrap_or("default");
                     let msg = crate::state_fs::sessions::ChatMsg {
                         agent_id: target_id.to_string(),
@@ -1191,9 +1224,10 @@ pub(crate) async fn chat_handler(
                     .await;
                 }
             } else {
-                // Not queued — persist and emit so the UI shows the message.
-                if let Some(ref missions_dir) = mission_sessions_root {
-                    let store = crate::state_fs::SessionStore::with_sessions_dir(missions_dir.clone());
+                // Emit + persist plain text. Images are ephemeral (sent inline
+                // as base64 for the current turn only, not persisted to disk).
+                if let Some(ref alt_dir) = sessions_root_override {
+                    let store = crate::state_fs::SessionStore::with_sessions_dir(alt_dir.clone());
                     persist_and_emit_to_store(
                         &store,
                         &events_tx,
@@ -1272,8 +1306,8 @@ pub(crate) async fn chat_handler(
                 engine.tools.builtins.set_session_id(session_id.clone());
 
                 // Route session persistence to mission directory when applicable.
-                if let Some(ref missions_dir) = mission_root_for_spawn {
-                    engine.cfg.session_root = Some(missions_dir.clone());
+                if let Some(ref alt_dir) = sessions_override_for_spawn {
+                    engine.cfg.session_root = Some(alt_dir.clone());
                 }
 
                 // Clear mission-only restrictions — user-initiated chats should
@@ -1305,8 +1339,8 @@ pub(crate) async fn chat_handler(
                 // freshly created (e.g. after model change invalidated cache).
                 if engine.chat_history.is_empty() {
                     let sid = ctx.session_id.as_deref().unwrap_or("default");
-                    let history_result = if let Some(ref missions_dir) = mission_root_for_spawn {
-                        let store = crate::state_fs::SessionStore::with_sessions_dir(missions_dir.clone());
+                    let history_result = if let Some(ref alt_dir) = sessions_override_for_spawn {
+                        let store = crate::state_fs::SessionStore::with_sessions_dir(alt_dir.clone());
                         store.get_chat_history(sid)
                     } else if let Ok(proj_ctx) = ctx.manager.get_or_create_project(ctx.root.clone()).await {
                         proj_ctx.sessions.get_chat_history(sid)
@@ -1326,9 +1360,8 @@ pub(crate) async fn chat_handler(
                             } else {
                                 "assistant"
                             };
-                            engine.chat_history.push(
-                                crate::ollama::ChatMessage::new(role, &m.content),
-                            );
+                            let msg = crate::ollama::ChatMessage::new(role, &m.content);
+                            engine.chat_history.push(msg);
                         }
                         engine.truncate_chat_history();
                         if !engine.chat_history.is_empty() {
@@ -1336,6 +1369,38 @@ pub(crate) async fn chat_handler(
                                 "Restored {} chat_history messages from session store",
                                 engine.chat_history.len()
                             );
+                        }
+                    }
+                }
+
+                // Load session-bound skill if the session has one.
+                if engine.active_skill.is_none() {
+                    if let Some(sid) = &ctx.session_id {
+                        let bound_skill_name = if let Some(ref alt_dir) = sessions_override_for_spawn {
+                            let store = crate::state_fs::SessionStore::with_sessions_dir(alt_dir.clone());
+                            match store.get_session_meta(sid) {
+                                Ok(meta) => meta.and_then(|m| m.skill),
+                                Err(e) => {
+                                    tracing::warn!("Failed to read session meta for {}: {}", sid, e);
+                                    None
+                                }
+                            }
+                        } else if let Ok(proj_ctx) = ctx.manager.get_or_create_project(ctx.root.clone()).await {
+                            match proj_ctx.sessions.get_session_meta(sid) {
+                                Ok(meta) => meta.and_then(|m| m.skill),
+                                Err(e) => {
+                                    tracing::warn!("Failed to read session meta for {}: {}", sid, e);
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(ref skill_name) = bound_skill_name {
+                            if let Some(skill) = manager.skill_manager.get_skill(skill_name).await {
+                                tracing::info!("Session-bound skill activated: {}", skill.name);
+                                engine.active_skill = Some(skill);
+                            }
                         }
                     }
                 }

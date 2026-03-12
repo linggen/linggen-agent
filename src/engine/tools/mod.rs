@@ -11,7 +11,6 @@ pub(crate) use tool_helpers::{normalize_tool_args, summarize_tool_args};
 pub(crate) use delegation::{run_delegation, TaskArgs};
 
 use crate::agent_manager::AgentManager;
-use crate::config::AgentPolicy;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -173,7 +172,6 @@ pub struct Tools {
     delegation_depth: usize,
     max_delegation_depth: usize,
     run_id: Option<String>,
-    agent_policy: Option<AgentPolicy>,
     memory_dir: Option<PathBuf>,
     ask_user_bridge: Option<Arc<AskUserBridge>>,
     progress_tx: Option<ToolProgressSender>,
@@ -192,7 +190,6 @@ impl Tools {
             delegation_depth: 0,
             max_delegation_depth: 2,
             run_id: None,
-            agent_policy: None,
             memory_dir: None,
             ask_user_bridge: None,
             progress_tx: None,
@@ -224,10 +221,6 @@ impl Tools {
 
     pub fn max_delegation_depth(&self) -> usize {
         self.max_delegation_depth
-    }
-
-    pub fn set_policy(&mut self, policy: Option<AgentPolicy>) {
-        self.agent_policy = policy;
     }
 
     pub fn set_run_id(&mut self, run_id: Option<String>) {
