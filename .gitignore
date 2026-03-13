@@ -19,8 +19,13 @@ Cargo.lock
 
 # macOS
 .DS_Store
-.claude/
 pkg/
+
+# AI tool configs
+.claude/
+.antigravity/
+.codex/
+.cursor/
 .linggen/
 
 # VS Code
