@@ -28,6 +28,7 @@ export default defineConfig({
     proxy: {
       '/api': `http://localhost:${backendPort}`,
       '/apps': `http://localhost:${backendPort}`,
+      '/sdk': `http://localhost:${backendPort}`,
     },
   },
   build: {

@@ -7,7 +7,7 @@ import { ContentBlockView, TurnSummaryFooter } from './ContentBlockView';
 import { tryRenderSpecialBlock } from './SpecialBlocks';
 import { getMessagePhase, isTransientStatus, isToolStatusText } from './MessagePhase';
 import { visibleMessageText } from './MessageHelpers';
-import { stripEmbeddedStructuredJson } from '../../lib/messageUtils';
+import { stripEmbeddedStructuredJson, isPlanMessage } from '../../lib/messageUtils';
 
 /** Top-level agent message renderer — unified widget-list model.
  *
@@ -58,7 +58,11 @@ export const AgentMessage: React.FC<{
     }
   }
 
-  const fallbackText = !hasToolBlocks ? visibleMessageText(msg) : '';
+  // Plan messages store JSON in msg.text — don't sanitize or the plan JSON
+  // gets stripped by stripStructuredJsonFromText, hiding the PlanBlock.
+  const fallbackText = !hasToolBlocks
+    ? (isPlanMessage(msg) ? (msg.text || '').trim() : visibleMessageText(msg))
+    : '';
 
   // Error messages get a prominent banner style.
   if (msg.isError) {

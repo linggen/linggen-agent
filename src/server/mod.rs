@@ -38,7 +38,7 @@ use agent_api::{
     cancel_agent_run, cancel_tool_execution,
     run_agent, set_task,
 };
-use chat_api::{approve_plan_handler, ask_user_response_handler, chat_handler, clear_chat_history_api, compact_chat_api, edit_plan_handler, pending_ask_user_handler, reject_plan_handler};
+use chat_api::{approve_plan_handler, ask_user_response_handler, chat_handler, clear_chat_history_api, compact_chat_api, edit_plan_handler, get_system_prompt_api, pending_ask_user_handler, reject_plan_handler};
 use config_api::{get_config_api, get_credentials_api, get_models_health, update_config_api, update_credentials_api, get_codex_auth_status, start_codex_auth_login, codex_auth_logout};
 use projects_api::{
     add_project, create_session, delete_agent_file_api, delete_skill_file_api,
@@ -61,6 +61,10 @@ use workspace_api::{get_agent_tree, get_workspace_state, list_files, read_file_a
 #[derive(RustEmbed)]
 #[folder = "ui/dist/"]
 struct Assets;
+
+#[derive(RustEmbed)]
+#[folder = "ui-sdk/dist/"]
+struct SdkAssets;
 
 pub struct ServerState {
     pub manager: Arc<AgentManager>,
@@ -323,6 +327,7 @@ impl ServerEvent {
                 Some(Self::ToolProgress { agent_id, tool, line, stream })
             }
             AgentEvent::ContentBlockStart { agent_id, block_id, block_type, tool, args, parent_id } => {
+                tracing::debug!("SSE ContentBlockStart: agent={} type={} tool={:?}", agent_id, block_type, tool);
                 Some(Self::ContentBlockStart { agent_id, block_id, block_type, tool, args, parent_id })
             }
             AgentEvent::ContentBlockUpdate { agent_id, block_id, status, summary, is_error, parent_id, extra } => {
@@ -1119,6 +1124,7 @@ pub async fn prepare_server(
         .route("/api/chat", post(chat_handler))
         .route("/api/chat/clear", post(clear_chat_history_api))
         .route("/api/chat/compact", post(compact_chat_api))
+        .route("/api/chat/system-prompt", get(get_system_prompt_api))
         .route("/api/plan/approve", post(approve_plan_handler))
         .route("/api/plan/edit", post(edit_plan_handler))
         .route("/api/plan/reject", post(reject_plan_handler))
@@ -1139,6 +1145,7 @@ pub async fn prepare_server(
         .route("/api/storage/tree", get(storage_tree))
         .route("/api/storage/file", get(storage_read_file).put(storage_write_file).delete(storage_delete_file))
         .route("/apps/{skill_name}/{*file_path}", get(serve_app_file))
+        .route("/sdk/{*file_path}", get(serve_sdk_file))
         .fallback(static_handler)
         .with_state(state.clone());
 
@@ -1239,6 +1246,31 @@ async fn serve_app_file(
                 .unwrap_or_else(|_| Response::new(axum::body::Body::from("internal server error")))
         }
         Err(_) => build_err(404, &format!("File not found: {}", file_path_clean)),
+    }
+}
+
+/// Serve UI SDK files from the embedded SdkAssets.
+/// Route: GET /sdk/{*file_path}
+async fn serve_sdk_file(
+    axum::extract::Path(file_path): axum::extract::Path<String>,
+) -> Response {
+    let path = file_path.trim_start_matches('/');
+
+    match SdkAssets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            Response::builder()
+                .header("Content-Type", mime.as_ref())
+                .header("Access-Control-Allow-Origin", "*")
+                .header("Cache-Control", "public, max-age=3600")
+                .body(axum::body::Body::from(content.data.to_vec()))
+                .unwrap_or_else(|_| Response::new(axum::body::Body::from("internal server error")))
+        }
+        None => Response::builder()
+            .status(404)
+            .header("Content-Type", "text/plain")
+            .body(axum::body::Body::from(format!("SDK file not found: {}", path)))
+            .unwrap_or_else(|_| Response::new(axum::body::Body::from("not found"))),
     }
 }
 

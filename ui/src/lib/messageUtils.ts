@@ -748,13 +748,18 @@ export const mergeChatMessages = (persisted: ChatMessage[], live: ChatMessage[])
     // Only try fallback for agent messages.
     if (msg.role === 'user' || msg.from === 'user') return msg;
 
+    // Never cross-match plan messages with non-plan messages — plan messages
+    // carry JSON text (not content blocks) and inheriting tool blocks would
+    // hide the PlanBlock rendering path.
+    const msgIsPlan = isPlanMessage(msg);
     const fallbackIdx = live.findIndex(
       (candidate, idx) =>
         !mergedLiveIndices.has(idx) &&
         !candidate.isGenerating &&
         (msg.from || msg.role) === (candidate.from || candidate.role) &&
         Math.abs((msg.timestampMs ?? 0) - (candidate.timestampMs ?? 0)) <= 120_000 &&
-        hasRichContent(candidate)
+        hasRichContent(candidate) &&
+        isPlanMessage(candidate) === msgIsPlan
     );
     if (fallbackIdx >= 0) {
       mergedLiveIndices.add(fallbackIdx);

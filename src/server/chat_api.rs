@@ -5,7 +5,7 @@ use crate::server::chat_helpers::{
 };
 use crate::server::{AgentStatusKind, QueuedChatItem, ServerEvent, ServerState};
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -154,6 +154,34 @@ pub(crate) async fn clear_chat_history_api(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SystemPromptQuery {
+    project_root: String,
+    agent_id: String,
+}
+
+pub(crate) async fn get_system_prompt_api(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<SystemPromptQuery>,
+) -> impl IntoResponse {
+    let root = match PathBuf::from(&query.project_root).canonicalize() {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    let ctx = match state.manager.get_or_create_project(root).await {
+        Ok(ctx) => ctx,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let agents = ctx.agents.lock().await;
+    if let Some(agent_mutex) = agents.get(&query.agent_id) {
+        let engine = agent_mutex.lock().await;
+        let (content, _hash) = engine.build_stable_system_content();
+        Json(serde_json::json!({ "system_prompt": content })).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, format!("Agent '{}' not found", query.agent_id)).into_response()
     }
 }
 
@@ -644,7 +672,13 @@ async fn run_plan_dispatch(
 
     match outcome {
         Ok(ref out) => {
-            persist_and_emit_last_assistant_text(ctx, engine).await;
+            // Skip emitting the raw plan text as a regular message — the plan
+            // content reaches the UI via the PlanUpdate SSE event instead.
+            // Emitting it here would create a duplicate text message that hides
+            // the PlanBlock widget.
+            if !matches!(out, crate::engine::AgentOutcome::Plan(_)) {
+                persist_and_emit_last_assistant_text(ctx, engine).await;
+            }
             if let crate::engine::AgentOutcome::Plan(ref plan) = out {
                 // Persist the plan as a JSON message so it survives session reload.
                 let plan_json = serde_json::json!({ "type": "plan", "plan": plan }).to_string();

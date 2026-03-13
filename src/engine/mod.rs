@@ -306,8 +306,11 @@ impl AgentEngine {
             // --- Native tool calling path ---
             if !native_tool_calls.is_empty() {
                 // Emit visible text content (strip any embedded JSON actions).
+                // In plan mode, suppress text content blocks — plan text reaches
+                // the UI via PlanUpdate SSE events instead.  Emitting it here
+                // would create a duplicate text message that hides the PlanBlock.
                 let visible_text = text_before_first_json(&raw);
-                if !visible_text.is_empty() {
+                if !visible_text.is_empty() && !self.plan_mode {
                     if let Some(manager) = self.tools.get_manager() {
                         let agent_id = self
                             .agent_id
@@ -457,9 +460,10 @@ impl AgentEngine {
             // --- Legacy path: parse JSON actions from free-form text ---
 
             // Emit text segment event for text before the first JSON object.
+            // Suppress in plan mode — plan text is delivered via PlanUpdate SSE.
             {
                 let text_before = text_before_first_json(&raw);
-                if !text_before.is_empty() {
+                if !text_before.is_empty() && !self.plan_mode {
                     if let Some(manager) = self.tools.get_manager() {
                         let agent_id = self
                             .agent_id

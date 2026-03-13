@@ -1,7 +1,9 @@
-import React from 'react';
-import { Copy, Eraser, Settings } from 'lucide-react';
+import React, { useState } from 'react';
+import { Copy, Eraser, FileText, Settings } from 'lucide-react';
 import { cn } from '../lib/cn';
 import { useUiStore } from '../stores/uiStore';
+import { useProjectStore } from '../stores/projectStore';
+import { useAgentStore } from '../stores/agentStore';
 
 export const HeaderBar: React.FC<{
   copyChat: () => void;
@@ -16,6 +18,7 @@ export const HeaderBar: React.FC<{
   isRunning,
   onOpenSettings,
 }) => {
+  const [spStatus, setSpStatus] = useState<'idle' | 'copied' | 'error'>('idle');
   const sseStatus = useUiStore((s) => s.sseStatus);
   return (
     <header className="flex items-center justify-between px-6 py-2.5 border-b border-slate-200 dark:border-white/5 bg-white/90 dark:bg-[#0f0f0f]/90 backdrop-blur-md z-50">
@@ -40,6 +43,40 @@ export const HeaderBar: React.FC<{
           title={copyChatStatus === 'copied' ? 'Copied' : copyChatStatus === 'error' ? 'Copy failed' : 'Copy Chat'}
         >
           <Copy size={14} />
+        </button>
+        <button
+          onClick={async () => {
+            const projectRoot = useProjectStore.getState().selectedProjectRoot;
+            const agentId = useAgentStore.getState().selectedAgent;
+            if (!projectRoot) return;
+            try {
+              const url = new URL('/api/chat/system-prompt', window.location.origin);
+              url.searchParams.append('project_root', projectRoot);
+              url.searchParams.append('agent_id', agentId);
+              const resp = await fetch(url.toString());
+              const data = await resp.json();
+              if (data.system_prompt) {
+                await navigator.clipboard.writeText(data.system_prompt);
+                setSpStatus('copied');
+              } else {
+                setSpStatus('error');
+              }
+            } catch {
+              setSpStatus('error');
+            }
+            setTimeout(() => setSpStatus('idle'), 1500);
+          }}
+          className={cn(
+            'p-1.5 rounded-md transition-colors text-slate-400 shrink-0',
+            spStatus === 'copied'
+              ? 'bg-green-500/10 text-green-600'
+              : spStatus === 'error'
+                ? 'bg-red-500/10 text-red-500'
+                : 'hover:bg-slate-100 dark:hover:bg-white/5'
+          )}
+          title={spStatus === 'copied' ? 'Copied!' : spStatus === 'error' ? 'Failed' : 'Copy System Prompt'}
+        >
+          <FileText size={14} />
         </button>
         <button
           onClick={clearChat}

@@ -76,6 +76,19 @@ export const PlanBlock: React.FC<{
           <MarkdownContent text={plan.plan_text || ''} />
         </div>
       )}
+      {Array.isArray(plan.items) && plan.items.length > 0 && !editing && (
+        <div className="space-y-1">
+          <div className="text-[11px] font-semibold text-slate-600 dark:text-slate-300">Task List</div>
+          {plan.items.map((item: any) => (
+            <div key={item.id} className="flex items-start gap-2 text-[11px]">
+              <span className={`mt-0.5 shrink-0 ${item.status === 'done' ? 'text-emerald-500' : item.status === 'in_progress' ? 'text-blue-500' : 'text-slate-400'}`}>
+                {item.status === 'done' ? '\u2611' : '\u2610'}
+              </span>
+              <span className={item.status === 'done' ? 'line-through opacity-60' : ''}>{item.title}</span>
+            </div>
+          ))}
+        </div>
+      )}
       {plan.status === 'planned' && onApprovePlan && onRejectPlan && !editing && (() => {
         const ctx = pendingPlanAgentId ? agentContext?.[pendingPlanAgentId.toLowerCase()] : undefined;
         const pct = ctx?.tokenLimit && ctx.tokenLimit > 0

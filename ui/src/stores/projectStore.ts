@@ -274,9 +274,26 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
 
   fetchAllAgentTrees: async () => {
-    const { projects, fetchAgentTree } = get();
+    const { projects, selectedProjectRoot } = get();
     if (projects.length === 0) return;
-    await Promise.all(projects.map((p) => fetchAgentTree(p.path)));
+    const entries = await Promise.all(
+      projects.map(async (p) => {
+        const root = p.path;
+        try {
+          const resp = await fetch(`/api/workspace/tree?project_root=${encodeURIComponent(root)}`);
+          return [root, await resp.json()] as const;
+        } catch (e) {
+          console.error(`Error fetching agent tree (${root}):`, e);
+          return null;
+        }
+      }),
+    );
+    // Batch all tree updates into a single set() to avoid cascading re-renders.
+    const trees: Record<string, any> = { ...get().agentTreesByProject };
+    for (const entry of entries) {
+      if (entry) trees[entry[0]] = entry[1];
+    }
+    set({ agentTreesByProject: trees });
   },
 
   fetchFiles: async (path = '') => {

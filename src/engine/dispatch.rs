@@ -365,6 +365,16 @@ impl AgentEngine {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
                 tracing::info!("EnterPlanMode: {:?}", reason);
+                // If already in plan mode, treat as a no-op so the model
+                // continues researching instead of exiting the loop.
+                if self.plan_mode {
+                    tracing::warn!("EnterPlanMode called while already in plan mode — ignoring");
+                    state.messages.push(self.tool_result_msg_for(
+                        "You are already in plan mode. Continue researching and produce your plan text directly — do not call EnterPlanMode again.".to_string(),
+                        &tc_id, "EnterPlanMode",
+                    ));
+                    return None;
+                }
                 // Push tool result so native tool calling APIs see a matching response.
                 state.messages.push(self.tool_result_msg_for(
                     "Entering plan mode.".to_string(),
