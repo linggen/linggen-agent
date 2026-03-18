@@ -241,6 +241,12 @@ const App: React.FC = () => {
 
   // --- Initial data load ---
   useEffect(() => {
+    // In compact skill mode, only fetch models (for the model picker).
+    // Skip projects, sessions, skills, etc. — the iframe is a clean slate.
+    if (isCompact && compactSession) {
+      useAgentStore.getState().fetchModels();
+      return;
+    }
     useProjectStore.getState().fetchProjects();
     useAgentStore.getState().fetchSkills();
     useAgentStore.getState().fetchAgents();
@@ -255,6 +261,9 @@ const App: React.FC = () => {
 
   // --- React to selected project changes ---
   useEffect(() => {
+    // In compact skill mode, skip all project-related fetching — the iframe
+    // only needs the skill session, not the project's sessions/files/agents.
+    if (isCompact && compactSession) return;
     if (selectedProjectRoot) {
       useProjectStore.getState().fetchFiles();
       useChatStore.getState().fetchWorkspaceState();
@@ -270,6 +279,7 @@ const App: React.FC = () => {
 
   // --- React to projects list changes ---
   useEffect(() => {
+    if (isCompact && compactSession) return;
     if (projects.length > 0) {
       useProjectStore.getState().fetchAllAgentTrees();
       useProjectStore.getState().fetchAllSessionCounts();
