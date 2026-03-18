@@ -373,8 +373,10 @@ async fn run_skill_dispatch(
                             width: app.width,
                             height: app.height,
                         });
-                        // Also open in the system browser (for TUI users).
-                        let _ = open_in_browser(&full_url);
+                        // TUI users: open in system browser if no web UI clients are listening.
+                        if ctx.events_tx.receiver_count() <= 1 {
+                            let _ = open_in_browser(&full_url);
+                        }
                     }
                     "url" => {
                         let _ = ctx.events_tx.send(ServerEvent::AppLaunched {
@@ -385,7 +387,9 @@ async fn run_skill_dispatch(
                             width: app.width,
                             height: app.height,
                         });
-                        let _ = open_in_browser(&app.entry);
+                        if ctx.events_tx.receiver_count() <= 1 {
+                            let _ = open_in_browser(&app.entry);
+                        }
                     }
                     "bash" => {
                         if let Some(ref skill_dir) = skill.skill_dir {
