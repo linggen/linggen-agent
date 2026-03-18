@@ -89,15 +89,18 @@ export function dispatchSseEvent(item: UiSseMessage): void {
 
   // SDK bridge: forward events to parent window when running in iframe (compact/embed mode)
   if (window.parent !== window) {
-    if (item.kind === 'token' && item.text) {
-      window.parent.postMessage({ type: 'linggen-sdk-event', event: 'stream_token', payload: { text: item.text, done: item.phase === 'done' } }, '*');
-    } else if (item.kind === 'turn_complete') {
-      // Gather the last assistant message text for onStreamEnd
-      const msgs = useChatStore.getState().messages;
-      const lastMsg = [...msgs].reverse().find(m => m.role === 'assistant');
-      window.parent.postMessage({ type: 'linggen-sdk-event', event: 'stream_end', payload: { text: lastMsg?.text || '' } }, '*');
-    } else if (item.kind === 'message' && item.data?.role === 'assistant') {
-      window.parent.postMessage({ type: 'linggen-sdk-event', event: 'message', payload: { text: item.text || '', role: 'assistant' } }, '*');
+    const targetOrigin = useUiStore.getState().sdkParentOrigin;
+    // Only forward if we have a verified parent origin from the SDK handshake
+    if (targetOrigin) {
+      if (item.kind === 'token' && item.text) {
+        window.parent.postMessage({ type: 'linggen-sdk-event', event: 'stream_token', payload: { text: item.text, done: item.phase === 'done' } }, targetOrigin);
+      } else if (item.kind === 'turn_complete') {
+        const msgs = useChatStore.getState().messages;
+        const lastMsg = [...msgs].reverse().find(m => m.role === 'assistant');
+        window.parent.postMessage({ type: 'linggen-sdk-event', event: 'stream_end', payload: { text: lastMsg?.text || '' } }, targetOrigin);
+      } else if (item.kind === 'message' && item.data?.role === 'assistant') {
+        window.parent.postMessage({ type: 'linggen-sdk-event', event: 'message', payload: { text: item.text || '', role: 'assistant' } }, targetOrigin);
+      }
     }
   }
 

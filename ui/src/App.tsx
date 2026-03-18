@@ -382,6 +382,8 @@ const App: React.FC = () => {
     // SDK command bridge: parent iframe sends commands via postMessage
     const handleSdkCommand = (e: MessageEvent) => {
       if (e.data?.type !== 'linggen-sdk') return;
+      // Capture parent origin for secure postMessage replies
+      if (e.origin) useUiStore.getState().setSdkParentOrigin(e.origin);
       const { action, payload } = e.data;
       switch (action) {
         case 'send': {

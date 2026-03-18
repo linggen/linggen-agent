@@ -789,7 +789,13 @@ fn is_safe_zip_path(rel_path: &str, base_dir: &Path) -> bool {
     if rel_path.is_empty() || rel_path.starts_with('/') {
         return false;
     }
-    // Reject any component that is ".."
+    // Reject any path component that is ".." to prevent traversal.
+    // Using a string check is conservative but safe regardless of whether
+    // base_dir is absolute or relative.
+    if Path::new(rel_path).components().any(|c| matches!(c, Component::ParentDir)) {
+        return false;
+    }
+    // Double-check: the joined path must still start with the base.
     let dest = base_dir.join(rel_path);
     let canonical: PathBuf = dest.components().collect();
     let base_canonical: PathBuf = base_dir.components().collect();

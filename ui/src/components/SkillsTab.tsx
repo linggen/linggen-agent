@@ -398,7 +398,9 @@ export const SkillsTab: React.FC<{
 
   const refreshAll = async () => {
     setRefreshing(true);
-    await Promise.all([fetchSkills(), fetchSkillFiles(), fetchBuiltInSkills(true), fetchTrending()]);
+    const tasks: Promise<unknown>[] = [fetchSkills(), fetchSkillFiles(), fetchBuiltInSkills(true), fetchTrending()];
+    if (mpQuery.trim()) tasks.push(searchCommunity(mpQuery));
+    await Promise.all(tasks);
     setRefreshing(false);
   };
 

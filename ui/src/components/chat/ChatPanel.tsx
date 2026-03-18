@@ -256,6 +256,17 @@ export const ChatPanel: React.FC<{
   const [loadingChildrenByRunId, setLoadingChildrenByRunId] = useState<Record<string, boolean>>({});
   const [childrenErrorByRunId, setChildrenErrorByRunId] = useState<Record<string, string>>({});
   const notFoundRunIds = useRef<Set<string>>(new Set());
+  // Refs for guard checks in fetch callbacks to avoid infinite render loops.
+  // Using state values in useCallback deps causes: fetch fails → state update →
+  // callback recreated → useEffect re-fires → fetch again → infinite loop.
+  const runContextByIdRef = useRef(runContextById);
+  runContextByIdRef.current = runContextById;
+  const loadingContextByRunIdRef = useRef(loadingContextByRunId);
+  loadingContextByRunIdRef.current = loadingContextByRunId;
+  const childrenByRunIdRef = useRef(childrenByRunId);
+  childrenByRunIdRef.current = childrenByRunId;
+  const loadingChildrenByRunIdRef = useRef(loadingChildrenByRunId);
+  loadingChildrenByRunIdRef.current = loadingChildrenByRunId;
   const prevProjectRootRef = useRef(projectRoot);
 
   if (projectRoot !== prevProjectRootRef.current) {
@@ -559,8 +570,8 @@ export const ChatPanel: React.FC<{
     (runId?: string, force = false) => {
       if (!runId) return;
       if (notFoundRunIds.current.has(runId)) return;
-      if (loadingContextByRunId[runId]) return;
-      if (!force && runContextById[runId]) return;
+      if (loadingContextByRunIdRef.current[runId]) return;
+      if (!force && runContextByIdRef.current[runId]) return;
       setLoadingContextByRunId((prev) => ({ ...prev, [runId]: true }));
       setContextErrorByRunId((prev) => {
         const next = { ...prev };
@@ -590,15 +601,15 @@ export const ChatPanel: React.FC<{
         }
       })();
     },
-    [runContextById, loadingContextByRunId, projectRoot]
+    [projectRoot]
   );
 
   const fetchRunChildren = useCallback(
     (runId?: string, force = false) => {
       if (!runId) return;
       if (notFoundRunIds.current.has(runId)) return;
-      if (loadingChildrenByRunId[runId]) return;
-      if (!force && childrenByRunId[runId]) return;
+      if (loadingChildrenByRunIdRef.current[runId]) return;
+      if (!force && childrenByRunIdRef.current[runId]) return;
       setLoadingChildrenByRunId((prev) => ({ ...prev, [runId]: true }));
       setChildrenErrorByRunId((prev) => {
         const next = { ...prev };
@@ -627,7 +638,7 @@ export const ChatPanel: React.FC<{
         }
       })();
     },
-    [childrenByRunId, loadingChildrenByRunId, projectRoot]
+    [projectRoot]
   );
 
   useEffect(() => {
