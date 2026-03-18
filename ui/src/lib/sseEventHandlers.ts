@@ -85,7 +85,13 @@ function formatToolStartLine(toolName: string, argsStr: string): string {
 export function dispatchSseEvent(item: UiSseMessage): void {
   const { activeSessionId } = useProjectStore.getState();
   // Allow notifications through regardless — they are global events.
-  if (item.kind !== 'notification' && item.session_id && activeSessionId && item.session_id !== activeSessionId) return;
+  if (item.kind !== 'notification' && item.session_id && item.session_id !== 'global') {
+    // Drop events from other sessions when we have an active session.
+    if (activeSessionId && item.session_id !== activeSessionId) return;
+    // Drop session-scoped events when no session is active — they belong to
+    // skill apps or other scoped sessions, not the main view.
+    if (!activeSessionId) return;
+  }
 
   switch (item.kind) {
     case 'run':          handleRun(item); return;

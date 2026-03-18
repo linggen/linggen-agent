@@ -65,6 +65,8 @@ pub(crate) async fn persist_and_emit_to_store(
 }
 
 /// Persist to flat-file session store without emitting an SSE event.
+/// Routes mission/skill session dirs to their own stores without registering
+/// them as projects.
 pub(crate) async fn persist_message_only(
     manager: &Arc<AgentManager>,
     root: &Path,
@@ -76,15 +78,25 @@ pub(crate) async fn persist_message_only(
     is_observation: bool,
 ) {
     let sid = session_id.unwrap_or("default");
+    let msg = crate::state_fs::sessions::ChatMsg {
+        agent_id: agent_id.to_string(),
+        from_id: from.to_string(),
+        to_id: to.to_string(),
+        content: content.to_string(),
+        timestamp: crate::util::now_ts_secs(),
+        is_observation,
+    };
+    // Mission/skill session dirs should not be registered as projects.
+    let missions_base = crate::paths::global_missions_dir();
+    let skills_base = crate::paths::global_skills_dir();
+    if root.starts_with(&missions_base) || root.starts_with(&skills_base) {
+        let store = crate::state_fs::SessionStore::with_sessions_dir(root.to_path_buf());
+        if let Err(e) = store.add_chat_message(sid, &msg) {
+            tracing::warn!("Failed to persist chat message to scoped store: {}", e);
+        }
+        return;
+    }
     if let Ok(ctx) = manager.get_or_create_project(root.to_path_buf()).await {
-        let msg = crate::state_fs::sessions::ChatMsg {
-            agent_id: agent_id.to_string(),
-            from_id: from.to_string(),
-            to_id: to.to_string(),
-            content: content.to_string(),
-            timestamp: crate::util::now_ts_secs(),
-            is_observation,
-        };
         if let Err(e) = ctx.sessions.add_chat_message(sid, &msg) {
             tracing::warn!("Failed to persist chat message: {}", e);
         }

@@ -1038,7 +1038,8 @@ impl AgentManager {
     }
 
     /// Convenience: persist a chat message via the project's flat-file session store.
-    /// If `ws_root` points to the missions sessions directory, persists there directly.
+    /// If `ws_root` points to a mission or skill sessions directory, persists there
+    /// directly without registering it as a project.
     pub async fn add_chat_message(
         &self,
         ws_root: &std::path::Path,
@@ -1051,6 +1052,15 @@ impl AgentManager {
             let store = SessionStore::with_sessions_dir(ws_root.to_path_buf());
             if let Err(e) = store.add_chat_message(session_id, msg) {
                 tracing::warn!("Failed to persist chat message to mission store: {}", e);
+            }
+            return;
+        }
+        // Skill session roots live under `~/.linggen/skills/{name}/sessions/`.
+        let skills_base = crate::paths::global_skills_dir();
+        if ws_root.starts_with(&skills_base) {
+            let store = SessionStore::with_sessions_dir(ws_root.to_path_buf());
+            if let Err(e) = store.add_chat_message(session_id, msg) {
+                tracing::warn!("Failed to persist chat message to skill store: {}", e);
             }
             return;
         }
