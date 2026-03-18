@@ -93,6 +93,17 @@ export function dispatchSseEvent(item: UiSseMessage): void {
     if (!activeSessionId) return;
   }
 
+  // Skill app bridge: forward key events to parent when embedded as iframe
+  if (window.parent !== window) {
+    if (item.kind === 'token' && item.text) {
+      window.parent.postMessage({ type: 'linggen-skill-event', event: 'stream_token', payload: { text: item.text, done: item.phase === 'done' } }, '*');
+    } else if (item.kind === 'turn_complete') {
+      const msgs = useChatStore.getState().messages;
+      const lastMsg = [...msgs].reverse().find(m => m.role === 'assistant' || (m as any).role === 'agent');
+      window.parent.postMessage({ type: 'linggen-skill-event', event: 'stream_end', payload: { text: lastMsg?.text || '' } }, '*');
+    }
+  }
+
   switch (item.kind) {
     case 'run':          handleRun(item); return;
     case 'queue':        handleQueue(item); return;

@@ -379,9 +379,45 @@ const App: React.FC = () => {
         if (text) { e.preventDefault(); navigator.clipboard.writeText(text).catch(() => {}); }
       }
     };
+    // Skill app bridge: parent page sends commands via postMessage when
+    // this chat panel is embedded as an iframe in an app skill page.
+    const handleSkillCommand = (e: MessageEvent) => {
+      if (e.data?.type !== 'linggen-skill') return;
+      const { action, payload } = e.data;
+      switch (action) {
+        case 'send': {
+          const input = document.querySelector<HTMLTextAreaElement>('[data-chat-input] textarea, .ce-input, textarea');
+          if (input) {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+            setter?.call(input, payload?.text || '');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            const form = input.closest('form');
+            if (form) form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+          }
+          break;
+        }
+        case 'add_message':
+          useChatStore.getState().addMessage({
+            role: payload?.role === 'user' ? 'user' as const : 'agent' as const,
+            from: payload?.role === 'user' ? 'user' : 'assistant',
+            to: '',
+            text: payload?.text || '',
+            timestamp: new Date().toLocaleTimeString(),
+            timestampMs: Date.now(),
+            isGenerating: false,
+          });
+          break;
+        case 'clear':
+          clearChat();
+          break;
+      }
+    };
+    window.addEventListener('message', handleSkillCommand);
+
     window.addEventListener('message', handleMessage);
     document.addEventListener('keydown', handleCopy);
     return () => {
+      window.removeEventListener('message', handleSkillCommand);
       window.removeEventListener('message', handleMessage);
       document.removeEventListener('keydown', handleCopy);
     };
@@ -602,6 +638,10 @@ const App: React.FC = () => {
       if (data?.session_id && !sid) {
         useProjectStore.getState().setActiveSessionId(data.session_id);
         useProjectStore.getState().fetchSessions();
+        // Notify parent app page of new session
+        if (window.parent !== window) {
+          window.parent.postMessage({ type: 'linggen-skill-event', event: 'session_created', payload: { sessionId: data.session_id } }, '*');
+        }
       }
       if (data?.status === 'queued') {
         useChatStore.getState().removeLastUserMessage(userMessage, agentToUse);
