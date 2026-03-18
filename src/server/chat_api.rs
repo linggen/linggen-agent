@@ -91,6 +91,7 @@ async fn run_loop_with_tracking(
     agent_id: &str,
     session_id: Option<&str>,
     detail: &str,
+    events_tx: &tokio::sync::broadcast::Sender<crate::server::ServerEvent>,
 ) -> Result<crate::engine::AgentOutcome, anyhow::Error> {
     let run_id = manager
         .begin_agent_run(root, session_id, agent_id, None, Some(detail.to_string()))
@@ -116,7 +117,14 @@ async fn run_loop_with_tracking(
                     tracing::error!("Agent loop failed: {}", msg);
                     crate::project_store::AgentRunStatus::Failed
                 };
-                let _ = manager.finish_agent_run(&run_id, status, Some(msg)).await;
+                let _ = manager.finish_agent_run(&run_id, status, Some(msg.clone())).await;
+                // Emit error to chat so the user sees it in the UI.
+                let _ = events_tx.send(crate::server::ServerEvent::Message {
+                    from: agent_id.to_string(),
+                    to: "user".to_string(),
+                    content: format!("Error: {}", msg),
+                    session_id: session_id.map(|s| s.to_string()),
+                });
             }
         }
     }
@@ -459,7 +467,7 @@ async fn run_skill_dispatch(
 
     let outcome = run_loop_with_tracking(
         &ctx.manager, &ctx.root, engine, &ctx.agent_id,
-        ctx.session_id.as_deref(), "chat:skill",
+        ctx.session_id.as_deref(), "chat:skill", &ctx.events_tx,
     )
     .await;
 
@@ -553,7 +561,7 @@ async fn run_trigger_dispatch(
 
     let outcome = run_loop_with_tracking(
         &ctx.manager, &ctx.root, engine, &ctx.agent_id,
-        ctx.session_id.as_deref(), "chat:trigger",
+        ctx.session_id.as_deref(), "chat:trigger", &ctx.events_tx,
     )
     .await;
 
@@ -668,6 +676,7 @@ async fn run_plan_dispatch(
         &ctx.agent_id,
         ctx.session_id.as_deref(),
         "chat:plan",
+        &ctx.events_tx,
     )
     .await;
 
@@ -769,7 +778,7 @@ async fn run_plan_execution(
 
     let exec_outcome = run_loop_with_tracking(
         &ctx.manager, &ctx.root, engine, &ctx.agent_id,
-        ctx.session_id.as_deref(), "chat:plan-execution",
+        ctx.session_id.as_deref(), "chat:plan-execution", &ctx.events_tx,
     )
     .await;
 
@@ -967,7 +976,7 @@ async fn run_structured_loop(
 
     let outcome = run_loop_with_tracking(
         &ctx.manager, &ctx.root, engine, &ctx.agent_id,
-        ctx.session_id.as_deref(), "chat:structured-loop",
+        ctx.session_id.as_deref(), "chat:structured-loop", &ctx.events_tx,
     )
     .await;
 
