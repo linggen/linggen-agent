@@ -954,9 +954,7 @@ const App: React.FC = () => {
             }>
             <SkillsCard skills={skills} projectRoot={selectedProjectRoot} onClickSkill={(skill) => {
               if (skill.app) {
-                if (skill.app.launcher === 'web') window.open(`/apps/${skill.name}/${skill.app.entry}`, '_blank');
-                else if (skill.app.launcher === 'url') window.open(skill.app.entry, '_blank');
-                else sendChatMessage(`/${skill.name}`);
+                sendChatMessage(`/${skill.name} --web`);
               } else sendChatMessage(`/${skill.name}`);
             }} />
           </CollapsibleCard>

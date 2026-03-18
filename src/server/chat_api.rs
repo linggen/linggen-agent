@@ -352,83 +352,85 @@ async fn run_skill_dispatch(
                 .await;
                 return;
             }
-            // App skill: skip model, execute directly.
-            if let Some(ref app) = skill.app {
-                let launch_msg = format!("Launching app: {}", skill.name);
-                persist_and_emit_message(
-                    &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
-                    "user", &ctx.agent_id, &launch_msg, ctx.session_id.as_deref(), false,
-                )
-                .await;
+            // App skill: launch app UI only when --web flag is present.
+            // Without --web, fall through to run as a regular skill (model uses tools).
+            let wants_web = user_args.as_ref().map_or(false, |a| a.contains("--web"));
+            if wants_web {
+                if let Some(ref app) = skill.app {
+                    let launch_msg = format!("Launching app: {}", skill.name);
+                    persist_and_emit_message(
+                        &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+                        "user", &ctx.agent_id, &launch_msg, ctx.session_id.as_deref(), false,
+                    )
+                    .await;
 
-                match app.launcher.as_str() {
-                    "web" => {
-                        let url = format!("/apps/{}/{}", skill.name, app.entry);
-                        let full_url = format!("http://localhost:{}{}", ctx.state.port, url);
-                        let _ = ctx.events_tx.send(ServerEvent::AppLaunched {
-                            skill: skill.name.clone(),
-                            launcher: "web".to_string(),
-                            url,
-                            title: skill.description.clone(),
-                            width: app.width,
-                            height: app.height,
-                        });
-                        // TUI users: open in system browser if no web UI clients are listening.
-                        if ctx.events_tx.receiver_count() <= 1 {
-                            let _ = open_in_browser(&full_url);
-                        }
-                    }
-                    "url" => {
-                        let _ = ctx.events_tx.send(ServerEvent::AppLaunched {
-                            skill: skill.name.clone(),
-                            launcher: "url".to_string(),
-                            url: app.entry.clone(),
-                            title: skill.description.clone(),
-                            width: app.width,
-                            height: app.height,
-                        });
-                        if ctx.events_tx.receiver_count() <= 1 {
-                            let _ = open_in_browser(&app.entry);
-                        }
-                    }
-                    "bash" => {
-                        if let Some(ref skill_dir) = skill.skill_dir {
-                            let script = skill_dir.join(&app.entry);
-                            let mut cmd = std::process::Command::new("sh");
-                            cmd.arg(script.as_os_str());
-                            if let Some(ref args) = user_args {
-                                for arg in args.split_whitespace() {
-                                    cmd.arg(arg);
-                                }
+                    match app.launcher.as_str() {
+                        "web" => {
+                            let url = format!("/apps/{}/{}", skill.name, app.entry);
+                            let full_url = format!("http://localhost:{}{}", ctx.state.port, url);
+                            let _ = ctx.events_tx.send(ServerEvent::AppLaunched {
+                                skill: skill.name.clone(),
+                                launcher: "web".to_string(),
+                                url,
+                                title: skill.description.clone(),
+                                width: app.width,
+                                height: app.height,
+                            });
+                            if ctx.events_tx.receiver_count() <= 1 {
+                                let _ = open_in_browser(&full_url);
                             }
-                            cmd.current_dir(&ctx.root);
-                            match cmd.output()
-                            {
-                                Ok(output) => {
-                                    let result_msg = String::from_utf8_lossy(&output.stdout).to_string();
-                                    if !result_msg.trim().is_empty() {
+                        }
+                        "url" => {
+                            let _ = ctx.events_tx.send(ServerEvent::AppLaunched {
+                                skill: skill.name.clone(),
+                                launcher: "url".to_string(),
+                                url: app.entry.clone(),
+                                title: skill.description.clone(),
+                                width: app.width,
+                                height: app.height,
+                            });
+                            if ctx.events_tx.receiver_count() <= 1 {
+                                let _ = open_in_browser(&app.entry);
+                            }
+                        }
+                        "bash" => {
+                            if let Some(ref skill_dir) = skill.skill_dir {
+                                let script = skill_dir.join(&app.entry);
+                                let mut cmd = std::process::Command::new("sh");
+                                cmd.arg(script.as_os_str());
+                                if let Some(ref args) = user_args {
+                                    for arg in args.split_whitespace() {
+                                        cmd.arg(arg);
+                                    }
+                                }
+                                cmd.current_dir(&ctx.root);
+                                match cmd.output() {
+                                    Ok(output) => {
+                                        let result_msg = String::from_utf8_lossy(&output.stdout).to_string();
+                                        if !result_msg.trim().is_empty() {
+                                            persist_and_emit_message(
+                                                &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+                                                &ctx.agent_id, "user", &result_msg, ctx.session_id.as_deref(), false,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let err_msg = format!("Failed to run app: {}", e);
                                         persist_and_emit_message(
                                             &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
-                                            &ctx.agent_id, "user", &result_msg, ctx.session_id.as_deref(), false,
+                                            &ctx.agent_id, "user", &err_msg, ctx.session_id.as_deref(), false,
                                         )
                                         .await;
                                     }
                                 }
-                                Err(e) => {
-                                    let err_msg = format!("Failed to run app: {}", e);
-                                    persist_and_emit_message(
-                                        &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
-                                        &ctx.agent_id, "user", &err_msg, ctx.session_id.as_deref(), false,
-                                    )
-                                    .await;
-                                }
                             }
                         }
+                        _ => {}
                     }
-                    _ => {}
+                    let _ = ctx.events_tx.send(ServerEvent::StateUpdated);
+                    return;
                 }
-                let _ = ctx.events_tx.send(ServerEvent::StateUpdated);
-                return;
             }
             engine.active_skill = Some(skill);
         }
