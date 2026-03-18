@@ -60,7 +60,7 @@ interface ChatState {
   turnComplete: (agentId: string, durationMs?: number, contextTokens?: number) => void;
 
   // Workspace state
-  fetchWorkspaceState: () => Promise<void>;
+  fetchWorkspaceState: (opts?: { projectRoot?: string; sessionId?: string }) => Promise<void>;
 
   // Helpers
   isInClearCooldown: () => boolean;
@@ -579,8 +579,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     return next;
   })),
 
-  fetchWorkspaceState: async () => {
-    const { selectedProjectRoot, activeSessionId, isMissionSession, activeMissionId } = useProjectStore.getState();
+  fetchWorkspaceState: async (opts) => {
+    const projectState = useProjectStore.getState();
+    const selectedProjectRoot = opts?.projectRoot ?? projectState.selectedProjectRoot;
+    const activeSessionId = opts?.sessionId ?? projectState.activeSessionId;
+    const { isMissionSession, activeMissionId } = projectState;
     if (!activeSessionId) return;
     if (isMissionSession && !activeMissionId) return;
     if (!isMissionSession && !selectedProjectRoot) return;

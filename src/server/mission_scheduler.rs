@@ -135,12 +135,6 @@ pub async fn mission_scheduler_loop(state: Arc<ServerState>) {
                 mission.id, mission.project
             );
 
-            let _ = state.events_tx.send(ServerEvent::MissionTriggered {
-                mission_id: mission.id.clone(),
-                agent_id: MISSION_AGENT_ID.to_string(),
-                project_root: project_path.clone(),
-            });
-
             state
                 .manager
                 .update_agent_activity(&project_path, MISSION_AGENT_ID)
@@ -331,6 +325,14 @@ async fn dispatch_mission_prompt(
         state.agent_sessions.write().unwrap()
             .insert(agent_id.to_string(), sid.clone());
     }
+
+    // Emit MissionTriggered AFTER agent_sessions registration so the event
+    // gets enriched with the correct session_id and doesn't leak to other sessions.
+    let _ = state.events_tx.send(ServerEvent::MissionTriggered {
+        mission_id: mission.id.clone(),
+        agent_id: agent_id.to_string(),
+        project_root: project_path.to_string(),
+    });
 
     state
         .send_agent_status(

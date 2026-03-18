@@ -15,6 +15,9 @@ export interface SseConnectionOptions {
   /** When provided, the SSE connection passes session_id to the server for
    *  server-side filtering. The connection reconnects when this value changes. */
   sessionId?: string | null;
+  /** Called on reconnect (not initial connect) — use to resync state.
+   *  When not provided, the default resyncState is used. */
+  onReconnect?: () => void;
 }
 
 /** Refetch all critical state after an SSE reconnect to fill any gaps. */
@@ -26,17 +29,19 @@ function resyncState() {
   useUiStore.getState().fetchPendingAskUser();
 }
 
-export function useSseConnection({ onEvent, onParseError, sessionId }: SseConnectionOptions) {
+export function useSseConnection({ onEvent, onParseError, sessionId, onReconnect }: SseConnectionOptions) {
   const lastSeqRef = useRef(0);
   const hadConnectionRef = useRef(false);
   // Use refs so the EventSource doesn't need to be recreated when callbacks change
   const onEventRef = useRef(onEvent);
   const onParseErrorRef = useRef(onParseError);
+  const onReconnectRef = useRef(onReconnect);
 
   useEffect(() => {
     onEventRef.current = onEvent;
     onParseErrorRef.current = onParseError;
-  }, [onEvent, onParseError]);
+    onReconnectRef.current = onReconnect;
+  }, [onEvent, onParseError, onReconnect]);
 
   useEffect(() => {
     const url = sessionId
@@ -56,7 +61,11 @@ export function useSseConnection({ onEvent, onParseError, sessionId }: SseConnec
 
       // On reconnect (not initial connect), resync state to fill any gaps
       if (wasReconnecting) {
-        resyncState();
+        if (onReconnectRef.current) {
+          onReconnectRef.current();
+        } else {
+          resyncState();
+        }
       }
     };
 

@@ -82,15 +82,15 @@ function formatToolStartLine(toolName: string, argsStr: string): string {
 // Main dispatcher
 // ---------------------------------------------------------------------------
 
-export function dispatchSseEvent(item: UiSseMessage): void {
-  const { activeSessionId } = useProjectStore.getState();
+export function dispatchSseEvent(item: UiSseMessage, sessionIdOverride?: string): void {
+  const effectiveSessionId = sessionIdOverride ?? useProjectStore.getState().activeSessionId;
   // Allow notifications and permission prompts through regardless — they are global events.
   if (item.kind !== 'notification' && item.kind !== 'ask_user' && item.session_id && item.session_id !== 'global') {
     // Drop events from other sessions when we have an active session.
-    if (activeSessionId && item.session_id !== activeSessionId) return;
+    if (effectiveSessionId && item.session_id !== effectiveSessionId) return;
     // Drop session-scoped events when no session is active — they belong to
     // skill apps or other scoped sessions, not the main view.
-    if (!activeSessionId) return;
+    if (!effectiveSessionId) return;
   }
 
   // Skill app bridge: forward key events to parent when embedded as iframe

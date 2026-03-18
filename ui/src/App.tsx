@@ -7,7 +7,7 @@ import { ModelsCard } from './components/ModelsCard';
 import { CollapsibleCard } from './components/CollapsibleCard';
 import { SkillsCard } from './components/SkillsCard';
 import { FilePreview } from './components/FilePreview';
-import { ChatPanel } from './components/chat';
+import { ChatWidget } from './components/chat';
 import { HeaderBar } from './components/HeaderBar';
 import { SettingsPage } from './components/SettingsPage';
 import { MissionSessionNav } from './components/MissionSessionNav';
@@ -15,63 +15,15 @@ import { MissionEditor } from './components/MissionPage';
 import { AgentSpecEditorModal } from './components/AgentSpecEditorModal';
 import { ToastContainer } from './components/ToastContainer';
 import { AppPanel } from './components/AppPanel';
-import type { AgentRunInfo, AgentRunSummary } from './types';
 import {
   buildAgentWorkInfo,
-  buildSubagentInfos,
 } from './lib/messageUtils';
 import { useProjectStore } from './stores/projectStore';
 import { useAgentStore } from './stores/agentStore';
 import { useChatStore } from './stores/chatStore';
 import { useUiStore } from './stores/uiStore';
-import { useSseConnection } from './hooks/useSseConnection';
-import { useSseDispatch } from './hooks/useSseDispatch';
-
-// ---------------------------------------------------------------------------
-// Auto-scroll hook (needs DOM refs — stays in React)
-// ---------------------------------------------------------------------------
-
-function useAutoScroll(messages: { length: number }, lastMsg: { isGenerating?: boolean; content?: any[] } | undefined) {
-  const chatEndRef = useRef<HTMLDivElement>(null);
-  const lastChatCountRef = useRef(0);
-  const lastContentLenRef = useRef(0);
-  const isNearBottomRef = useRef(true);
-  const chatScrollContainerRef = useRef<HTMLElement | null>(null);
-
-  useEffect(() => {
-    const endEl = chatEndRef.current;
-    if (!endEl) return;
-    const container = endEl.parentElement;
-    if (!container) return;
-    chatScrollContainerRef.current = container;
-    const onScroll = () => {
-      const { scrollTop, scrollHeight, clientHeight } = container;
-      const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
-      const threshold = scrollHeight * 0.1;
-      isNearBottomRef.current = distanceFromBottom <= Math.max(threshold, 80);
-    };
-    container.addEventListener('scroll', onScroll, { passive: true });
-    return () => container.removeEventListener('scroll', onScroll);
-  }, []);
-
-  const lastContentLen = lastMsg?.isGenerating ? (lastMsg.content?.length || 0) : 0;
-  useEffect(() => {
-    const newMessages = messages.length > lastChatCountRef.current;
-    const newContentBlocks = lastContentLen > lastContentLenRef.current;
-    if ((newMessages || newContentBlocks) && isNearBottomRef.current) {
-      chatEndRef.current?.scrollIntoView({ behavior: 'auto', block: 'nearest', inline: 'nearest' });
-    }
-    lastChatCountRef.current = messages.length;
-    lastContentLenRef.current = lastContentLen;
-  }, [messages.length, lastContentLen]);
-
-  const scrollToBottom = useCallback(() => {
-    isNearBottomRef.current = true;
-    chatEndRef.current?.scrollIntoView({ behavior: 'auto', block: 'nearest', inline: 'nearest' });
-  }, []);
-
-  return { chatEndRef, scrollToBottom };
-}
+import { useRunInfo } from './hooks/useRunInfo';
+import { useChatActions } from './hooks/useChatActions';
 
 // ---------------------------------------------------------------------------
 // Compact mode (VS Code sidebar)
@@ -80,9 +32,7 @@ function useAutoScroll(messages: { length: number }, lastMsg: { isGenerating?: b
 const compactParams = new URLSearchParams(window.location.search);
 const isCompact = compactParams.get('mode') === 'compact';
 const compactProject = compactParams.get('project') || '';
-const compactSkill = compactParams.get('skill') || '';
 const compactSession = compactParams.get('session') || '';
-const compactModel = compactParams.get('model') || '';
 const compactHideToolbar = compactParams.get('hide_toolbar') === '1';
 
 // ---------------------------------------------------------------------------
@@ -98,21 +48,17 @@ const App: React.FC = () => {
 
   // Shortcuts
   const { projects, selectedProjectRoot, sessions, activeSessionId, isMissionSession, agentTreesByProject } = projectStore;
-  const { agents, models, skills, agentRuns, selectedAgent, agentStatus, agentStatusText, agentContext, defaultModels, ollamaStatus, sessionTokens, tokensPerSec, cancellingRunIds, reloadingSkills, reloadingAgents } = agentStore;
-  const { displayMessages, messages: chatMessages } = chatStore;
-  const { currentPage, sidebarTab, editingMission, missionRefreshKey, overlay, modelPickerOpen, showAgentSpecEditor, openApp, selectedFileContent, selectedFilePath, queuedMessages, pendingPlan, pendingPlanAgentId, pendingAskUser, activePlan, verboseMode, copyChatStatus } = uiStore;
+  const { agents, models, skills, selectedAgent, agentStatus, agentStatusText, agentContext, defaultModels, ollamaStatus, sessionTokens, tokensPerSec, reloadingSkills, reloadingAgents } = agentStore;
+  const { messages: chatMessages } = chatStore;
+  const { currentPage, sidebarTab, editingMission, missionRefreshKey, showAgentSpecEditor, openApp, selectedFileContent, selectedFilePath, copyChatStatus } = uiStore;
 
   const isRunning = agentStore.isRunning();
   const mainAgents = agents;
 
-  // --- Auto-scroll ---
-  const lastMsg = chatMessages[chatMessages.length - 1];
-  const { chatEndRef, scrollToBottom } = useAutoScroll(chatMessages, lastMsg);
-
   // Session-change tracking (for clear-on-switch)
   const prevSessionIdRef = useRef<string | null>(null);
 
-  // --- Derived memos ---
+  // --- Derived memos (sidebar only) ---
   const activeModelId = useMemo(() => {
     for (const name of Object.keys(agentStatusText)) {
       const status = agentStatus[name];
@@ -132,112 +78,13 @@ const App: React.FC = () => {
     [agentTreesByProject, selectedProjectRoot],
   );
   const agentWork = useMemo(() => buildAgentWorkInfo(agentTree), [agentTree]);
-  const subagents = useMemo(
-    () => buildSubagentInfos(agentTree, mainAgentIds, agentStatus),
-    [agentTree, mainAgentIds, agentStatus],
-  );
 
-  const sortedAgentRuns = useMemo(() => {
-    const statusScore = (status: string) => (status === 'running' ? 1 : 0);
-    return [...agentRuns].sort(
-      (a, b) => statusScore(b.status) - statusScore(a.status) || Number(b.started_at || 0) - Number(a.started_at || 0),
-    );
-  }, [agentRuns]);
+  // --- Run info (for sidebar AgentsCard) ---
+  const { agentRunSummary, runningMainRunIds } = useRunInfo();
 
-  const mainRunIds = useMemo(() => {
-    const out: Record<string, string> = {};
-    for (const run of sortedAgentRuns) {
-      const agentId = run.agent_id.toLowerCase();
-      if (run.parent_run_id) continue;
-      if (!out[agentId]) out[agentId] = run.run_id;
-    }
-    return out;
-  }, [sortedAgentRuns]);
-
-  const subagentRunIds = useMemo(() => {
-    const out: Record<string, string> = {};
-    for (const run of sortedAgentRuns) {
-      const agentId = run.agent_id.toLowerCase();
-      if (!run.parent_run_id) continue;
-      if (!out[agentId]) out[agentId] = run.run_id;
-    }
-    return out;
-  }, [sortedAgentRuns]);
-
-  const runningMainRunIds = useMemo(() => {
-    const out: Record<string, string> = {};
-    for (const run of sortedAgentRuns) {
-      const agentId = run.agent_id.toLowerCase();
-      if (run.parent_run_id || run.status !== 'running') continue;
-      if (!out[agentId]) out[agentId] = run.run_id;
-    }
-    return out;
-  }, [sortedAgentRuns]);
-
-  const runningSubagentRunIds = useMemo(() => {
-    const out: Record<string, string> = {};
-    for (const run of sortedAgentRuns) {
-      const agentId = run.agent_id.toLowerCase();
-      if (!run.parent_run_id || run.status !== 'running') continue;
-      if (!out[agentId]) out[agentId] = run.run_id;
-    }
-    return out;
-  }, [sortedAgentRuns]);
-
-  const mainRunHistory = useMemo(() => {
-    const out: Record<string, AgentRunInfo[]> = {};
-    for (const run of sortedAgentRuns) {
-      const agentId = run.agent_id.toLowerCase();
-      if (run.parent_run_id) continue;
-      if (!out[agentId]) out[agentId] = [];
-      out[agentId].push(run);
-    }
-    return out;
-  }, [sortedAgentRuns]);
-
-  const subagentRunHistory = useMemo(() => {
-    const out: Record<string, AgentRunInfo[]> = {};
-    for (const run of sortedAgentRuns) {
-      const agentId = run.agent_id.toLowerCase();
-      if (!run.parent_run_id) continue;
-      if (!out[agentId]) out[agentId] = [];
-      out[agentId].push(run);
-    }
-    return out;
-  }, [sortedAgentRuns]);
-
-  const agentRunSummary = useMemo(() => {
-    const out: Record<string, AgentRunSummary> = {};
-    for (const agent of agents) {
-      const agentId = agent.name.toLowerCase();
-      const latest = mainRunHistory[agentId]?.[0];
-      if (!latest) continue;
-      const children = sortedAgentRuns.filter((run) => run.parent_run_id === latest.run_id);
-      const timelineEvents = 1 + (latest.ended_at ? 1 : 0) + children.reduce((count, child) => count + 1 + (child.ended_at ? 1 : 0), 0);
-      const lastEventAt = Math.max(
-        Number(latest.ended_at || 0), Number(latest.started_at || 0),
-        ...children.flatMap((child) => [Number(child.started_at || 0), Number(child.ended_at || 0)]),
-      );
-      out[agentId] = {
-        run_id: latest.run_id,
-        status: latest.status,
-        started_at: latest.started_at,
-        ended_at: latest.ended_at,
-        child_count: children.length,
-        timeline_events: timelineEvents,
-        last_event_at: lastEventAt,
-      };
-    }
-    return out;
-  }, [agents, mainRunHistory, sortedAgentRuns]);
-
-  // --- SSE ---
-  const handleSseEvent = useSseDispatch();
-  useSseConnection({
-    onEvent: handleSseEvent,
-    onParseError: () => { chatStore.fetchWorkspaceState(); agentStore.fetchAgentRuns(); },
-    sessionId: activeSessionId,
-  });
+  // --- Chat actions (for header clear/copy) ---
+  const scrollToBottomNoop = useCallback(() => {}, []);
+  const { clearChat, copyChat, sendChatMessage } = useChatActions(scrollToBottomNoop, runningMainRunIds);
 
   // --- Initial data load ---
   useEffect(() => {
@@ -245,6 +92,8 @@ const App: React.FC = () => {
     // Skip projects, sessions, skills, etc. — the iframe is a clean slate.
     if (isCompact && compactSession) {
       useAgentStore.getState().fetchModels();
+      useAgentStore.getState().fetchSkills();
+      useAgentStore.getState().fetchAgents();
       return;
     }
     useProjectStore.getState().fetchProjects();
@@ -310,7 +159,7 @@ const App: React.FC = () => {
       // Restore any pending AskUser/permission widget for this session.
       fetchPendingAskUser();
     }
-  }, [activeSessionId, selectedProjectRoot, isMissionSession]);
+  }, [activeSessionId, selectedProjectRoot, isMissionSession, fetchPendingAskUser]);
 
   // --- Poll workspace state for mission sessions (backup; SSE also triggers reloads) ---
   useEffect(() => {
@@ -336,9 +185,11 @@ const App: React.FC = () => {
     if (!isCompact || compactSessionInitRef.current) return;
     compactSessionInitRef.current = true;
 
-    // Skill-bound embed mode: session is created by the SDK wrapper
+    // Skill-bound embed mode: session is created by the SDK wrapper.
+    // Clear selectedProjectRoot in memory (not localStorage) so API calls
+    // don't inherit the main page's project — the backend will use cwd.
     if (compactSession) {
-      useProjectStore.getState().setActiveSessionId(compactSession);
+      useProjectStore.setState({ activeSessionId: compactSession, selectedProjectRoot: '' });
       return;
     }
 
@@ -369,6 +220,9 @@ const App: React.FC = () => {
   }, []);
 
   // --- Clipboard bridge for VS Code compact mode ---
+  const clearChatRef = useRef(clearChat);
+  const sendChatMessageRef = useRef(sendChatMessage);
+  useEffect(() => { clearChatRef.current = clearChat; sendChatMessageRef.current = sendChatMessage; }, [clearChat, sendChatMessage]);
   useEffect(() => {
     if (!isCompact) return;
     document.documentElement.setAttribute('data-compact', '');
@@ -396,14 +250,8 @@ const App: React.FC = () => {
       const { action, payload } = e.data;
       switch (action) {
         case 'send': {
-          const input = document.querySelector<HTMLTextAreaElement>('[data-chat-input] textarea, .ce-input, textarea');
-          if (input) {
-            const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-            setter?.call(input, payload?.text || '');
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            const form = input.closest('form');
-            if (form) form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-          }
+          // Send directly via the chat action — no DOM manipulation needed.
+          sendChatMessageRef.current(payload?.text || '');
           break;
         }
         case 'add_message':
@@ -418,7 +266,7 @@ const App: React.FC = () => {
           });
           break;
         case 'clear':
-          clearChat();
+          clearChatRef.current();
           break;
       }
     };
@@ -433,329 +281,7 @@ const App: React.FC = () => {
     };
   }, []);
 
-  // --- Chat actions ---
-  const clearChat = useCallback(async () => {
-    const { selectedProjectRoot: root, activeSessionId: sid } = useProjectStore.getState();
-    if (!root) return;
-
-    // Cancel any running agent first
-    const runId = runningMainRunIds[selectedAgent];
-    if (runId) {
-      agentStore.cancelAgentRun(runId);
-    }
-
-    useChatStore.getState().clear();
-    const ui = useUiStore.getState();
-    ui.setQueuedMessages([]);
-    ui.setActivePlan(null);
-    ui.setPendingPlan(null);
-    ui.setPendingPlanAgentId(null);
-    ui.setPendingAskUser(null);
-    try {
-      const resp = await fetch('/api/chat/clear', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_root: root, session_id: sid }),
-      });
-      if (!resp.ok) console.error('Clear chat API error:', resp.status);
-      useChatStore.getState().clear();
-    } catch (e) { console.error('Error clearing chat:', e); }
-  }, [runningMainRunIds, selectedAgent]);
-
-  const sendChatMessage = useCallback(async (userMessage: string, targetAgent?: string, images?: string[]) => {
-    if (!userMessage.trim() && !(images && images.length > 0)) return;
-    const { selectedProjectRoot: root, activeSessionId: sid } = useProjectStore.getState();
-    const agent = useAgentStore.getState().selectedAgent;
-    if (!root) return;
-    const agentToUse = targetAgent || agent;
-    if (!agentToUse) return;
-    const now = new Date();
-    const trimmed = userMessage.trim();
-    const ui = useUiStore.getState();
-    const chat = useChatStore.getState();
-
-    if (trimmed !== '/help' && trimmed !== '/status' && trimmed !== '/clear' && trimmed !== '/compact' && !trimmed.startsWith('/compact ') && !trimmed.startsWith('/model') && !trimmed.startsWith('!')) {
-      chat.addMessage({
-        role: 'user', from: 'user', to: agentToUse, text: userMessage,
-        timestamp: now.toLocaleTimeString(), timestampMs: now.getTime(), isGenerating: false,
-        ...(images && images.length > 0 ? { images, imageCount: images.length } : {}),
-      });
-      scrollToBottom();
-    }
-
-    // /model
-    if (trimmed === '/model' || trimmed.startsWith('/model ')) {
-      const modelArg = trimmed.slice('/model'.length).trim();
-      if (!modelArg) { ui.setModelPickerOpen(true); ui.setOverlay(null); }
-      else {
-        const currentModels = useAgentStore.getState().models;
-        const valid = currentModels.length === 0 || currentModels.some((m) => m.id === modelArg);
-        if (!valid) { ui.setOverlay(`Unknown model: \`${modelArg}\`. Use \`/model\` to see available models.`); }
-        else {
-          try {
-            const resp = await fetch('/api/config');
-            if (resp.ok) {
-              const config = await resp.json();
-              const newDefaults = [modelArg];
-              const updated = { ...config, routing: { ...config.routing, default_models: newDefaults } };
-              const saveResp = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updated) });
-              if (saveResp.ok) { useAgentStore.setState({ defaultModels: newDefaults }); ui.setOverlay(`Switched default model to: \`${modelArg}\``); }
-            }
-          } catch (e) { ui.setOverlay(`Error switching model: ${e}`); }
-        }
-      }
-      return;
-    }
-
-    if (trimmed === '/help') {
-      ui.setOverlay([
-        '**Commands:**', '- `/help` — Show available commands', '- `/clear` — Clear chat context',
-        '- `/compact [focus]` — Compact context (summarize old messages)',
-        '- `/status` — Show project status', '- `/model` — List models; `/model <id>` — Switch default model',
-        '- `/plan <task>` — Ask agent to create a plan (read-only)', '- `/image <path>` — Attach an image file',
-        '- `!command` — Run a shell command directly',
-        '- `@path` — Mention a file', '- `@@agent message` — Send to specific agent', '', '**Skills:** Type `/` to see available skills.',
-      ].join('\n'));
-      return;
-    }
-
-    if (trimmed === '/status') {
-      try {
-        const resp = await fetch(`/api/status?project_root=${encodeURIComponent(root)}`);
-        if (resp.ok) {
-          const data = await resp.json();
-          const modelLines = (data.models || []).map((m: any) => `- \`${m.id}${m.id === data.default_model ? ' ✓' : ''}\`  (${m.provider}: ${m.model})`);
-          const usageLines = (data.model_usage || []).map((entry: [string, number]) => `- \`${entry[0]}\` — ${entry[1]} runs`);
-          const fmt = (n: number) => n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1_000 ? `${(n / 1_000).toFixed(1)}K` : `${n}`;
-          const promptTok = data.session_prompt_tokens || 0;
-          const completionTok = data.session_completion_tokens || 0;
-          const lines = [
-            `**Version:** v${data.version || '?'}`, `**Session:** \`${sid || '(none)'}\``,
-            `**Workspace:** \`${root}\``, `**Agent:** ${agent}`,
-            `**Model:** \`${data.default_model || '(none)'}\``,
-          ];
-          if (promptTok > 0 || completionTok > 0) lines.push(`**Tokens:** ↑ ${fmt(promptTok)}  ↓ ${fmt(completionTok)}  (total: ${fmt(promptTok + completionTok)})`);
-          lines.push('', '**Models:**', ...modelLines, '', '| Metric | Value |', '|--------|-------|',
-            `| Sessions | ${data.sessions} |`, `| Total runs | ${data.total_runs} |`,
-            `| Completed | ${data.completed_runs} |`, `| Failed | ${data.failed_runs} |`,
-            `| Cancelled | ${data.cancelled_runs} |`, `| Active days | ${data.active_days} |`);
-          if (usageLines.length > 0) lines.push('', '**Model usage:**', ...usageLines);
-          ui.setOverlay(lines.join('\n'));
-        } else { ui.setOverlay(`Status request failed: ${resp.status} ${resp.statusText}`); }
-      } catch (e) { ui.setOverlay(`Error fetching status: ${e}`); }
-      return;
-    }
-
-    if (trimmed === '/clear') { await clearChat(); return; }
-
-    // ! prefix — direct bash execution (CC-style)
-    if (trimmed.startsWith('!') && trimmed.length > 1) {
-      const cmd = trimmed.slice(1);
-      const ts = new Date();
-      chat.addMessage({
-        role: 'user', from: 'user', to: 'system', text: `\`$ ${cmd}\``,
-        timestamp: ts.toLocaleTimeString(), timestampMs: ts.getTime(), isGenerating: false,
-      });
-      scrollToBottom();
-      try {
-        const resp = await fetch('/api/bash', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ project_root: root, command: cmd }),
-        });
-        const data = await resp.json();
-        const output = [data.stdout, data.stderr].filter(Boolean).join('\n').trim();
-        const exitInfo = data.exit_code !== 0 ? `\n\n(exit code ${data.exit_code})` : '';
-        const resultTs = new Date();
-        chat.addMessage({
-          role: 'assistant', from: 'system', to: 'user',
-          text: output ? `\`\`\`\n${output}\n\`\`\`${exitInfo}` : `(no output)${exitInfo}`,
-          timestamp: resultTs.toLocaleTimeString(), timestampMs: resultTs.getTime(), isGenerating: false,
-        });
-        scrollToBottom();
-      } catch (e) {
-        console.error('Bash error:', e);
-      }
-      return;
-    }
-
-    if (trimmed === '/compact' || trimmed.startsWith('/compact ')) {
-      const focus = trimmed.slice('/compact'.length).trim() || undefined;
-      const { setAgentStatus, setAgentStatusText } = useAgentStore.getState();
-      setAgentStatus((s) => ({ ...s, [agentToUse]: 'thinking' as const }));
-      setAgentStatusText((s) => ({ ...s, [agentToUse]: 'Compacting conversation' }));
-      try {
-        const resp = await fetch('/api/chat/compact', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ project_root: root, session_id: sid, agent_id: agentToUse, focus }),
-        });
-        const data = await resp.json();
-        const clearStatus = () => {
-          setAgentStatus((s) => ({ ...s, [agentToUse]: 'idle' as const }));
-          setAgentStatusText((s) => { const n = { ...s }; delete n[agentToUse]; return n; });
-        };
-        clearStatus();
-        if (data.compacted) {
-          // Clear UI and reload compacted state from rewritten session file.
-          useChatStore.getState().clear(false);
-          await useChatStore.getState().fetchWorkspaceState();
-          // Add CC-style "Conversation compacted" banner with referenced files.
-          const refs = (data.referenced_files || []) as string[];
-          const refsText = refs.length > 0
-            ? '\n\n' + refs.map((f: string) => `Referenced file ${f}`).join('\n')
-            : '';
-          const ts = new Date();
-          useChatStore.getState().addMessage({
-            role: 'assistant', from: 'system', to: 'user',
-            text: `Conversation compacted.${refsText}`,
-            timestamp: ts.toLocaleTimeString(), timestampMs: ts.getTime(), isGenerating: false,
-          });
-        } else {
-          const ts = new Date();
-          useChatStore.getState().addMessage({
-            role: 'assistant', from: agentToUse, to: 'user', text: 'Nothing to compact.',
-            timestamp: ts.toLocaleTimeString(), timestampMs: ts.getTime(), isGenerating: false,
-          });
-        }
-        scrollToBottom();
-      } catch (e) {
-        setAgentStatus((s) => ({ ...s, [agentToUse]: 'idle' as const }));
-        setAgentStatusText((s) => { const n = { ...s }; delete n[agentToUse]; return n; });
-        console.error('Compact error:', e);
-      }
-      return;
-    }
-
-    if (trimmed.startsWith('/user_story ')) {
-      await fetch('/api/task', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_root: root, agent_id: agentToUse, task: trimmed.substring(12).trim() }),
-      });
-      return;
-    }
-
-    try {
-      const { isMissionSession, activeMissionId } = useProjectStore.getState();
-      const resp = await fetch('/api/chat', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          project_root: root, agent_id: agentToUse, message: userMessage,
-          session_id: sid,
-          ...(isMissionSession && activeMissionId ? { mission_id: activeMissionId } : {}),
-          ...(useUiStore.getState().sessionModel ? { model_id: useUiStore.getState().sessionModel } : {}),
-          ...(images && images.length > 0 ? { images } : {}),
-        }),
-      });
-      const data = await resp.json();
-      if (data?.session_id && !sid) {
-        useProjectStore.getState().setActiveSessionId(data.session_id);
-        useProjectStore.getState().fetchSessions();
-        // Notify parent app page of new session
-        if (window.parent !== window) {
-          window.parent.postMessage({ type: 'linggen-skill-event', event: 'session_created', payload: { sessionId: data.session_id } }, '*');
-        }
-      }
-      if (data?.status === 'queued') {
-        useChatStore.getState().removeLastUserMessage(userMessage, agentToUse);
-        return;
-      }
-      useAgentStore.getState().setAgentStatus((prev) => ({ ...prev, [agentToUse]: 'model_loading' }));
-      useAgentStore.getState().setAgentStatusText((prev) => ({ ...prev, [agentToUse]: 'Model Loading' }));
-      useChatStore.getState().upsertGenerating(agentToUse, 'Model loading...', 'Model loading...');
-    } catch (e) {
-      console.error('Error in chat:', e);
-    }
-  }, [scrollToBottom, clearChat]);
-
-  const respondToAskUser = useCallback(async (questionId: string, answers: any[]) => {
-    try {
-      await fetch('/api/ask-user-response', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question_id: questionId, answers }),
-      });
-      useUiStore.getState().setPendingAskUser(null);
-    } catch (e) { console.error('Error responding to AskUser:', e); }
-  }, []);
-
-  const approvePlan = useCallback(async (clearContext = false) => {
-    const { pendingPlanAgentId: planAgent } = useUiStore.getState();
-    const { selectedProjectRoot: root, activeSessionId: sid } = useProjectStore.getState();
-    if (!planAgent || !root) return;
-    try {
-      await fetch('/api/plan/approve', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_root: root, agent_id: planAgent, session_id: sid, clear_context: clearContext }),
-      });
-      const ui = useUiStore.getState();
-      ui.setPendingPlan(null);
-      ui.setPendingPlanAgentId(null);
-    } catch (e) { console.error('Error approving plan:', e); }
-  }, []);
-
-  const rejectPlan = useCallback(async () => {
-    const { pendingPlanAgentId: planAgent } = useUiStore.getState();
-    const { selectedProjectRoot: root, activeSessionId: sid } = useProjectStore.getState();
-    if (!planAgent || !root) return;
-    try {
-      await fetch('/api/plan/reject', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_root: root, agent_id: planAgent, session_id: sid }),
-      });
-      const ui = useUiStore.getState();
-      ui.setPendingPlan(null);
-      ui.setPendingPlanAgentId(null);
-    } catch (e) { console.error('Error rejecting plan:', e); }
-  }, []);
-
-  const editPlan = useCallback(async (text: string) => {
-    const { pendingPlanAgentId: planAgent } = useUiStore.getState();
-    const { selectedProjectRoot: root } = useProjectStore.getState();
-    if (!planAgent || !root) return;
-    try {
-      const res = await fetch('/api/plan/edit', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_root: root, agent_id: planAgent, text }),
-      });
-      if (res.ok) useUiStore.getState().setPendingPlan((prev) => prev ? { ...prev, plan_text: text } : prev);
-    } catch (e) { console.error('Error editing plan:', e); }
-  }, []);
-
-  const copyChat = useCallback(async () => {
-    try {
-      const { selectedProjectRoot: root, activeSessionId: sid } = useProjectStore.getState();
-      const agent = useAgentStore.getState().selectedAgent;
-      const msgs = useChatStore.getState().displayMessages;
-      const headerLines = [
-        'Linggen Agent Chat Export', `Project: ${root || '(none)'}`,
-        `Session: ${sid || 'default'}`, `Agent: ${agent}`,
-        `ExportedAt: ${new Date().toISOString()}`, '',
-      ];
-      const body = msgs.map((m) => {
-        const from = m.from || m.role;
-        const to = m.to ? ` → ${m.to}` : '';
-        const lines: string[] = [`[${m.timestamp}] ${from}${to}`];
-        if (m.subagentTree && m.subagentTree.length > 0) {
-          for (const sa of m.subagentTree) {
-            const stats = [];
-            if (sa.toolCount > 0) stats.push(`${sa.toolCount} tool uses`);
-            if (sa.contextTokens > 0) stats.push(`${(sa.contextTokens / 1000).toFixed(1)}k tokens`);
-            lines.push(`  [subagent:${sa.subagentId}] ${sa.task}${stats.length ? ` (${stats.join(', ')})` : ''} — ${sa.status}`);
-          }
-        }
-        const entries = Array.isArray(m.activityEntries) ? m.activityEntries : [];
-        if (entries.length > 0) { for (const entry of entries) lines.push(`  > ${entry}`); }
-        else if (m.activitySummary) { lines.push(`  > ${m.activitySummary}`); }
-        if (m.text) lines.push(m.text);
-        return lines.join('\n') + '\n';
-      }).join('\n');
-      await navigator.clipboard.writeText(headerLines.join('\n') + body);
-      useUiStore.getState().setCopyChatStatus('copied');
-      window.setTimeout(() => useUiStore.getState().setCopyChatStatus('idle'), 1200);
-    } catch (e) {
-      console.error('Failed to copy chat', e);
-      useUiStore.getState().setCopyChatStatus('error');
-      window.setTimeout(() => useUiStore.getState().setCopyChatStatus('idle'), 1600);
-    }
-  }, []);
-
+  // --- Sidebar callbacks ---
   const readFile = useCallback(async (path: string, projectRootOverride?: string) => {
     const root = projectRootOverride || useProjectStore.getState().selectedProjectRoot;
     if (!root) return;
@@ -771,23 +297,6 @@ const App: React.FC = () => {
     if (projectRoot !== useProjectStore.getState().selectedProjectRoot) useProjectStore.getState().setSelectedProjectRoot(projectRoot);
     readFile(path, projectRoot);
   }, [readFile]);
-
-  const switchModel = useCallback(async (modelId: string) => {
-    try {
-      const resp = await fetch('/api/config');
-      if (resp.ok) {
-        const config = await resp.json();
-        const newDefaults = [modelId];
-        const updated = { ...config, routing: { ...config.routing, default_models: newDefaults } };
-        const saveResp = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updated) });
-        if (saveResp.ok) {
-          useAgentStore.setState({ defaultModels: newDefaults });
-          useUiStore.getState().setModelPickerOpen(false);
-          useUiStore.getState().setOverlay(`Switched to: \`${modelId}\``);
-        }
-      }
-    } catch (e) { useUiStore.getState().setOverlay(`Error switching model: ${e}`); useUiStore.getState().setModelPickerOpen(false); }
-  }, []);
 
   // --- Render ---
   return (
@@ -930,47 +439,10 @@ const App: React.FC = () => {
         {/* Center: Chat */}
         <main className={`flex-1 flex flex-col overflow-hidden bg-slate-100/40 dark:bg-[#0a0a0a] min-h-0${isCompact ? ' p-0' : ''}`}>
           <div className={`flex-1 min-h-0${isCompact ? '' : ' p-2'}`}>
-            <ChatPanel
-              chatMessages={displayMessages}
-              queuedMessages={queuedMessages}
-              chatEndRef={chatEndRef}
-              projectRoot={selectedProjectRoot}
+            <ChatWidget
               sessionId={activeSessionId}
-              selectedAgent={selectedAgent}
-              setSelectedAgent={agentStore.setSelectedAgent}
-              skills={skills}
-              agents={agents}
-              mainAgents={mainAgents}
-              subagents={subagents}
-              mainRunIds={mainRunIds}
-              subagentRunIds={subagentRunIds}
-              runningMainRunIds={runningMainRunIds}
-              runningSubagentRunIds={runningSubagentRunIds}
-              mainRunHistory={mainRunHistory}
-              subagentRunHistory={subagentRunHistory}
-              cancellingRunIds={cancellingRunIds}
-              onCancelRun={(id) => agentStore.cancelAgentRun(id)}
-              onCancelAgentRun={(id) => agentStore.cancelAgentRun(id)}
-              isRunning={isRunning}
-              onSendMessage={sendChatMessage}
-              activePlan={activePlan}
-              pendingPlan={pendingPlan}
-              pendingPlanAgentId={pendingPlanAgentId}
-              agentContext={agentContext}
-              onApprovePlan={approvePlan}
-              onRejectPlan={rejectPlan}
-              onEditPlan={editPlan}
-              pendingAskUser={pendingAskUser}
-              onRespondToAskUser={respondToAskUser}
-              verboseMode={verboseMode}
-              agentStatus={agentStatus}
-              overlay={overlay}
-              onDismissOverlay={() => { uiStore.setOverlay(null); uiStore.setModelPickerOpen(false); }}
-              modelPickerOpen={modelPickerOpen}
-              models={models}
-              defaultModels={defaultModels}
-              tokensPerSec={tokensPerSec}
-              onSwitchModel={switchModel}
+              projectRoot={selectedProjectRoot}
+              mode={isCompact ? 'compact' : 'full'}
             />
           </div>
         </main>

@@ -1370,9 +1370,11 @@ async fn events_handler(
                         return None;
                     }
                     None => {
-                        // Events without session_id: agent_sessions enrichment above
-                        // should have set it. If still None, it's a timing gap —
-                        // let through since registration now happens before spawn.
+                        // Events without session_id after enrichment: this means
+                        // the agent isn't registered for any session (e.g. a mission
+                        // event before agent_sessions registration). Drop it to
+                        // prevent cross-session bleed.
+                        return None;
                     }
                     _ => {} // session matches — pass through
                 }
