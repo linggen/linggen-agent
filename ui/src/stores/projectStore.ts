@@ -55,9 +55,16 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     ? window.localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY) || ''
     : '',
   sessions: [],
-  activeSessionId: typeof window !== 'undefined'
-    ? window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY) || null
-    : null,
+  activeSessionId: (() => {
+    if (typeof window === 'undefined') return null;
+    // In compact/embed mode, use the session from URL params immediately
+    // to avoid flash of the main project's persisted session.
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('mode') === 'compact' && params.get('session')) {
+      return params.get('session');
+    }
+    return window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY) || null;
+  })(),
   isMissionSession: false,
   activeMissionId: null,
   activeMissionProject: null,
