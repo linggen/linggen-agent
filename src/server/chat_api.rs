@@ -1685,9 +1685,24 @@ pub(crate) async fn approve_plan_handler(
             }
         }
 
-        // Persist and emit the approved plan (after clear, so it's the first message).
+        // Persist the approved plan to disk AND emit to UI.
+        // persist_and_emit_plan only emits — we also need to write to messages.jsonl
+        // so the status is correct on reload.
         let plan_snapshot = engine.plan.clone().unwrap();
-        engine.persist_and_emit_plan(plan_snapshot).await;
+        engine.persist_and_emit_plan(plan_snapshot.clone()).await;
+        let plan_json = serde_json::json!({ "type": "plan", "plan": plan_snapshot });
+        persist_and_emit_message(
+            &manager,
+            &events_tx,
+            &root_clone,
+            &agent_id,
+            &agent_id,
+            "user",
+            &plan_json.to_string(),
+            session_id.as_deref(),
+            false,
+        )
+        .await;
 
         // Build a ChatRunCtx so we can reuse run_plan_execution.
         let session_id_for_cleanup = session_id.clone();

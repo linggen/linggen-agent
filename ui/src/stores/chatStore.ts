@@ -683,7 +683,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         state.syncPersisted(msgs);
 
         // Restore pending plan state from persisted messages (e.g. after server restart).
-        // Find the last plan message with status "planned" and set it as pending.
+        // Find the MOST RECENT plan message — only set as pending if its status is "planned".
+        // If the most recent plan is approved/executing/completed/rejected, there's no pending plan.
         const uiState = useUiStore.getState();
         if (!uiState.pendingPlanAgentId) {
           for (let i = msgs.length - 1; i >= 0; i--) {
@@ -694,8 +695,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
               if (parsed?.plan?.status === 'planned') {
                 uiState.setPendingPlan(parsed.plan);
                 uiState.setPendingPlanAgentId(m.from || m.role || '');
-                break;
               }
+              // Stop at the first plan found regardless of status
+              break;
             } catch { /* ignore */ }
           }
         }
