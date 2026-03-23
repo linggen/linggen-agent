@@ -59,8 +59,8 @@ interface UiState {
   copyChatStatus: 'idle' | 'copied' | 'error';
 
   // Transport connection status
-  connectionStatus: 'connected' | 'reconnecting';
-  setConnectionStatus: (status: 'connected' | 'reconnecting') => void;
+  connectionStatus: 'connected' | 'reconnecting' | 'disconnected';
+  setConnectionStatus: (status: 'connected' | 'reconnecting' | 'disconnected') => void;
 
   // Toasts
   toasts: Toast[];
@@ -118,7 +118,7 @@ export const useUiStore = create<UiState>((set) => ({
   activePlan: null,
   verboseMode: typeof window !== 'undefined' ? window.localStorage.getItem(VERBOSE_MODE_STORAGE_KEY) === 'true' : false,
   copyChatStatus: 'idle',
-  connectionStatus: 'connected',
+  connectionStatus: (typeof document !== 'undefined' && document.querySelector('meta[name="linggen-instance"]')) ? 'disconnected' : 'connected',
   setConnectionStatus: (status) => set({ connectionStatus: status }),
   toasts: [],
   addToast: (toast) => {

@@ -126,11 +126,8 @@ async fn run_peer(
                     .map(|mut ch| ch.write(false, msg.as_bytes()))
                     .unwrap_or(Ok(false));
                 match written {
-                    Ok(true) => {
-                        tracing::debug!("DC write ok: {}bytes, {} remaining", msg_len, pending_dc_writes.len());
-                    }
-                    other => {
-                        tracing::debug!("DC write blocked: {}bytes, result={:?}, pausing", msg_len, other);
+                    Ok(true) => { /* accepted */ }
+                    _ => {
                         pending_dc_writes.push_front((cid, msg));
                         dc_write_paused = true;
                     }

@@ -1,8 +1,8 @@
-import React, { useMemo, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { Bot, FilePenLine, Plus, RefreshCw, Settings, Sparkles, Zap } from 'lucide-react';
 import { cn } from './lib/cn';
 import { AgentsCard } from './components/AgentsCard';
-import { SessionNav } from './components/SessionNav';
+import { SessionList } from './components/SessionList';
 import { ModelsCard } from './components/ModelsCard';
 import { CollapsibleCard } from './components/CollapsibleCard';
 import { SkillsCard } from './components/SkillsCard';
@@ -10,7 +10,6 @@ import { FilePreview } from './components/FilePreview';
 import { ChatWidget } from './components/chat';
 import { HeaderBar } from './components/HeaderBar';
 import { SettingsPage } from './components/SettingsPage';
-import { MissionSessionNav } from './components/MissionSessionNav';
 import { MissionEditor } from './components/MissionPage';
 import { AgentSpecEditorModal } from './components/AgentSpecEditorModal';
 import { ToastContainer } from './components/ToastContainer';
@@ -31,13 +30,32 @@ import { useChatActions } from './hooks/useChatActions';
 
 const compactParams = new URLSearchParams(window.location.search);
 const isCompact = compactParams.get('mode') === 'compact';
+const isMobileParam = compactParams.get('mode') === 'mobile';
 const compactProject = compactParams.get('project') || '';
 const compactSession = compactParams.get('session') || '';
 const compactHideToolbar = compactParams.get('hide_toolbar') === '1';
 
+/** Detect mobile viewport (< 768px) or explicit ?mode=mobile. */
+function useIsMobile(): boolean {
+  const [mobile, setMobile] = useState(
+    isMobileParam || (!isCompact && window.innerWidth < 768),
+  );
+  useEffect(() => {
+    if (isMobileParam || isCompact) return; // explicit mode — no resize detection
+    const mq = window.matchMedia('(max-width: 767px)');
+    const onChange = (e: MediaQueryListEvent) => setMobile(e.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+  return mobile;
+}
+
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
+
+/** Detect remote/tunnel mode (blob iframe with injected instance meta tag). */
+const isRemoteMode = typeof document !== 'undefined' && !!document.querySelector('meta[name="linggen-instance"]');
 
 const App: React.FC = () => {
   // --- Stores ---
@@ -46,11 +64,28 @@ const App: React.FC = () => {
   const chatStore = useChatStore();
   const uiStore = useUiStore();
 
+  // In remote mode, gate rendering until WebRTC transport is connected.
+  // This prevents stores from fetching with [] fallback before data channel is ready.
+  const { connectionStatus } = uiStore;
+  if (isRemoteMode && connectionStatus === 'disconnected') {
+    return (
+      <div className="h-screen flex items-center justify-center bg-white dark:bg-[#0b0e14]">
+        <div className="text-center space-y-4">
+          <div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-slate-200 dark:border-slate-700 border-t-emerald-500" />
+          <p className="text-slate-500 dark:text-slate-400 text-sm">Connecting to linggen server…</p>
+        </div>
+      </div>
+    );
+  }
+
+  const isMobile = useIsMobile();
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
   // Shortcuts
   const { projects, selectedProjectRoot, sessions, activeSessionId, isMissionSession, agentTreesByProject } = projectStore;
   const { agents, models, skills, selectedAgent, agentStatus, agentStatusText, agentContext, defaultModels, ollamaStatus, sessionTokens, tokensPerSec, reloadingSkills, reloadingAgents } = agentStore;
   const { messages: chatMessages } = chatStore;
-  const { currentPage, sidebarTab, editingMission, missionRefreshKey, showAgentSpecEditor, openApp, selectedFileContent, selectedFilePath, copyChatStatus } = uiStore;
+  const { currentPage, editingMission, missionRefreshKey, showAgentSpecEditor, openApp, selectedFileContent, selectedFilePath, copyChatStatus } = uiStore;
 
   const isRunning = agentStore.isRunning();
   const mainAgents = agents;
@@ -97,6 +132,7 @@ const App: React.FC = () => {
       return;
     }
     useProjectStore.getState().fetchProjects();
+    useProjectStore.getState().fetchAllSessions();
     useAgentStore.getState().fetchSkills();
     useAgentStore.getState().fetchAgents();
     useAgentStore.getState().fetchModels();
@@ -224,6 +260,15 @@ const App: React.FC = () => {
     })();
   }, []);
 
+  // --- Mobile: set data attribute for CSS safe-area insets ---
+  useEffect(() => {
+    if (isMobile) {
+      document.documentElement.setAttribute('data-mobile', '');
+    } else {
+      document.documentElement.removeAttribute('data-mobile');
+    }
+  }, [isMobile]);
+
   // --- Clipboard bridge for VS Code compact mode ---
   const clearChatRef = useRef(clearChat);
   const sendChatMessageRef = useRef(sendChatMessage);
@@ -341,6 +386,7 @@ const App: React.FC = () => {
           clearChat={clearChat}
           isRunning={isRunning}
           onOpenSettings={() => uiStore.setCurrentPage('settings')}
+          onToggleMobileMenu={() => setMobileMenuOpen(!mobileMenuOpen)}
         />
       )}
 
@@ -369,92 +415,73 @@ const App: React.FC = () => {
       {/* Main Layout */}
       <div className="flex-1 flex overflow-hidden">
 
-        {/* Left sidebar */}
+        {/* Mobile slide-over session list */}
+        {!isCompact && mobileMenuOpen && (
+          <>
+            <div className="fixed inset-0 bg-black/30 z-40 md:hidden" onClick={() => setMobileMenuOpen(false)} />
+            <div className="fixed inset-y-0 left-0 w-72 z-50 md:hidden bg-white dark:bg-[#0f0f0f] shadow-xl animate-slide-in flex flex-col">
+              <SessionList
+                activeSessionId={activeSessionId}
+                onSelectSession={(session) => {
+                  const isMission = session.creator === 'mission';
+                  projectStore.setActiveSessionId(session.id);
+                  projectStore.setIsMissionSession(isMission);
+                  projectStore.setActiveMissionId(isMission && session.mission_id ? session.mission_id : null);
+                  if (session.project && session.project !== selectedProjectRoot) {
+                    projectStore.setSelectedProjectRoot(session.project);
+                  }
+                  window.localStorage.setItem('linggen:active-session', session.id);
+                  setMobileMenuOpen(false);
+                }}
+                onCreateSession={() => { projectStore.createSession(); setMobileMenuOpen(false); }}
+                onDeleteSession={(id) => projectStore.removeSession(id)}
+                onOpenSettings={(tab) => { uiStore.setCurrentPage('settings'); setMobileMenuOpen(false); }}
+              />
+            </div>
+          </>
+        )}
+
+        {/* Left sidebar — unified session list (desktop only) */}
         {!isCompact && (
-        <div className="w-72 border-r border-slate-200 dark:border-white/5 flex flex-col bg-white dark:bg-[#0f0f0f] h-full">
-          {/* Tab switcher */}
-          <div className="flex border-b border-slate-200 dark:border-white/5">
-            <button onClick={() => uiStore.setSidebarTab('projects')}
-              className={cn('flex-1 py-2 text-[11px] font-bold uppercase tracking-wider transition-colors',
-                sidebarTab === 'projects' ? 'text-blue-600 dark:text-blue-400 border-b-2 border-blue-500' : 'text-slate-400 hover:text-slate-600 dark:hover:text-slate-300')}>
-              Projects
-            </button>
-            <button onClick={() => uiStore.setSidebarTab('missions')}
-              className={cn('flex-1 py-2 text-[11px] font-bold uppercase tracking-wider transition-colors',
-                sidebarTab === 'missions' ? 'text-blue-600 dark:text-blue-400 border-b-2 border-blue-500' : 'text-slate-400 hover:text-slate-600 dark:hover:text-slate-300')}>
-              Missions
-            </button>
-          </div>
-
-          {sidebarTab === 'projects' && (<>
-          <SessionNav
-            projects={projects}
-            selectedProjectRoot={selectedProjectRoot}
-            setSelectedProjectRoot={projectStore.setSelectedProjectRoot}
-            sessions={sessions.filter((s) => !s.title.startsWith('Mission:'))}
+        <div className="hidden md:flex w-72 border-r border-slate-200 dark:border-white/5 flex-col bg-white dark:bg-[#0f0f0f] h-full">
+          <SessionList
             activeSessionId={activeSessionId}
-            setActiveSessionId={(id) => { projectStore.setActiveSessionId(id); projectStore.setIsMissionSession(false); }}
-            createSession={() => projectStore.createSession()}
-            removeSession={(id) => projectStore.removeSession(id)}
-            renameSession={(id, title) => projectStore.renameSession(id, title)}
-            sessionCountsByProject={projectStore.sessionCountsByProject}
-            treesByProject={agentTreesByProject}
-            onSelectPath={selectAgentPathFromTree}
-            pickFolder={() => projectStore.pickFolder()}
-            removeProject={(path) => projectStore.removeProject(path)}
-          />
-          <div className="border-t border-slate-200 dark:border-white/5">
-            <CollapsibleCard title="AGENTS" icon={<Bot size={12} />} iconColor="text-blue-500" badge={`${mainAgents.length}`} defaultOpen
-              headerAction={
-                <div className="flex items-center gap-0.5">
-                  <button onClick={() => agentStore.reloadAgents()} disabled={reloadingAgents}
-                    className="p-1 hover:bg-slate-100 dark:hover:bg-white/5 rounded transition-colors text-slate-400 hover:text-blue-500 disabled:opacity-50" title="Reload agents from disk">
-                    <RefreshCw size={12} className={reloadingAgents ? 'animate-spin' : ''} />
-                  </button>
-                  <button onClick={() => uiStore.setShowAgentSpecEditor(true)} disabled={!selectedProjectRoot}
-                    title="Edit agent markdown specs" className="p-1 rounded hover:bg-slate-200 dark:hover:bg-white/10 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 disabled:opacity-30 transition-colors">
-                    <FilePenLine size={12} />
-                  </button>
-                </div>
-              }>
-              <AgentsCard agents={mainAgents} workspaceState={chatStore.workspaceState} isRunning={isRunning}
-                selectedAgent={selectedAgent} setSelectedAgent={agentStore.setSelectedAgent}
-                agentStatus={agentStatus} agentStatusText={agentStatusText} agentWork={agentWork}
-                agentRunSummary={agentRunSummary} agentContext={agentContext} projectRoot={selectedProjectRoot} />
-            </CollapsibleCard>
-          </div>
-          </>)}
-
-          {sidebarTab === 'missions' && (
-          <MissionSessionNav
-            activeSessionId={activeSessionId}
-            setActiveSessionId={(id, missionId) => {
-              useProjectStore.setState({ activeSessionId: id, isMissionSession: true, activeMissionId: missionId ?? null });
-              if (id) window.localStorage.setItem('linggen:active-session', id);
+            onSelectSession={(session) => {
+              const isMission = session.creator === 'mission';
+              projectStore.setActiveSessionId(session.id);
+              projectStore.setIsMissionSession(isMission);
+              if (isMission && session.mission_id) {
+                projectStore.setActiveMissionId(session.mission_id);
+              } else {
+                projectStore.setActiveMissionId(null);
+              }
+              // Switch project context if session belongs to a different project
+              if (session.project && session.project !== selectedProjectRoot) {
+                projectStore.setSelectedProjectRoot(session.project);
+              }
+              window.localStorage.setItem('linggen:active-session', session.id);
             }}
-            projects={projects}
-            onCreateMission={() => uiStore.openMissionEditor(null)}
-            onEditMission={(mission) => uiStore.openMissionEditor(mission)}
-            refreshKey={missionRefreshKey}
+            onCreateSession={() => projectStore.createSession()}
+            onDeleteSession={(id) => projectStore.removeSession(id)}
+            onOpenSettings={(tab) => uiStore.setCurrentPage('settings')}
           />
-          )}
         </div>
         )}
 
         {/* Center: Chat */}
-        <main className={`flex-1 flex flex-col overflow-hidden bg-slate-100/40 dark:bg-[#0a0a0a] min-h-0${isCompact ? ' p-0' : ''}`}>
-          <div className={`flex-1 min-h-0${isCompact ? '' : ' p-2'}`}>
+        <main className={`flex-1 flex flex-col overflow-hidden bg-slate-100/40 dark:bg-[#0a0a0a] min-h-0${isCompact || isMobile ? ' p-0' : ''}`}>
+          <div className={`flex-1 min-h-0${isCompact || isMobile ? '' : ' p-2'}`}>
             <ChatWidget
               sessionId={activeSessionId}
               projectRoot={selectedProjectRoot}
-              mode={isCompact ? 'compact' : 'full'}
+              mode={isCompact ? 'compact' : isMobile ? 'mobile' : 'full'}
             />
           </div>
         </main>
 
-        {/* Right sidebar */}
-        {!isCompact && (
-        <aside className="w-72 border-l border-slate-200 dark:border-white/5 flex flex-col bg-slate-100/40 dark:bg-[#0a0a0a] p-3 gap-3 overflow-y-auto">
+        {/* Right sidebar (hidden on mobile) */}
+        {!isCompact && !isMobile && (
+        <aside className="hidden lg:flex w-72 border-l border-slate-200 dark:border-white/5 flex-col bg-slate-100/40 dark:bg-[#0a0a0a] p-3 gap-3 overflow-y-auto">
           <CollapsibleCard title="MODELS" icon={<Sparkles size={12} />} iconColor="text-purple-500" badge={`${models.length}`} defaultOpen
             headerAction={
               <button onClick={() => uiStore.openSettings('models')}

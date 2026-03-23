@@ -103,11 +103,11 @@ export function installFetchProxy(): void {
         // Transport not ready
       }
 
-      // In blob iframe (tunnel mode), relative URLs can't be resolved.
-      // Return empty array response for API calls while transport is connecting.
-      // Most API endpoints return arrays — returning [] prevents .map()/.filter() crashes.
+      // In blob iframe (tunnel mode), relative URLs can't be resolved by the browser.
+      // Return 503 — the UI gates rendering until transport is connected, so this
+      // should only be hit by background polling (heartbeat, status checks).
       if (typeof url === 'string' && url.startsWith('/') && window.location.protocol === 'blob:') {
-        return Promise.resolve(new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        return Promise.resolve(new Response('null', { status: 503, headers: { 'Content-Type': 'application/json' } }));
       }
     }
 
