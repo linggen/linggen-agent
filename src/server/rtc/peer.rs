@@ -112,8 +112,18 @@ async fn run_peer(
     let http_client = reqwest::Client::new();
     // Channel for async control request responses — avoids blocking str0m's event loop.
     let (ctrl_resp_tx, mut ctrl_resp_rx) = tokio::sync::mpsc::channel::<(Option<String>, str0m::channel::ChannelId, serde_json::Value)>(32);
+    // Queue of pending data channel writes — drained one per poll_output cycle
+    // to avoid overflowing str0m's SCTP send buffer with large chunked responses.
+    let mut pending_dc_writes: std::collections::VecDeque<(str0m::channel::ChannelId, String)> = std::collections::VecDeque::new();
 
     loop {
+        // Drain one pending write per cycle (interleaved with poll_output for flushing)
+        if let Some((cid, msg)) = pending_dc_writes.pop_front() {
+            if let Some(mut ch) = rtc.channel(cid) {
+                let _ = ch.write(false, msg.as_bytes());
+            }
+        }
+
         // Poll str0m for output
         let timeout = match rtc.poll_output()? {
             Output::Timeout(t) => t,
@@ -214,7 +224,7 @@ async fn run_peer(
             Duration::ZERO
         };
 
-        if wait.is_zero() {
+        if wait.is_zero() || !pending_dc_writes.is_empty() {
             rtc.handle_input(Input::Timeout(Instant::now()))?;
             continue;
         }
@@ -256,7 +266,7 @@ async fn run_peer(
             // Receive async control request responses and send on data channel
             Some((rid, cid, result)) = ctrl_resp_rx.recv() => {
                 if let Some(rid) = rid {
-                    send_chunked_response(&mut rtc, cid, &rid, result);
+                    enqueue_response(&mut pending_dc_writes, cid, &rid, result);
                 }
             }
 
@@ -477,13 +487,12 @@ async fn handle_session_message(
 /// (e.g., file contents for tunnel loading) are split into chunks that the client reassembles.
 const MAX_DC_MESSAGE: usize = 64_000; // ~64 KB — conservative to account for JSON escaping overhead
 
-fn send_chunked_response(
-    rtc: &mut Rtc,
+fn enqueue_response(
+    queue: &mut std::collections::VecDeque<(str0m::channel::ChannelId, String)>,
     cid: str0m::channel::ChannelId,
     request_id: &str,
     result: serde_json::Value,
 ) {
-    // Check if the body is large enough to need chunking
     let body = result.get("data")
         .and_then(|d| d.get("body"))
         .and_then(|b| b.as_str());
@@ -491,7 +500,6 @@ fn send_chunked_response(
     if let Some(body_str) = body {
         tracing::debug!("Response for {request_id}: body_len={}", body_str.len());
         if body_str.len() > MAX_DC_MESSAGE {
-            // Send body in chunks, then a final message with status
             let status = result.get("data")
                 .and_then(|d| d.get("status"))
                 .and_then(|s| s.as_u64())
@@ -504,28 +512,20 @@ fn send_chunked_response(
                     "request_id": request_id,
                     "chunk": { "index": i, "total": total, "data": chunk }
                 });
-                if let Some(mut ch) = rtc.channel(cid) {
-                    let _ = ch.write(false, msg.to_string().as_bytes());
-                }
+                queue.push_back((cid, msg.to_string()));
             }
-            // Final message signals completion with status
             let final_msg = serde_json::json!({
                 "request_id": request_id,
                 "data": { "status": status, "body": "" }
             });
-            if let Some(mut ch) = rtc.channel(cid) {
-                let _ = ch.write(false, final_msg.to_string().as_bytes());
-            }
+            queue.push_back((cid, final_msg.to_string()));
             return;
         }
     }
 
-    // Small response — send as single message
     let mut resp = result;
     resp["request_id"] = serde_json::Value::String(request_id.to_string());
-    if let Some(mut ch) = rtc.channel(cid) {
-        let _ = ch.write(false, resp.to_string().as_bytes());
-    }
+    queue.push_back((cid, resp.to_string()));
 }
 
 /// Split a string into chunks of at most `max_bytes`, respecting UTF-8 character boundaries.
