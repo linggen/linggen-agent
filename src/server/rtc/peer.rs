@@ -255,11 +255,7 @@ async fn run_peer(
             // Receive async control request responses and send on data channel
             Some((rid, cid, result)) = ctrl_resp_rx.recv() => {
                 if let Some(rid) = rid {
-                    let mut resp = result;
-                    resp["request_id"] = serde_json::Value::String(rid);
-                    if let Some(mut ch) = rtc.channel(cid) {
-                        let _ = ch.write(false, resp.to_string().as_bytes());
-                    }
+                    send_chunked_response(&mut rtc, cid, &rid, result);
                 }
             }
 
@@ -471,6 +467,64 @@ async fn handle_session_message(
         Err(e) => {
             tracing::warn!("RTC proxy to {endpoint} error: {e}");
         }
+    }
+}
+
+/// Send a control channel response, chunking if it exceeds data channel message size limits.
+/// WebRTC data channels negotiate max-message-size (typically 256 KB). Large responses
+/// (e.g., file contents for tunnel loading) are split into chunks that the client reassembles.
+const MAX_DC_MESSAGE: usize = 200_000; // ~200 KB, well under 256 KB limit
+
+fn send_chunked_response(
+    rtc: &mut Rtc,
+    cid: str0m::channel::ChannelId,
+    request_id: &str,
+    result: serde_json::Value,
+) {
+    // Check if the body is large enough to need chunking
+    let body = result.get("data")
+        .and_then(|d| d.get("body"))
+        .and_then(|b| b.as_str());
+
+    if let Some(body_str) = body {
+        if body_str.len() > MAX_DC_MESSAGE {
+            // Send body in chunks, then a final message with status
+            let status = result.get("data")
+                .and_then(|d| d.get("status"))
+                .and_then(|s| s.as_u64())
+                .unwrap_or(200);
+            let chunks: Vec<&str> = body_str.as_bytes()
+                .chunks(MAX_DC_MESSAGE)
+                .map(|c| std::str::from_utf8(c).unwrap_or(""))
+                .collect();
+            let total = chunks.len();
+
+            for (i, chunk) in chunks.iter().enumerate() {
+                let msg = serde_json::json!({
+                    "request_id": request_id,
+                    "chunk": { "index": i, "total": total, "data": chunk }
+                });
+                if let Some(mut ch) = rtc.channel(cid) {
+                    let _ = ch.write(false, msg.to_string().as_bytes());
+                }
+            }
+            // Final message signals completion with status
+            let final_msg = serde_json::json!({
+                "request_id": request_id,
+                "data": { "status": status, "body": "" }
+            });
+            if let Some(mut ch) = rtc.channel(cid) {
+                let _ = ch.write(false, final_msg.to_string().as_bytes());
+            }
+            return;
+        }
+    }
+
+    // Small response — send as single message
+    let mut resp = result;
+    resp["request_id"] = serde_json::Value::String(request_id.to_string());
+    if let Some(mut ch) = rtc.channel(cid) {
+        let _ = ch.write(false, resp.to_string().as_bytes());
     }
 }
 
