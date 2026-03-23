@@ -236,7 +236,9 @@ async fn run_peer(
             Duration::ZERO
         };
 
-        if wait.is_zero() || !pending_dc_writes.is_empty() {
+        // Keep spinning without blocking if: timeout elapsed OR we have writes ready to send.
+        // But do NOT spin when paused — we need to enter select! to receive UDP (SCTP ACKs).
+        if wait.is_zero() || (!dc_write_paused && !pending_dc_writes.is_empty()) {
             rtc.handle_input(Input::Timeout(Instant::now()))?;
             continue;
         }
