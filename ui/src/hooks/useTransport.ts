@@ -11,6 +11,7 @@
 import { useEffect, useRef } from 'react';
 import { SseTransport, getTransport, setTransport, type TransportCallbacks, type TransportStatus } from '../lib/transport';
 import { RtcTransport } from '../lib/rtcTransport';
+import { RelaySignaling } from '../lib/signaling';
 import { dispatchEvent } from '../lib/eventDispatcher';
 import { useUiStore } from '../stores/uiStore';
 import { useChatStore } from '../stores/chatStore';
@@ -42,12 +43,23 @@ function shouldUseWebRTC(): boolean {
   if (params.get('transport') === 'webrtc') return true;
   // Explicit opt-out
   if (params.get('transport') === 'sse') return false;
+  // Remote mode (instance param present) — always WebRTC
+  if (getInstanceId()) return true;
   // Remote host (not localhost) — use WebRTC
   const host = window.location.hostname;
   if (host !== 'localhost' && host !== '127.0.0.1' && !host.startsWith('192.168.') && !host.startsWith('10.')) {
     return true;
   }
   return false;
+}
+
+/** Get remote instance ID from URL or injected meta tag (tunnel mode). */
+function getInstanceId(): string | null {
+  const params = new URLSearchParams(window.location.search);
+  return params.get('instance')
+    || window.location.pathname.match(/\/connect\/([^/]+)/)?.[1]
+    || document.querySelector('meta[name="linggen-instance"]')?.getAttribute('content')
+    || null;
 }
 
 export interface UseTransportOptions {
@@ -97,7 +109,11 @@ export function useTransport({ sessionId, onReconnect, onParseError }: UseTransp
 
     let transport;
     if (shouldUseWebRTC()) {
-      transport = new RtcTransport(callbacks);
+      const instanceId = getInstanceId();
+      const config = instanceId
+        ? { signaling: new RelaySignaling(instanceId) }
+        : {};
+      transport = new RtcTransport(callbacks, config);
       setTransport(transport);
     } else {
       transport = getTransport(callbacks);

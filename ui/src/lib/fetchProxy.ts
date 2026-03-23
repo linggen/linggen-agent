@@ -59,9 +59,15 @@ async function rtcFetch(input: RequestInfo | URL, init?: RequestInit): Promise<R
   const status = result.status || 200;
   const responseBody = typeof result.body === 'string' ? result.body : JSON.stringify(result.body || '');
 
+  // Infer content type from URL for non-API requests
+  const contentTypeHeader = url.endsWith('.js') ? 'application/javascript'
+    : url.endsWith('.css') ? 'text/css'
+    : url.endsWith('.html') ? 'text/html'
+    : 'application/json';
+
   return new Response(responseBody, {
     status,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': contentTypeHeader },
   });
 }
 
@@ -74,9 +80,15 @@ export function installFetchProxy(): void {
   window.fetch = ((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
 
-    // Only proxy /api/* requests when on WebRTC transport AND the control channel is open.
-    // Exclude the WHIP endpoint itself — it must always use direct HTTP to establish the connection.
-    if (isWebRtcTransport() && typeof url === 'string' && url.startsWith('/api/') && !url.includes('/api/rtc/')) {
+    // Proxy /api/* and /assets/* requests through WebRTC when connected.
+    // /api/rtc/* is excluded — it must use direct HTTP for signaling.
+    // /assets/* is proxied only for remote/tunnel mode (lazy-loaded JS/CSS chunks).
+    const shouldProxy = typeof url === 'string' && (
+      (url.startsWith('/api/') && !url.includes('/api/rtc/'))
+      || url.startsWith('/assets/')
+      || url.startsWith('/apps/')
+    );
+    if (isWebRtcTransport() && shouldProxy) {
       try {
         const transport = getTransport();
         if (transport.status() === 'connected') {

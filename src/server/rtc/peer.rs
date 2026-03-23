@@ -75,6 +75,7 @@ async fn create_peer_inner(offer_sdp: String, state: Arc<ServerState>, remote: b
         .context("Failed to accept SDP offer")?;
 
     let answer_sdp = answer.to_sdp_string();
+    tracing::debug!("SDP answer:\n{answer_sdp}");
 
     // Spawn the peer event loop
     let events_rx = state.events_tx.subscribe();
@@ -352,7 +353,14 @@ async fn process_control_request_async(
             let method = req.body.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
             let url_path = req.body.get("url").and_then(|v| v.as_str()).unwrap_or("/");
             // SECURITY: validate the path to prevent SSRF attacks.
-            if !url_path.starts_with("/api/") || url_path.contains('@') || url_path.contains("://") || url_path.contains("..") {
+            // Allow /api/*, /assets/*, /apps/* (skills), /index.html, /logo.svg
+            // for tunnel-loaded remote UI and lazy-loaded chunks.
+            let path_ok = url_path.starts_with("/api/")
+                || url_path.starts_with("/assets/")
+                || url_path.starts_with("/apps/")
+                || url_path == "/index.html"
+                || url_path == "/logo.svg";
+            if !path_ok || url_path.contains('@') || url_path.contains("://") || url_path.contains("..") {
                 return serde_json::json!({ "error": "Invalid URL path" });
             }
             let url = format!("http://127.0.0.1:{port}{url_path}");

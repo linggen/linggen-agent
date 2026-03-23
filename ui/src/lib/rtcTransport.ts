@@ -1,11 +1,11 @@
 /**
  * WebRTC transport — uses data channels for bidirectional chat events.
  *
- * Signaling via WHIP: one HTTP POST with SDP offer, get SDP answer back.
- * Each session gets its own data channel for natural isolation.
+ * Signaling is pluggable via SignalingStrategy:
+ *   Local:  WhipSignaling — single POST to /api/rtc/whip
+ *   Remote: RelaySignaling — POST offer to relay, poll for answer
  *
- * Local:  WHIP POST to /api/rtc/whip (direct to linggen server)
- * Remote: WHIP POST to signaling relay (future)
+ * Each session gets its own data channel for natural isolation.
  */
 import type { UiEvent } from '../types';
 import type {
@@ -16,11 +16,12 @@ import type {
   AskUserResponse,
   PlanAction,
 } from './transport';
+import { WhipSignaling, type SignalingStrategy } from './signaling';
 
 /** Configuration for the WebRTC transport. */
 export interface RtcTransportConfig {
-  /** WHIP endpoint URL. Default: '/api/rtc/whip' (local). */
-  whipUrl?: string;
+  /** Signaling strategy. Default: WhipSignaling('/api/rtc/whip'). */
+  signaling?: SignalingStrategy;
   /** ICE servers for NAT traversal. */
   iceServers?: RTCIceServer[];
 }
@@ -57,6 +58,8 @@ export class RtcTransport implements Transport {
   private requestIdCounter = 0;
   // Sessions requested before connection was ready — replayed on connect
   private pendingSubscriptions = new Set<string>();
+  // Abort controller for in-flight signaling (cancelled on cleanup/disconnect)
+  private signalingAbort: AbortController | null = null;
 
   constructor(callbacks: TransportCallbacks, config: RtcTransportConfig = {}) {
     this.callbacks = callbacks;
@@ -180,30 +183,21 @@ export class RtcTransport implements Transport {
         }
       };
 
-      // WHIP: create offer, gather all ICE candidates, send as one POST
+      // Create offer, gather all ICE candidates (full ICE, no trickle)
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
-
-      // Wait for ICE gathering to complete (full ICE, no trickle)
       await this.waitForIceGathering();
 
-      // Send complete SDP offer via WHIP
-      const whipUrl = this.config.whipUrl || '/api/rtc/whip';
-      const response = await fetch(whipUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/sdp' },
-        body: this.pc.localDescription!.sdp,
-      });
-
-      if (!response.ok) {
-        throw new Error(`WHIP failed: ${response.status} ${response.statusText}`);
-      }
-
-      const answerSdp = await response.text();
-      await this.pc.setRemoteDescription({
-        type: 'answer',
-        sdp: answerSdp,
-      });
+      // Exchange SDP via the configured signaling strategy
+      const signaling = this.config.signaling ?? new WhipSignaling();
+      const controller = new AbortController();
+      this.signalingAbort = controller;
+      const answerSdp = await signaling.exchange(
+        this.pc.localDescription!.sdp,
+        controller.signal,
+      );
+      this.signalingAbort = null;
+      await this.pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
     } catch (err) {
       console.error('WebRTC connection failed:', err);
       this.handleDisconnect();
@@ -359,6 +353,12 @@ export class RtcTransport implements Transport {
 
   private cleanup(): void {
     this.stopHeartbeat();
+
+    // Abort any in-flight signaling (e.g. relay polling)
+    if (this.signalingAbort) {
+      this.signalingAbort.abort();
+      this.signalingAbort = null;
+    }
 
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
