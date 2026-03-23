@@ -125,7 +125,7 @@ async fn handle_remote_offer(
     nonce: &str,
     offer_sdp: &str,
 ) {
-    // Create peer connection for remote offer (binds to 0.0.0.0, full ICE)
+    // Create peer connection for remote offer (binds to 0.0.0.0, ICE-lite)
     match super::peer::create_remote_peer(offer_sdp.to_string(), state.clone()).await {
         Ok(answer_sdp) => {
             info!("Created peer connection for remote offer, posting answer");

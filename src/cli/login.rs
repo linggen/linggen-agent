@@ -97,7 +97,7 @@ async fn receive_token_via_callback() -> Result<Option<String>> {
         // Send a response to close the browser tab
         let html = "<html><body><h2>✅ Authenticated!</h2><p>You can close this tab and return to the terminal.</p><script>window.close()</script></body></html>";
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             html.len(),
             html
         );

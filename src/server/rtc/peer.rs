@@ -49,15 +49,12 @@ async fn create_peer_inner(offer_sdp: String, state: Arc<ServerState>, remote: b
     let local_addr = socket.local_addr()?;
     tracing::info!("WebRTC peer UDP socket bound to {local_addr} (remote={remote})");
 
-    // Create str0m Rtc instance.
-    // ICE-lite for local (simple, fast). Full ICE for remote (needs STUN).
-    let mut rtc = if remote {
-        RtcConfig::new().build(Instant::now())
-    } else {
-        RtcConfig::new()
-            .set_ice_lite(true)
-            .build(Instant::now())
-    };
+    // Create str0m Rtc instance with ICE-lite.
+    // str0m is Sans-IO — it can't do STUN discovery, so full ICE won't work.
+    // ICE-lite makes us passive; the browser drives connectivity checks.
+    let mut rtc = RtcConfig::new()
+        .set_ice_lite(true)
+        .build(Instant::now());
 
     // Add local candidate (the UDP socket address).
     // For remote peers bound to 0.0.0.0, resolve the actual local IP.
