@@ -115,12 +115,23 @@ async fn run_peer(
     // Queue of pending data channel writes — drained one per poll_output cycle
     // to avoid overflowing str0m's SCTP send buffer with large chunked responses.
     let mut pending_dc_writes: std::collections::VecDeque<(str0m::channel::ChannelId, String)> = std::collections::VecDeque::new();
+    let mut dc_write_paused = false; // true when last write was rejected (buffer full)
 
     loop {
-        // Drain one pending write per cycle (interleaved with poll_output for flushing)
-        if let Some((cid, msg)) = pending_dc_writes.pop_front() {
-            if let Some(mut ch) = rtc.channel(cid) {
-                let _ = ch.write(false, msg.as_bytes());
+        // Drain one pending write — but only if not paused (waiting for buffer to flush)
+        if !dc_write_paused {
+            if let Some((cid, msg)) = pending_dc_writes.pop_front() {
+                let written = rtc.channel(cid)
+                    .map(|mut ch| ch.write(false, msg.as_bytes()))
+                    .unwrap_or(Ok(false));
+                match written {
+                    Ok(true) => { /* accepted */ }
+                    _ => {
+                        // Buffer full — re-queue and pause until Transmit drains buffer
+                        pending_dc_writes.push_front((cid, msg));
+                        dc_write_paused = true;
+                    }
+                }
             }
         }
 
@@ -130,6 +141,7 @@ async fn run_peer(
 
             Output::Transmit(t) => {
                 socket.send_to(&t.contents, t.destination).await?;
+                dc_write_paused = false; // buffer drained, can try writing again
                 continue;
             }
 
