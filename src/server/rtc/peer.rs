@@ -112,20 +112,23 @@ async fn run_peer(
     let http_client = reqwest::Client::new();
     // Channel for async control request responses — avoids blocking str0m's event loop.
     let (ctrl_resp_tx, mut ctrl_resp_rx) = tokio::sync::mpsc::channel::<(Option<String>, str0m::channel::ChannelId, serde_json::Value)>(32);
-    // Queue of pending data channel writes — drained one per poll_output cycle
-    // to avoid overflowing str0m's SCTP send buffer with large chunked responses.
-    let mut pending_dc_writes: std::collections::VecDeque<(str0m::channel::ChannelId, String)> = std::collections::VecDeque::new();
-    let mut dc_write_paused = false; // true when last write was rejected (buffer full)
+    // Queue of pending data channel writes — drained as fast as SCTP buffer allows.
+    // Messages are either text (JSON) or binary (gzip-compressed file data).
+    let mut pending_dc_writes: std::collections::VecDeque<(str0m::channel::ChannelId, DcMessage)> = std::collections::VecDeque::new();
+    let mut dc_write_paused = false;
 
     loop {
         // Drain as many pending writes as the SCTP buffer will accept.
-        // Writing multiple chunks per cycle maximizes throughput — critical for
-        // bulk transfers like UI tunnel loading where SCTP slow-start ramps up quickly.
         while !dc_write_paused {
             if let Some((cid, msg)) = pending_dc_writes.pop_front() {
-                let written = rtc.channel(cid)
-                    .map(|mut ch| ch.write(false, msg.as_bytes()))
-                    .unwrap_or(Ok(false));
+                let written = match &msg {
+                    DcMessage::Text(s) => rtc.channel(cid)
+                        .map(|mut ch| ch.write(false, s.as_bytes()))
+                        .unwrap_or(Ok(false)),
+                    DcMessage::Binary(b) => rtc.channel(cid)
+                        .map(|mut ch| ch.write(true, b))
+                        .unwrap_or(Ok(false)),
+                };
                 match written {
                     Ok(true) => { /* accepted — try writing more */ }
                     _ => {
@@ -134,7 +137,7 @@ async fn run_peer(
                     }
                 }
             } else {
-                break; // queue empty
+                break;
             }
         }
 
@@ -499,13 +502,25 @@ async fn handle_session_message(
     }
 }
 
-/// Send a control channel response, chunking if it exceeds data channel message size limits.
-/// WebRTC data channels negotiate max-message-size (typically 256 KB). Large responses
-/// (e.g., file contents for tunnel loading) are split into chunks that the client reassembles.
-const MAX_DC_MESSAGE: usize = 64_000; // ~64 KB — larger chunks, fewer messages, better throughput
+/// Text or binary message for the data channel write queue.
+enum DcMessage {
+    Text(String),
+    Binary(Vec<u8>),
+}
 
+/// Max binary chunk size — 64 KB raw binary (no JSON overhead).
+const MAX_BINARY_CHUNK: usize = 64_000;
+
+/// Enqueue a response, using gzip + binary for large bodies.
+///
+/// Protocol for large responses:
+/// 1. JSON header: `{ request_id, binary_start: { total_bytes, status } }`
+/// 2. Binary chunks: raw gzip bytes (ch.write(true, ...))
+/// 3. JSON footer: `{ request_id, binary_end: true }`
+///
+/// Client checks `typeof event.data` — string = JSON, ArrayBuffer = binary.
 fn enqueue_response(
-    queue: &mut std::collections::VecDeque<(str0m::channel::ChannelId, String)>,
+    queue: &mut std::collections::VecDeque<(str0m::channel::ChannelId, DcMessage)>,
     cid: str0m::channel::ChannelId,
     request_id: &str,
     result: serde_json::Value,
@@ -515,34 +530,53 @@ fn enqueue_response(
         .and_then(|b| b.as_str());
 
     if let Some(body_str) = body {
-        tracing::debug!("Response for {request_id}: body_len={}", body_str.len());
-        if body_str.len() > MAX_DC_MESSAGE {
+        if body_str.len() > MAX_BINARY_CHUNK {
             let status = result.get("data")
                 .and_then(|d| d.get("status"))
                 .and_then(|s| s.as_u64())
                 .unwrap_or(200);
-            let chunks = split_utf8_safe(body_str, MAX_DC_MESSAGE);
-            let total = chunks.len();
 
-            for (i, chunk) in chunks.iter().enumerate() {
-                let msg = serde_json::json!({
-                    "request_id": request_id,
-                    "chunk": { "index": i, "total": total, "data": chunk }
-                });
-                queue.push_back((cid, msg.to_string()));
-            }
-            let final_msg = serde_json::json!({
+            // Gzip compress the body
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(body_str.as_bytes()).ok();
+            let compressed = encoder.finish().unwrap_or_default();
+
+            tracing::info!(
+                "Response for {request_id}: {}KB → gzip {}KB ({} chunks)",
+                body_str.len() / 1024,
+                compressed.len() / 1024,
+                (compressed.len() + MAX_BINARY_CHUNK - 1) / MAX_BINARY_CHUNK,
+            );
+
+            // Header (JSON text)
+            let header = serde_json::json!({
                 "request_id": request_id,
-                "data": { "status": status, "body": "" }
+                "binary_start": { "total_bytes": compressed.len(), "status": status }
             });
-            queue.push_back((cid, final_msg.to_string()));
+            queue.push_back((cid, DcMessage::Text(header.to_string())));
+
+            // Binary chunks
+            for chunk in compressed.chunks(MAX_BINARY_CHUNK) {
+                queue.push_back((cid, DcMessage::Binary(chunk.to_vec())));
+            }
+
+            // Footer (JSON text)
+            let footer = serde_json::json!({
+                "request_id": request_id,
+                "binary_end": true
+            });
+            queue.push_back((cid, DcMessage::Text(footer.to_string())));
             return;
         }
     }
 
+    // Small response — single JSON message
     let mut resp = result;
     resp["request_id"] = serde_json::Value::String(request_id.to_string());
-    queue.push_back((cid, resp.to_string()));
+    queue.push_back((cid, DcMessage::Text(resp.to_string())));
 }
 
 /// Split a string into chunks of at most `max_bytes`, respecting UTF-8 character boundaries.
