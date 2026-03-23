@@ -118,20 +118,23 @@ async fn run_peer(
     let mut dc_write_paused = false; // true when last write was rejected (buffer full)
 
     loop {
-        // Drain one pending write — but only if not paused (waiting for buffer to flush)
-        if !dc_write_paused {
+        // Drain as many pending writes as the SCTP buffer will accept.
+        // Writing multiple chunks per cycle maximizes throughput — critical for
+        // bulk transfers like UI tunnel loading where SCTP slow-start ramps up quickly.
+        while !dc_write_paused {
             if let Some((cid, msg)) = pending_dc_writes.pop_front() {
-                let msg_len = msg.len();
                 let written = rtc.channel(cid)
                     .map(|mut ch| ch.write(false, msg.as_bytes()))
                     .unwrap_or(Ok(false));
                 match written {
-                    Ok(true) => { /* accepted */ }
+                    Ok(true) => { /* accepted — try writing more */ }
                     _ => {
                         pending_dc_writes.push_front((cid, msg));
                         dc_write_paused = true;
                     }
                 }
+            } else {
+                break; // queue empty
             }
         }
 
@@ -499,7 +502,7 @@ async fn handle_session_message(
 /// Send a control channel response, chunking if it exceeds data channel message size limits.
 /// WebRTC data channels negotiate max-message-size (typically 256 KB). Large responses
 /// (e.g., file contents for tunnel loading) are split into chunks that the client reassembles.
-const MAX_DC_MESSAGE: usize = 16_000; // ~16 KB — small enough for SCTP congestion window
+const MAX_DC_MESSAGE: usize = 64_000; // ~64 KB — larger chunks, fewer messages, better throughput
 
 fn enqueue_response(
     queue: &mut std::collections::VecDeque<(str0m::channel::ChannelId, String)>,
