@@ -9,7 +9,7 @@
  * - When URL has ?transport=webrtc or the page is served from a remote host: WebRTC
  */
 import { useEffect, useRef } from 'react';
-import { SseTransport, getTransport, setTransport, type TransportCallbacks, type TransportStatus } from '../lib/transport';
+import { getTransport, setTransport, type TransportCallbacks, type TransportStatus } from '../lib/transport';
 import { RtcTransport } from '../lib/rtcTransport';
 import { RelaySignaling } from '../lib/signaling';
 import { dispatchEvent } from '../lib/eventDispatcher';
@@ -18,12 +18,16 @@ import { useChatStore } from '../stores/chatStore';
 import { useAgentStore } from '../stores/agentStore';
 import { useProjectStore } from '../stores/projectStore';
 
-/** Refetch all critical state after a reconnect to fill any gaps. */
+/** Refetch all critical state after connect/reconnect to fill any gaps. */
 function resyncState() {
-  useChatStore.getState().fetchWorkspaceState();
-  useAgentStore.getState().fetchAgentRuns();
+  useProjectStore.getState().fetchProjects();
   useProjectStore.getState().fetchSessions();
+  useProjectStore.getState().fetchAllSessions();
   useProjectStore.getState().fetchAllAgentTrees();
+  useAgentStore.getState().fetchModels();
+  useAgentStore.getState().fetchSkills();
+  useAgentStore.getState().fetchAgentRuns();
+  useChatStore.getState().fetchWorkspaceState();
   useUiStore.getState().fetchPendingAskUser();
 }
 
