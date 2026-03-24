@@ -20,6 +20,7 @@ import { useChatStore } from './stores/chatStore';
 import { useUiStore } from './stores/uiStore';
 import { useRunInfo } from './hooks/useRunInfo';
 import { useChatActions } from './hooks/useChatActions';
+import { useTransport } from './hooks/useTransport';
 
 // ---------------------------------------------------------------------------
 // Compact mode (VS Code sidebar)
@@ -60,6 +61,10 @@ const App: React.FC = () => {
   const agentStore = useAgentStore();
   const chatStore = useChatStore();
   const uiStore = useUiStore();
+
+  // Initialize transport early — must run before connection gate to establish WebRTC.
+  // In remote mode, this triggers relay signaling + WebRTC connection.
+  useTransport({ sessionId: projectStore.activeSessionId });
 
   const isMobile = useIsMobile();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
