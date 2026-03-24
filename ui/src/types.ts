@@ -213,6 +213,11 @@ export interface SessionInfo {
   repo_path: string;
   title: string;
   created_at: number;
+  creator?: string;         // "user" | "mission" | "skill"
+  project?: string;         // full project path
+  project_name?: string;    // short name (last path segment)
+  skill?: string | null;    // bound skill name
+  mission_id?: string | null; // mission ID if creator is "mission"
 }
 
 export interface AgentRunInfo {

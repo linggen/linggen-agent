@@ -64,7 +64,7 @@ async fn heartbeat_loop(config: &RemoteConfig) {
             }
         }
 
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_secs(300)).await; // 5 minutes
     }
 }
 

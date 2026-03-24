@@ -121,5 +121,5 @@ OpenClaw (264K stars) looks similar on the surface — local-first, personal, ex
 
 ### Planned
 
-- Built-in secure remote access (WebRTC or proxy — no SSH tunnels needed)
+- Built-in secure remote access via WebRTC — P2P data channels, signaling relay on linggen.dev, UI loaded from server via data channel (no SSH tunnels needed)
 - Skills marketplace with community contributions

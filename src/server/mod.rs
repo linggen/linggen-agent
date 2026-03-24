@@ -46,7 +46,7 @@ use projects_api::{
     get_agent_context_api, get_agent_file_api, get_skill_file_api, list_agent_children_api,
     get_status_api,
     list_agent_files_api, list_agent_runs_api, list_agents_api, list_models_api, list_projects,
-    list_sessions, list_skill_files_api, list_skill_sessions, list_skills, reload_agents, reload_skills,
+    delete_unified_session, list_all_sessions, list_sessions, list_skill_files_api, list_skill_sessions, list_skills, reload_agents, reload_skills,
     remove_project, remove_session_api, remove_skill_session_api,
     rename_session_api, resolve_session_api, upsert_agent_file_api, upsert_skill_file_api,
 };
@@ -227,6 +227,16 @@ pub enum ServerEvent {
         project_root: String,
     },
     Notification(NotificationPayload),
+    /// A new session was created — used to update the unified session list in real-time.
+    SessionCreated {
+        session_id: String,
+        title: String,
+        creator: String,
+        project: Option<String>,
+        project_name: Option<String>,
+        skill: Option<String>,
+        mission_id: Option<String>,
+    },
     TextSegment {
         agent_id: String,
         text: String,
@@ -645,6 +655,36 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             session_id: None,
             project_root: Some(project_root),
             data: Some(json!({ "status": "mission_triggered", "mission_id": mission_id })),
+        }),
+        ServerEvent::SessionCreated {
+            ref session_id,
+            ref title,
+            ref creator,
+            ref project,
+            ref project_name,
+            ref skill,
+            ref mission_id,
+        } => Some(UiEvent {
+            id: format!("session-created-{session_id}-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: "notification".to_string(),
+            phase: None,
+            text: Some(format!("Session created: {title}")),
+            agent_id: None,
+            session_id: Some("global".to_string()),
+            project_root: project.clone(),
+            data: Some(json!({
+                "kind": "session_created",
+                "session_id": session_id,
+                "title": title,
+                "creator": creator,
+                "project": project,
+                "project_name": project_name,
+                "skill": skill,
+                "mission_id": mission_id,
+            })),
         }),
         ServerEvent::Notification(ref payload) => {
             let data = serde_json::to_value(payload).ok();
@@ -1119,6 +1159,7 @@ pub async fn prepare_server(
         .route("/api/skill-file", post(upsert_skill_file_api))
         .route("/api/skill-file", delete(delete_skill_file_api))
         .route("/api/sessions", get(list_sessions))
+        .route("/api/sessions/all", get(list_all_sessions).delete(delete_unified_session))
         .route("/api/sessions", post(create_session))
         .route("/api/sessions", patch(rename_session_api))
         .route("/api/sessions", delete(remove_session_api))

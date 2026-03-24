@@ -269,6 +269,23 @@ async fn dispatch_mission_prompt(
 
     let manager = state.manager.clone();
     let events_tx = state.events_tx.clone();
+
+    // Emit session_created so the unified session list updates in real-time
+    if !has_pre_session {
+        if let Some(ref sid) = session_id {
+            let _ = events_tx.send(crate::server::ServerEvent::SessionCreated {
+                session_id: sid.clone(),
+                title: mission_session_title(mission),
+                creator: "mission".into(),
+                project: Some(mission.project.clone().unwrap_or_default()),
+                project_name: std::path::Path::new(&mission.project.clone().unwrap_or_default())
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string()),
+                skill: Some("mission".to_string()),
+                mission_id: Some(mission.id.clone()),
+            });
+        }
+    }
     let missions_sessions_dir = crate::paths::mission_sessions_dir(&mission.id);
 
     // Begin a run record

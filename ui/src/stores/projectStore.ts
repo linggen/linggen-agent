@@ -11,6 +11,8 @@ interface ProjectState {
   projects: ProjectInfo[];
   selectedProjectRoot: string;
   sessions: SessionInfo[];
+  /** Unified list of ALL sessions across projects, missions, skills. */
+  allSessions: SessionInfo[];
   activeSessionId: string | null;
   isMissionSession: boolean;
   activeMissionId: string | null;
@@ -39,6 +41,8 @@ interface ProjectState {
   pickFolder: () => Promise<void>;
 
   fetchSessions: () => Promise<void>;
+  /** Fetch the unified list of ALL sessions from /api/sessions/all. */
+  fetchAllSessions: () => Promise<void>;
   createSession: () => Promise<void>;
   removeSession: (id: string) => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
@@ -55,6 +59,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     ? window.localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY) || ''
     : '',
   sessions: [],
+  allSessions: [],
   activeSessionId: (() => {
     if (typeof window === 'undefined') return null;
     // In compact/embed mode, use the session from URL params immediately
@@ -194,8 +199,19 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     }
   },
 
+  fetchAllSessions: async () => {
+    try {
+      const resp = await fetch('/api/sessions/all');
+      const raw = await resp.json();
+      const data: SessionInfo[] = raw.sessions ?? [];
+      set({ allSessions: data });
+    } catch (e) {
+      console.error('Failed to fetch all sessions:', e);
+    }
+  },
+
   createSession: async () => {
-    const { selectedProjectRoot, fetchSessions, fetchAllSessionCounts } = get();
+    const { selectedProjectRoot, fetchSessions, fetchAllSessions, fetchAllSessionCounts } = get();
     if (!selectedProjectRoot) return;
     const now = new Date();
     const title = `Chat ${now.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}, ${now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`;
@@ -208,6 +224,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       const data = await resp.json();
       set({ activeSessionId: data.id });
       fetchSessions();
+      fetchAllSessions();
       fetchAllSessionCounts();
     } catch (e) {
       console.error('Error creating session:', e);
@@ -215,16 +232,24 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
 
   removeSession: async (id) => {
-    const { selectedProjectRoot, activeSessionId, fetchSessions, fetchAllSessionCounts } = get();
-    if (!selectedProjectRoot || !confirm('Remove this session?')) return;
+    const { activeSessionId, allSessions, fetchSessions, fetchAllSessions, fetchAllSessionCounts } = get();
+    if (!confirm('Remove this session?')) return;
+    // Find session metadata to route the delete to the correct store
+    const session = allSessions.find(s => s.id === id);
     try {
-      await fetch('/api/sessions', {
+      await fetch('/api/sessions/all', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_root: selectedProjectRoot, session_id: id }),
+        body: JSON.stringify({
+          session_id: id,
+          project: session?.project || null,
+          mission_id: session?.mission_id || null,
+          skill: session?.skill || null,
+        }),
       });
       if (activeSessionId === id) set({ activeSessionId: null });
       fetchSessions();
+      fetchAllSessions();
       fetchAllSessionCounts();
     } catch (e) {
       console.error('Error removing session:', e);

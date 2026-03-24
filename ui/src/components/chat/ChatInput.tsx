@@ -33,6 +33,7 @@ export interface ChatInputProps {
   models?: ModelInfo[];
   defaultModels?: string[];
   onSwitchModel?: (modelId: string) => void;
+  mobile?: boolean;
 }
 
 export const ChatInput: React.FC<ChatInputProps> = ({
@@ -55,6 +56,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   models: modelsList,
   defaultModels: defaultModelsList,
   onSwitchModel,
+  mobile,
 }) => {
   const [chatInput, setChatInput] = useState('');
   const [pendingImages, setPendingImages] = useState<string[]>([]);
@@ -634,25 +636,34 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                 setShowFileDropdown(false);
               }
             }}
-            placeholder="Message... (/ for skills, @ for files, @@ for agents, Shift+Enter for newline)"
+            placeholder={mobile ? "Message..." : "Message... (/ for skills, @ for files, @@ for agents, Shift+Enter for newline)"}
             rows={1}
-            className="flex-1 bg-transparent border-none px-1.5 py-1.5 text-[13px] outline-none resize-none min-h-[34px] max-h-[200px] leading-5"
+            className={cn(
+              "flex-1 bg-transparent border-none outline-none resize-none leading-5",
+              mobile ? "px-2 py-2.5 text-[15px] min-h-[42px] max-h-[160px]" : "px-1.5 py-1.5 text-[13px] min-h-[34px] max-h-[200px]",
+            )}
           />
           {isRunning && selectedMainRunningRunId && onCancelAgentRun && (
             <button
               onClick={() => onCancelAgentRun(selectedMainRunningRunId)}
-              className="w-8 h-8 rounded-lg bg-red-500 text-white flex items-center justify-center hover:bg-red-600 transition-colors"
+              className={cn(
+                "rounded-lg bg-red-500 text-white flex items-center justify-center hover:bg-red-600 transition-colors",
+                mobile ? "w-10 h-10" : "w-8 h-8",
+              )}
               title="Stop agent"
             >
-              <Square size={12} fill="currentColor" />
+              <Square size={mobile ? 14 : 12} fill="currentColor" />
             </button>
           )}
           <button
             onClick={send}
-            className="w-8 h-8 rounded-lg bg-blue-600 text-white flex items-center justify-center hover:bg-blue-500 transition-colors"
+            className={cn(
+              "rounded-lg bg-blue-600 text-white flex items-center justify-center hover:bg-blue-500 transition-colors",
+              mobile ? "w-10 h-10" : "w-8 h-8",
+            )}
             title="Send"
           >
-            <Send size={14} />
+            <Send size={mobile ? 16 : 14} />
           </button>
         </div>
       </div>

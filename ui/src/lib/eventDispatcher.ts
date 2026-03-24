@@ -629,6 +629,11 @@ function handleNotification(item: UiEvent): void {
       useUiStore.getState().bumpMissionRefreshKey();
       return;
     }
+    case 'session_created': {
+      // Refresh the unified session list so the new session appears with animation
+      useProjectStore.getState().fetchAllSessions();
+      return;
+    }
     default:
       return;
   }

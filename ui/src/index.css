@@ -23,9 +23,21 @@
   }
 }
 
+@keyframes slide-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
 @theme {
   --animate-thinking-bounce: thinking-bounce 1.4s ease-in-out infinite;
   --animate-slide-in: slide-in 0.25s ease-out;
+  --animate-slide-in-right: slide-in-right 0.25s ease-out;
 }
 
 :root {
@@ -217,5 +229,15 @@ body {
   .markdown-mermaid-error {
     background: rgba(239, 68, 68, 0.12);
     color: rgba(248, 113, 113, 1);
+  }
+}
+
+/* Mobile: iOS safe area insets for notch/home indicator */
+@supports (padding-bottom: env(safe-area-inset-bottom)) {
+  html[data-mobile] {
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
   }
 }

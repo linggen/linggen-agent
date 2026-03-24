@@ -2,12 +2,26 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Agent Server",
+      "name": "Agent (Dev)",
       "type": "lldb",
       "request": "launch",
       "program": "${workspaceFolder}/target/debug/ling",
       "preLaunchTask": "cargo build agent",
       "args": ["--web", "--dev"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_LOG": "info",
+        "PATH": "${env:HOME}/.cargo/bin:${env:PATH}"
+      },
+      "sourceLanguages": ["rust"]
+    },
+    {
+      "name": "Agent (Prod)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/ling",
+      "preLaunchTask": "build agent all",
+      "args": ["--web"],
       "cwd": "${workspaceFolder}",
       "env": {
         "RUST_LOG": "info",
@@ -29,8 +43,8 @@
   ],
   "compounds": [
     {
-      "name": "Agent Server + UI",
-      "configurations": ["Agent Server", "Agent UI"],
+      "name": "Agent Dev (Server + UI)",
+      "configurations": ["Agent Server (Dev)", "Agent UI"],
       "stopAll": true
     }
   ]

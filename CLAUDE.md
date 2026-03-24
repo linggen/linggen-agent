@@ -23,6 +23,7 @@ Read files under `doc/` and follow them. If you find wrong content in any doc fi
 - `doc/log-spec.md` — logging levels, throttling, output targets
 - `doc/insight.md` — vision, roadmap, competitive positioning
 - `doc/webrtc-spec.md` — WebRTC transport: P2P remote access, signaling, data channels
+- `doc/proxy-spec.md` — proxy rooms: community model sharing, credits, auto-dispatch
 
 ## Build, Test, Run
 

@@ -42,9 +42,17 @@ export const ModelsCard: React.FC<{
   sessionTokens?: { prompt: number; completion: number };
 }> = ({ models, agents, ollamaStatus, tokensPerSec, activeModelId, agentContext, defaultModels = [], onToggleDefault, onChangeReasoningEffort, sessionTokens }) => {
   const tps = Number.isFinite(Number(tokensPerSec)) ? Number(tokensPerSec) : 0;
+  const scrollContainerRef = React.useRef<HTMLDivElement>(null);
+
+  // Scroll to the default (starred) model on mount
+  React.useEffect(() => {
+    if (!scrollContainerRef.current || defaultModels.length === 0) return;
+    const el = scrollContainerRef.current.querySelector('[data-default-model]');
+    if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, []);
 
   return (
-    <div className="px-3 py-2 space-y-2 max-h-48 overflow-y-auto">
+    <div ref={scrollContainerRef} className="px-3 py-2 space-y-2 max-h-48 overflow-y-auto">
       {models.map((m) => {
         const isActive = ollamaStatus?.models?.some((om) => om.name.includes(m.model) || m.model.includes(om.name));
         const activeInfo = ollamaStatus?.models?.find((om) => om.name.includes(m.model) || m.model.includes(om.name));
@@ -62,7 +70,7 @@ export const ModelsCard: React.FC<{
           : false;
         const showTps = tps > 0 && isGeneratingModel;
         return (
-          <div key={m.id} className={cn(
+          <div key={m.id} {...(isStarred ? { 'data-default-model': '' } : {})} className={cn(
             'rounded-lg border bg-slate-50/50 dark:bg-white/[0.02] p-2.5 space-y-1.5',
             isStarred ? 'border-amber-300/60 dark:border-amber-700/40' : 'border-slate-100 dark:border-white/5'
           )}>

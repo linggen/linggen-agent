@@ -58,22 +58,21 @@ Engine → ServerEvent → events_tx (broadcast)
 | Mode | Web UI served from | Signaling via | Data flows |
 |:-----|:-------------------|:--------------|:-----------|
 | Local | `localhost:9898` | WHIP endpoint on linggen (`/api/rtc/whip`) | WebRTC data channels (local ICE) |
-| Remote | `linggen.dev` (static) | WHIP relay (authenticated, CF Worker or Aliyun) | WebRTC data channels (P2P via STUN) |
+| Remote | Bootstrap from `linggen.dev`, full UI via data channel | WHIP relay (authenticated, CF Worker or Aliyun) | WebRTC data channels (P2P via STUN) |
 
 In local mode, ICE resolves instantly using local candidates — no STUN needed, negligible overhead. The same WebRTC code path handles both cases.
 
 ### Remote access via linggen.dev
 
-For remote access, the browser cannot reach `localhost:9898` to load the UI. Instead, `linggen.dev` serves:
+For remote access, the browser cannot reach `localhost:9898`. `linggen.dev` serves a lightweight bootstrap page that establishes the WebRTC connection, then loads the full UI from the linggen server through the data channel.
 
 | Path | What it serves | Backing |
 |:-----|:---------------|:--------|
-| `/` | Static web UI (same build as local) | CF Pages (free) |
 | `/login`, `/dashboard` | User account, linked instances | CF Worker + KV |
-| `/signaling` | WHIP relay (authenticated) | CF Worker + KV |
-| `/connect/{instance}` | Direct connection page | CF Pages (static) |
+| `/signaling` | Signaling relay (authenticated) | CF Worker + KV |
+| `/connect/{instance}` | Bootstrap page (WebRTC + UI loading via DC) | CF Worker |
 
-No chat data or media ever passes through `linggen.dev` — only signaling metadata during connection setup.
+No UI build artifacts are deployed to `linggen.dev`. The linggen server is the single source of truth for its UI. No chat data, media, or UI assets pass through `linggen.dev` — only signaling metadata during connection setup.
 
 ### Regional hosts
 
@@ -142,34 +141,18 @@ Endpoint: `POST /api/rtc/whip`
 
 No external infrastructure needed. One endpoint, one round trip.
 
-### Remote signaling (WHIP relay)
+### Remote signaling (relay)
 
-When the UI is loaded from `linggen.dev`, the client cannot reach linggen's WHIP endpoint directly (behind NAT). The signaling relay bridges the gap.
-
-All relay requests require authentication via the user's session token (for browser clients) or API token (for linggen instances).
+When connecting remotely, the client cannot reach linggen's WHIP endpoint directly (behind NAT). The signaling relay on `linggen.dev` bridges the gap. All relay requests are authenticated (session token for browser clients, API token for linggen instances).
 
 Flow:
 
-1. Linggen server long-polls the relay, waiting for offers:
-   `GET https://relay/rooms/{instance_id}/offer`
-   `Authorization: Bearer <api_token>`
-   (blocks until a client connects)
+1. Linggen server polls the relay for incoming offers (`GET /api/signaling/{instance_id}/offer`).
+2. Remote client POSTs its SDP offer to the relay, receives a nonce.
+3. Linggen picks up the offer, creates a peer connection, POSTs the SDP answer back with the nonce.
+4. Client polls for the answer using the nonce until it arrives.
 
-2. Remote client POSTs its SDP offer to the relay:
-   `POST https://relay/rooms/{instance_id}/offer`
-   `Authorization: Bearer <session_token>`
-   (body = SDP offer)
-
-3. Relay verifies both tokens belong to the same user account. Delivers the offer to linggen's waiting GET.
-
-4. Linggen processes the offer, POSTs the SDP answer back:
-   `POST https://relay/rooms/{instance_id}/answer`
-   `Authorization: Bearer <api_token>`
-   (body = SDP answer)
-
-5. Client's original POST returns with the SDP answer.
-
-Two HTTP requests from each side. No WebSocket. The relay is a stateless HTTP queue with auth checks.
+All stateless HTTP — no WebSocket. The relay is a simple nonce-based queue with auth checks.
 
 ### Why WHIP over custom signaling
 
@@ -219,29 +202,9 @@ Each session's events flow on a dedicated data channel. No filtering needed — 
 
 When the user switches sessions in the UI, the frontend simply reads from a different data channel. Old session channels stay open (messages are cached). No clear/refetch cycle.
 
-### Skill pages in remote mode
+### Remote asset loading
 
-Skill web pages (HTML, CSS, JS) are embedded in the linggen binary via `rust_embed` and served locally at `/apps/{skill}/`. In remote mode, the browser can't reach these URLs directly.
-
-Solution: the main UI fetches skill files via the `http_request` message on the control data channel, then loads them into the skill iframe using blob URLs. Skill iframes communicate with the main UI via `postMessage` (which `chat-bridge.js` already does today). The main UI routes skill messages through its WebRTC connection — skills don't need their own transport.
-
-```
-Main UI (remote)
-  │
-  │ 1. Skill needs /apps/game-table/index.html
-  │    → sends http_request on dc:control
-  │    → linggen returns file content via dc:control
-  │    → main UI creates blob URL, sets as iframe src
-  │
-  └── <iframe src="blob:...">
-        │
-        │ 2. Skill sends postMessage to parent (chat, events, etc.)
-        │    → parent routes through dc:sess-{id}
-        │
-        └── skill works normally, no HTTP needed
-```
-
-No skill files need to be hosted on `linggen.dev`. Skills are fetched on demand from the linggen server through the existing data channel.
+In remote mode, all assets (main UI and skill pages) are fetched from the linggen server through the data channel's HTTP proxy. This covers `/index.html`, `/assets/*` (JS/CSS chunks), and `/apps/*` (skill files). Skill iframes are loaded via blob URLs and communicate with the main UI via `postMessage`. No files need to be hosted on `linggen.dev`.
 
 ### Media tracks (future)
 
@@ -303,14 +266,15 @@ TURN credentials are time-limited and issued by linggen.dev's API based on the u
 ### Setup (remote)
 
 1. User logs into `linggen.dev`. Dashboard shows linked instances.
-2. User clicks an instance to connect. UI loads from `linggen.dev`.
-3. Client creates `RTCPeerConnection` with configured ICE servers (including TURN if Pro account).
-4. Client creates the `control` data channel.
-5. Client generates SDP offer, gathers all ICE candidates.
-6. Client sends SDP offer to `linggen.dev/signaling` (WHIP relay), authenticated with session token.
+2. User clicks an instance to connect. Bootstrap page loads from `linggen.dev/connect/{instance}`.
+3. Bootstrap creates `RTCPeerConnection` with configured ICE servers (including TURN if Pro account).
+4. Bootstrap creates the `control` data channel.
+5. Bootstrap generates SDP offer, gathers all ICE candidates.
+6. Bootstrap sends SDP offer to relay via `RelaySignaling` (POST offer, poll for answer), authenticated with session token.
 7. Relay matches to the user's instance, delivers offer to linggen's waiting long-poll.
 8. Linggen returns SDP answer via relay. Peer connection establishes.
-9. Control channel opens. Client creates session data channels as needed.
+9. Control channel opens. Bootstrap fetches the full UI (`/index.html`, `/assets/*`) via `http_request` on the control channel.
+10. Full UI loads and takes over. Client creates session data channels as needed.
 
 ### Reconnection
 
@@ -411,11 +375,11 @@ Added WHIP endpoint (`POST /api/rtc/whip`). Integrated str0m (Rust WebRTC librar
 
 ### Phase 3: linggen.dev + user accounts
 
-Build `linggen.dev`: static UI hosting (CF Pages), user accounts (CF Worker + KV), signaling relay (CF Worker). Implement `ling remote login` CLI command. Instance registration and dashboard with online status.
+Build `linggen.dev`: bootstrap connect page, user accounts, signaling relay (all CF Worker + KV). Implement `ling remote login` CLI command. Instance registration and dashboard. UI loaded from linggen server via data channel — not hosted on linggen.dev.
 
 ### Phase 4: Regional relays
 
-Deploy signaling relay + static UI on Aliyun for China access (`cn.linggen.dev`). Configure region-appropriate STUN servers. Same account system — user logs in once, accesses instances from any regional host.
+Deploy signaling relay + bootstrap page on Aliyun for China access (`cn.linggen.dev`). Configure region-appropriate STUN servers. Same account system — user logs in once, accesses instances from any regional host.
 
 ### Phase 5: TURN relay (paid tier)
 

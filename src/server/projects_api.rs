@@ -70,9 +70,14 @@ struct AgentFileWriteResponse {
 }
 
 fn canonical_project_root(project_root: &str) -> PathBuf {
-    PathBuf::from(project_root)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(project_root))
+    let expanded = if project_root == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(project_root))
+    } else if project_root.starts_with("~/") {
+        dirs::home_dir().unwrap_or_default().join(&project_root[2..])
+    } else {
+        PathBuf::from(project_root)
+    };
+    expanded.canonicalize().unwrap_or(expanded)
 }
 
 fn normalize_agent_md_path(path: &str) -> Result<String, String> {
@@ -1055,4 +1060,168 @@ pub(crate) async fn get_status_api(
         session_completion_tokens,
     })
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Unified session delete — routes to the correct session store
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub(crate) struct DeleteUnifiedSessionRequest {
+    session_id: String,
+    /// For project sessions — which project owns it.
+    #[serde(default)]
+    project: Option<String>,
+    /// For mission sessions — which mission owns it.
+    #[serde(default)]
+    mission_id: Option<String>,
+    /// For skill sessions — which skill owns it.
+    #[serde(default)]
+    skill: Option<String>,
+}
+
+/// DELETE /api/sessions/all — delete a session from any store.
+pub(crate) async fn delete_unified_session(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<DeleteUnifiedSessionRequest>,
+) -> impl IntoResponse {
+    let result = if let Some(ref mission_id) = req.mission_id {
+        // Mission session
+        let store = crate::state_fs::SessionStore::with_sessions_dir(
+            crate::paths::mission_sessions_dir(mission_id),
+        );
+        store.remove_session(&req.session_id)
+    } else if let Some(ref skill) = req.skill {
+        // Skill session
+        let store = crate::state_fs::SessionStore::with_sessions_dir(
+            crate::paths::skill_sessions_dir(skill),
+        );
+        store.remove_session(&req.session_id)
+    } else if let Some(ref project) = req.project {
+        // Project session
+        let root = canonical_project_root(project);
+        match state.manager.get_or_create_project(root).await {
+            Ok(ctx) => ctx.sessions.remove_session(&req.session_id),
+            Err(e) => Err(e),
+        }
+    } else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+
+    match result {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified session list — all sessions from all sources
+// ---------------------------------------------------------------------------
+
+/// GET /api/sessions/all — return sessions from projects, missions, and skills.
+pub(crate) async fn list_all_sessions(
+    State(state): State<Arc<ServerState>>,
+) -> impl IntoResponse {
+    let mut all: Vec<serde_json::Value> = Vec::new();
+
+    // 1. Project sessions
+    if let Ok(projects) = state.manager.store.list_projects() {
+        for project in &projects {
+            let root = canonical_project_root(&project.path);
+            if let Ok(ctx) = state.manager.get_or_create_project(root).await {
+                if let Ok(sessions) = ctx.sessions.list_sessions() {
+                    let proj_name = std::path::Path::new(&project.path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| project.path.clone());
+                    for s in sessions {
+                        all.push(serde_json::json!({
+                            "id": s.id,
+                            "title": s.title,
+                            "created_at": s.created_at,
+                            "creator": s.creator,
+                            "project": project.path,
+                            "project_name": proj_name,
+                            "skill": s.skill,
+                            "mission_id": serde_json::Value::Null,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Mission sessions
+    let missions_dir = crate::paths::global_missions_dir();
+    if missions_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&missions_dir) {
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let mission_id = entry.file_name().to_string_lossy().to_string();
+                if mission_id == "sessions" {
+                    continue; // skip legacy global sessions dir
+                }
+                let store = crate::state_fs::SessionStore::with_sessions_dir(
+                    crate::paths::mission_sessions_dir(&mission_id),
+                );
+                if let Ok(sessions) = store.list_sessions() {
+                    for s in sessions {
+                        all.push(serde_json::json!({
+                            "id": s.id,
+                            "title": s.title,
+                            "created_at": s.created_at,
+                            "creator": s.creator,
+                            "project": serde_json::Value::Null,
+                            "project_name": serde_json::Value::Null,
+                            "skill": s.skill,
+                            "mission_id": mission_id,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Skill sessions
+    let skills_dir = crate::paths::global_skills_dir();
+    if skills_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let skill_name = entry.file_name().to_string_lossy().to_string();
+                let sessions_dir = crate::paths::skill_sessions_dir(&skill_name);
+                if !sessions_dir.exists() {
+                    continue;
+                }
+                let store = crate::state_fs::SessionStore::with_sessions_dir(sessions_dir);
+                if let Ok(sessions) = store.list_sessions() {
+                    for s in sessions {
+                        all.push(serde_json::json!({
+                            "id": s.id,
+                            "title": s.title,
+                            "created_at": s.created_at,
+                            "creator": "skill",
+                            "project": serde_json::Value::Null,
+                            "project_name": serde_json::Value::Null,
+                            "skill": skill_name,
+                            "mission_id": serde_json::Value::Null,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by created_at descending (newest first)
+    all.sort_by(|a, b| {
+        let ta = a["created_at"].as_u64().unwrap_or(0);
+        let tb = b["created_at"].as_u64().unwrap_or(0);
+        tb.cmp(&ta)
+    });
+
+    Json(serde_json::json!({ "sessions": all })).into_response()
 }

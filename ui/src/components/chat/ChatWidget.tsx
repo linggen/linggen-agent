@@ -18,12 +18,13 @@ export interface ChatWidgetProps {
   /** Session to connect to. Null/undefined = no session (events from all sessions are accepted). */
   sessionId?: string | null;
   projectRoot?: string;
-  mode?: 'full' | 'compact';
+  mode?: 'full' | 'compact' | 'mobile';
 }
 
 export const ChatWidget: React.FC<ChatWidgetProps> = ({
   sessionId,
   projectRoot,
+  mode,
 }) => {
   // --- Stores ---
   const displayMessages = useChatStore((s) => s.displayMessages);
@@ -159,6 +160,7 @@ export const ChatWidget: React.FC<ChatWidgetProps> = ({
       defaultModels={defaultModels}
       tokensPerSec={tokensPerSec}
       onSwitchModel={switchModel}
+      mobile={mode === 'mobile'}
     />
   );
 };

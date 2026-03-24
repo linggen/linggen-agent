@@ -1085,8 +1085,10 @@ pub(crate) async fn chat_handler(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
-    let root = if req.project_root.is_empty() {
-        std::env::current_dir().unwrap_or_default()
+    let root = if req.project_root.is_empty() || req.project_root == "~" {
+        dirs::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    } else if req.project_root.starts_with("~/") {
+        dirs::home_dir().unwrap_or_default().join(&req.project_root[2..])
     } else {
         PathBuf::from(&req.project_root)
     };
@@ -1172,6 +1174,19 @@ pub(crate) async fn chat_handler(
             };
             let _ = ctx.sessions.add_session(&meta);
         }
+        // Emit session_created so the unified session list updates in real-time
+        let _ = state.events_tx.send(ServerEvent::SessionCreated {
+            session_id: new_id.clone(),
+            title: auto_session_title(&req.message),
+            creator: session_creator.into(),
+            project: Some(project_root_str.clone()),
+            project_name: std::path::Path::new(&project_root_str)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string()),
+            skill: req.skill_name.clone(),
+            mission_id: req.mission_id.clone(),
+        });
+
         Some(new_id)
     };
     let effective_session_id = session_id.clone().unwrap_or_else(|| "default".to_string());

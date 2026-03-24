@@ -113,7 +113,7 @@ A project can have **multiple active missions**. Each mission defines a cron sch
 - **CLI**: `ling` starts backend server + TUI.
 - **Web UI**: agent/skill management, session chat, agent tab views, mission page, settings, memory.
 - **Agent switching**: `/agent <name>` or tab views.
-- **Remote access**: power users proxy the Web UI remotely (SSH tunnel, reverse proxy). Future: built-in secure proxy or WebRTC.
+- **Remote access**: built-in WebRTC transport for access from anywhere. `linggen.dev` provides signaling relay and bootstrap — the full UI is loaded from the linggen server via data channel. See `webrtc-spec.md`.
 
 ## Safety Requirements
 

@@ -202,6 +202,7 @@ export const ChatPanel: React.FC<{
   defaultModels?: string[];
   onSwitchModel?: (modelId: string) => void;
   tokensPerSec?: number;
+  mobile?: boolean;
 }> = ({
   chatMessages,
   queuedMessages,
@@ -243,6 +244,7 @@ export const ChatPanel: React.FC<{
   defaultModels: defaultModelsList,
   onSwitchModel,
   tokensPerSec,
+  mobile,
 }) => {
   const [openSubagentId, setOpenSubagentId] = useState<string | null>(null);
   const [selectedMainRunByAgent, setSelectedMainRunByAgent] = useState<Record<string, string>>({});
@@ -724,12 +726,33 @@ export const ChatPanel: React.FC<{
         {(sessionId || selectedMainRunId) && (
           <details className="rounded-md border border-slate-200 dark:border-white/10 bg-white/80 dark:bg-black/20 px-2 py-1 text-[10px] text-slate-600 dark:text-slate-300">
             <summary className="cursor-pointer flex flex-wrap items-center gap-2">
-              {sessionId && (
-                <>
-                  <span className="font-semibold uppercase tracking-wider text-slate-500">Session</span>
-                  <span className="font-mono truncate">{sessionId}</span>
-                </>
-              )}
+              {sessionId && (() => {
+                const sessionMeta = useProjectStore.getState().allSessions.find(s => s.id === sessionId);
+                return (
+                  <>
+                    <span className="font-semibold uppercase tracking-wider text-slate-500">Session</span>
+                    <span className="font-mono truncate max-w-[160px]">{sessionId}</span>
+                    {sessionMeta?.project_name && (
+                      <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-white/5 text-slate-500 text-[9px]">
+                        📁 {sessionMeta.project_name}
+                      </span>
+                    )}
+                    {sessionMeta?.creator && sessionMeta.creator !== 'user' && (
+                      <span className={cn('px-1.5 py-0.5 rounded text-[9px] font-medium',
+                        sessionMeta.creator === 'mission' ? 'bg-amber-100 dark:bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                          : 'bg-purple-100 dark:bg-purple-500/10 text-purple-600 dark:text-purple-400'
+                      )}>
+                        {sessionMeta.creator === 'mission' ? '🤖' : '✨'} {sessionMeta.creator}
+                      </span>
+                    )}
+                    {sessionMeta?.skill && sessionMeta.creator !== 'mission' && (
+                      <span className="px-1.5 py-0.5 rounded bg-purple-50 dark:bg-purple-500/5 text-purple-500 text-[9px]">
+                        {sessionMeta.skill}
+                      </span>
+                    )}
+                  </>
+                );
+              })()}
               {selectedMainContext?.run?.status && (
                 <span className={cn('px-1.5 py-0.5 rounded-full uppercase tracking-wide', statusBadgeClass(selectedMainContext.run.status))}>
                   {selectedMainContext.run.status}
@@ -985,6 +1008,7 @@ export const ChatPanel: React.FC<{
         models={modelsList}
         defaultModels={defaultModelsList}
         onSwitchModel={onSwitchModel}
+        mobile={mobile}
       />
 
       {selectedSubagent && (

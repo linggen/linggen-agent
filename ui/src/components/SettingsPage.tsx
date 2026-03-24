@@ -105,18 +105,36 @@ export const SettingsPage: React.FC<{
   return (
     <div className="flex flex-col h-screen bg-slate-100/70 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200">
       {/* Top bar */}
-      <header className="flex items-center justify-between px-6 py-3 border-b border-slate-200 dark:border-white/5 bg-white/90 dark:bg-[#0f0f0f]/90 backdrop-blur-md z-50">
-        <button onClick={onBack} className="flex items-center gap-2 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:text-blue-600 transition-colors">
-          <ArrowLeft size={16} /> Back
-        </button>
-
-        {/* Tab strip */}
-        <nav className="flex items-center gap-1">
+      <header className="border-b border-slate-200 dark:border-white/5 bg-white/90 dark:bg-[#0f0f0f]/90 backdrop-blur-md z-50">
+        <div className="flex items-center justify-between px-3 md:px-6 py-2 md:py-3">
+          <button onClick={onBack} className="flex items-center gap-1.5 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:text-blue-600 transition-colors shrink-0">
+            <ArrowLeft size={16} /> Back
+          </button>
+          <div className="flex items-center gap-2">
+            {error && <span className="text-[10px] text-red-500 max-w-40 truncate">{error}</span>}
+            {success && <span className="text-[10px] text-green-500">Saved</span>}
+            {showSaveButton && (
+              <button
+                onClick={saveConfig}
+                disabled={!dirty || saving}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors ${
+                  dirty
+                    ? 'bg-blue-600 text-white hover:bg-blue-700 shadow-lg shadow-blue-600/20'
+                    : 'bg-slate-200 dark:bg-white/10 text-slate-400 cursor-not-allowed'
+                }`}
+              >
+                {saving ? 'Saving...' : 'Save'}
+              </button>
+            )}
+          </div>
+        </div>
+        {/* Tab strip — scrollable on mobile */}
+        <nav className="flex items-center gap-1 px-3 md:px-6 pb-2 overflow-x-auto">
           {tabs.map((tab) => (
             <button
               key={tab.key}
               onClick={() => setActiveTab(tab.key)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
                 activeTab === tab.key
                   ? 'bg-blue-600/10 text-blue-600 dark:text-blue-400'
                   : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5'
@@ -126,31 +144,12 @@ export const SettingsPage: React.FC<{
             </button>
           ))}
         </nav>
-
-        <div className="flex items-center gap-3">
-          {error && <span className="text-[10px] text-red-500 max-w-60 truncate">{error}</span>}
-          {success && <span className="text-[10px] text-green-500">Saved</span>}
-          {showSaveButton && (
-            <button
-              onClick={saveConfig}
-              disabled={!dirty || saving}
-              className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-colors ${
-                dirty
-                  ? 'bg-blue-600 text-white hover:bg-blue-700 shadow-lg shadow-blue-600/20'
-                  : 'bg-slate-200 dark:bg-white/10 text-slate-400 cursor-not-allowed'
-              }`}
-            >
-              {saving ? 'Saving...' : 'Save'}
-            </button>
-          )}
-          {!showSaveButton && <div className="w-16" />}
-        </div>
       </header>
 
       {/* Tab content */}
       <div className="flex-1 overflow-hidden">
         {activeTab === 'models' && (
-          <div className="h-full overflow-y-auto p-6">
+          <div className="h-full overflow-y-auto p-3 md:p-6">
             <div className="max-w-4xl mx-auto">
               <ModelsTab config={config} onChange={setConfig} onCredsDirtyChange={setCredsDirty} saveCredsRef={saveCredsRef} />
             </div>
@@ -162,7 +161,7 @@ export const SettingsPage: React.FC<{
         )}
 
         {activeTab === 'skills' && (
-          <div className="h-full overflow-y-auto px-6 py-5">
+          <div className="h-full overflow-y-auto px-3 md:px-6 py-4 md:py-5">
             <div className="max-w-6xl mx-auto h-full">
               <SkillsTab projectRoot={projectRoot} />
             </div>
@@ -170,7 +169,7 @@ export const SettingsPage: React.FC<{
         )}
 
         {activeTab === 'tools' && (
-          <div className="h-full overflow-y-auto p-6">
+          <div className="h-full overflow-y-auto p-3 md:p-6">
             <div className="max-w-4xl mx-auto">
               <ToolsTab />
             </div>
@@ -178,7 +177,7 @@ export const SettingsPage: React.FC<{
         )}
 
         {activeTab === 'general' && (
-          <div className="h-full overflow-y-auto p-6">
+          <div className="h-full overflow-y-auto p-3 md:p-6">
             <div className="max-w-4xl mx-auto">
               <GeneralTab config={config} onChange={setConfig} />
             </div>
