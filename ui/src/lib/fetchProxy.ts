@@ -102,13 +102,12 @@ export function installFetchProxy(): void {
       } catch {
         // Transport not ready
       }
+    }
 
-      // In blob iframe (tunnel mode), relative URLs can't be resolved by the browser.
-      // Return 503 — the UI gates rendering until transport is connected, so this
-      // should only be hit by background polling (heartbeat, status checks).
-      if (typeof url === 'string' && url.startsWith('/') && window.location.protocol === 'blob:') {
-        return Promise.resolve(new Response('null', { status: 503, headers: { 'Content-Type': 'application/json' } }));
-      }
+    // In blob iframe (tunnel mode), relative URLs can't be resolved by the browser.
+    // Intercept regardless of transport state — prevents URL parse errors.
+    if (shouldProxy && typeof url === 'string' && url.startsWith('/') && window.location.protocol === 'blob:') {
+      return Promise.resolve(new Response('null', { status: 503, headers: { 'Content-Type': 'application/json' } }));
     }
 
     return _originalFetch(input, init);
