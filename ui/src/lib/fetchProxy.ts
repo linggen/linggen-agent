@@ -79,7 +79,12 @@ async function rtcFetch(input: RequestInfo | URL, init?: RequestInit): Promise<R
 export function installFetchProxy(): void {
   console.log('[fetchProxy] installed');
   window.fetch = ((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+
+    // Normalize absolute same-origin URLs to relative paths so shouldProxy catches them.
+    // e.g. "https://linggen.dev/api/workspace/state?..." → "/api/workspace/state?..."
+    const origin = window.location.origin;
+    const url = rawUrl.startsWith(origin) ? rawUrl.slice(origin.length) : rawUrl;
 
     // Proxy /api/* and /assets/* requests through WebRTC when connected.
     // /api/rtc/* is excluded — it must use direct HTTP for signaling.
@@ -102,8 +107,9 @@ export function installFetchProxy(): void {
       try {
         const transport = getTransport();
         if (transport.status() === 'connected') {
-          // Try WebRTC proxy, fall back to direct HTTP on failure
-          return rtcFetch(input, init).catch((err) => {
+          // Try WebRTC proxy, fall back to direct HTTP on failure.
+          // Use normalized url (relative path) so the server gets /api/... not https://...
+          return rtcFetch(url, init).catch((err) => {
             console.warn('WebRTC fetch proxy failed, falling back to HTTP:', err.message);
             return _originalFetch(input, init);
           });

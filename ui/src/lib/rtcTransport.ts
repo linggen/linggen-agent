@@ -219,9 +219,14 @@ export class RtcTransport implements Transport {
       // Control channel is ready — NOW the connection is fully usable.
       // Don't fire these on pc.onconnectionstatechange because the data
       // channel may not be open yet at that point.
-      this.callbacks.onReconnect?.();
+      //
+      // IMPORTANT: setStatus('connected') MUST come before onReconnect.
+      // onReconnect triggers resyncState() which fetches /api/* endpoints.
+      // The fetchProxy only routes through WebRTC when status === 'connected',
+      // so if we call onReconnect first, all fetches get empty stub responses.
       this.reconnectAttempt = 0;
       this.setStatus('connected');
+      this.callbacks.onReconnect?.();
       this.startHeartbeat();
       for (const sid of this.pendingSubscriptions) {
         this.openSessionChannel(sid);
