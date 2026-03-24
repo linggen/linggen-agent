@@ -107,7 +107,16 @@ export function useTransport({ sessionId, onReconnect, onParseError }: UseTransp
       },
     };
 
+    // Check if transport already exists (another useTransport call may have created it)
     let transport;
+    try {
+      transport = getTransport();
+      // Transport exists — already initialized by another component
+      return;
+    } catch {
+      // No transport yet — create one
+    }
+
     if (shouldUseWebRTC()) {
       const instanceId = getInstanceId();
       const config = instanceId
