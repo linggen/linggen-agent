@@ -100,7 +100,7 @@ async fn run_peer(
     state: Arc<ServerState>,
     mut events_rx: tokio::sync::broadcast::Receiver<crate::server::ServerEvent>,
 ) -> Result<()> {
-    let mut buf = vec![0u8; 2000];
+    let mut buf = vec![0u8; 65536];
     let mut control_channel_id = None;
     let mut session_channels: HashMap<String, str0m::channel::ChannelId> = HashMap::new();
     let mut channel_sessions: HashMap<str0m::channel::ChannelId, String> = HashMap::new();
@@ -116,6 +116,8 @@ async fn run_peer(
     // Messages are either text (JSON) or binary (gzip-compressed file data).
     let mut pending_dc_writes: std::collections::VecDeque<(str0m::channel::ChannelId, String)> = std::collections::VecDeque::new();
     let mut dc_write_paused = false;
+    // Track when ICE entered Disconnected state for timeout-based cleanup.
+    let mut disconnected_since: Option<Instant> = None;
 
     loop {
         // Drain ONE pending write per cycle — writing multiple crashes str0m's SCTP.
@@ -146,15 +148,17 @@ async fn run_peer(
 
             Output::Event(event) => {
                 match event {
-                    Event::IceConnectionStateChange(state) => {
-                        tracing::info!("WebRTC ICE state: {state:?}");
-                        // Only exit on terminal states. Disconnected is transient.
-                        if matches!(state, IceConnectionState::Disconnected) {
-                            // Check if peer is truly dead
+                    Event::IceConnectionStateChange(ice_state) => {
+                        tracing::info!("WebRTC ICE state: {ice_state:?}");
+                        if matches!(ice_state, IceConnectionState::Disconnected) {
                             if !rtc.is_alive() {
-                                tracing::info!("WebRTC peer is no longer alive, exiting");
+                                tracing::info!("WebRTC peer disconnected and no longer alive, exiting");
                                 return Ok(());
                             }
+                            // Start a disconnect timer — if still disconnected after 30s, exit.
+                            disconnected_since = Some(Instant::now());
+                        } else {
+                            disconnected_since = None;
                         }
                     }
 
@@ -226,6 +230,14 @@ async fn run_peer(
                 continue;
             }
         };
+
+        // Exit if disconnected for more than 30 seconds (str0m has no Failed/Closed states).
+        if let Some(since) = disconnected_since {
+            if Instant::now().duration_since(since) > Duration::from_secs(30) {
+                tracing::info!("WebRTC peer disconnected for 30s — exiting");
+                return Ok(());
+            }
+        }
 
         // Calculate how long to wait
         let now = Instant::now();
@@ -482,7 +494,7 @@ async fn handle_session_message(
 
     // Proxy to local HTTP API
     let url = format!("http://127.0.0.1:{port}{endpoint}");
-    tracing::info!("RTC session proxy: {msg_type} → {endpoint} body={body}");
+    tracing::info!("RTC session proxy: {msg_type} → {endpoint}");
     match client.post(&url).json(&body).send().await {
         Ok(resp) => {
             if !resp.status().is_success() {
@@ -499,6 +511,8 @@ async fn handle_session_message(
 
 /// Max base64 chunk size per JSON message (~48 KB raw → ~64 KB base64, well under 256 KB SCTP limit).
 const MAX_CHUNK_RAW: usize = 48_000;
+/// Max pending data channel writes before dropping new messages.
+const MAX_DC_WRITE_QUEUE: usize = 4000;
 
 /// Enqueue a response, using gzip + base64 for large bodies.
 ///
@@ -514,6 +528,11 @@ fn enqueue_response(
     request_id: &str,
     result: serde_json::Value,
 ) {
+    if queue.len() >= MAX_DC_WRITE_QUEUE {
+        tracing::warn!("DC write queue full ({MAX_DC_WRITE_QUEUE}), dropping response for {request_id}");
+        return;
+    }
+
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
 

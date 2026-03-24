@@ -14,22 +14,44 @@ pub mod relay;
 use axum::{
     body::Bytes,
     extract::State,
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
+    Json,
 };
 use std::sync::Arc;
 
 use crate::server::ServerState;
+
+/// Return the WHIP auth token (local UI fetches this before connecting).
+pub async fn whip_token_handler(
+    State(state): State<Arc<ServerState>>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "token": state.whip_token }))
+}
 
 /// WHIP endpoint: accept SDP offer, return SDP answer.
 ///
 /// The client sends a complete SDP offer (with ICE candidates bundled).
 /// We create an Rtc instance, bind a UDP socket, accept the offer,
 /// and return the SDP answer. The peer connection runs in a background task.
+///
+/// Requires `Authorization: Bearer <whip_token>` header.
 pub async fn whip_handler(
     State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    // Verify WHIP auth token
+    let auth_ok = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t == state.whip_token)
+        .unwrap_or(false);
+    if !auth_ok {
+        return (StatusCode::UNAUTHORIZED, "Invalid or missing WHIP token").into_response();
+    }
+
     let offer_str = match std::str::from_utf8(&body) {
         Ok(s) => s.to_string(),
         Err(_) => {

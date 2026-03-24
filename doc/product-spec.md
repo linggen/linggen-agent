@@ -61,7 +61,7 @@ Skills are the primary extension mechanism. Built-in tools only for core operati
 
 - Framework ships with default agents; users create more by dropping `agents/*.md` files.
 - Each session has its own context, effective tools, model, and optional bound skill.
-- Two default agents: `ling` (versatile, adapts via skills) and `mission` (autonomous scheduled tasks).
+- One default agent: `ling` (versatile, adapts to any context via skills). Missions are cron-scheduled tasks, not a separate agent.
 - Switch via `/agent <name>` or tab views in web UI.
 
 ### 3. Unified CLI and shared sessions

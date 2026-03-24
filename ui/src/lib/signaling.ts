@@ -16,9 +16,17 @@ export class WhipSignaling implements SignalingStrategy {
   constructor(private whipUrl: string = '/api/rtc/whip') {}
 
   async exchange(offerSdp: string, signal: AbortSignal): Promise<string> {
+    // Fetch the WHIP auth token
+    const tokenResp = await _originalFetch('/api/rtc/token', { signal });
+    if (!tokenResp.ok) throw new Error(`Failed to get WHIP token: ${tokenResp.status}`);
+    const { token } = await tokenResp.json();
+
     const resp = await _originalFetch(this.whipUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/sdp' },
+      headers: {
+        'Content-Type': 'application/sdp',
+        'Authorization': `Bearer ${token}`,
+      },
       body: offerSdp,
       signal,
     });

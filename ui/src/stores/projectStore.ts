@@ -61,15 +61,15 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     : '',
   sessions: [],
   allSessions: [],
+  // Session ID is validated against the fetched sessions list in fetchSessions().
+  // Only compact/embed mode sets it immediately (from URL params).
   activeSessionId: (() => {
     if (typeof window === 'undefined') return null;
-    // In compact/embed mode, use the session from URL params immediately
-    // to avoid flash of the main project's persisted session.
     const params = new URLSearchParams(window.location.search);
     if (params.get('mode') === 'compact' && params.get('session')) {
       return params.get('session');
     }
-    return window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY) || null;
+    return null;
   })(),
   isMissionSession: false,
   activeMissionId: null,
@@ -178,22 +178,40 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       const raw = await resp.json();
       const data: SessionInfo[] = raw.sessions ?? raw ?? [];
       set((s) => {
-        let activeSessionId = s.activeSessionId;
-        if (activeSessionId && data.some((sess) => sess.id === activeSessionId)) {
-          // Keep current — only update sessions list
-          return { sessions: data };
-        } else if (activeSessionId && isMissionSession) {
-          // Keep mission session — only update sessions list
-          return { sessions: data };
-        } else if (data.length > 0) {
-          activeSessionId = data[0].id;
-          if (s.isMissionSession) return { sessions: data };
+        // Skip update if sessions list hasn't changed (prevents re-render loops from SSE)
+        const sessionsChanged = data.length !== s.sessions.length
+          || data.some((sess, i) => sess.id !== s.sessions[i]?.id);
+
+        // Determine active session: keep current > restore from localStorage > first session
+        let next = s.activeSessionId;
+
+        if (next && data.some((sess) => sess.id === next)) {
+          // Current session still valid — keep it
+        } else if (next && isMissionSession) {
+          // Mission session — keep even if not in the regular sessions list
         } else {
-          activeSessionId = null;
+          // Try restoring from localStorage
+          const persisted = typeof window !== 'undefined'
+            ? window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY) : null;
+          if (persisted && data.some((sess) => sess.id === persisted)) {
+            next = persisted;
+          } else if (data.length > 0) {
+            // Fall back to first session
+            next = data[0].id;
+          } else {
+            next = null;
+          }
+          // Sync localStorage
+          if (next) window.localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, next);
+          else window.localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
         }
-        // Only include activeSessionId if it actually changed
-        if (activeSessionId === s.activeSessionId) return { sessions: data };
-        return { sessions: data, activeSessionId };
+
+        const sessionChanged = next !== s.activeSessionId;
+        if (!sessionsChanged && !sessionChanged) return {};
+        const patch: Partial<ProjectState> = {};
+        if (sessionsChanged) patch.sessions = data;
+        if (sessionChanged) patch.activeSessionId = next;
+        return patch;
       });
     } catch (e) {
       console.error('Failed to fetch sessions:', e);
@@ -248,7 +266,10 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
           skill: session?.skill || null,
         }),
       });
-      if (activeSessionId === id) set({ activeSessionId: null });
+      if (activeSessionId === id) {
+        window.localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
+        set({ activeSessionId: null });
+      }
       fetchSessions();
       fetchAllSessions();
       fetchAllSessionCounts();

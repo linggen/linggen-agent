@@ -340,9 +340,22 @@ const App: React.FC = () => {
   // --- Info panel props (shared between desktop sidebar and mobile drawer) ---
   const handleClickSkill = useCallback((skill: any) => {
     if (skill.app) {
-      if (skill.app.launcher === 'web') window.open(`/apps/${skill.name}/${skill.app.entry}`, '_blank');
-      else if (skill.app.launcher === 'url') window.open(skill.app.entry, '_blank');
-      else sendChatMessage(`/${skill.name} --web`);
+      if (skill.app.launcher === 'web') {
+        // Open in AppPanel (in-page iframe) — works on both local and remote
+        // because the iframe's fetch calls go through the fetch proxy.
+        uiStore.setOpenApp({
+          skill: skill.name,
+          launcher: 'web',
+          url: `/apps/${skill.name}/${skill.app.entry}`,
+          title: skill.name,
+          width: skill.app.width,
+          height: skill.app.height,
+        });
+      } else if (skill.app.launcher === 'url') {
+        window.open(skill.app.entry, '_blank');
+      } else {
+        sendChatMessage(`/${skill.name} --web`);
+      }
     } else sendChatMessage(`/${skill.name}`);
   }, [sendChatMessage]);
 

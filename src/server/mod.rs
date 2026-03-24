@@ -88,6 +88,9 @@ pub struct ServerState {
     /// Uses `std::sync::RwLock` so SSE readers never block on each other and only
     /// briefly contend with writers (register/deregister are single insert/remove).
     pub agent_sessions: Arc<std::sync::RwLock<HashMap<String, String>>>,
+    /// Random token required for WHIP endpoint authentication.
+    /// Generated at startup, passed to the UI via /api/status.
+    pub whip_token: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1055,6 +1058,7 @@ pub async fn prepare_server(
         event_seq: AtomicU64::new(1),
         session_tokens: Arc::new(Mutex::new(HashMap::new())),
         agent_sessions: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        whip_token: uuid::Uuid::new_v4().to_string(),
     });
 
     // Bridge internal AgentManager events to SSE for the UI.
@@ -1194,6 +1198,7 @@ pub async fn prepare_server(
         .route("/api/bash", post(run_bash_api))
         .route("/api/events", get(events_handler))
         .route("/api/rtc/whip", post(rtc::whip_handler))
+        .route("/api/rtc/token", get(rtc::whip_token_handler))
         .route("/api/status", get(get_status_api))
         .route("/api/health", get(health_handler))
         .route("/api/utils/pick-folder", get(pick_folder))

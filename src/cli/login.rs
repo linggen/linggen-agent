@@ -63,9 +63,15 @@ async fn receive_token_via_callback() -> Result<Option<String>> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let callback_url = format!("http://localhost:{port}/callback");
+    let csrf_state = uuid::Uuid::new_v4().to_string();
 
-    // Open browser to the link page with callback
-    let link_url = format!("{}/auth/link?callback={}", DEFAULT_RELAY_URL, urlencoding::encode(&callback_url));
+    // Open browser to the link page with callback + CSRF state
+    let link_url = format!(
+        "{}/auth/link?callback={}&state={}",
+        DEFAULT_RELAY_URL,
+        urlencoding::encode(&callback_url),
+        urlencoding::encode(&csrf_state),
+    );
     println!("  Opening browser for authentication...\n");
 
     if open::that(&link_url).is_err() {
@@ -82,17 +88,35 @@ async fn receive_token_via_callback() -> Result<Option<String>> {
         let n = stream.read(&mut buf).await?;
         let request = String::from_utf8_lossy(&buf[..n]);
 
-        // Parse token from GET /callback?token=usr_xxx
-        let token = request
+        // Parse token and state from GET /callback?token=usr_xxx&state=...
+        let parsed_url = request
             .lines()
             .next()
             .and_then(|line| line.split(' ').nth(1))
-            .and_then(|path| url::Url::parse(&format!("http://localhost{path}")).ok())
-            .and_then(|url| {
-                url.query_pairs()
-                    .find(|(k, _)| k == "token")
-                    .map(|(_, v)| v.to_string())
-            });
+            .and_then(|path| url::Url::parse(&format!("http://localhost{path}")).ok());
+
+        // Verify CSRF state parameter
+        let returned_state = parsed_url.as_ref().and_then(|url| {
+            url.query_pairs()
+                .find(|(k, _)| k == "state")
+                .map(|(_, v)| v.to_string())
+        });
+        if returned_state.as_deref() != Some(&csrf_state) {
+            // Send error page and reject
+            let html = "<html><body><h2>❌ Authentication failed</h2><p>Security check failed (state mismatch). Please try again.</p></body></html>";
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                html.len(), html
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            return Ok(None);
+        }
+
+        let token = parsed_url.and_then(|url| {
+            url.query_pairs()
+                .find(|(k, _)| k == "token")
+                .map(|(_, v)| v.to_string())
+        });
 
         // Send a response to close the browser tab
         let html = "<html><body><h2>✅ Authenticated!</h2><p>You can close this tab and return to the terminal.</p><script>window.close()</script></body></html>";
@@ -195,6 +219,9 @@ pub async fn run() -> Result<()> {
 
     let toml_str = toml::to_string_pretty(&config).context("Failed to serialize config")?;
     let path = remote_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("Failed to create ~/.linggen directory")?;
+    }
     std::fs::write(&path, &toml_str).context("Failed to write remote.toml")?;
 
     // Set file permissions to 0o600 (owner read/write only) on Unix
