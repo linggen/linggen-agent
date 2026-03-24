@@ -4,6 +4,7 @@ import { cn } from '../lib/cn';
 import { useUiStore } from '../stores/uiStore';
 import { useProjectStore } from '../stores/projectStore';
 import { useAgentStore } from '../stores/agentStore';
+import logoUrl from '/logo.svg?url';
 
 export const HeaderBar: React.FC<{
   copyChat: () => void;
@@ -33,7 +34,7 @@ export const HeaderBar: React.FC<{
             <Menu size={18} />
           </button>
         )}
-        <img src="/logo.svg" alt="Linggen" className="w-6 h-6 md:w-7 md:h-7" />
+        <img src={logoUrl} alt="Linggen" className="w-6 h-6 md:w-7 md:h-7" />
         <h1 className="text-sm md:text-base font-bold tracking-tight text-slate-900 dark:text-white"><span className="hidden md:inline">Linggen Agent</span><span className="md:hidden">Linggen</span></h1>
       </div>
 

@@ -56,6 +56,8 @@ export class RtcTransport implements Transport {
     timer: ReturnType<typeof setTimeout>;
   }>();
   private requestIdCounter = 0;
+  // In-progress gzip chunked transfers (keyed by request_id)
+  private gzipTransfers = new Map<string, { chunks: string[]; status: number; expectedChunks: number }>();
   // Sessions requested before connection was ready — replayed on connect
   private pendingSubscriptions = new Set<string>();
   // Abort controller for in-flight signaling (cancelled on cleanup/disconnect)
@@ -238,6 +240,38 @@ export class RtcTransport implements Transport {
       try {
         const msg = JSON.parse(event.data);
 
+        // Handle gzip chunked transfer (large responses like /api/skills)
+        if (msg.request_id && msg.gzip_start) {
+          this.gzipTransfers.set(msg.request_id, {
+            chunks: [],
+            status: msg.gzip_start.status || 200,
+            expectedChunks: msg.gzip_start.chunks || 0,
+          });
+          return;
+        }
+        if (msg.request_id && msg.gzip_chunk) {
+          const transfer = this.gzipTransfers.get(msg.request_id);
+          if (transfer) transfer.chunks.push(msg.gzip_chunk);
+          return;
+        }
+        if (msg.request_id && msg.gzip_end) {
+          const transfer = this.gzipTransfers.get(msg.request_id);
+          const pending = this.pendingRequests.get(msg.request_id);
+          this.gzipTransfers.delete(msg.request_id);
+          if (transfer && pending) {
+            this.pendingRequests.delete(msg.request_id);
+            // Decode base64 chunks → binary → decompress gzip
+            const binaryStr = transfer.chunks.map(c => atob(c)).join('');
+            const bytes = new Uint8Array(binaryStr.length);
+            for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+            new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip')))
+              .text()
+              .then(body => pending.resolve({ status: transfer.status, body }))
+              .catch(err => pending.reject(new Error(`Decompress failed: ${err.message}`)));
+          }
+          return;
+        }
+
         // Handle RPC responses synchronously (callers are awaiting)
         if (msg.request_id && this.pendingRequests.has(msg.request_id)) {
           const pending = this.pendingRequests.get(msg.request_id)!;
@@ -375,6 +409,7 @@ export class RtcTransport implements Transport {
       pending.reject(new Error('Transport disconnected'));
     }
     this.pendingRequests.clear();
+    this.gzipTransfers.clear();
 
     // Re-queue active sessions for replay after reconnect
     for (const [sid] of this.sessionChannels) {
