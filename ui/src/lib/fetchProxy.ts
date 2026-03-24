@@ -104,17 +104,17 @@ export function installFetchProxy(): void {
       }
     }
 
-    // In blob iframe (tunnel mode), relative URLs can't be resolved by the browser.
-    // Return safe empty responses that won't crash stores' .map() / .sessions etc.
-    if (shouldProxy && typeof url === 'string' && url.startsWith('/') && window.location.protocol === 'blob:') {
-      // Return structure that matches what each endpoint normally returns
-      const emptyBody = typeof url === 'string' && (
+    // In remote mode, API calls must go through WebRTC — not directly to linggen.dev.
+    // Before transport is connected, return safe empty responses to prevent crashes.
+    const isRemote = !!document.querySelector('meta[name="linggen-instance"]');
+    if (shouldProxy && isRemote && typeof url === 'string' && url.startsWith('/')) {
+      const emptyBody =
         url.includes('/sessions') ? '{"sessions":[]}' :
         url.includes('/projects') ? '[]' :
         url.includes('/skills') ? '[]' :
         url.includes('/models') ? '[]' :
         url.includes('/agents') ? '[]' :
-        '{}');
+        '{}';
       return Promise.resolve(new Response(emptyBody, { status: 200, headers: { 'Content-Type': 'application/json' } }));
     }
 
