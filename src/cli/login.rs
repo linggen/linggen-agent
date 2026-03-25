@@ -84,7 +84,7 @@ async fn receive_token_via_callback() -> Result<Option<String>> {
     // Wait for the browser to redirect back with the token (timeout 120s)
     let result = tokio::time::timeout(std::time::Duration::from_secs(120), async {
         let (mut stream, _) = listener.accept().await?;
-        let mut buf = vec![0u8; 4096];
+        let mut buf = vec![0u8; 8192];
         let n = stream.read(&mut buf).await?;
         let request = String::from_utf8_lossy(&buf[..n]);
 
@@ -158,7 +158,7 @@ fn read_token_manually() -> Result<String> {
 pub async fn run() -> Result<()> {
     println!("\n  🌐 Linggen Remote Login\n");
     println!("  This links your machine to your linggen.dev account");
-    println!("  for remote access via WebRTC.\n");
+    println!("  for remote access from any device.\n");
 
     // Try automated browser flow, fall back to manual paste
     let token = match receive_token_via_callback().await {
@@ -175,16 +175,10 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    // Step 3: Ask for instance name
-    let hostname = gethostname::gethostname()
+    // Use hostname as instance name
+    let instance_name = gethostname::gethostname()
         .to_string_lossy()
         .to_string();
-    print!("  Instance name [{}]: ", hostname);
-    io::stdout().flush()?;
-    let mut name = String::new();
-    io::stdin().read_line(&mut name)?;
-    let name = name.trim().to_string();
-    let instance_name = if name.is_empty() { hostname } else { name };
 
     // Step 4: Get or create instance ID
     let instance_id = get_or_create_instance_id()?;
@@ -245,6 +239,7 @@ pub async fn run_logout() -> Result<()> {
     if path.exists() {
         std::fs::remove_file(&path).context("Failed to remove remote.toml")?;
         println!("  Remote access configuration removed.");
+        println!("  Instance will appear offline after heartbeat expires.");
     } else {
         println!("  No remote configuration found.");
     }

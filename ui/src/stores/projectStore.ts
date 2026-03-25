@@ -343,11 +343,19 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       }),
     );
     // Batch all tree updates into a single set() to avoid cascading re-renders.
-    const trees: Record<string, any> = { ...get().agentTreesByProject };
+    const prev = get().agentTreesByProject;
+    const trees: Record<string, any> = { ...prev };
+    let changed = false;
     for (const entry of entries) {
-      if (entry) trees[entry[0]] = entry[1];
+      if (entry) {
+        const [root, tree] = entry;
+        if (JSON.stringify(prev[root]) !== JSON.stringify(tree)) {
+          trees[root] = tree;
+          changed = true;
+        }
+      }
     }
-    set({ agentTreesByProject: trees });
+    if (changed) set({ agentTreesByProject: trees });
   },
 
   fetchFiles: async (path = '') => {

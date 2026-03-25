@@ -169,12 +169,13 @@ async fn run_peer(
                         } else if let Some(session_id) = label.strip_prefix("sess-") {
                             session_channels.insert(session_id.to_string(), id);
                             channel_sessions.insert(id, session_id.to_string());
-                            // Flush any buffered events for this session
+                            // Flush buffered events through the write queue (not directly —
+                            // direct writes without poll_output() cause SCTP corruption).
                             if let Some((_created, buffered)) = pending_events.remove(session_id) {
                                 tracing::info!("Flushing {} buffered events for session {session_id}", buffered.len());
                                 for json in buffered {
-                                    if let Some(mut ch) = rtc.channel(id) {
-                                        let _ = ch.write(false, json.as_bytes());
+                                    if pending_dc_writes.len() < MAX_DC_WRITE_QUEUE {
+                                        pending_dc_writes.push_back((id, json));
                                     }
                                 }
                             }
@@ -278,11 +279,11 @@ async fn run_peer(
             result = events_rx.recv() => {
                 if let Ok(event) = result {
                     forward_event_to_channels(
-                        &mut rtc,
                         &event,
                         &session_channels,
                         control_channel_id,
                         &mut pending_events,
+                        &mut pending_dc_writes,
                         &state,
                     );
                 }
@@ -565,6 +566,15 @@ fn enqueue_response(
                 compressed.len() / 1024,
             );
 
+            // Check if there's enough room for the full gzip transfer (header + chunks + footer)
+            let needed = 2 + num_chunks;
+            if queue.len() + needed > MAX_DC_WRITE_QUEUE {
+                tracing::warn!("DC write queue too full for gzip response ({needed} entries needed), dropping {request_id}");
+                let err = serde_json::json!({ "request_id": request_id, "error": "Queue full" });
+                queue.push_back((cid, err.to_string()));
+                return;
+            }
+
             // Header
             let header = serde_json::json!({
                 "request_id": request_id,
@@ -612,11 +622,11 @@ fn get_local_ip() -> Option<std::net::IpAddr> {
 const MAX_PENDING_EVENTS: usize = 2000;
 
 fn forward_event_to_channels(
-    rtc: &mut Rtc,
     event: &crate::server::ServerEvent,
     session_channels: &HashMap<String, str0m::channel::ChannelId>,
     control_channel_id: Option<str0m::channel::ChannelId>,
     pending_events: &mut HashMap<String, (Instant, Vec<String>)>,
+    pending_dc_writes: &mut std::collections::VecDeque<(str0m::channel::ChannelId, String)>,
     state: &Arc<ServerState>,
 ) {
     // Prune expired pending event buffers (older than 60s)
@@ -634,21 +644,21 @@ fn forward_event_to_channels(
         Err(_) => return,
     };
 
-    // Route to session channel if available, buffer if channel not yet open
+    // Route to session channel if available, buffer if channel not yet open.
+    // All writes go through the pending_dc_writes queue — writing directly to
+    // str0m channels without a poll_output() in between causes SCTP corruption.
     match ui_msg.session_id.as_deref() {
         Some("global") | None => {
-            // Global events and events without session_id go to control channel
             if let Some(cid) = control_channel_id {
-                if let Some(mut ch) = rtc.channel(cid) {
-                    let _ = ch.write(false, json.as_bytes());
+                if pending_dc_writes.len() < MAX_DC_WRITE_QUEUE {
+                    pending_dc_writes.push_back((cid, json));
                 }
             }
         }
         Some(sid) => {
             if let Some(&cid) = session_channels.get(sid) {
-                // Channel is open — send directly
-                if let Some(mut ch) = rtc.channel(cid) {
-                    let _ = ch.write(false, json.as_bytes());
+                if pending_dc_writes.len() < MAX_DC_WRITE_QUEUE {
+                    pending_dc_writes.push_back((cid, json));
                 }
             } else {
                 // Channel not yet open — buffer the event

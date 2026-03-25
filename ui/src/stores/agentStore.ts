@@ -265,8 +265,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       url.searchParams.append('session_id', activeSessionId);
       const resp = await dedupFetch(url.toString());
       if (!resp.ok) return;
-      const data = await resp.json();
-      set({ agentRuns: Array.isArray(data) ? data : [] });
+      const raw = await resp.json();
+      const data = Array.isArray(raw) ? raw : [];
+      // Skip update if runs haven't changed (prevents re-render loops from SSE)
+      const prev = get().agentRuns;
+      if (data.length === prev.length && data.every((r: any, i: number) => r.run_id === prev[i]?.run_id && r.status === prev[i]?.status)) return;
+      set({ agentRuns: data });
     } catch (e) {
       console.error('Error fetching agent runs:', e);
     }

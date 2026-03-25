@@ -8,7 +8,6 @@ import { useProjectStore } from '../stores/projectStore';
 import { useAgentStore } from '../stores/agentStore';
 import { useChatStore } from '../stores/chatStore';
 import { useUiStore } from '../stores/uiStore';
-import { openAppInNewTab } from './appLauncher';
 import type { AgentStatusValue } from '../stores/agentStore';
 import {
   stripEmbeddedStructuredJson,
@@ -587,8 +586,14 @@ function handleToolProgress(item: UiEvent): void {
 function handleAppLaunched(item: UiEvent): void {
   const data = item.data || {};
   const url = data.url || '';
-  if (url) {
-    openAppInNewTab(url);
+  if (!url) return;
+  const isRemote = !!document.querySelector('meta[name="linggen-instance"]');
+  if (isRemote) {
+    const instanceId = document.querySelector('meta[name="linggen-instance"]')?.getAttribute('content') || '';
+    const relayOrigin = document.querySelector('meta[name="linggen-relay-origin"]')?.getAttribute('content') || '';
+    window.open(`${relayOrigin}/app/connect/${instanceId}?app=${encodeURIComponent(url)}`, '_blank');
+  } else {
+    window.open(url, '_blank');
   }
 }
 

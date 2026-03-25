@@ -10,7 +10,6 @@ import { MissionEditor } from './components/MissionPage';
 import { AgentSpecEditorModal } from './components/AgentSpecEditorModal';
 import { ToastContainer } from './components/ToastContainer';
 import { AppPanel } from './components/AppPanel';
-import { openAppInNewTab } from './lib/appLauncher';
 import { InfoPanel } from './components/InfoPanel';
 import {
   buildAgentWorkInfo,
@@ -290,7 +289,6 @@ const App: React.FC = () => {
       const { action, payload } = e.data;
       switch (action) {
         case 'send': {
-          // Send directly via the chat action — no DOM manipulation needed.
           sendChatMessageRef.current(payload?.text || '');
           break;
         }
@@ -342,7 +340,14 @@ const App: React.FC = () => {
   const handleClickSkill = useCallback((skill: any) => {
     if (skill.app) {
       if (skill.app.launcher === 'web') {
-        openAppInNewTab(`/apps/${skill.name}/${skill.app.entry}`);
+        const appUrl = `/apps/${skill.name}/${skill.app.entry}`;
+        if (isRemoteMode) {
+          const instanceId = document.querySelector('meta[name="linggen-instance"]')?.getAttribute('content') || '';
+          const relayOrigin = document.querySelector('meta[name="linggen-relay-origin"]')?.getAttribute('content') || '';
+          window.open(`${relayOrigin}/app/connect/${instanceId}?app=${encodeURIComponent(appUrl)}`, '_blank');
+        } else {
+          window.open(appUrl, '_blank');
+        }
       } else if (skill.app.launcher === 'url') {
         window.open(skill.app.entry, '_blank');
       } else {

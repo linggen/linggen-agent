@@ -78,7 +78,9 @@ interface ChatState {
 
 /** Compute display messages from raw messages. */
 function computeDisplay(messages: ChatMessage[]): ChatMessage[] {
-  const deduped = dedupPlanMessages(messages);
+  // Hide [BOARD_MOVE] messages — internal game state not meant for display
+  const visible = messages.filter(m => !(m.role === 'user' && m.text?.startsWith('[BOARD_MOVE]')));
+  const deduped = dedupPlanMessages(visible);
   const plans: ChatMessage[] = [];
   const nonPlans: ChatMessage[] = [];
   for (const msg of deduped) {
@@ -639,6 +641,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       const resp = await dedupFetch(url.toString());
       const data = await resp.json();
+      // Skip update if workspace state hasn't meaningfully changed (prevents re-render loops)
+      const prev = get().workspaceState;
+      const prevMsgCount = prev?.messages?.length ?? 0;
+      const newMsgCount = data?.messages?.length ?? 0;
+      const prevStatus = prev?.agent_status;
+      const newStatus = data?.agent_status;
+      if (prevMsgCount === newMsgCount && prevStatus === newStatus && prev?.plan_status === data?.plan_status) return;
       set({ workspaceState: data });
 
       const state = get();

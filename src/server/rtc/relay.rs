@@ -12,9 +12,6 @@ use tracing::{info, warn, debug};
 use crate::cli::login::{load_remote_config, RemoteConfig};
 use crate::server::ServerState;
 
-/// Maximum concurrent remote peer connections.
-const MAX_REMOTE_PEERS: usize = 4;
-
 fn build_relay_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -36,8 +33,6 @@ pub fn spawn_relay_tasks(state: Arc<ServerState>) {
         config.instance_name, config.instance_id
     );
 
-    let peer_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_REMOTE_PEERS));
-
     // Spawn heartbeat loop
     let hb_config = config.clone();
     tokio::spawn(async move {
@@ -47,7 +42,7 @@ pub fn spawn_relay_tasks(state: Arc<ServerState>) {
     // Spawn offer polling loop
     let poll_config = config.clone();
     tokio::spawn(async move {
-        offer_poll_loop(&poll_config, state, peer_semaphore).await;
+        offer_poll_loop(&poll_config, state).await;
     });
 }
 
@@ -82,7 +77,7 @@ async fn heartbeat_loop(config: &RemoteConfig) {
 }
 
 /// Poll for incoming SDP offers and create peer connections.
-async fn offer_poll_loop(config: &RemoteConfig, state: Arc<ServerState>, peer_sem: Arc<tokio::sync::Semaphore>) {
+async fn offer_poll_loop(config: &RemoteConfig, state: Arc<ServerState>) {
     let client = build_relay_client();
     let url = format!(
         "{}/api/signaling/{}/offer",
@@ -109,21 +104,11 @@ async fn offer_poll_loop(config: &RemoteConfig, state: Arc<ServerState>, peer_se
 
                         if !nonce.is_empty() && !sdp.is_empty() {
                             info!("Received remote offer (nonce: {nonce})");
-                            // Acquire semaphore permit to cap concurrent peers.
-                            let permit = match peer_sem.clone().try_acquire_owned() {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    warn!("Max remote peers ({MAX_REMOTE_PEERS}) reached, dropping offer");
-                                    tokio::time::sleep(Duration::from_secs(2)).await;
-                                    continue;
-                                }
-                            };
                             let cfg = config.clone();
                             let st = state.clone();
                             let cl = client.clone();
                             tokio::spawn(async move {
                                 handle_remote_offer(&cfg, &st, &cl, &nonce, &sdp).await;
-                                drop(permit); // release on peer task exit
                             });
                         }
                     }
@@ -140,11 +125,13 @@ async fn offer_poll_loop(config: &RemoteConfig, state: Arc<ServerState>, peer_se
                 warn!("Offer poll failed: {} (backoff {:?})", resp.status(), error_backoff);
                 tokio::time::sleep(error_backoff).await;
                 error_backoff = (error_backoff * 2).min(Duration::from_secs(120));
+                continue; // skip the normal 2s poll delay
             }
             Err(e) => {
                 warn!("Offer poll error: {} (backoff {:?})", e, error_backoff);
                 tokio::time::sleep(error_backoff).await;
                 error_backoff = (error_backoff * 2).min(Duration::from_secs(120));
+                continue; // skip the normal 2s poll delay
             }
         }
 
