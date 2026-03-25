@@ -213,13 +213,14 @@ export function useChatActions(
     }
 
     try {
-      const { isMissionSession, activeMissionId } = useProjectStore.getState();
+      const { isMissionSession, activeMissionId, isSkillSession, activeSkillName } = useProjectStore.getState();
       const data = await getTransport().sendChat({
         project_root: root,
         agent_id: agentToUse,
         message: userMessage,
         session_id: sid,
         ...(isMissionSession && activeMissionId ? { mission_id: activeMissionId } : {}),
+        ...(isSkillSession && activeSkillName ? { skill_name: activeSkillName } : {}),
         ...(useUiStore.getState().sessionModel ? { model_id: useUiStore.getState().sessionModel } : {}),
         ...(images && images.length > 0 ? { images } : {}),
       }) as any;

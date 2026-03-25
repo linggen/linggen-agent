@@ -31,6 +31,7 @@ const isCompact = compactParams.get('mode') === 'compact';
 const isMobileParam = compactParams.get('mode') === 'mobile';
 const compactProject = compactParams.get('project') || '';
 const compactSession = compactParams.get('session') || '';
+const compactSkill = compactParams.get('skill') || '';
 const compactHideToolbar = compactParams.get('hide_toolbar') === '1';
 
 /** Detect mobile viewport (< 768px) or explicit ?mode=mobile. */
@@ -220,7 +221,11 @@ const App: React.FC = () => {
     // Clear selectedProjectRoot in memory (not localStorage) so API calls
     // don't inherit the main page's project — the backend will use cwd.
     if (compactSession) {
-      useProjectStore.setState({ activeSessionId: compactSession, selectedProjectRoot: '' });
+      useProjectStore.setState({
+        activeSessionId: compactSession,
+        selectedProjectRoot: '',
+        ...(compactSkill ? { isSkillSession: true, activeSkillName: compactSkill } : {}),
+      });
       return;
     }
 
