@@ -195,7 +195,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 
         if (next && data.some((sess) => sess.id === next)) {
           // Current session still valid — keep it
-        } else if (next && (isMissionSession || s.isSkillSession)) {
+        } else if (next && (s.isMissionSession || s.isSkillSession)) {
           // Mission/skill session — keep even if not in the regular sessions list
         } else {
           // Try restoring from localStorage
@@ -231,7 +231,23 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       const resp = await dedupFetch('/api/sessions/all');
       const raw = await resp.json();
       const data: SessionInfo[] = raw.sessions ?? [];
-      set({ allSessions: data });
+      set((s) => {
+        const patch: Partial<ProjectState> = { allSessions: data };
+        // Auto-select first session on initial load if none is active
+        if (!s.activeSessionId && data.length > 0) {
+          const first = data[0];
+          patch.activeSessionId = first.id;
+          const isMission = first.creator === 'mission';
+          const isSkill = first.creator === 'skill' || (!first.project && first.skill);
+          patch.isMissionSession = isMission;
+          patch.isSkillSession = !!isSkill;
+          patch.activeMissionId = isMission && first.mission_id ? first.mission_id : null;
+          patch.activeSkillName = isSkill && first.skill ? first.skill : null;
+          if (first.project) patch.selectedProjectRoot = first.project;
+          window.localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, first.id);
+        }
+        return patch;
+      });
     } catch (e) {
       console.error('Failed to fetch all sessions:', e);
     }
