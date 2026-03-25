@@ -166,7 +166,8 @@ const App: React.FC = () => {
 
   // --- React to session changes ---
   useEffect(() => {
-    if (selectedProjectRoot || isMissionSession) {
+    const { isSkillSession } = projectStore;
+    if (selectedProjectRoot || isMissionSession || isSkillSession) {
       const prev = prevSessionIdRef.current;
       prevSessionIdRef.current = activeSessionId;
       const isSessionAdoption = prev === null && activeSessionId !== null;

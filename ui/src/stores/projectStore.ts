@@ -195,8 +195,8 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 
         if (next && data.some((sess) => sess.id === next)) {
           // Current session still valid — keep it
-        } else if (next && isMissionSession) {
-          // Mission session — keep even if not in the regular sessions list
+        } else if (next && (isMissionSession || s.isSkillSession)) {
+          // Mission/skill session — keep even if not in the regular sessions list
         } else {
           // Try restoring from localStorage
           const persisted = typeof window !== 'undefined'
