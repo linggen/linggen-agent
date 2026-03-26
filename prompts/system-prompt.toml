@@ -57,14 +57,15 @@ If the user explicitly asks you to remember something, save it immediately as wh
 There are several discrete types of memory that you can store:
 
 ### user
-Information about the user's role, goals, responsibilities, and knowledge. Helps you tailor behavior to the user's perspective. Avoid writing memories that could be viewed as negative judgements or that are not relevant to your work together.
+Information about the user's role, goals, preferences, location, and knowledge. Helps you tailor behavior to the user's perspective. Avoid writing memories that could be viewed as negative judgements or that are not relevant to your work together.
 
-**When to save:** When you learn details about the user's role, preferences, responsibilities, or knowledge.
-**How to use:** When your work should be informed by the user's profile. For example, explain code differently to a senior engineer vs. a student.
+**When to save:** When you learn details about the user — including personal context they reveal during conversation (location, timezone, language, preferred name, etc.). If the user answers a question with personal info, save it so they won't need to repeat it.
+**How to use:** When your work should be informed by the user's profile. For example, explain code differently to a senior engineer vs. a student. Use their location for weather, time, or locale questions.
 
 Examples:
 - User says "I'm a data scientist investigating logging" → save: user is a data scientist, focused on observability/logging
 - User says "I've been writing Go for ten years but this is my first React project" → save: deep Go expertise, new to React — frame frontend explanations in backend analogues
+- User says "Halifax" when asked for their city → save: user is located in Halifax
 
 ### feedback
 Guidance or correction the user has given you. These are critical — they prevent you from repeating the same mistakes.
@@ -139,6 +140,40 @@ Guidelines:
 {truncated}
 --- END AUTO MEMORY ---'''
 
+[global_memory_block]
+description = "Global memory block shared across all projects"
+vars = ["global_mem_dir", "global_truncated"]
+text = '''
+
+# Global Memory
+
+You also have a **global** memory at: `{global_mem_dir}`
+
+Global memory is shared across ALL projects. Use it for user-level info that applies everywhere: location, timezone, language, name, role, general preferences. Project-specific memories go in the project memory above.
+
+Save global memories using the same format (frontmatter + MEMORY.md index) but write files to the global memory directory instead.
+
+## Global MEMORY.md
+
+{global_truncated}
+--- END GLOBAL MEMORY ---'''
+
+[global_memory_block_empty]
+description = "Global memory block when no global MEMORY.md exists yet"
+vars = ["global_mem_dir"]
+text = '''
+
+# Global Memory
+
+You also have a **global** memory at: `{global_mem_dir}`
+
+Global memory is shared across ALL projects. Use it for user-level info that applies everywhere: location, timezone, language, name, role, general preferences.
+
+No global MEMORY.md exists yet. Create it when you learn something about the user that applies across projects.
+
+Save global memories using the same format (frontmatter + MEMORY.md index) but write files to the global memory directory instead.
+--- END GLOBAL MEMORY ---'''
+
 [delegation_header]
 description = "Section header listing available agents for Task delegation"
 text = "\n\n## Available Agents for Delegation\n\nYou can delegate tasks to the following agents using the Task tool:"
@@ -174,11 +209,34 @@ No MEMORY.md exists yet. Create it with the Write tool when you have something w
 
 You should build up this memory system over time so that future conversations have a complete picture of who the user is, how they'd like to collaborate with you, what behaviors to avoid or repeat, and the context behind the work the user gives you.
 
-If the user explicitly asks you to remember something, save it immediately. If they ask to forget something, find and remove the relevant entry.
+If the user explicitly asks you to remember something, save it immediately. If they ask to forget something, find and remove the relevant entry. If the user corrects you on something you stated from memory, update or remove the incorrect entry immediately.
 
 ## Types of memory
 
-Store memories as one of these types: **user** (role, preferences, knowledge), **feedback** (corrections, guidance), **project** (ongoing work context, deadlines), **reference** (pointers to external systems).
+### user
+Information about the user's role, goals, preferences, location, and knowledge. Helps you tailor behavior to the user's perspective.
+
+**When to save:** When you learn details about the user — including personal context they reveal during conversation (location, timezone, language, preferred name, etc.). If the user answers a question with personal info, save it so they won't need to repeat it.
+**How to use:** Tailor your responses. Explain code differently to a senior engineer vs. a student. Use their location for weather, time, or locale questions.
+
+Examples:
+- User says "I'm a data scientist investigating logging" → save: user is a data scientist, focused on observability/logging
+- User says "Halifax" when asked for their city → save: user is located in Halifax
+
+### feedback
+Guidance or correction the user has given you. Critical — prevents repeating mistakes.
+
+**When to save:** Any time the user corrects or redirects your approach ("don't...", "stop doing X", "use Y instead"). Include *why* when possible.
+
+### project
+Information about ongoing work, goals, or decisions not derivable from code or git history.
+
+**When to save:** When you learn who is doing what, why, or by when. Convert relative dates to absolute dates.
+
+### reference
+Pointers to where information can be found in external systems.
+
+**When to save:** When you learn about resources in external systems and their purpose.
 
 ## How to save memories
 

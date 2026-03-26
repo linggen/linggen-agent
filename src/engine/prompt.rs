@@ -201,7 +201,7 @@ impl AgentEngine {
             }
         }
 
-        // --- Auto Memory ---
+        // --- Auto Memory (project-scoped) ---
         if let Some(memory_dir) = self.tools.memory_dir() {
             let memory_path = memory_dir.join("MEMORY.md");
             let mem_dir_display = memory_dir.display().to_string();
@@ -222,6 +222,32 @@ impl AgentEngine {
                 stable.push_str(&self.prompt_store.render_or_fallback(
                     keys::SYSTEM_MEMORY_BLOCK_EMPTY,
                     &[("mem_dir", &mem_dir_display)],
+                ));
+            }
+        }
+
+        // --- Global Memory (shared across all projects) ---
+        {
+            let global_mem_dir = crate::paths::global_memory_dir();
+            let global_mem_path = global_mem_dir.join("MEMORY.md");
+            let global_dir_display = global_mem_dir.display().to_string();
+            let mut global_appended = false;
+            if let Ok(content) = std::fs::read_to_string(&global_mem_path) {
+                let content = content.trim();
+                if !content.is_empty() {
+                    let truncated: String =
+                        content.lines().take(200).collect::<Vec<_>>().join("\n");
+                    stable.push_str(&self.prompt_store.render_or_fallback(
+                        keys::GLOBAL_MEMORY_BLOCK,
+                        &[("global_mem_dir", &global_dir_display), ("global_truncated", &truncated)],
+                    ));
+                    global_appended = true;
+                }
+            }
+            if !global_appended {
+                stable.push_str(&self.prompt_store.render_or_fallback(
+                    keys::GLOBAL_MEMORY_BLOCK_EMPTY,
+                    &[("global_mem_dir", &global_dir_display)],
                 ));
             }
         }
@@ -467,6 +493,12 @@ impl AgentEngine {
                     .collect::<HashSet<String>>();
                 // Skill tool is always allowed so the model can discover/invoke skills.
                 allowed.insert("Skill".to_string());
+                // Read/Write are always allowed when memory is enabled,
+                // so the model can save user info to memory during any skill.
+                if self.tools.memory_dir().is_some() {
+                    allowed.insert("Read".to_string());
+                    allowed.insert("Write".to_string());
+                }
                 return Some(allowed);
             }
         }

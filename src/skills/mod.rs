@@ -2,7 +2,7 @@ pub mod marketplace;
 
 use crate::engine::skill_tool::SkillToolDef;
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -199,6 +199,25 @@ pub enum SkillSource {
     Compat { label: String },
 }
 
+/// Deserialize `allowed-tools` as either a single string ("Bash") or a list (["Bash", "Read"]).
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        Str(String),
+        Vec(Vec<String>),
+    }
+    let opt: Option<StringOrVec> = Option::deserialize(deserializer)?;
+    Ok(match opt {
+        Some(StringOrVec::Str(s)) => Some(s.split(',').map(|s| s.trim().to_string()).collect()),
+        Some(StringOrVec::Vec(v)) => Some(v),
+        None => None,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct SkillFrontmatter {
     name: String,
@@ -211,7 +230,7 @@ struct SkillFrontmatter {
     disable_model_invocation: bool,
     #[serde(default = "default_user_invocable", rename = "user-invocable")]
     user_invocable: bool,
-    #[serde(default, rename = "allowed-tools")]
+    #[serde(default, rename = "allowed-tools", deserialize_with = "deserialize_string_or_vec")]
     allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     model: Option<String>,

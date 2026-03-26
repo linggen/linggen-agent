@@ -175,8 +175,14 @@ async fn update_binary(
     }
 
     match current_version {
-        Some(cv) => println!("[{}] Updated v{} -> v{}", binary_name, cv, manifest.version),
-        None => println!("[{}] Installed v{} at {}", binary_name, manifest.version, target_path.display()),
+        Some(cv) => {
+            println!("[{}] Updated v{} -> v{}", binary_name, cv, manifest.version);
+            println!("\n  Tip: run `ling init` to update agents and skills to match the new version.");
+        }
+        None => {
+            println!("[{}] Installed v{} at {}", binary_name, manifest.version, target_path.display());
+            println!("\n  Tip: run `ling init` to set up agents, skills, and default config.");
+        }
     }
 
     Ok(())

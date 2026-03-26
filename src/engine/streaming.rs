@@ -118,6 +118,10 @@ pub(crate) fn check_context_staleness(
             content.hash(&mut hasher);
         }
     }
+    // Also check global memory
+    if let Ok(content) = std::fs::read_to_string(crate::paths::global_memory_dir().join("MEMORY.md")) {
+        content.hash(&mut hasher);
+    }
     hasher.finish() != prev_hash
 }
 

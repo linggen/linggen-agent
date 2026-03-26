@@ -73,3 +73,8 @@ pub fn projects_dir() -> PathBuf {
     linggen_home().join("projects")
 }
 
+/// `~/.linggen/memory/` — global memory shared across all projects
+pub fn global_memory_dir() -> PathBuf {
+    linggen_home().join("memory")
+}
+

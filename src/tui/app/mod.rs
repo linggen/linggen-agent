@@ -189,6 +189,10 @@ impl App {
                 "  ──────────────────────────────────────────",
                 sep,
             )),
+            Line::from(Span::styled(
+                "  Tip: run `ling --web` for web UI only (no TUI)",
+                dim,
+            )),
             Line::from(""),
         ];
 

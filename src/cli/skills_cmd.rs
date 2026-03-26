@@ -3,6 +3,18 @@ use crate::skills::marketplace::{self, SkillScope};
 use anyhow::Result;
 use std::path::PathBuf;
 
+/// Notify the running server to reload skills (best-effort, no error if server isn't running).
+async fn notify_reload(config: &Config) {
+    let port = config.server.port;
+    let url = format!("http://localhost:{}/api/skills/reload", port);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build();
+    if let Ok(client) = client {
+        let _ = client.post(&url).send().await;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum SkillsAction {
     Add {
@@ -23,7 +35,7 @@ pub enum SkillsAction {
     },
 }
 
-pub async fn run(action: SkillsAction, _config: &Config) -> Result<()> {
+pub async fn run(action: SkillsAction, config: &Config) -> Result<()> {
     match action {
         SkillsAction::Add {
             name,
@@ -56,6 +68,7 @@ pub async fn run(action: SkillsAction, _config: &Config) -> Result<()> {
             )
             .await?;
             println!("{}", msg);
+            notify_reload(config).await;
         }
         SkillsAction::Remove { name, global } => {
             let scope = if global {
@@ -73,6 +86,7 @@ pub async fn run(action: SkillsAction, _config: &Config) -> Result<()> {
 
             let msg = marketplace::delete_skill(&name, &target_dir)?;
             println!("{}", msg);
+            notify_reload(config).await;
         }
         SkillsAction::List => {
             println!("Installed skills:\n");

@@ -6,6 +6,7 @@ use std::time::Duration;
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const CYAN: &str = "\x1b[36m";
+const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
 fn ok(label: &str, detail: &str) {
@@ -21,48 +22,94 @@ fn info(label: &str, detail: &str) {
 }
 
 pub async fn run(config: &Config, config_path: Option<&Path>) -> Result<()> {
-    println!("ling doctor\n");
+    println!("ling status\n");
 
-    // 1. Binary version
-    let version = env!("CARGO_PKG_VERSION");
-    ok("Version", version);
+    // 1. Version + update check
+    let current = env!("CARGO_PKG_VERSION");
+    let latest = fetch_latest_version().await;
+    match &latest {
+        Some(v) if v != current => {
+            println!(
+                "  Version:     v{current}  {DIM}(latest: v{v} — run `ling update`){RESET}"
+            );
+        }
+        Some(_) => {
+            println!("  Version:     v{current}  {DIM}(up to date){RESET}");
+        }
+        None => {
+            println!("  Version:     v{current}");
+        }
+    }
 
-    // 2. Config file
+    // 2. Config
     match config_path {
-        Some(p) => ok("Config", &p.display().to_string()),
-        None => info("Config", "(default)"),
+        Some(p) => println!("  Config:      {}", p.display()),
+        None => println!("  Config:      (default)"),
     }
 
     // 3. Workspace
     match crate::workspace::resolve_workspace_root(None) {
-        Ok(ws) => ok("Workspace", &ws.display().to_string()),
-        Err(_) => info("Workspace", "none"),
+        Ok(ws) => println!("  Workspace:   {}", ws.display()),
+        Err(_) => println!("  Workspace:   none"),
     }
 
-    // 4. Agent server port
+    // 4. Agent server
     let port = config.server.port;
-    match check_tcp_port(port).await {
-        true => ok("Agent server", &format!("port {} is listening", port)),
-        false => info("Agent server", &format!("port {} not reachable", port)),
-    }
+    let listening = is_port_listening(port).await;
+    let pid = std::fs::read_to_string(crate::paths::linggen_home().join("ling.pid"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    print_server_status(port, listening, pid);
 
-    // 5. Models
+    // 5. Logs
+    check_log_dir(config);
+
+    // 6. Models
+    println!();
     check_models(config).await;
 
-    // 7. Skills dirs
+    // 7. Skills
+    println!();
     check_skills_dirs();
 
-    // 8. Agents dir
+    // 8. Agents
+    println!();
     check_agents_dir();
-
-    // 9. Log directory
-    check_log_dir(config);
 
     println!();
     Ok(())
 }
 
-async fn check_tcp_port(port: u16) -> bool {
+fn print_server_status(port: u16, listening: bool, pid: Option<u32>) {
+    let (icon, detail) = match (listening, pid) {
+        (true, Some(pid)) => ("\u{2705}", format!("port {} running (PID {})", port, pid)),
+        (true, None) => ("\u{2705}", format!("port {} running", port)),
+        (false, Some(pid)) => {
+            if is_process_running(pid) {
+                (
+                    "\u{274c}",
+                    format!("port {} process alive (PID {}) but port not listening", port, pid),
+                )
+            } else {
+                ("\u{274c}", format!("port {} not running (stale PID)", port))
+            }
+        }
+        (false, None) => ("\u{274c}", format!("port {} not running", port)),
+    };
+    println!("  Agent:       {} {}", icon, detail);
+}
+
+fn is_process_running(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+async fn is_port_listening(port: u16) -> bool {
     tokio::time::timeout(
         Duration::from_secs(1),
         tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)),
@@ -72,11 +119,40 @@ async fn check_tcp_port(port: u16) -> bool {
     .unwrap_or(false)
 }
 
+async fn fetch_latest_version() -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Manifest {
+        version: String,
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("linggen")
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok()?;
+
+    let resp = client
+        .get("https://github.com/linggen/linggen/releases/latest/download/manifest.json")
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let manifest: Manifest = resp.json().await.ok()?;
+    Some(manifest.version)
+}
+
 async fn check_models(config: &Config) {
     if config.models.is_empty() {
-        info("Models", "none configured");
+        println!("  Models (0):");
+        info("  none configured", "");
         return;
     }
+
+    println!("  Models ({}):", config.models.len());
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -84,7 +160,7 @@ async fn check_models(config: &Config) {
     {
         Ok(c) => c,
         Err(_) => {
-            fail("Models", "failed to build HTTP client");
+            fail("  HTTP client", "failed to build");
             return;
         }
     };
@@ -123,12 +199,13 @@ async fn check_models(config: &Config) {
 }
 
 fn check_skills_dirs() {
-    let dirs_to_check: Vec<(PathBuf, &str)> = vec![
+    println!("  Skills:");
+    let dirs: Vec<(PathBuf, &str)> = vec![
         (crate::paths::global_skills_dir(), "global"),
         (PathBuf::from(".linggen/skills"), "project"),
     ];
 
-    for (dir, scope) in dirs_to_check {
+    for (dir, scope) in dirs {
         if dir.exists() {
             let count = std::fs::read_dir(&dir)
                 .map(|entries| entries.filter_map(|e| e.ok()).count())
@@ -147,6 +224,7 @@ fn check_skills_dirs() {
 }
 
 fn check_agents_dir() {
+    println!("  Agents:");
     let count_md = |dir: &Path| -> usize {
         if !dir.exists() {
             return 0;
@@ -155,17 +233,12 @@ fn check_agents_dir() {
             .map(|entries| {
                 entries
                     .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path()
-                            .extension()
-                            .map_or(false, |ext| ext == "md")
-                    })
+                    .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
                     .count()
             })
             .unwrap_or(0)
     };
 
-    // Global agents
     let global_dir = crate::paths::global_agents_dir();
     if global_dir.exists() {
         let count = count_md(&global_dir);
@@ -180,7 +253,6 @@ fn check_agents_dir() {
         );
     }
 
-    // Project agents
     let project_dir = PathBuf::from("agents");
     if project_dir.exists() {
         let count = count_md(&project_dir);
@@ -200,17 +272,16 @@ fn check_log_dir(config: &Config) {
 
     match log_dir {
         Some(dir) if dir.exists() => {
-            // Check writable by trying to create a temp file
             let test_path = dir.join(".doctor-check");
             match std::fs::write(&test_path, "") {
                 Ok(_) => {
                     let _ = std::fs::remove_file(&test_path);
-                    ok("Logs", &dir.display().to_string());
+                    println!("  Logs:        {}", dir.display());
                 }
-                Err(_) => fail("Logs", &format!("{} (not writable)", dir.display())),
+                Err(_) => println!("  Logs:        {} {RED}(not writable){RESET}", dir.display()),
             }
         }
-        Some(dir) => info("Logs", &format!("{} (not found)", dir.display())),
-        None => info("Logs", "could not determine log directory"),
+        Some(dir) => println!("  Logs:        {} {CYAN}(not found){RESET}", dir.display()),
+        None => println!("  Logs:        {CYAN}(unknown){RESET}"),
     }
 }

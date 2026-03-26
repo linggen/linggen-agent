@@ -58,9 +58,10 @@ struct Cli {
 enum Command {
     /// Stop background daemon
     Stop,
-    /// Show agent server status
+    /// Show status and diagnose installation health
     Status,
-    /// Diagnose installation health
+    /// Alias for status
+    #[command(hide = true)]
     Doctor,
     /// Run eval tasks against the agent
     Eval {
@@ -177,13 +178,13 @@ async fn main() -> Result<()> {
     // Lightweight subcommands — no tracing/AgentManager needed.
     match &cli.cmd {
         Some(Command::Doctor) => {
-            return cli::doctor::run(&config, config_path.as_deref()).await;
+            return cli::status::run(&config, config_path.as_deref()).await;
         }
         Some(Command::Stop) => {
             return cli::daemon::stop_agent().await;
         }
         Some(Command::Status) => {
-            return cli::daemon::status(&config, config_path.as_deref()).await;
+            return cli::status::run(&config, config_path.as_deref()).await;
         }
         Some(Command::Init) => {
             return cli::init::run(true, None).await;

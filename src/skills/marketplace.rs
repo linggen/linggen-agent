@@ -180,6 +180,9 @@ pub async fn search_community(query: &str) -> Result<Vec<MarketplaceSkill>> {
         }
     }
 
+    // Sort by install count (most popular first)
+    results.sort_by(|a, b| b.install_count.cmp(&a.install_count));
+
     Ok(results)
 }
 

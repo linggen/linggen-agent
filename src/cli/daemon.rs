@@ -81,22 +81,6 @@ async fn stop_process_by_pid_file(pid_path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn print_port_status(label: &str, port: u16, listening: bool, pid: Option<u32>) {
-    print!("  {:<12} port {}", format!("{}:", label), port);
-    match (listening, pid) {
-        (true, Some(pid)) => println!("  running (PID {})", pid),
-        (true, None) => println!("  running"),
-        (false, Some(pid)) => {
-            if is_process_running(pid) {
-                println!("  process alive (PID {}) but port not listening", pid);
-            } else {
-                println!("  not running (stale PID)");
-            }
-        }
-        (false, None) => println!("  not running"),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Agent daemon
 // ---------------------------------------------------------------------------
@@ -169,59 +153,3 @@ pub async fn stop_agent() -> Result<()> {
     stop_process_by_pid_file(&agent_pid_file(), "Agent server").await
 }
 
-// ---------------------------------------------------------------------------
-// Status
-// ---------------------------------------------------------------------------
-
-pub async fn status(config: &Config, config_path: Option<&Path>) -> Result<()> {
-    println!("ling status\n");
-
-    // Version
-    println!("  Version:     v{}", env!("CARGO_PKG_VERSION"));
-
-    // Config
-    match config_path {
-        Some(p) => println!("  Config:      {}", p.display()),
-        None => println!("  Config:      (default)"),
-    }
-
-    // Agent server
-    let port = config.server.port;
-    let listening = is_port_listening(port).await;
-    let pid = fs::read_to_string(agent_pid_file())
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok());
-    print_port_status("Agent", port, listening, pid);
-
-    // Workspace
-    match crate::workspace::resolve_workspace_root(None) {
-        Ok(ws) => println!("  Workspace:   {}", ws.display()),
-        Err(_) => println!("  Workspace:   none"),
-    }
-
-    // Models and agents counts
-    println!("  Models:      {}", config.models.len());
-
-    // Count agents from both global and project directories (dedup by filename stem)
-    let mut agent_ids = std::collections::HashSet::new();
-    let count_md = |dir: &Path, seen: &mut std::collections::HashSet<String>| {
-        if dir.exists() {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for e in entries.filter_map(|e| e.ok()) {
-                    let p = e.path();
-                    if p.extension().map_or(false, |ext| ext == "md") {
-                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                            seen.insert(stem.to_lowercase());
-                        }
-                    }
-                }
-            }
-        }
-    };
-    count_md(&crate::paths::global_agents_dir(), &mut agent_ids);
-    count_md(&PathBuf::from("agents"), &mut agent_ids);
-    println!("  Agents:      {}", agent_ids.len());
-
-    println!();
-    Ok(())
-}
