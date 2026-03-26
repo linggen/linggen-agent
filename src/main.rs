@@ -110,12 +110,8 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum AuthAction {
-    /// Login with ChatGPT (opens browser)
-    Login {
-        /// Use device code flow instead of browser
-        #[arg(long, default_value_t = false)]
-        device: bool,
-    },
+    /// Login with ChatGPT (auto-detects browser availability)
+    Login,
     /// Logout (clear stored tokens)
     Logout,
     /// Show authentication status
@@ -206,12 +202,8 @@ async fn main() -> Result<()> {
         }
         Some(Command::Auth { action }) => {
             match action {
-                AuthAction::Login { device } => {
-                    if *device {
-                        codex_auth::device_code_login().await?;
-                    } else {
-                        codex_auth::browser_login().await?;
-                    }
+                AuthAction::Login => {
+                    codex_auth::browser_login().await?;
                     println!("ChatGPT OAuth login successful.");
                 }
                 AuthAction::Logout => {

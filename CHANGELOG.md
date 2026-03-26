@@ -1,14 +1,16 @@
 # Changelog
 
-## v0.8.0 (2026-03-24)
+## v0.8.0 (2026-03-25)
 
-WebRTC remote access, mobile UI, and infrastructure improvements.
+Remote access, mobile UI, Google login, and infrastructure improvements.
 
 ### Added
 
-- **Remote access via WebRTC** — access your linggen from any device. Run `ling login` to link to your linggen.dev account, then connect from any browser at `linggen.dev/app`. Peer-to-peer data channels carry all chat and API traffic — no VPN or port forwarding needed.
-- **`ling login` / `ling logout` / `ling status`** — CLI commands for managing remote access. Browser-based OAuth flow with automatic token exchange; fallback to manual paste.
-- **Signaling relay** — lightweight relay on linggen.dev handles WebRTC connection setup. Nonce-based offer/answer exchange via stateless HTTP.
+- **Remote access** — access your linggen from any device. Run `ling login` to link to your linggen.dev account, then connect from any browser at `linggen.dev/app`. Peer-to-peer connection — no VPN or port forwarding needed.
+- **`ling login` / `ling logout` / `ling status`** — CLI commands for managing remote access. Fully automatic browser-based OAuth flow with token exchange; no manual steps needed.
+- **`ling auth login`** — ChatGPT subscription auth. Auto-detects headless/SSH environments and falls back to device code flow (removed `--device` flag).
+- **Google login** — sign in to linggen.dev with Google or GitHub. Email-based account matching across providers.
+- **Signaling relay** — lightweight relay on linggen.dev handles connection setup. Nonce-based offer/answer exchange via stateless HTTP.
 - **Mobile UI** — responsive layout auto-detected on narrow viewports (or via `?mode=mobile`). Full-bleed chat, larger touch targets, iOS safe area support. Right-side drawer for models and skills.
 - **Gzip chunked transfer** — large responses (skill files, API data) are gzip-compressed and sent as base64 chunks over data channels. Handles SCTP backpressure correctly.
 - **Skills open in-app** — web launcher skills now open in an in-page iframe panel instead of a new browser tab. Works in both local and remote mode.
@@ -16,6 +18,7 @@ WebRTC remote access, mobile UI, and infrastructure improvements.
 
 ### Changed
 
+- **`ling login` non-interactive** — uses hostname automatically, no instance name prompt.
 - **Heartbeat interval** — increased from 30s to 5 minutes to reduce relay load. Online threshold set to 10 minutes.
 - **Online status via D1** — instance online/offline status is now determined by `updated_at` timestamp in D1 database instead of KV TTL keys. Eliminates KV write quota consumption from heartbeats.
 - **JWT sessions** — linggen.dev authentication switched from KV-stored sessions to signed JWT cookies (HMAC-SHA256). Eliminates KV reads on every authenticated request.

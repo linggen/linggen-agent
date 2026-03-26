@@ -265,6 +265,26 @@ pub async fn refresh_tokens(
 }
 
 // ---------------------------------------------------------------------------
+// Browser detection
+// ---------------------------------------------------------------------------
+
+/// Detect whether the current environment can open a browser.
+/// Returns `false` for SSH sessions, missing displays, and non-interactive shells.
+fn can_open_browser() -> bool {
+    // SSH session — no local browser
+    if std::env::var("SSH_CONNECTION").is_ok() || std::env::var("SSH_TTY").is_ok() {
+        return false;
+    }
+    // Linux without a display server
+    #[cfg(target_os = "linux")]
+    if std::env::var("DISPLAY").is_err() && std::env::var("WAYLAND_DISPLAY").is_err() {
+        return false;
+    }
+    // macOS and Windows always have a way to open a browser if we're not in SSH
+    true
+}
+
+// ---------------------------------------------------------------------------
 // Browser-based OAuth flow (Authorization Code + PKCE)
 // ---------------------------------------------------------------------------
 
@@ -334,8 +354,15 @@ pub async fn browser_login() -> Result<CodexAuthTokens> {
             .ok();
     });
 
-    // Open browser
+    // Open browser (auto-detect headless and fall back to device code flow)
     info!("Opening browser for ChatGPT OAuth login...");
+    let can_open = can_open_browser();
+    if !can_open {
+        info!("Headless environment detected — switching to device code flow.");
+        // Abort the callback server since we won't use it
+        server_handle.abort();
+        return device_code_login().await;
+    }
     let open_result = if cfg!(target_os = "macos") {
         std::process::Command::new("open").arg(&auth_url).spawn()
     } else if cfg!(target_os = "linux") {
@@ -346,7 +373,9 @@ pub async fn browser_login() -> Result<CodexAuthTokens> {
         Err(std::io::Error::new(std::io::ErrorKind::Other, "unsupported platform"))
     };
     if let Err(e) = open_result {
-        warn!("Failed to open browser: {}. Please open this URL manually:\n{}", e, auth_url);
+        warn!("Failed to open browser: {} — falling back to device code flow.", e);
+        server_handle.abort();
+        return device_code_login().await;
     }
 
     // Wait for the callback

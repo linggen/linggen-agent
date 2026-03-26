@@ -29,6 +29,11 @@ ling stop                         # Stop background daemon
 ling status                       # Show agent status
 ling doctor                       # Full health diagnostics
 
+ling login                        # Set up remote access
+ling auth login                   # Sign in with ChatGPT subscription
+ling auth logout                  # Clear ChatGPT tokens
+ling auth status                  # Check auth status
+
 ling install                      # Install/update ling
 ling update                       # Update ling
 ling init                         # Bootstrap skills
@@ -48,6 +53,10 @@ ling eval                         # Run eval tasks
 | `init` | Bulk-install skills from `linggen/skills` | No |
 | `install` | Install/update the ling binary | No |
 | `update` | Update the ling binary | No |
+| `login` | Set up remote access via linggen.dev | No |
+| `auth login` | Sign in with ChatGPT subscription | No |
+| `auth logout` | Clear ChatGPT OAuth tokens | No |
+| `auth status` | Show ChatGPT auth status | No |
 | `skills` | Manage skills (add/remove/list/search) | No |
 
 "Needs full runtime" means the command initialises tracing, `AgentManager`, database, and skill loading. Lightweight commands only load `Config`.
