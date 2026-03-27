@@ -301,16 +301,16 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             models: vec![ModelConfig {
-                id: "qwen3.5:35b".to_string(),
-                provider: "ollama".to_string(),
-                url: "http://127.0.0.1:11434".to_string(),
-                model: "qwen3.5:35b".to_string(),
+                id: "gpt-5.4".to_string(),
+                provider: "chatgpt".to_string(),
+                url: "https://chatgpt.com/backend-api/codex".to_string(),
+                model: "gpt-5.4".to_string(),
                 api_key: None,
-                keep_alive: Some("10m".to_string()),
+                keep_alive: None,
                 context_window: None,
                 tags: Vec::new(),
                 supports_tools: None,
-                auth_mode: None,
+                auth_mode: Some("chatgpt_oauth".to_string()),
                 reasoning_effort: None,
             }],
             server: ServerConfig { port: 9898 },
