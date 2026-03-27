@@ -6,12 +6,30 @@ use grep::searcher::sinks::UTF8;
 use grep::searcher::Searcher;
 use ignore::WalkBuilder;
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
+
+/// Walk up from `path` looking for a `.git` directory or file (worktrees).
+pub fn find_git_root(path: &Path) -> Option<PathBuf> {
+    let mut dir = Some(path);
+    while let Some(d) = dir {
+        if d.join(".git").exists() {
+            // Skip if git root is the user's home directory (dotfiles repo)
+            if let Some(home) = dirs::home_dir() {
+                if d == home {
+                    return None;
+                }
+            }
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
+}
 
 #[derive(Debug, Deserialize)]
 pub(super) struct SearchArgs {
@@ -237,10 +255,30 @@ impl Tools {
             if let Some(pos) = sentinel_pos {
                 // The line after the sentinel is the pwd output.
                 if pos + 1 < lines.len() {
-                    let new_cwd = std::path::PathBuf::from(lines[pos + 1]);
+                    let new_cwd = PathBuf::from(lines[pos + 1]);
                     if new_cwd.is_absolute() && new_cwd.exists() {
                         if let Some(sid) = &self.session_id {
-                            self.cwd_by_session.lock().unwrap().insert(sid.clone(), new_cwd);
+                            let old_cwd = self.cwd_by_session.lock().unwrap()
+                                .get(sid).cloned();
+                            self.cwd_by_session.lock().unwrap().insert(sid.clone(), new_cwd.clone());
+                            // Emit working folder change if cwd actually changed
+                            if old_cwd.as_ref() != Some(&new_cwd) {
+                                if let Some(ref tx) = self.progress_tx {
+                                    let git_root = find_git_root(&new_cwd);
+                                    let project = git_root.as_ref()
+                                        .map(|p| p.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    let project_name = git_root.as_ref()
+                                        .and_then(|p| p.file_name())
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    let _ = tx.send((
+                                        "__cwd_changed__".to_string(),
+                                        new_cwd.to_string_lossy().to_string(),
+                                        format!("{}|{}", project, project_name),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }

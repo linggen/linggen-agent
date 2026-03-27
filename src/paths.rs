@@ -48,25 +48,16 @@ pub fn compat_skills_dirs() -> Vec<(PathBuf, &'static str)> {
     ]
 }
 
+/// `~/.linggen/sessions/` — flat directory for all sessions
+pub fn global_sessions_dir() -> PathBuf {
+    linggen_home().join("sessions")
+}
+
 /// `~/.linggen/missions/`
 pub fn global_missions_dir() -> PathBuf {
     linggen_home().join("missions")
 }
 
-/// `~/.linggen/missions/sessions/` (legacy global dir — kept for migration)
-pub fn missions_sessions_dir() -> PathBuf {
-    global_missions_dir().join("sessions")
-}
-
-/// `~/.linggen/missions/{mission_id}/sessions/`
-pub fn mission_sessions_dir(mission_id: &str) -> PathBuf {
-    global_missions_dir().join(mission_id).join("sessions")
-}
-
-/// `~/.linggen/skills/{skill_name}/sessions/`
-pub fn skill_sessions_dir(skill_name: &str) -> PathBuf {
-    global_skills_dir().join(skill_name).join("sessions")
-}
 
 /// `~/.linggen/projects/`
 pub fn projects_dir() -> PathBuf {

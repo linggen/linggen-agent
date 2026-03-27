@@ -105,27 +105,6 @@ pub async fn mission_scheduler_loop(state: Arc<ServerState>) {
                 });
             let root = std::path::PathBuf::from(&project_path);
 
-            // Check if mission agent is busy
-            let agent = match state
-                .manager
-                .get_or_create_agent(&root, MISSION_AGENT_ID)
-                .await
-            {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-
-            if agent.try_lock().is_err() {
-                debug!(
-                    "Mission scheduler: mission agent is busy, skipping mission '{}'",
-                    mission.id
-                );
-                // Don't record skipped entries — they flood the runs list
-                // and add no value. The dedup check already prevents re-firing.
-                ms.last_fire_minute = Some(current_minute);
-                continue;
-            }
-
             // Fire!
             ms.last_fire_minute = Some(current_minute);
             ms.daily_count += 1;
@@ -195,7 +174,7 @@ fn mission_session_title(mission: &Mission) -> String {
     format!("Mission: {}{} — {}", prompt_preview, suffix, time)
 }
 
-/// Create a new session for a mission run under `~/.linggen/missions/{mission_id}/sessions/`.
+/// Create a new session for a mission run in the global session store.
 pub fn create_mission_session(mission: &Mission) -> Option<String> {
     let session_id = format!(
         "sess-{}-{}",
@@ -203,7 +182,7 @@ pub fn create_mission_session(mission: &Mission) -> Option<String> {
         &uuid::Uuid::new_v4().to_string()[..8]
     );
     let store = crate::state_fs::SessionStore::with_sessions_dir(
-        crate::paths::mission_sessions_dir(&mission.id),
+        crate::paths::global_sessions_dir(),
     );
     let meta = crate::state_fs::sessions::SessionMeta {
         id: session_id.clone(),
@@ -211,6 +190,12 @@ pub fn create_mission_session(mission: &Mission) -> Option<String> {
         created_at: crate::util::now_ts_secs(),
         skill: Some("mission".to_string()),
         creator: "mission".into(),
+        cwd: mission.project.clone(),
+        project: mission.project.clone(),
+        project_name: mission.project.as_ref().and_then(|p| {
+            std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string())
+        }),
+        mission_id: Some(mission.id.clone()),
     };
     match store.add_session(&meta) {
         Ok(_) => Some(session_id),
@@ -245,7 +230,12 @@ async fn dispatch_mission_prompt(
 
     let agent_id = MISSION_AGENT_ID;
 
-    let agent = match state.manager.get_or_create_agent(&root, agent_id).await {
+    // Use pre-created session or create a new one
+    let has_pre_session = pre_session_id.is_some();
+    let session_id = pre_session_id.or_else(|| create_mission_session(mission));
+
+    let sid = session_id.as_deref().unwrap_or("default");
+    let agent = match state.manager.get_or_create_session_agent(sid, &root, agent_id).await {
         Ok(a) => a,
         Err(e) => {
             warn!(
@@ -257,15 +247,7 @@ async fn dispatch_mission_prompt(
         }
     };
 
-    let Ok(mut engine) = agent.try_lock() else {
-        debug!("Mission scheduler: mission agent became busy before dispatch");
-        record_mission_run(&state, mission, "", None, "skipped", true);
-        return;
-    };
-
-    // Use pre-created session or create a new one
-    let has_pre_session = pre_session_id.is_some();
-    let session_id = pre_session_id.or_else(|| create_mission_session(mission));
+    let mut engine = agent.lock().await;
 
     let manager = state.manager.clone();
     let events_tx = state.events_tx.clone();
@@ -286,8 +268,6 @@ async fn dispatch_mission_prompt(
             });
         }
     }
-    let missions_sessions_dir = crate::paths::mission_sessions_dir(&mission.id);
-
     // Begin a run record
     let run_id = match manager
         .begin_agent_run(
@@ -318,11 +298,11 @@ async fn dispatch_mission_prompt(
     // Persist the mission prompt as a "user" message so it appears in the session chat.
     // Skip if the trigger API already persisted it (pre-created session).
     if !has_pre_session {
-        let mission_store = crate::state_fs::SessionStore::with_sessions_dir(
-            missions_sessions_dir.clone(),
+        let global_store = crate::state_fs::SessionStore::with_sessions_dir(
+            crate::paths::global_sessions_dir(),
         );
         if let Some(sid) = session_id.as_deref() {
-            let _ = mission_store.add_chat_message(
+            let _ = global_store.add_chat_message(
                 sid,
                 &crate::state_fs::sessions::ChatMsg {
                     agent_id: agent_id.to_string(),
@@ -364,9 +344,6 @@ async fn dispatch_mission_prompt(
     engine.task = Some(message.clone());
     engine.set_parent_agent(None);
     engine.set_run_id(Some(run_id.clone()));
-    // Route session persistence to the missions sessions directory
-    engine.cfg.session_root = Some(missions_sessions_dir);
-
     // Force Auto permission mode — missions run without human supervision,
     // so Ask/AcceptEdits would hang forever waiting for approval.
     engine.cfg.tool_permission_mode = crate::config::ToolPermissionMode::Auto;

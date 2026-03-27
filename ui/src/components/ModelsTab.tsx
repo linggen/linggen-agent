@@ -75,13 +75,16 @@ export const ModelsTab: React.FC<{
 
   const defaultModels = config.routing?.default_models ?? [];
 
+  const hasOllamaModels = config.models?.some((m: { provider: string }) => m.provider === 'ollama') ?? false;
+
   const fetchOllamaStatus = useCallback(async () => {
+    if (!hasOllamaModels) return;
     try {
       const resp = await fetch('/api/utils/ollama-status');
       if (resp.ok) setOllamaStatus(await resp.json());
       else setOllamaStatus(null);
     } catch { setOllamaStatus(null); }
-  }, []);
+  }, [hasOllamaModels]);
 
   const fetchHealth = useCallback(async () => {
     try {

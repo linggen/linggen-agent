@@ -755,7 +755,7 @@ impl AgentEngine {
             .to_string();
             manager
                 .add_chat_message(
-                    self.session_storage_root(),
+                    &self.cfg.ws_root,
                     session_id.unwrap_or("default"),
                     &crate::state_fs::sessions::ChatMsg {
                         agent_id: from.clone(),

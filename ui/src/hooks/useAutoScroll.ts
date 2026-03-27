@@ -10,17 +10,27 @@ export function useAutoScroll(messages: { length: number }, lastMsg: { isGenerat
   const isNearBottomRef = useRef(true);
   const chatScrollContainerRef = useRef<HTMLElement | null>(null);
 
+  const lastScrollTopRef = useRef(0);
+
   useEffect(() => {
     const endEl = chatEndRef.current;
     if (!endEl) return;
     const container = endEl.parentElement;
     if (!container) return;
     chatScrollContainerRef.current = container;
+    lastScrollTopRef.current = container.scrollTop;
     const onScroll = () => {
       const { scrollTop, scrollHeight, clientHeight } = container;
       const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
-      const threshold = scrollHeight * 0.1;
-      isNearBottomRef.current = distanceFromBottom <= Math.max(threshold, 80);
+      // User scrolled up → stop auto-scroll
+      if (scrollTop < lastScrollTopRef.current) {
+        isNearBottomRef.current = false;
+      }
+      // User scrolled back to bottom → resume auto-scroll
+      if (distanceFromBottom <= 1) {
+        isNearBottomRef.current = true;
+      }
+      lastScrollTopRef.current = scrollTop;
     };
     container.addEventListener('scroll', onScroll, { passive: true });
     return () => container.removeEventListener('scroll', onScroll);

@@ -31,7 +31,7 @@ pub(crate) async fn set_task(
 
     match state
         .manager
-        .get_or_create_agent(&root, &req.agent_id)
+        .get_or_create_session_agent("default", &root, &req.agent_id)
         .await
     {
         Ok(agent) => {
@@ -89,7 +89,7 @@ pub(crate) async fn run_agent(
 
     match state
         .manager
-        .get_or_create_agent(&root, &req.agent_id)
+        .get_or_create_session_agent(req.session_id.as_deref().unwrap_or("default"), &root, &req.agent_id)
         .await
     {
         Ok(agent) => {

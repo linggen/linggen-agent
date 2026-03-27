@@ -119,6 +119,7 @@ export function dispatchEvent(item: UiEvent, sessionIdOverride?: string): void {
     case 'tool_progress': handleToolProgress(item); return;
     case 'app_launched':   handleAppLaunched(item); return;
     case 'notification':   handleNotification(item); return;
+    case 'working_folder': handleWorkingFolder(item); return;
   }
 }
 
@@ -639,4 +640,23 @@ function handleNotification(item: UiEvent): void {
     default:
       return;
   }
+}
+
+function handleWorkingFolder(item: UiEvent): void {
+  const data = item.data;
+  if (!data || !item.session_id) return;
+  // Update the session's metadata in the store
+  const store = useProjectStore.getState();
+  const sessions = store.allSessions.map((s) => {
+    if (s.id === item.session_id) {
+      return {
+        ...s,
+        cwd: data.cwd as string,
+        project: data.project as string | undefined,
+        project_name: data.project_name as string | undefined,
+      };
+    }
+    return s;
+  });
+  useProjectStore.setState({ allSessions: sessions });
 }

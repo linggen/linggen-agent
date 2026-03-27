@@ -163,25 +163,35 @@ pub fn http_client() -> Result<reqwest::Client> {
 }
 
 /// Search community skills across all registries (skills.sh + ClawHub).
+/// Results are interleaved from both sources (each pre-sorted by relevance),
+/// so neither source dominates the top of the list.
 pub async fn search_community(query: &str) -> Result<Vec<MarketplaceSkill>> {
     let (sh_result, ch_result) = tokio::join!(
         search_skills_sh_community(query),
         search_clawhub(query),
     );
 
-    let mut results = sh_result.unwrap_or_default();
-    let mut seen: HashSet<String> = results.iter().map(|s| s.skill_id.to_lowercase()).collect();
+    let sh_skills = sh_result.unwrap_or_default();
+    let ch_skills = ch_result.unwrap_or_default();
 
-    // Append ClawHub results, deduplicating by skill_id
-    for skill in ch_result.unwrap_or_default() {
-        let key = skill.skill_id.to_lowercase();
-        if seen.insert(key) {
-            results.push(skill);
+    // Interleave results from both sources, deduplicating by skill_id.
+    let mut results = Vec::with_capacity(sh_skills.len() + ch_skills.len());
+    let mut seen = HashSet::new();
+    let mut sh_iter = sh_skills.into_iter();
+    let mut ch_iter = ch_skills.into_iter();
+    loop {
+        let sh_next = sh_iter.next();
+        let ch_next = ch_iter.next();
+        if sh_next.is_none() && ch_next.is_none() {
+            break;
+        }
+        for skill in [sh_next, ch_next].into_iter().flatten() {
+            let key = skill.skill_id.to_lowercase();
+            if seen.insert(key) {
+                results.push(skill);
+            }
         }
     }
-
-    // Sort by install count (most popular first)
-    results.sort_by(|a, b| b.install_count.cmp(&a.install_count));
 
     Ok(results)
 }
@@ -816,9 +826,15 @@ pub(crate) fn extract_all_skills_from_zip(
 
     // First pass: find all SKILL.md files and their parent dirs.
     let mut skill_roots: Vec<(String, PathBuf)> = Vec::new();
+    let mut has_root_skill = false;
     for i in 0..archive.len() {
         let entry = archive.by_index(i)?;
         let name = entry.name().to_string();
+        // Check for root-level SKILL.md (no parent directory)
+        if name == "SKILL.md" || name == "skill.md" {
+            has_root_skill = true;
+            continue;
+        }
         if !(name.ends_with("/SKILL.md") || name.ends_with("/skill.md")) {
             continue;
         }
@@ -835,6 +851,27 @@ pub(crate) fn extract_all_skills_from_zip(
             continue;
         }
         skill_roots.push((dir_name, parent.to_path_buf()));
+    }
+
+    // Handle root-level SKILL.md — all ZIP contents belong to one skill.
+    // Extract into a "_root" subdirectory; the caller will rename as needed.
+    if has_root_skill && skill_roots.is_empty() {
+        let dir_name = "_root".to_string();
+        let target_dir = target_base_dir.join(&dir_name);
+        fs::create_dir_all(&target_dir)?;
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)?;
+            let entry_name = entry.name().to_string();
+            if entry.is_dir() { continue; }
+            if !is_safe_zip_path(&entry_name, &target_dir) { continue; }
+            let dest = target_dir.join(&entry_name);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut outfile = fs::File::create(&dest)?;
+            std::io::copy(&mut entry, &mut outfile)?;
+        }
+        return Ok(vec![dir_name]);
     }
 
     // Deduplicate by dir_name (first occurrence wins).

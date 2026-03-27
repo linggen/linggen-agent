@@ -24,7 +24,6 @@ pub mod routing;
 pub struct ProjectContext {
     pub agents: Mutex<HashMap<String, Arc<Mutex<AgentEngine>>>>,
     pub state_fs: StateFs,
-    pub sessions: SessionStore,
     pub watcher: Mutex<Option<notify::RecommendedWatcher>>,
 }
 
@@ -37,6 +36,10 @@ pub struct AgentManager {
     pub store: Arc<ProjectStore>,
     pub missions: Arc<crate::project_store::MissionStore>,
     pub skill_manager: Arc<SkillManager>,
+    /// Global flat session store at `~/.linggen/sessions/`.
+    pub global_sessions: SessionStore,
+    /// Per-session agent engines. Each session gets its own engine — no lock contention.
+    pub session_engines: Mutex<HashMap<String, Arc<Mutex<AgentEngine>>>>,
     working_places: Mutex<HashMap<String, HashMap<String, WorkingPlaceEntry>>>,
     cancelled_runs: Mutex<HashSet<String>>,
     /// Per-tool-block cancellation flags (block_id → AtomicBool).
@@ -413,6 +416,8 @@ impl AgentManager {
                 run_project_map: Mutex::new(HashMap::new()),
                 last_activity: Mutex::new(HashMap::new()),
                 interface_mode,
+                global_sessions: SessionStore::with_sessions_dir(crate::paths::global_sessions_dir()),
+                session_engines: Mutex::new(HashMap::new()),
             }),
             rx,
         )
@@ -451,11 +456,9 @@ impl AgentManager {
         }
 
         let state_fs = StateFs::new(root.clone());
-        let sessions = self.store.session_store(&key);
         let ctx = Arc::new(ProjectContext {
             agents: Mutex::new(HashMap::new()),
             state_fs,
-            sessions,
             watcher: Mutex::new(None),
         });
 
@@ -575,7 +578,7 @@ impl AgentManager {
         let mut engine = AgentEngine::new(
             EngineConfig {
                 ws_root: project_root.clone(),
-                session_root: None,
+
                 max_iters: config.agent.max_iters,
                 write_safety_mode: config.agent.write_safety_mode,
                 tool_permission_mode: config.agent.tool_permission_mode,
@@ -614,6 +617,93 @@ impl AgentManager {
         let agent = Arc::new(Mutex::new(engine));
         agents.insert(normalized_id, agent.clone());
         Ok(agent)
+    }
+
+    /// Get or create an agent engine for a specific session.
+    /// Each session gets its own engine instance — no lock contention between sessions.
+    pub async fn get_or_create_session_agent(
+        self: &Arc<Self>,
+        session_id: &str,
+        project_root: &PathBuf,
+        agent_id: &str,
+    ) -> Result<Arc<Mutex<AgentEngine>>> {
+        let normalized_id = Self::normalize_agent_id(agent_id);
+
+        // Check if this session already has an engine
+        {
+            let engines = self.session_engines.lock().await;
+            if let Some(engine) = engines.get(session_id) {
+                return Ok(engine.clone());
+            }
+        }
+
+        // Create a new engine for this session (reuse existing creation logic)
+        let project_root = Self::canonical_project_root(project_root);
+        let agent_spec = self
+            .find_agent_spec_for_project(&project_root, &normalized_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Agent '{}' not found in {}/agents",
+                    normalized_id,
+                    project_root.display()
+                )
+            })?;
+
+        let config = self.config.read().await.clone();
+        let models = self.models.read().await.clone();
+        let model_id = Self::resolve_model_id(
+            &config,
+            &models,
+            &normalized_id,
+            agent_spec.spec.model.clone(),
+        )?;
+
+        let role = AgentRole::Lead;
+        let mut engine = AgentEngine::new(
+            EngineConfig {
+                ws_root: project_root.clone(),
+                max_iters: config.agent.max_iters,
+                write_safety_mode: config.agent.write_safety_mode,
+                tool_permission_mode: config.agent.tool_permission_mode,
+                prompt_loop_breaker: config.agent.prompt_loop_breaker.clone(),
+                interface_mode: self.interface_mode,
+                bash_allow_prefixes: None,
+                mission_allowed_tools: None,
+            },
+            models,
+            model_id,
+            role,
+        )?;
+
+        engine.default_models = config.routing.default_models.clone();
+        engine.auto_fallback = config.routing.auto_fallback;
+        engine.set_spec(
+            normalized_id.clone(),
+            agent_spec.spec,
+            agent_spec.system_prompt,
+        );
+        engine.set_manager_context(self.clone());
+        engine.set_delegation_depth(0, config.agent.max_delegation_depth);
+        engine.load_skill_tools(&self.skill_manager).await;
+        engine.load_available_skills_metadata(&self.skill_manager).await;
+        if let Ok(specs) = self.list_agent_specs(&project_root).await {
+            engine.available_agents_metadata = specs
+                .iter()
+                .map(|s| (s.spec.name.clone(), s.spec.description.clone()))
+                .collect();
+        }
+
+        let repo_path_str = project_root.to_string_lossy().to_string();
+        engine.set_memory_dir(self.store.memory_dir(&repo_path_str));
+
+        let agent = Arc::new(Mutex::new(engine));
+        self.session_engines.lock().await.insert(session_id.to_string(), agent.clone());
+        Ok(agent)
+    }
+
+    /// Remove a session's engine when the session is deleted.
+    pub async fn remove_session_engine(&self, session_id: &str) {
+        self.session_engines.lock().await.remove(session_id);
     }
 
     /// Create a fresh, uncached `AgentEngine` for a single delegation call.
@@ -656,7 +746,7 @@ impl AgentManager {
         let mut engine = AgentEngine::new(
             EngineConfig {
                 ws_root: project_root.clone(),
-                session_root: None,
+
                 max_iters: config.agent.max_iters,
                 write_safety_mode: config.agent.write_safety_mode,
                 tool_permission_mode: config.agent.tool_permission_mode,
@@ -1032,42 +1122,15 @@ impl AgentManager {
         Ok(())
     }
 
-    /// Create a `SessionStore` for the global missions sessions directory.
-    pub fn missions_session_store(&self) -> SessionStore {
-        SessionStore::with_sessions_dir(crate::paths::missions_sessions_dir())
-    }
-
-    /// Convenience: persist a chat message via the project's flat-file session store.
-    /// If `ws_root` points to a mission or skill sessions directory, persists there
-    /// directly without registering it as a project.
+    /// Persist a chat message to the global flat session store.
     pub async fn add_chat_message(
         &self,
-        ws_root: &std::path::Path,
+        _ws_root: &std::path::Path,
         session_id: &str,
         msg: &crate::state_fs::sessions::ChatMsg,
     ) {
-        // Mission session roots live under `~/.linggen/missions/{id}/sessions/`.
-        let missions_base = crate::paths::global_missions_dir();
-        if ws_root.starts_with(&missions_base) {
-            let store = SessionStore::with_sessions_dir(ws_root.to_path_buf());
-            if let Err(e) = store.add_chat_message(session_id, msg) {
-                tracing::warn!("Failed to persist chat message to mission store: {}", e);
-            }
-            return;
-        }
-        // Skill session roots live under `~/.linggen/skills/{name}/sessions/`.
-        let skills_base = crate::paths::global_skills_dir();
-        if ws_root.starts_with(&skills_base) {
-            let store = SessionStore::with_sessions_dir(ws_root.to_path_buf());
-            if let Err(e) = store.add_chat_message(session_id, msg) {
-                tracing::warn!("Failed to persist chat message to skill store: {}", e);
-            }
-            return;
-        }
-        if let Ok(ctx) = self.get_or_create_project(ws_root.to_path_buf()).await {
-            if let Err(e) = ctx.sessions.add_chat_message(session_id, msg) {
-                tracing::warn!("Failed to persist chat message: {}", e);
-            }
+        if let Err(e) = self.global_sessions.add_chat_message(session_id, msg) {
+            tracing::warn!("Failed to persist chat message: {}", e);
         }
     }
 

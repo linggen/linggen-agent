@@ -86,9 +86,6 @@ impl std::fmt::Display for InterfaceMode {
 
 pub struct EngineConfig {
     pub ws_root: PathBuf,
-    /// Override for session storage root (e.g. `~/.linggen/missions/sessions/`).
-    /// When set, chat messages are persisted here instead of `{ws_root}/.linggen/sessions/`.
-    pub session_root: Option<PathBuf>,
     pub max_iters: usize,
     pub write_safety_mode: crate::config::WriteSafetyMode,
     pub tool_permission_mode: crate::config::ToolPermissionMode,
@@ -373,10 +370,27 @@ impl AgentEngine {
         })
     }
 
-    /// Returns the root path used for session storage.
-    /// Uses `session_root` override if set, otherwise falls back to `ws_root`.
-    pub fn session_storage_root(&self) -> &std::path::Path {
-        self.cfg.session_root.as_deref().unwrap_or(&self.cfg.ws_root)
+    /// Check if the agent's cwd has entered/left a git project and update
+    /// ws_root + invalidate the cached system prompt accordingly.
+    pub fn check_working_folder_change(&mut self) {
+        use crate::engine::tools::search_exec_find_git_root;
+        let cwd = self.tools.builtins.cwd();
+        let git_root = search_exec_find_git_root(&cwd);
+        let new_ws_root = git_root.unwrap_or_else(|| {
+            dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
+        });
+        if new_ws_root != self.cfg.ws_root {
+            tracing::info!(
+                "Working folder changed: {} → {}",
+                self.cfg.ws_root.display(),
+                new_ws_root.display()
+            );
+            self.cfg.ws_root = new_ws_root.clone();
+            self.cached_system_prompt = None; // Force rebuild with new CLAUDE.md
+            // Reload permissions from new project
+            let linggen_dir = new_ws_root.join(".linggen");
+            self.permission_store = crate::engine::permission::PermissionStore::load(&linggen_dir);
+        }
     }
 
     pub fn set_spec(&mut self, agent_id: String, spec: AgentSpec, system_prompt: String) {

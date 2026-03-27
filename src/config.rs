@@ -15,6 +15,9 @@ pub struct Config {
     pub agents: Vec<AgentSpecRef>,
     #[serde(default)]
     pub routing: RoutingConfig,
+    /// Default working folder for new sessions. Defaults to `~` if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -197,6 +200,20 @@ pub enum ComplexityLevel {
 }
 
 impl Config {
+    /// Resolve home_path to an absolute PathBuf. Defaults to `~`.
+    pub fn resolved_home_path(&self) -> PathBuf {
+        if let Some(ref p) = self.home_path {
+            if p.starts_with("~/") || p == "~" {
+                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+                if p == "~" { home } else { home.join(&p[2..]) }
+            } else {
+                PathBuf::from(p)
+            }
+        } else {
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+        }
+    }
+
     pub fn load_with_path() -> Result<(Self, Option<PathBuf>)> {
         let mut candidates = Vec::new();
 
@@ -328,6 +345,7 @@ impl Default for Config {
             },
             agents: Vec::new(),
             routing: RoutingConfig::default(),
+            home_path: None,
         }
     }
 }

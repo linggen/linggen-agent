@@ -118,7 +118,7 @@ impl AgentEngine {
                 .unwrap_or_else(|| "unknown".to_string());
             manager
                 .add_chat_message(
-                    self.session_storage_root(),
+                    &self.cfg.ws_root,
                     session_id.unwrap_or("default"),
                     &crate::state_fs::sessions::ChatMsg {
                         agent_id: aid.clone(),
@@ -766,6 +766,8 @@ impl AgentEngine {
         }
 
         self.drain_tool_progress(&mut state.progress_rx).await;
+        // Check if the agent cd'd into/out of a git project
+        self.check_working_folder_change();
         None
     }
 }

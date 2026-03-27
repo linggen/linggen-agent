@@ -119,8 +119,9 @@ pub async fn run_single_task(
     let (manager, _rx) = AgentManager::new(config.clone(), None, store.clone(), skill_manager.clone(), crate::engine::InterfaceMode::Web);
 
     // 6. Get or create agent
+    let eval_session_id = format!("eval-{}", crate::util::now_ts_secs());
     let agent = manager
-        .get_or_create_agent(&tmpdir, &task_def.agent_id)
+        .get_or_create_session_agent(&eval_session_id, &tmpdir, &task_def.agent_id)
         .await?;
 
     // 7. Configure engine

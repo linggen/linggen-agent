@@ -6,6 +6,7 @@ mod delegation;
 mod tool_helpers;
 
 pub use tool_helpers::canonical_tool_name;
+pub use search_exec::find_git_root as search_exec_find_git_root;
 pub(crate) use tool_helpers::full_tool_schema_entries;
 pub(crate) use tool_helpers::{normalize_tool_args, summarize_tool_args};
 pub(crate) use delegation::{run_delegation, TaskArgs};

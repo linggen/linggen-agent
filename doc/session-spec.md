@@ -23,6 +23,45 @@ Session = Context. One session, one context. They are the same thing.
 
 A session is created by a **creator**, which determines the session's initial configuration — tools, system prompt, model. The creator copies its spec into the session. After creation, the session's configuration can change dynamically during the conversation.
 
+## Working folder
+
+Every session has a **working folder** (cwd) — the directory the agent operates in. The working folder replaces the old "project selection" concept.
+
+### Home path
+
+The **home path** is the default working folder for new sessions. Defaults to `~`. Users can change it in settings (e.g. `~/workspace`, `~/projects`). Stored in `linggen.toml` as `home_path`.
+
+### How it works
+
+1. **New chat** — starts at the home path. No project picker — just click `+` and go.
+2. **Agent or user runs `cd`** — after any bash command, the backend checks the new cwd.
+3. **Git detection** — if `.git/` exists in the cwd or any parent, the session enters **project mode** for that git root. The engine loads the project's `CLAUDE.md`, agents, permissions, and git context.
+4. **Leaving a project** — if the agent `cd`s to a directory outside any git repo, the session returns to **home mode**.
+
+### Home mode vs project mode
+
+| Aspect | Home mode | Project mode |
+|:-------|:----------|:-------------|
+| cwd | home path (default `~`) | anywhere within the git repo |
+| CLAUDE.md | not loaded from home path | loaded from git root + parents |
+| agents/ | global only (`~/.linggen/agents/`) | global + project (`{git_root}/agents/`) |
+| Permissions | `~/.linggen/permissions.json` | `{git_root}/.linggen/permissions.json` |
+| Git context | none | branch, status, recent commits |
+| Sandbox | unrestricted (home path scope) | unrestricted (no tightening on project entry) |
+| Memory | global (`~/.linggen/memory/`) | project-scoped (`~/.linggen/projects/{encoded}/memory/`) |
+
+### Session metadata tracks working folder
+
+The session's `cwd`, `project`, and `project_name` fields are updated whenever the working folder changes. These are persisted to `session.yaml` so the UI can display the current context and group sessions by project.
+
+### What triggers detection
+
+Any bash command execution — both agent-initiated and user-initiated (`! cd /path`). After the command runs, the backend reads the new cwd (already tracked via the `__LINGGEN_CWD__` sentinel) and walks up looking for `.git/`.
+
+### Auto-registration
+
+When a git root is detected for the first time, the project is automatically registered in the project store (same as if the user had manually added it). No manual project management needed.
+
 ## Creators
 
 Every session has a creator that determines how it was born and what capabilities it starts with.
@@ -54,8 +93,12 @@ Each session carries:
 | `created_at` | creation | no | Unix timestamp |
 | `creator` | creation | promotion only | Who owns this session: `user`, `skill`, `agent`, `mission`. Changes from `mission` → `user` on promotion. |
 | `skill` | creation | no | Bound skill name (if any) — active for the session's lifetime |
+| `mission_id` | creation | no | Originating mission (if creator is `mission`) |
 | `agent_id` | creation | yes | Which agent runs in this session |
 | `model` | creation | yes | Model override for this session |
+| `cwd` | creation | yes | Current working folder. Starts at home path. Updated on `cd`. |
+| `project` | runtime | yes | Detected git root path (if any). `null` in home mode. |
+| `project_name` | runtime | yes | Display name — last segment of git root (e.g. `linggen`). `null` in home mode. |
 | `messages` | runtime | append | Chat history (`messages.jsonl`) |
 
 ### What's dynamic (can change during chat)
@@ -64,6 +107,8 @@ Each session carries:
 - **Agent** — user can switch agents mid-conversation via `/agent` (tools change accordingly)
 - **System prompt** — rebuilt each turn from current agent + skill + environment + project instructions
 - **Title** — can be renamed
+- **Working folder** — changes when agent or user runs `cd`. Triggers project detection.
+- **Project context** — loads/unloads CLAUDE.md, permissions, git info when entering/leaving a git repo.
 
 ### What's fixed for the session lifetime
 
@@ -79,14 +124,16 @@ The system prompt is rebuilt each turn from layers. Which layers are included de
 [2]  Agent body              — always (sets identity and behavior)
 [3]  Available skills        — skill names + descriptions for discovery
 [4]  Active skill body       — when session has a bound skill
-[5]  Environment             — always (platform, workspace, date)
-[6]  Project instructions    — when CLAUDE.md exists
-[7]  Memory                  — when MEMORY.md exists and Write tool available
+[5]  Environment             — always (platform, cwd, date)
+[6]  Project instructions    — when in project mode and CLAUDE.md exists at git root
+[7]  Memory                  — global memory always; project memory when in project mode
 [8]  Tool schemas            — when effective_tools is non-empty
 [9]  Plan mode instructions  — when plan_mode is active
 [10] Delegation targets      — when Task tool is in effective_tools
 [11] Plan execution context  — when plan is approved/executing
 ```
+
+Layers 5-7 are sensitive to the working folder. When the session transitions between home mode and project mode, the system prompt is rebuilt with the appropriate project instructions and memory.
 
 A zero-tool session (e.g., game-table skill with `allowed-tools: []`) gets layers 1-7 only — a minimal, focused prompt for pure conversation.
 
@@ -121,22 +168,15 @@ No separate policy system — the tool list IS the permission model.
 
 ## Storage
 
-Sessions live under their creator's namespace:
-
-| Creator | Session path |
-|:--------|:------------|
-| `user` | `~/.linggen/projects/{encoded}/sessions/{session_id}/` |
-| `skill` | `~/.linggen/skills/{skill_name}/sessions/{session_id}/` |
-| `mission` | `~/.linggen/missions/{mission_id}/sessions/{session_id}/` |
-| `agent` | Ephemeral — not persisted to disk |
-
-Each persisted session directory contains:
+All sessions live in one flat directory:
 
 ```
-{session_id}/
-  session.yaml      # SessionMeta (id, title, created_at, creator, skill, ...)
+~/.linggen/sessions/{session_id}/
+  session.yaml      # SessionMeta (id, title, created_at, creator, skill, cwd, project, ...)
   messages.jsonl     # one ChatMsg per line, append-only
 ```
+
+No per-project, per-skill, or per-mission session directories. The `creator`, `skill`, `project`, and `mission_id` fields in `session.yaml` provide the metadata for filtering and grouping. Agent-created (sub-agent) sessions are ephemeral and not persisted.
 
 See `storage-spec.md` for the full filesystem layout.
 
@@ -205,9 +245,14 @@ This is how `ling` can delegate exploration to itself: the sub-task runs in an i
 
 ## API
 
-Session CRUD is part of the projects API:
-
-- `POST /api/sessions` — create session (accepts `skill`, `title`)
-- `GET /api/sessions` — list sessions for a project
+- `POST /api/sessions` — create session (accepts `skill`, `title`). No project required — starts in home mode.
+- `GET /api/sessions` — list all user sessions (optionally filter by project)
 - `DELETE /api/sessions/:id` — delete a session
 - `POST /api/chat` — send message to a session (creates session if needed)
+
+## UI behavior
+
+- **New chat** — clicking `+` immediately creates a home-mode session. No project picker dialog.
+- **Chat header** — shows the current working folder or project name (read-only). Updated reactively when the agent `cd`s.
+- **Session list** — sessions can be grouped/labeled by their `project_name` field. No manual project management in the sidebar.
+- **Project cards** — removed from sidebar. Projects are auto-discovered, not manually managed.

@@ -36,6 +36,18 @@ pub struct SessionMeta {
     /// Who created this session: "user", "skill", "mission", "agent"
     #[serde(default = "default_creator", skip_serializing_if = "is_default_creator")]
     pub creator: String,
+    /// Current working directory of the agent in this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Detected git root path when agent is inside a project. None in home mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Display name — last segment of git root (e.g. "linggen"). None in home mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    /// Originating mission ID (when creator is "mission").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +330,7 @@ mod tests {
             created_at: 1000,
             skill: None,
             creator: "user".into(),
+            cwd: None, project: None, project_name: None, mission_id: None,
         };
         store.add_session(&meta).unwrap();
 
@@ -347,6 +360,7 @@ mod tests {
                     created_at: ts,
                     skill: None,
                     creator: "user".into(),
+                    cwd: None, project: None, project_name: None, mission_id: None,
                 })
                 .unwrap();
         }
@@ -364,6 +378,7 @@ mod tests {
             created_at: 1000,
             skill: None,
             creator: "user".into(),
+            cwd: None, project: None, project_name: None, mission_id: None,
         };
         store.add_session(&meta).unwrap();
 
@@ -402,6 +417,7 @@ mod tests {
                 created_at: 1000,
                 skill: None,
                 creator: "user".into(),
+                cwd: None, project: None, project_name: None, mission_id: None,
             })
             .unwrap();
 
@@ -449,6 +465,7 @@ mod tests {
                 created_at: 1000,
                 skill: None,
                 creator: "user".into(),
+                cwd: None, project: None, project_name: None, mission_id: None,
             })
             .unwrap();
         store
@@ -480,6 +497,7 @@ mod tests {
                 created_at: 1000,
                 skill: None,
                 creator: "user".into(),
+                cwd: None, project: None, project_name: None, mission_id: None,
             })
             .unwrap();
         store
@@ -511,6 +529,7 @@ mod tests {
                 created_at: 1000,
                 skill: None,
                 creator: "user".into(),
+                cwd: None, project: None, project_name: None, mission_id: None,
             })
             .is_err());
         assert!(store
@@ -520,6 +539,7 @@ mod tests {
                 created_at: 1000,
                 skill: None,
                 creator: "user".into(),
+                cwd: None, project: None, project_name: None, mission_id: None,
             })
             .is_err());
         assert!(store
@@ -529,6 +549,7 @@ mod tests {
                 created_at: 1000,
                 skill: None,
                 creator: "user".into(),
+                cwd: None, project: None, project_name: None, mission_id: None,
             })
             .is_err());
     }

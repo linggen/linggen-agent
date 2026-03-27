@@ -144,23 +144,20 @@ pub(crate) async fn clear_chat_history_api(
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    match state.manager.get_or_create_project(root).await {
-        Ok(ctx) => match ctx.sessions.clear_chat_history(&session_id) {
-            Ok(removed) => {
-                // Also clear in-memory chat history for all agents in this project/session
-                let agents = ctx.agents.lock().await;
-                for agent_mutex in agents.values() {
-                    let mut agent = agent_mutex.lock().await;
-                    agent.chat_history.clear();
-                    agent.observations.clear();
+    match state.manager.global_sessions.clear_chat_history(&session_id) {
+        Ok(removed) => {
+            // Clear in-memory chat history for this session's engine
+            {
+                let engines = state.manager.session_engines.lock().await;
+                if let Some(engine_mutex) = engines.get(&session_id) {
+                    let mut engine = engine_mutex.lock().await;
+                    engine.chat_history.clear();
+                    engine.observations.clear();
                 }
-                drop(agents);
-
-                let _ = state.events_tx.send(ServerEvent::StateUpdated);
-                Json(serde_json::json!({ "removed": removed })).into_response()
             }
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
+            let _ = state.events_tx.send(ServerEvent::StateUpdated);
+            Json(serde_json::json!({ "removed": removed })).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -255,7 +252,7 @@ pub(crate) async fn compact_chat_api(
                         }
                     })
                     .collect();
-                if let Err(e) = ctx.sessions.rewrite_chat_history(&session_id, &chat_msgs) {
+                if let Err(e) = state.manager.global_sessions.rewrite_chat_history(&session_id, &chat_msgs) {
                     tracing::warn!("Failed to rewrite session after compact: {e}");
                 }
             }
@@ -1094,86 +1091,48 @@ pub(crate) async fn chat_handler(
     };
     let project_root_str = root.to_string_lossy().to_string();
 
-    // Determine if this chat belongs to a mission or skill — if so, route session
-    // persistence to their session store, not the project's.
-    let sessions_root_override: Option<std::path::PathBuf> = if let Some(ref mid) = req.mission_id {
-        Some(crate::paths::mission_sessions_dir(mid))
-    } else if let Some(ref skill) = req.skill_name {
-        Some(crate::paths::skill_sessions_dir(skill))
-    } else {
-        None
-    };
-
     // Session creator type — computed once, used when creating new sessions.
     let session_creator: &str = if req.mission_id.is_some() { "mission" }
         else if req.skill_name.is_some() { "skill" }
         else { "user" };
 
-    // Auto-create a new session when none is provided, instead of falling
-    // back to a hidden "default" session.
+    let global_sessions = &state.manager.global_sessions;
+
+    // Auto-create a new session when none is provided.
     // When a session_id IS provided (e.g. from TUI), ensure it exists in the
     // session store so the Web UI can list it.
     let session_id: Option<String> = if let Some(sid) = req.session_id.clone() {
-        if let Some(ref alt_dir) = sessions_root_override {
-            // Mission session — ensure it exists in the mission store.
-            let store = crate::state_fs::SessionStore::with_sessions_dir(alt_dir.clone());
-            let exists = store.list_sessions().ok()
-                .map(|ss| ss.iter().any(|s| s.id == sid))
-                .unwrap_or(false);
-            if !exists {
-                let now = crate::util::now_ts_secs();
-
-                let meta = crate::state_fs::sessions::SessionMeta {
-                    id: sid.clone(),
-                    title: auto_session_title(&req.message),
-                    created_at: now,
-                    skill: None,
-                    creator: session_creator.into(),
-                };
-                let _ = store.add_session(&meta);
-            }
-        } else if let Ok(ctx) = state.manager.get_or_create_project(root.clone()).await {
-            let exists = ctx.sessions.list_sessions().ok()
-                .map(|ss| ss.iter().any(|s| s.id == sid))
-                .unwrap_or(false);
-            if !exists {
-                let now = crate::util::now_ts_secs();
-
-                let meta = crate::state_fs::sessions::SessionMeta {
-                    id: sid.clone(),
-                    title: auto_session_title(&req.message),
-                    created_at: now,
-                    skill: None,
-                    creator: session_creator.into(),
-                };
-                let _ = ctx.sessions.add_session(&meta);
-            }
+        // Ensure session exists in global store
+        let exists = matches!(global_sessions.get_session_meta(&sid), Ok(Some(_)));
+        if !exists {
+            let now = crate::util::now_ts_secs();
+            let meta = crate::state_fs::sessions::SessionMeta {
+                id: sid.clone(),
+                title: auto_session_title(&req.message),
+                created_at: now,
+                skill: req.skill_name.clone(),
+                creator: session_creator.into(),
+                cwd: Some(project_root_str.clone()),
+                project: None, project_name: None,
+                mission_id: req.mission_id.clone(),
+            };
+            let _ = global_sessions.add_session(&meta);
         }
         Some(sid)
     } else {
         let now = crate::util::now_ts_secs();
         let new_id = format!("sess-{}-{}", now, &uuid::Uuid::new_v4().to_string()[..8]);
-        let creator = if req.mission_id.is_some() { "mission" } else if req.skill_name.is_some() { "skill" } else { "user" };
-        if let Some(ref alt_dir) = sessions_root_override {
-            let store = crate::state_fs::SessionStore::with_sessions_dir(alt_dir.clone());
-            let meta = crate::state_fs::sessions::SessionMeta {
-                id: new_id.clone(),
-                title: auto_session_title(&req.message),
-                created_at: now,
-                skill: None,
-                creator: session_creator.into(),
-            };
-            let _ = store.add_session(&meta);
-        } else if let Ok(ctx) = state.manager.get_or_create_project(root.clone()).await {
-            let meta = crate::state_fs::sessions::SessionMeta {
-                id: new_id.clone(),
-                title: auto_session_title(&req.message),
-                created_at: now,
-                skill: None,
-                creator: session_creator.into(),
-            };
-            let _ = ctx.sessions.add_session(&meta);
-        }
+        let meta = crate::state_fs::sessions::SessionMeta {
+            id: new_id.clone(),
+            title: auto_session_title(&req.message),
+            created_at: now,
+            skill: req.skill_name.clone(),
+            creator: session_creator.into(),
+            cwd: Some(project_root_str.clone()),
+            project: None, project_name: None,
+            mission_id: req.mission_id.clone(),
+        };
+        let _ = global_sessions.add_session(&meta);
         // Emit session_created so the unified session list updates in real-time
         let _ = state.events_tx.send(ServerEvent::SessionCreated {
             session_id: new_id.clone(),
@@ -1210,7 +1169,7 @@ pub(crate) async fn chat_handler(
             (req.agent_id.clone(), req.message.clone())
         };
 
-    match state.manager.get_or_create_agent(&root, &target_id).await {
+    match state.manager.get_or_create_session_agent(&effective_session_id, &root, &target_id).await {
         Ok(agent) => {
             let was_busy = agent.try_lock().is_err();
             let queued_item = if was_busy {
@@ -1267,65 +1226,32 @@ pub(crate) async fn chat_handler(
             let _req_mode = req.mode.clone();
             let req_model_id = req.model_id.clone();
             let req_images = req.images.clone();
-            let sessions_override_for_spawn = sessions_root_override.clone();
-
             if was_busy {
                 // When queued, only persist to disk — don't emit via SSE.
-                if let Some(ref alt_dir) = sessions_root_override {
-                    let store = crate::state_fs::SessionStore::with_sessions_dir(alt_dir.clone());
-                    let sid = session_id.as_deref().unwrap_or("default");
-                    let msg = crate::state_fs::sessions::ChatMsg {
-                        agent_id: target_id.to_string(),
-                        from_id: "user".to_string(),
-                        to_id: target_id.to_string(),
-                        content: clean_msg.clone(),
-                        timestamp: crate::util::now_ts_secs(),
-                        is_observation: false,
-                    };
-                    let _ = store.add_chat_message(sid, &msg);
-                } else {
-                    persist_message_only(
-                        &state.manager,
-                        &root,
-                        &target_id,
-                        "user",
-                        &target_id,
-                        &clean_msg,
-                        session_id.as_deref(),
-                        false,
-                    )
-                    .await;
-                }
+                let sid = session_id.as_deref().unwrap_or("default");
+                let msg = crate::state_fs::sessions::ChatMsg {
+                    agent_id: target_id.to_string(),
+                    from_id: "user".to_string(),
+                    to_id: target_id.to_string(),
+                    content: clean_msg.clone(),
+                    timestamp: crate::util::now_ts_secs(),
+                    is_observation: false,
+                };
+                let _ = global_sessions.add_chat_message(sid, &msg);
             } else {
                 // Emit + persist plain text. Images are ephemeral (sent inline
                 // as base64 for the current turn only, not persisted to disk).
-                if let Some(ref alt_dir) = sessions_root_override {
-                    let store = crate::state_fs::SessionStore::with_sessions_dir(alt_dir.clone());
-                    persist_and_emit_to_store(
-                        &store,
-                        &events_tx,
-                        &target_id,
-                        "user",
-                        &target_id,
-                        &clean_msg,
-                        session_id.as_deref(),
-                        false,
-                    )
-                    .await;
-                } else {
-                    persist_and_emit_message(
-                        &state.manager,
-                        &events_tx,
-                        &root,
-                        &target_id,
-                        "user",
-                        &target_id,
-                        &clean_msg,
-                        session_id.as_deref(),
-                        false,
-                    )
-                    .await;
-                }
+                persist_and_emit_to_store(
+                    global_sessions,
+                    &events_tx,
+                    &target_id,
+                    "user",
+                    &target_id,
+                    &clean_msg,
+                    session_id.as_deref(),
+                    false,
+                )
+                .await;
             }
 
             // Register agent → session mapping BEFORE spawn so SSE events are
@@ -1380,11 +1306,6 @@ pub(crate) async fn chat_handler(
                 // Set session_id on engine tools so subagent delegations inherit it.
                 engine.tools.builtins.set_session_id(session_id.clone());
 
-                // Route session persistence to mission directory when applicable.
-                if let Some(ref alt_dir) = sessions_override_for_spawn {
-                    engine.cfg.session_root = Some(alt_dir.clone());
-                }
-
                 // Clear mission-only restrictions — user-initiated chats should
                 // never be restricted by permission tiers (those apply only to
                 // automated scheduler runs via apply_permission_tier).
@@ -1395,26 +1316,21 @@ pub(crate) async fn chat_handler(
                 // The mission scheduler never goes through chat_handler (it calls
                 // dispatch_mission_prompt directly), so any request here with a
                 // mission session is from a real user taking over the conversation.
-                if sessions_override_for_spawn.is_some() {
-                    if let Some(ref sid) = session_id {
-                        if let Some(ref alt_dir) = sessions_override_for_spawn {
-                            let store = crate::state_fs::SessionStore::with_sessions_dir(alt_dir.clone());
-                            if let Ok(Some(mut meta)) = store.get_session_meta(sid) {
-                                if meta.creator == "mission" {
-                                    meta.creator = "user".to_string();
-                                    let _ = store.update_session_meta(&meta);
-                                }
-                            }
+                if let Some(ref sid) = session_id {
+                    if let Ok(Some(mut meta)) = state_clone.manager.global_sessions.get_session_meta(sid) {
+                        if meta.creator == "mission" {
+                            meta.creator = "user".to_string();
+                            let _ = state_clone.manager.global_sessions.update_session_meta(&meta);
+
+                            // Reset tool_permission_mode from Auto (forced by mission scheduler)
+                            // back to the configured default.
+                            let cfg = state_clone.manager.get_config_snapshot().await;
+                            engine.cfg.tool_permission_mode = cfg.agent.tool_permission_mode;
+
+                            // Force system prompt rebuild to reflect new permission context.
+                            engine.cached_system_prompt = None;
                         }
                     }
-
-                    // Reset tool_permission_mode from Auto (forced by mission scheduler)
-                    // back to the configured default.
-                    let cfg = state_clone.manager.get_config_snapshot().await;
-                    engine.cfg.tool_permission_mode = cfg.agent.tool_permission_mode;
-
-                    // Force system prompt rebuild to reflect new permission context.
-                    engine.cached_system_prompt = None;
                 }
 
                 let model_label = &engine.model_id;
@@ -1440,14 +1356,7 @@ pub(crate) async fn chat_handler(
                 // freshly created (e.g. after model change invalidated cache).
                 if engine.chat_history.is_empty() {
                     let sid = ctx.session_id.as_deref().unwrap_or("default");
-                    let history_result = if let Some(ref alt_dir) = sessions_override_for_spawn {
-                        let store = crate::state_fs::SessionStore::with_sessions_dir(alt_dir.clone());
-                        store.get_chat_history(sid)
-                    } else if let Ok(proj_ctx) = ctx.manager.get_or_create_project(ctx.root.clone()).await {
-                        proj_ctx.sessions.get_chat_history(sid)
-                    } else {
-                        Err(anyhow::anyhow!("no session store"))
-                    };
+                    let history_result = state.manager.global_sessions.get_chat_history(sid);
                     if let Ok(msgs) = history_result {
                         for m in &msgs {
                             if m.is_observation || m.from_id == "system" {
@@ -1477,25 +1386,12 @@ pub(crate) async fn chat_handler(
                 // Load session-bound skill if the session has one.
                 if engine.active_skill.is_none() {
                     if let Some(sid) = &ctx.session_id {
-                        let bound_skill_name = if let Some(ref alt_dir) = sessions_override_for_spawn {
-                            let store = crate::state_fs::SessionStore::with_sessions_dir(alt_dir.clone());
-                            match store.get_session_meta(sid) {
-                                Ok(meta) => meta.and_then(|m| m.skill),
-                                Err(e) => {
-                                    tracing::warn!("Failed to read session meta for {}: {}", sid, e);
-                                    None
-                                }
+                        let bound_skill_name = match state.manager.global_sessions.get_session_meta(sid) {
+                            Ok(meta) => meta.and_then(|m| m.skill),
+                            Err(e) => {
+                                tracing::warn!("Failed to read session meta for {}: {}", sid, e);
+                                None
                             }
-                        } else if let Ok(proj_ctx) = ctx.manager.get_or_create_project(ctx.root.clone()).await {
-                            match proj_ctx.sessions.get_session_meta(sid) {
-                                Ok(meta) => meta.and_then(|m| m.skill),
-                                Err(e) => {
-                                    tracing::warn!("Failed to read session meta for {}: {}", sid, e);
-                                    None
-                                }
-                            }
-                        } else {
-                            None
                         };
                         if let Some(ref skill_name) = bound_skill_name {
                             if let Some(skill) = manager.skill_manager.get_skill(skill_name).await {
@@ -1569,7 +1465,7 @@ async fn recover_plan_from_session(
 ) -> Option<crate::engine::Plan> {
     let sid = session_id.unwrap_or("default");
     let ctx = state.manager.get_or_create_project(root.to_path_buf()).await.ok()?;
-    let messages = ctx.sessions.get_chat_history(sid).ok()?;
+    let messages = state.manager.global_sessions.get_chat_history(sid).ok()?;
     // Scan backwards for the last plan message. Stop at the first plan found
     // regardless of status — if the most recent plan is "approved" or "completed",
     // there is no pending plan (don't keep scanning for older "planned" ones).
@@ -1621,7 +1517,8 @@ pub(crate) async fn approve_plan_handler(
 
     plan.status = crate::engine::PlanStatus::Approved;
 
-    let agent = match state.manager.get_or_create_agent(&root, &req.agent_id).await {
+    let sid = session_id.as_deref().unwrap_or("default");
+    let agent = match state.manager.get_or_create_session_agent(sid, &root, &req.agent_id).await {
         Ok(a) => a,
         Err(_) => {
             return (
@@ -1672,14 +1569,14 @@ pub(crate) async fn approve_plan_handler(
             // so the session file starts fresh with just the plan.
             let sid = session_id.as_deref().unwrap_or("default");
             if let Ok(ctx) = manager.get_or_create_project(root_clone.clone()).await {
-                if let Ok(msgs) = ctx.sessions.get_chat_history(sid) {
+                if let Ok(msgs) = state.manager.global_sessions.get_chat_history(sid) {
                     let plan_msgs: Vec<_> = msgs.into_iter().filter(|m| {
                         serde_json::from_str::<serde_json::Value>(&m.content)
                             .ok()
                             .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t == "plan"))
                             .unwrap_or(false)
                     }).collect();
-                    let _ = ctx.sessions.rewrite_chat_history(sid, &plan_msgs);
+                    let _ = state.manager.global_sessions.rewrite_chat_history(sid, &plan_msgs);
                 }
             }
             engine.observations.clear();

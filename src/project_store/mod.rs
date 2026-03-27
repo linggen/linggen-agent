@@ -93,11 +93,6 @@ impl ProjectStore {
         Ok(())
     }
 
-    pub fn session_store(&self, project_path: &str) -> SessionStore {
-        let sessions_dir = self.project_dir(project_path).join("sessions");
-        SessionStore::with_sessions_dir(sessions_dir)
-    }
-
     pub fn run_store(&self, project_path: &str) -> RunStore {
         let runs_dir = self.project_dir(project_path).join("runs");
         RunStore::new(runs_dir)
@@ -137,22 +132,6 @@ mod tests {
         assert_eq!(store.list_projects().unwrap().len(), 1);
         store.remove_project("/tmp/p").unwrap();
         assert_eq!(store.list_projects().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn test_session_store_returns_valid_store() {
-        let (store, _dir) = temp_store();
-        store.add_project("/tmp/p".into(), "p".into()).unwrap();
-        let sessions = store.session_store("/tmp/p");
-        sessions.add_session(&crate::state_fs::sessions::SessionMeta {
-            id: "s1".into(),
-            title: "test".into(),
-            created_at: 1000,
-            skill: None,
-            creator: "user".into(),
-        }).unwrap();
-        let list = sessions.list_sessions().unwrap();
-        assert_eq!(list.len(), 1);
     }
 
     #[test]

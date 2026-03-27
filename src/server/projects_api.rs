@@ -352,8 +352,7 @@ pub(crate) async fn get_agent_context_api(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let all_messages = match ctx
-        .sessions
+    let all_messages = match state.manager.global_sessions
         .get_chat_history(&run.session_id)
     {
         Ok(messages) => messages,
@@ -664,33 +663,31 @@ pub(crate) async fn list_sessions(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<ProjectQuery>,
 ) -> impl IntoResponse {
-    let root = canonical_project_root(&query.project_root);
-    match state.manager.get_or_create_project(root).await {
-        Ok(ctx) => {
-            let total = ctx.sessions.count_sessions();
-            match ctx.sessions.list_sessions_paginated(query.limit, query.offset) {
-                Ok(sessions) => {
-                    let api_sessions: Vec<serde_json::Value> = sessions
-                        .into_iter()
-                        .map(|s| {
-                            serde_json::json!({
-                                "id": s.id,
-                                "repo_path": query.project_root,
-                                "title": s.title,
-                                "created_at": s.created_at,
-                                "skill": s.skill,
-                                "creator": s.creator,
-                            })
-                        })
-                        .collect();
-                    Json(serde_json::json!({
-                        "sessions": api_sessions,
-                        "total": total,
-                    }))
-                    .into_response()
-                }
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            }
+    let total = state.manager.global_sessions.count_sessions();
+    match state.manager.global_sessions.list_sessions_paginated(query.limit, query.offset) {
+        Ok(sessions) => {
+            let api_sessions: Vec<serde_json::Value> = sessions
+                .into_iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "id": s.id,
+                        "repo_path": s.cwd.as_deref().unwrap_or(&query.project_root),
+                        "title": s.title,
+                        "created_at": s.created_at,
+                        "skill": s.skill,
+                        "creator": s.creator,
+                        "project": s.project,
+                        "project_name": s.project_name,
+                        "cwd": s.cwd,
+                        "mission_id": s.mission_id,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({
+                "sessions": api_sessions,
+                "total": total,
+            }))
+            .into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -715,36 +712,20 @@ pub(crate) async fn create_session(
         crate::util::now_ts_secs(),
         &uuid::Uuid::new_v4().to_string()[..8]
     );
+    let cwd = req.project_root.as_deref()
+        .map(|p| canonical_project_root(p).to_string_lossy().to_string());
     let meta = crate::state_fs::sessions::SessionMeta {
         id: id.clone(),
         title: req.title,
         created_at: crate::util::now_ts_secs(),
         skill: req.skill.clone(),
         creator: if req.skill.is_some() { "skill".into() } else { "user".into() },
+        cwd, project: None, project_name: None, mission_id: None,
     };
 
-    // Skill sessions go under ~/.linggen/skills/{name}/sessions/
-    if let Some(ref skill_name) = req.skill {
-        let sessions_dir = crate::paths::skill_sessions_dir(skill_name);
-        let store = crate::state_fs::sessions::SessionStore::with_sessions_dir(sessions_dir);
-        return match store.add_session(&meta) {
-            Ok(_) => Json(serde_json::json!({ "id": id })).into_response(),
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
-    }
-
-    // Project sessions go under ~/.linggen/projects/{encoded}/sessions/
-    let Some(ref project_root) = req.project_root else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    let root = canonical_project_root(project_root);
-    match state.manager.get_or_create_project(root).await {
-        Ok(ctx) => {
-            match ctx.sessions.add_session(&meta) {
-                Ok(_) => Json(serde_json::json!({ "id": id })).into_response(),
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            }
-        }
+    // All sessions go to the global flat store
+    match state.manager.global_sessions.add_session(&meta) {
+        Ok(_) => Json(serde_json::json!({ "id": id })).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -760,47 +741,42 @@ pub(crate) async fn resolve_session_api(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ResolveSessionRequest>,
 ) -> impl IntoResponse {
-    let root = canonical_project_root(&req.project_root);
-    match state.manager.get_or_create_project(root).await {
-        Ok(ctx) => {
-            // Check for the most recent session with no messages (empty).
-            // Only check the latest few sessions — no need to scan all.
-            if let Ok(sessions) = ctx.sessions.list_sessions_paginated(Some(10), None) {
-                for s in &sessions {
-                    if !ctx.sessions.session_has_messages(&s.id) {
-                        return Json(serde_json::json!({
-                            "id": s.id,
-                            "title": s.title,
-                            "reused": true,
-                        }))
-                        .into_response();
-                    }
-                }
+    let store = &state.manager.global_sessions;
+    // Check for the most recent session with no messages (empty).
+    if let Ok(sessions) = store.list_sessions_paginated(Some(10), None) {
+        for s in &sessions {
+            if !store.session_has_messages(&s.id) {
+                return Json(serde_json::json!({
+                    "id": s.id,
+                    "title": s.title,
+                    "reused": true,
+                }))
+                .into_response();
             }
-            // No empty session found — create a new one.
-            let now = crate::util::now_ts_secs();
-            let new_id = format!(
-                "sess-{}-{}",
-                now,
-                &uuid::Uuid::new_v4().to_string()[..8]
-            );
-            let meta = crate::state_fs::sessions::SessionMeta {
-                id: new_id.clone(),
-                title: "New Chat".to_string(),
-                created_at: now,
-                skill: None,
-                creator: "user".into(),
-            };
-            let _ = ctx.sessions.add_session(&meta);
-            Json(serde_json::json!({
-                "id": new_id,
-                "title": "New Chat",
-                "reused": false,
-            }))
-            .into_response()
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+    // No empty session found — create a new one.
+    let now = crate::util::now_ts_secs();
+    let new_id = format!(
+        "sess-{}-{}",
+        now,
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+    let meta = crate::state_fs::sessions::SessionMeta {
+        id: new_id.clone(),
+        title: "New Chat".to_string(),
+        created_at: now,
+        skill: None,
+        creator: "user".into(),
+        cwd: Some(req.project_root.clone()), project: None, project_name: None, mission_id: None,
+    };
+    let _ = store.add_session(&meta);
+    Json(serde_json::json!({
+        "id": new_id,
+        "title": "New Chat",
+        "reused": false,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -813,12 +789,8 @@ pub(crate) async fn remove_session_api(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<RemoveSessionRequest>,
 ) -> impl IntoResponse {
-    let root = canonical_project_root(&req.project_root);
-    match state.manager.get_or_create_project(root).await {
-        Ok(ctx) => match ctx.sessions.remove_session(&req.session_id) {
-            Ok(_) => StatusCode::OK,
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        },
+    match state.manager.global_sessions.remove_session(&req.session_id) {
+        Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -833,14 +805,14 @@ pub(crate) struct SkillSessionQuery {
 }
 
 pub(crate) async fn list_skill_sessions(
+    State(state): State<Arc<ServerState>>,
     Query(query): Query<SkillSessionQuery>,
 ) -> impl IntoResponse {
-    let sessions_dir = crate::paths::skill_sessions_dir(&query.skill);
-    let store = crate::state_fs::sessions::SessionStore::with_sessions_dir(sessions_dir);
-    match store.list_sessions() {
+    match state.manager.global_sessions.list_sessions() {
         Ok(sessions) => {
             let api_sessions: Vec<serde_json::Value> = sessions
                 .into_iter()
+                .filter(|s| s.skill.as_deref() == Some(&query.skill))
                 .map(|s| {
                     serde_json::json!({
                         "id": s.id,
@@ -859,19 +831,17 @@ pub(crate) async fn list_skill_sessions(
 
 /// GET /api/skill-sessions/state — return messages for a skill session.
 pub(crate) async fn get_skill_session_state(
+    State(state): State<Arc<ServerState>>,
     Query(query): Query<SkillSessionStateQuery>,
 ) -> impl IntoResponse {
-    let Some(skill) = query.skill.filter(|s| !s.is_empty()) else {
+    let Some(_skill) = query.skill.filter(|s| !s.is_empty()) else {
         return Json(serde_json::json!({ "messages": [] })).into_response();
     };
     let Some(session_id) = query.session_id.filter(|s| !s.is_empty()) else {
         return Json(serde_json::json!({ "messages": [] })).into_response();
     };
 
-    let store = crate::state_fs::SessionStore::with_sessions_dir(
-        crate::paths::skill_sessions_dir(&skill),
-    );
-    let messages = store
+    let messages = state.manager.global_sessions
         .get_chat_history(&session_id)
         .unwrap_or_default();
 
@@ -918,11 +888,10 @@ pub(crate) struct RemoveSkillSessionRequest {
 }
 
 pub(crate) async fn remove_skill_session_api(
+    State(state): State<Arc<ServerState>>,
     Json(req): Json<RemoveSkillSessionRequest>,
 ) -> impl IntoResponse {
-    let sessions_dir = crate::paths::skill_sessions_dir(&req.skill);
-    let store = crate::state_fs::sessions::SessionStore::with_sessions_dir(sessions_dir);
-    match store.remove_session(&req.session_id) {
+    match state.manager.global_sessions.remove_session(&req.session_id) {
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -939,12 +908,8 @@ pub(crate) async fn rename_session_api(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<RenameSessionRequest>,
 ) -> impl IntoResponse {
-    let root = canonical_project_root(&req.project_root);
-    match state.manager.get_or_create_project(root).await {
-        Ok(ctx) => match ctx.sessions.rename_session(&req.session_id, &req.title) {
-            Ok(_) => StatusCode::OK,
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        },
+    match state.manager.global_sessions.rename_session(&req.session_id, &req.title) {
+        Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -1062,12 +1027,7 @@ pub(crate) async fn get_status_api(
     model_usage.sort_by(|a, b| b.1.cmp(&a.1));
 
     // Sessions count
-    let sessions = match state.manager.get_or_create_project(
-        root.canonicalize().unwrap_or(root),
-    ).await {
-        Ok(ctx) => ctx.sessions.list_sessions().unwrap_or_default().len(),
-        Err(_) => 0,
-    };
+    let sessions = state.manager.global_sessions.count_sessions();
 
     // Default model
     let config = state.manager.get_config_snapshot().await;
@@ -1134,35 +1094,12 @@ pub(crate) struct DeleteUnifiedSessionRequest {
     skill: Option<String>,
 }
 
-/// DELETE /api/sessions/all — delete a session from any store.
+/// DELETE /api/sessions/all — delete a session from the global store.
 pub(crate) async fn delete_unified_session(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<DeleteUnifiedSessionRequest>,
 ) -> impl IntoResponse {
-    let result = if let Some(ref mission_id) = req.mission_id {
-        // Mission session
-        let store = crate::state_fs::SessionStore::with_sessions_dir(
-            crate::paths::mission_sessions_dir(mission_id),
-        );
-        store.remove_session(&req.session_id)
-    } else if let Some(ref skill) = req.skill {
-        // Skill session
-        let store = crate::state_fs::SessionStore::with_sessions_dir(
-            crate::paths::skill_sessions_dir(skill),
-        );
-        store.remove_session(&req.session_id)
-    } else if let Some(ref project) = req.project {
-        // Project session
-        let root = canonical_project_root(project);
-        match state.manager.get_or_create_project(root).await {
-            Ok(ctx) => ctx.sessions.remove_session(&req.session_id),
-            Err(e) => Err(e),
-        }
-    } else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-
-    match result {
+    match state.manager.global_sessions.remove_session(&req.session_id) {
         Ok(_) => StatusCode::OK.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -1172,131 +1109,30 @@ pub(crate) async fn delete_unified_session(
 // Unified session list — all sessions from all sources
 // ---------------------------------------------------------------------------
 
-/// GET /api/sessions/all — return sessions from projects, missions, and skills.
+/// GET /api/sessions/all — return all sessions from the global flat store.
 pub(crate) async fn list_all_sessions(
     State(state): State<Arc<ServerState>>,
 ) -> impl IntoResponse {
-    let mut all: Vec<serde_json::Value> = Vec::new();
-
-    // 1. Project sessions
-    if let Ok(projects) = state.manager.store.list_projects() {
-        for project in &projects {
-            let root = canonical_project_root(&project.path);
-            if let Ok(ctx) = state.manager.get_or_create_project(root).await {
-                if let Ok(sessions) = ctx.sessions.list_sessions() {
-                    let proj_name = std::path::Path::new(&project.path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| project.path.clone());
-                    for s in sessions {
-                        all.push(serde_json::json!({
-                            "id": s.id,
-                            "title": s.title,
-                            "created_at": s.created_at,
-                            "creator": s.creator,
-                            "project": project.path,
-                            "project_name": proj_name,
-                            "skill": s.skill,
-                            "mission_id": serde_json::Value::Null,
-                        }));
-                    }
-                }
-            }
+    match state.manager.global_sessions.list_sessions() {
+        Ok(sessions) => {
+            let all: Vec<serde_json::Value> = sessions
+                .into_iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "id": s.id,
+                        "title": s.title,
+                        "created_at": s.created_at,
+                        "creator": s.creator,
+                        "project": s.project,
+                        "project_name": s.project_name,
+                        "skill": s.skill,
+                        "mission_id": s.mission_id,
+                        "cwd": s.cwd,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "sessions": all })).into_response()
         }
+        Err(_) => Json(serde_json::json!({ "sessions": [] })).into_response(),
     }
-
-    // 2. Mission sessions
-    let missions_dir = crate::paths::global_missions_dir();
-    if missions_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&missions_dir) {
-            for entry in entries.flatten() {
-                if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                    continue;
-                }
-                let mission_id = entry.file_name().to_string_lossy().to_string();
-                if mission_id == "sessions" {
-                    continue; // skip legacy global sessions dir
-                }
-                // Load mission config to get its project path
-                let mission_store = crate::project_store::missions::MissionStore::new();
-                let mission_project = mission_store.get_mission(&mission_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|m| m.project);
-                let mission_project_name = mission_project.as_ref().and_then(|p| {
-                    std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string())
-                });
-                let store = crate::state_fs::SessionStore::with_sessions_dir(
-                    crate::paths::mission_sessions_dir(&mission_id),
-                );
-                if let Ok(sessions) = store.list_sessions() {
-                    for s in sessions {
-                        all.push(serde_json::json!({
-                            "id": s.id,
-                            "title": s.title,
-                            "created_at": s.created_at,
-                            "creator": s.creator,
-                            "project": mission_project,
-                            "project_name": mission_project_name,
-                            "skill": s.skill,
-                            "mission_id": mission_id,
-                        }));
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Skill sessions
-    let skills_dir = crate::paths::global_skills_dir();
-    if skills_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&skills_dir) {
-            for entry in entries.flatten() {
-                if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                    continue;
-                }
-                let skill_name = entry.file_name().to_string_lossy().to_string();
-                let sessions_dir = crate::paths::skill_sessions_dir(&skill_name);
-                if !sessions_dir.exists() {
-                    continue;
-                }
-                let store = crate::state_fs::SessionStore::with_sessions_dir(sessions_dir);
-                if let Ok(sessions) = store.list_sessions() {
-                    for s in sessions {
-                        all.push(serde_json::json!({
-                            "id": s.id,
-                            "title": s.title,
-                            "created_at": s.created_at,
-                            "creator": "skill",
-                            "project": serde_json::Value::Null,
-                            "project_name": serde_json::Value::Null,
-                            "skill": skill_name,
-                            "mission_id": serde_json::Value::Null,
-                        }));
-                    }
-                }
-            }
-        }
-    }
-
-    // Deduplicate by session ID (keep the first occurrence, which has richer metadata)
-    {
-        let mut seen = std::collections::HashSet::new();
-        all.retain(|s| {
-            if let Some(id) = s["id"].as_str() {
-                seen.insert(id.to_string())
-            } else {
-                true
-            }
-        });
-    }
-
-    // Sort by created_at descending (newest first)
-    all.sort_by(|a, b| {
-        let ta = a["created_at"].as_u64().unwrap_or(0);
-        let tb = b["created_at"].as_u64().unwrap_or(0);
-        tb.cmp(&ta)
-    });
-
-    Json(serde_json::json!({ "sessions": all })).into_response()
 }

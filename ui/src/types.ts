@@ -74,7 +74,7 @@ export interface UiEvent {
   seq: number;
   rev: number;
   ts_ms: number;
-  kind: 'message' | 'activity' | 'queue' | 'run' | 'token' | 'text_segment' | 'ask_user' | 'model_fallback' | 'content_block' | 'turn_complete' | 'app_launched' | 'tool_progress' | 'notification';
+  kind: 'message' | 'activity' | 'queue' | 'run' | 'token' | 'text_segment' | 'ask_user' | 'model_fallback' | 'content_block' | 'turn_complete' | 'app_launched' | 'tool_progress' | 'notification' | 'working_folder';
   phase?: string;
   text?: string;
   agent_id?: string;
@@ -218,6 +218,7 @@ export interface SessionInfo {
   project_name?: string;    // short name (last path segment)
   skill?: string | null;    // bound skill name
   mission_id?: string | null; // mission ID if creator is "mission"
+  cwd?: string;             // current working directory
 }
 
 export interface AgentRunInfo {

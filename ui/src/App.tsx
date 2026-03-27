@@ -191,7 +191,7 @@ const App: React.FC = () => {
       // Restore any pending AskUser/permission widget for this session.
       fetchPendingAskUser();
     }
-  }, [activeSessionId, selectedProjectRoot, isMissionSession, fetchPendingAskUser]);
+  }, [activeSessionId, selectedProjectRoot, isMissionSession, projectStore.isSkillSession, fetchPendingAskUser]);
 
   // --- Poll workspace state for mission sessions (backup; SSE also triggers reloads) ---
   useEffect(() => {

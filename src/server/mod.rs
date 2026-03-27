@@ -303,6 +303,13 @@ pub enum ServerEvent {
         context_tokens: Option<usize>,
         parent_id: Option<String>,
     },
+    /// Working folder changed — agent cd'd to a new directory.
+    WorkingFolderChanged {
+        session_id: String,
+        cwd: String,
+        project: Option<String>,
+        project_name: Option<String>,
+    },
 }
 
 impl ServerEvent {
@@ -935,6 +942,28 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
                 "parent_id": parent_id,
             })),
         }),
+        ServerEvent::WorkingFolderChanged {
+            session_id,
+            cwd,
+            project,
+            project_name,
+        } => Some(UiEvent {
+            id: format!("wf-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: "working_folder".to_string(),
+            phase: None,
+            text: None,
+            agent_id: None,
+            session_id: Some(session_id),
+            project_root: None,
+            data: Some(json!({
+                "cwd": cwd,
+                "project": project,
+                "project_name": project_name,
+            })),
+        }),
     }
 }
 
@@ -1080,6 +1109,40 @@ pub async fn prepare_server(
                     }
                     // All other variants have a 1:1 ServerEvent equivalent.
                     other => {
+                        // Intercept __cwd_changed__ progress events → WorkingFolderChanged
+                        if let crate::agent_manager::AgentEvent::ToolProgress {
+                            ref agent_id, ref tool, ref line, ..
+                        } = &other {
+                            if tool == "__cwd_changed__" {
+                                // line = cwd, stream = "project|project_name"
+                                let cwd = line.clone();
+                                if let crate::agent_manager::AgentEvent::ToolProgress { stream, .. } = &other {
+                                    let parts: Vec<&str> = stream.splitn(2, '|').collect();
+                                    let project = parts.first().filter(|s| !s.is_empty()).map(|s| s.to_string());
+                                    let project_name = parts.get(1).filter(|s| !s.is_empty()).map(|s| s.to_string());
+                                    // Find session_id for this agent
+                                    let sid = state_clone.agent_sessions.read().unwrap()
+                                        .get(agent_id).cloned()
+                                        .unwrap_or_default();
+                                    if !sid.is_empty() {
+                                        // Update session metadata
+                                        if let Ok(Some(mut meta)) = state_clone.manager.global_sessions.get_session_meta(&sid) {
+                                            meta.cwd = Some(cwd.clone());
+                                            meta.project = project.clone();
+                                            meta.project_name = project_name.clone();
+                                            let _ = state_clone.manager.global_sessions.update_session_meta(&meta);
+                                        }
+                                        let _ = state_clone.events_tx.send(ServerEvent::WorkingFolderChanged {
+                                            session_id: sid,
+                                            cwd,
+                                            project,
+                                            project_name,
+                                        });
+                                    }
+                                }
+                                continue; // Don't forward as ToolProgress
+                            }
+                        }
                         // Accumulate token usage from ContextUsage events.
                         if let crate::agent_manager::AgentEvent::ContextUsage {
                             agent_id: ctx_agent_id,
@@ -1437,7 +1500,7 @@ async fn events_handler(
                 if let Some(ref sid) = ui_msg.session_id {
                     if sid != "global" {
                         let is_passthrough = matches!(ui_msg.kind.as_str(),
-                            "agent_status" | "activity" | "run"
+                            "agent_status" | "activity" | "run" | "notification"
                         );
                         if !is_passthrough {
                             return None;

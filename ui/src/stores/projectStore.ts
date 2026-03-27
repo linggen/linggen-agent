@@ -179,7 +179,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
 
   fetchSessions: async () => {
-    const { selectedProjectRoot, isMissionSession } = get();
+    const { selectedProjectRoot } = get();
     if (!selectedProjectRoot) return;
     try {
       const resp = await dedupFetch(`/api/sessions?project_root=${encodeURIComponent(selectedProjectRoot)}&limit=50`);
@@ -254,15 +254,14 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
 
   createSession: async () => {
-    const { selectedProjectRoot, fetchSessions, fetchAllSessions, fetchAllSessionCounts } = get();
-    if (!selectedProjectRoot) return;
+    const { fetchSessions, fetchAllSessions, fetchAllSessionCounts } = get();
     const now = new Date();
     const title = `Chat ${now.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}, ${now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`;
     try {
       const resp = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_root: selectedProjectRoot, title }),
+        body: JSON.stringify({ title }),
       });
       const data = await resp.json();
       set({ activeSessionId: data.id });

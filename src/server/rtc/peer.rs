@@ -647,6 +647,13 @@ fn forward_event_to_channels(
     // Route to session channel if available, buffer if channel not yet open.
     // All writes go through the pending_dc_writes queue — writing directly to
     // str0m channels without a poll_output() in between causes SCTP corruption.
+    //
+    // Broadcast events (notifications, agent_status, activity, run) are also
+    // sent to the control channel so the main page can react (e.g. session list
+    // updates when a skill or mission creates a new session).
+    let is_broadcast = matches!(ui_msg.kind.as_str(),
+        "agent_status" | "activity" | "run" | "notification"
+    );
     match ui_msg.session_id.as_deref() {
         Some("global") | None => {
             if let Some(cid) = control_channel_id {
@@ -656,15 +663,24 @@ fn forward_event_to_channels(
             }
         }
         Some(sid) => {
+            // Send to the session's dedicated channel
             if let Some(&cid) = session_channels.get(sid) {
                 if pending_dc_writes.len() < MAX_DC_WRITE_QUEUE {
-                    pending_dc_writes.push_back((cid, json));
+                    pending_dc_writes.push_back((cid, json.clone()));
                 }
-            } else {
+            } else if !is_broadcast {
                 // Channel not yet open — buffer the event
                 let (_, buf) = pending_events.entry(sid.to_string()).or_insert_with(|| (Instant::now(), Vec::new()));
                 if buf.len() < MAX_PENDING_EVENTS {
-                    buf.push(json);
+                    buf.push(json.clone());
+                }
+            }
+            // Also send broadcast events to control channel for main page
+            if is_broadcast {
+                if let Some(cid) = control_channel_id {
+                    if pending_dc_writes.len() < MAX_DC_WRITE_QUEUE {
+                        pending_dc_writes.push_back((cid, json));
+                    }
                 }
             }
         }

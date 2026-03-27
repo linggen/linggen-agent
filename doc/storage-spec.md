@@ -25,10 +25,12 @@ Two-tier layout, aligned with Claude Code's `~/.claude/` + `{repo}/.claude/` con
 | Directory | Purpose |
 |-----------|---------|
 | `~/.linggen/` | Global home (override with `$LINGGEN_HOME`) |
-| `~/.linggen/missions/` | Global missions and their sessions |
-| `~/.linggen/skills/{name}/` | Per-skill state (sessions) |
-| `~/.linggen/projects/{encoded}/` | Per-project state (sessions, runs) |
-| `{workspace}/.linggen/` | Workspace-local settings (permissions, future config) |
+| `~/.linggen/sessions/` | All sessions (flat, creator/project tracked in metadata) |
+| `~/.linggen/runs/` | All agent run records |
+| `~/.linggen/memory/` | Global memory |
+| `~/.linggen/missions/` | Mission definitions and run history |
+| `~/.linggen/skills/{name}/` | Per-skill state |
+| `{repo}/.linggen/` | Project-local settings (permissions) |
 
 Project path encoding: `/Users/foo/project` → `-Users-foo-project` (same convention as Claude Code).
 
@@ -46,47 +48,38 @@ Project path encoding: `/Users/foo/project` → `-Users-foo-project` (same conve
 │   ├── {name}.md                     # Flat skill files
 │   └── {name}/
 │       ├── SKILL.md                  # Skill definition
-│       ├── scripts/                  # Skill assets (optional)
-│       └── sessions/                 # Skill-scoped sessions
-│           └── {session_id}/
-│               ├── session.yaml      # Session metadata (YAML)
-│               └── messages.jsonl    # Session messages (JSONL)
+│       └── scripts/                  # Skill assets (optional)
+├── sessions/                         # All sessions (user, skill, mission — flat)
+│   └── {session_id}/
+│       ├── session.yaml              # Session metadata (includes creator, cwd, project)
+│       └── messages.jsonl            # Chat messages, append-only (JSONL)
+├── runs/                             # All agent run records
+│   └── {run_id}.json
+├── memory/                           # Global memory
+│   └── ...
 ├── credentials.json                  # API keys for model providers (JSON)
+├── permissions.json                  # Global tool permissions (home mode)
 ├── missions/
 │   └── {mission_id}/
 │       ├── mission.md                # Mission definition (markdown + YAML frontmatter)
-│       ├── runs.jsonl                # Mission run history (JSONL)
-│       └── sessions/
-│           └── {session_id}/
-│               ├── session.yaml      # Mission session metadata (YAML)
-│               └── messages.jsonl    # Mission session messages (JSONL)
+│       └── runs.jsonl                # Mission run history (JSONL)
 ├── ling.pid                          # Daemon PID
 └── ling.log                          # Daemon stdout
 ```
 
-## Per-project state (`~/.linggen/projects/{encoded}/`)
+All sessions live in one flat directory. The `creator`, `project`, and `skill` fields in `session.yaml` provide the metadata for filtering, grouping, and display. No session files under `missions/` or `skills/` — those directories hold definitions only.
+
+## Project-local state (`{repo}/.linggen/`)
+
+Project-specific settings live inside the repo itself, not in `~/.linggen/`. Created when the agent grants project-scoped permissions.
 
 ```
-~/.linggen/projects/{encoded}/
-├── project.json                      # Project metadata (JSON)
-├── sessions/
-│   └── {session_id}/
-│       ├── session.yaml              # Session metadata (YAML)
-│       └── messages.jsonl            # Chat messages, append-only (JSONL)
-├── runs/
-│   └── {run_id}.json                 # Agent run records (JSON)
-└── memory/
-    └── ...                           # Agent memory (managed by memory skill)
+{repo}/.linggen/
+└── permissions.json                  # Project-scoped tool permissions (JSON)
 ```
 
-## Workspace-local state (`{workspace}/.linggen/`)
+Can be gitignored. Same pattern as Claude Code's `{repo}/.claude/settings.local.json`.
 
-```
-{workspace}/.linggen/
-└── permissions.json                  # Tool permission allows (JSON)
-```
-
-Same pattern as Claude Code's `{repo}/.claude/settings.local.json`. Lives in the repo, can be gitignored.
 
 ## Data formats
 
@@ -101,19 +94,17 @@ Same pattern as Claude Code's `{repo}/.claude/settings.local.json`. Lives in the
 
 Stored at `~/.linggen/credentials.json`. Keyed by model `id` from `linggen.toml`. Never committed to git. See `models.md` → Credentials.
 
-### Project info (`project.json`)
-
-```json
-{ "path": "/abs/path", "name": "project-name", "added_at": 1700000000 }
-```
-
 ### Tool permissions (`permissions.json`)
 
 ```json
 { "tool_allows": ["Write", "Edit"] }
 ```
 
-Project-scoped tool permission allows, stored at `{workspace}/.linggen/permissions.json`. Created when user selects "Allow all {tool} for this project". See `tool-spec.md` → Tool permission mode.
+Two locations:
+- `~/.linggen/permissions.json` — global permissions (home mode)
+- `{repo}/.linggen/permissions.json` — project-scoped permissions (loaded when agent enters a git repo)
+
+Created when user selects "Allow all {tool}". See `tool-spec.md` → Tool permission mode.
 
 ### Session metadata (`session.yaml`)
 
@@ -121,7 +112,13 @@ Project-scoped tool permission allows, stored at `{workspace}/.linggen/permissio
 id: sess-1700000000-abc12345
 title: "Fix login bug"
 created_at: 1700000000
+creator: user
+cwd: /Users/foo/workspace/myproject
+project: /Users/foo/workspace/myproject
+project_name: myproject
 ```
+
+All sessions live at `~/.linggen/sessions/{id}/` — no path reconstruction needed. `cwd`, `project`, and `project_name` are updated dynamically as the agent changes directories. `project` and `project_name` are null when in home mode (no git repo detected).
 
 ### Chat messages (`messages.jsonl`)
 
@@ -172,7 +169,7 @@ The markdown body is the mission prompt. Multiple missions can be active simulta
 
 ### Mission sessions
 
-Mission runs create sessions at `~/.linggen/missions/{mission_id}/sessions/` (per-mission, not per-project). Same format as project sessions (`session.yaml` + `messages.jsonl`). Each mission's sessions live alongside its definition and run history.
+Mission sessions are stored in `~/.linggen/sessions/` alongside all other sessions. The `creator: mission` and `mission_id` fields in `session.yaml` identify them as mission-created. Mission definitions and run history remain in `~/.linggen/missions/{mission_id}/`.
 
 ### Mission run history (`runs.jsonl`)
 

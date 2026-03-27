@@ -537,6 +537,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({
               setShowFileDropdown(false);
             }}
             onKeyDown={(e) => {
+              // Ignore Enter during IME composition (e.g. Chinese pinyin input)
+              if (e.key === 'Enter' && (e.nativeEvent.isComposing || e.keyCode === 229)) return;
               // Skill dropdown keyboard nav
               const suggestions = showSkillDropdown ? buildSkillSuggestions() : [];
               if (showSkillDropdown && suggestions.length > 0) {

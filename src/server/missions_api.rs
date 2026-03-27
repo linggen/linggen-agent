@@ -218,11 +218,8 @@ pub(crate) async fn trigger_mission(
 
     // Persist the initial user message so the UI has content when it loads the session
     if let Some(ref sid) = session_id {
-        let store = crate::state_fs::SessionStore::with_sessions_dir(
-            crate::paths::mission_sessions_dir(&mission.id),
-        );
         let message = format!("[Mission: {}]\n\n{}", mission.id, mission.prompt);
-        let _ = store.add_chat_message(
+        let _ = state.manager.global_sessions.add_chat_message(
             sid,
             &crate::state_fs::sessions::ChatMsg {
                 agent_id: MISSION_AGENT_ID.to_string(),
@@ -254,19 +251,17 @@ pub(crate) async fn trigger_mission(
 
 /// GET /api/missions/sessions/state?mission_id=xxx&session_id=xxx — read mission session messages
 pub(crate) async fn get_mission_session_state(
+    State(state): State<Arc<ServerState>>,
     Query(q): Query<MissionSessionQuery>,
 ) -> impl IntoResponse {
     let Some(session_id) = q.session_id.filter(|s| !s.is_empty()) else {
         return Json(serde_json::json!({ "messages": [] })).into_response();
     };
-    let Some(mission_id) = q.mission_id.filter(|s| !s.is_empty()) else {
+    let Some(_mission_id) = q.mission_id.filter(|s| !s.is_empty()) else {
         return Json(serde_json::json!({ "messages": [] })).into_response();
     };
 
-    let store = crate::state_fs::SessionStore::with_sessions_dir(
-        crate::paths::mission_sessions_dir(&mission_id),
-    );
-    let messages = store
+    let messages = state.manager.global_sessions
         .get_chat_history(&session_id)
         .unwrap_or_default();
 
@@ -308,12 +303,14 @@ pub(crate) struct MissionSessionQuery {
 
 /// GET /api/missions/:id/sessions — list sessions for a specific mission
 pub(crate) async fn list_mission_sessions(
+    State(state): State<Arc<ServerState>>,
     Path(mission_id): Path<String>,
 ) -> impl IntoResponse {
-    let store = crate::state_fs::SessionStore::with_sessions_dir(
-        crate::paths::mission_sessions_dir(&mission_id),
-    );
-    let sessions = store.list_sessions().unwrap_or_default();
+    let sessions: Vec<_> = state.manager.global_sessions.list_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.mission_id.as_deref() == Some(&mission_id))
+        .collect();
     Json(serde_json::json!({ "sessions": sessions })).into_response()
 }
 
@@ -322,10 +319,7 @@ pub(crate) async fn delete_mission_session(
     State(state): State<Arc<ServerState>>,
     Path((mission_id, session_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let store = crate::state_fs::SessionStore::with_sessions_dir(
-        crate::paths::mission_sessions_dir(&mission_id),
-    );
-    if let Err(e) = store.remove_session(&session_id) {
+    if let Err(e) = state.manager.global_sessions.remove_session(&session_id) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to delete session: {}", e),

@@ -191,8 +191,7 @@ pub(crate) async fn get_workspace_state(
         let tasks = ctx.state_fs.list_tasks().unwrap_or_default();
 
         let messages = match query.session_id.as_deref() {
-            Some(sid) if !sid.is_empty() => ctx
-                .sessions
+            Some(sid) if !sid.is_empty() => state.manager.global_sessions
                 .get_chat_history(sid)
                 .unwrap_or_default(),
             _ => Vec::new(),

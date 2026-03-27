@@ -1,15 +1,14 @@
 /**
- * Unified left panel — sessions, workspace, and missions in one view.
+ * Unified left panel — sessions and missions.
  *
- * Three sections:
+ * Two sections:
  * 1. SESSIONS — chronological list with filters and time grouping
- * 2. WORKSPACE — project management (add/remove)
- * 3. MISSIONS — mission list with inline trigger
+ * 2. MISSIONS — mission list with inline trigger
  */
 import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import {
   MessageSquare, Bot, Sparkles, Plus, Search, X, Trash2,
-  FolderOpen, Play, Pause, ChevronDown, ChevronRight, Settings, FolderPlus,
+  Play, Pause, ChevronDown, ChevronRight, Settings,
 } from 'lucide-react';
 import { cn } from '../lib/cn';
 import type { SessionInfo, CronMission } from '../types';
@@ -63,56 +62,6 @@ const timeGroup = (epochSecs: number): TimeGroup => {
 const groupOrder: Record<TimeGroup, number> = { Today: 0, Yesterday: 1, 'This Week': 2, Older: 3 };
 
 // ---------------------------------------------------------------------------
-// New Chat Dialog
-// ---------------------------------------------------------------------------
-
-const HOME_PATH = '~';
-
-const NewChatDialog: React.FC<{
-  projects: { path: string }[];
-  defaultProject: string;
-  onClose: () => void;
-  onCreate: (projectRoot: string) => void;
-}> = ({ projects, defaultProject, onClose, onCreate }) => {
-  const [selected, setSelected] = useState(defaultProject || projects[0]?.path || HOME_PATH);
-
-  return (
-    <div className="absolute left-0 right-0 top-0 z-20 mx-2 mt-1 bg-white dark:bg-[#1a1a1a] border border-slate-200 dark:border-white/10 rounded-lg shadow-lg p-3 animate-slide-in">
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">New Chat</span>
-        <button onClick={onClose} className="p-0.5 rounded hover:bg-slate-100 dark:hover:bg-white/5 text-slate-400">
-          <X size={12} />
-        </button>
-      </div>
-      <label className="text-[10px] text-slate-500 font-medium">Project</label>
-      <select
-        value={selected}
-        onChange={(e) => setSelected(e.target.value)}
-        className="w-full mt-0.5 mb-2 text-xs bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded px-2 py-1.5 outline-none focus:ring-1 focus:ring-blue-400 text-slate-700 dark:text-slate-300"
-      >
-        <option value={HOME_PATH}>Home (~)</option>
-        {projects.map((p) => {
-          const name = p.path.split('/').pop() || p.path;
-          return <option key={p.path} value={p.path}>{name}</option>;
-        })}
-      </select>
-      <div className="flex justify-end gap-1.5">
-        <button onClick={onClose} className="px-2.5 py-1 text-[11px] rounded border border-slate-200 dark:border-white/10 text-slate-500 hover:bg-slate-50 dark:hover:bg-white/5">
-          Cancel
-        </button>
-        <button
-          onClick={() => { onCreate(selected); onClose(); }}
-          disabled={!selected}
-          className="px-2.5 py-1 text-[11px] rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 font-medium"
-        >
-          Create
-        </button>
-      </div>
-    </div>
-  );
-};
-
-// ---------------------------------------------------------------------------
 // Section Header (collapsible)
 // ---------------------------------------------------------------------------
 
@@ -144,13 +93,9 @@ export const SessionList: React.FC<{
   onOpenSettings?: (tab?: string) => void;
 }> = ({ activeSessionId, onSelectSession, onCreateSession, onDeleteSession, onOpenSettings }) => {
   const allSessions = useProjectStore((s) => s.allSessions);
-  const projects = useProjectStore((s) => s.projects);
-  const selectedProjectRoot = useProjectStore((s) => s.selectedProjectRoot);
   const [filter, setFilter] = useState<CreatorFilter>('all');
   const [search, setSearch] = useState('');
   const [showSearch, setShowSearch] = useState(false);
-  const [showNewChat, setShowNewChat] = useState(false);
-  const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [missionsOpen, setMissionsOpen] = useState(false);
   const [missions, setMissions] = useState<CronMission[]>([]);
   const [triggeringMission, setTriggeringMission] = useState<string | null>(null);
@@ -209,10 +154,7 @@ export const SessionList: React.FC<{
     return [...map.entries()].sort((a, b) => groupOrder[a[0]] - groupOrder[b[0]]);
   }, [filtered]);
 
-  const handleCreateChat = useCallback((projectRoot: string) => {
-    useProjectStore.getState().setSelectedProjectRoot(projectRoot);
-    onCreateSession();
-  }, [onCreateSession]);
+
 
   const handleTriggerMission = useCallback(async (missionId: string) => {
     setTriggeringMission(missionId);
@@ -251,23 +193,13 @@ export const SessionList: React.FC<{
             title="Search sessions">
             {showSearch ? <X size={13} /> : <Search size={13} />}
           </button>
-          <button onClick={() => setShowNewChat(true)}
+          <button onClick={onCreateSession}
             className="p-1 rounded hover:bg-slate-100 dark:hover:bg-white/5 text-slate-400 hover:text-blue-500 transition-colors"
             title="New chat">
             <Plus size={13} />
           </button>
         </div>
       </div>
-
-      {/* New Chat Dialog */}
-      {showNewChat && (
-        <NewChatDialog
-          projects={projects}
-          defaultProject={selectedProjectRoot}
-          onClose={() => setShowNewChat(false)}
-          onCreate={handleCreateChat}
-        />
-      )}
 
       {/* Search */}
       {showSearch && (
@@ -312,9 +244,10 @@ export const SessionList: React.FC<{
               const isActive = session.id === activeSessionId;
               const isNew = newSessionIds.has(session.id);
               return (
-                <button key={session.id} onClick={() => onSelectSession(session)}
+                <div key={session.id} onClick={() => onSelectSession(session)} role="button" tabIndex={0}
+                  onKeyDown={(e) => { if (e.key === 'Enter') onSelectSession(session); }}
                   className={cn(
-                    'w-full flex items-start gap-2 px-3 py-2 text-left transition-all duration-150 group',
+                    'w-full flex items-start gap-2 px-3 py-2 text-left transition-all duration-150 group cursor-pointer',
                     'hover:bg-slate-100 dark:hover:bg-white/[0.04]',
                     isActive && 'bg-blue-50 dark:bg-blue-500/[0.08] border-l-2 border-blue-500',
                     !isActive && 'border-l-2 border-transparent',
@@ -349,52 +282,12 @@ export const SessionList: React.FC<{
                       </button>
                     )}
                   </div>
-                </button>
+                </div>
               );
             })}
           </div>
         ))}
       </div>
-
-      {/* ─── WORKSPACE section ─── */}
-      <SectionHeader title="Workspace" open={workspaceOpen} onToggle={() => setWorkspaceOpen(!workspaceOpen)} action={
-        <button onClick={() => useProjectStore.getState().pickFolder()}
-          className="p-0.5 rounded hover:bg-slate-200 dark:hover:bg-white/10 text-slate-400 hover:text-blue-500 transition-colors" title="Add project">
-          <FolderPlus size={11} />
-        </button>
-      } />
-      {workspaceOpen && (
-        <div className="border-t border-slate-100 dark:border-white/[0.03]">
-          {projects.length === 0 && (
-            <div className="px-3 py-3 text-xs text-slate-400 text-center">
-              No projects. <button onClick={() => useProjectStore.getState().pickFolder()} className="text-blue-500 hover:underline">Add one</button>
-            </div>
-          )}
-          {projects.map((p) => {
-            const isHome = /^\/Users\/[^/]+$/.test(p.path) || /^\/home\/[^/]+$/.test(p.path) || /^[A-Z]:\\Users\\[^\\]+$/.test(p.path) || p.path === '~';
-            const name = isHome ? 'HOME' : (p.path.split('/').pop() || p.path);
-            const isSelected = p.path === selectedProjectRoot;
-            return (
-              <div key={p.path} className={cn(
-                'flex items-center gap-2 px-3 py-1.5 group',
-                isSelected && 'bg-blue-50/50 dark:bg-blue-500/[0.05]'
-              )}>
-                <FolderOpen size={12} className={isSelected ? 'text-blue-500' : 'text-slate-400'} />
-                <button onClick={() => useProjectStore.getState().setSelectedProjectRoot(p.path)}
-                  className={cn('flex-1 text-left text-[11px] truncate',
-                    isSelected ? 'text-blue-600 dark:text-blue-400 font-medium' : 'text-slate-600 dark:text-slate-400')}>
-                  {name}
-                </button>
-                <button onClick={() => useProjectStore.getState().removeProject(p.path)}
-                  className="p-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-red-100 dark:hover:bg-red-500/10 text-slate-400 hover:text-red-500 transition-all"
-                  title="Remove project">
-                  <X size={10} />
-                </button>
-              </div>
-            );
-          })}
-        </div>
-      )}
 
       {/* ─── MISSIONS section ─── */}
       <SectionHeader title="Missions" open={missionsOpen} onToggle={() => setMissionsOpen(!missionsOpen)} action={

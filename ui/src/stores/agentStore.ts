@@ -204,6 +204,9 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   },
 
   fetchOllamaStatus: async () => {
+    // Only poll Ollama when at least one Ollama model is configured
+    const hasOllama = get().models.some((m) => m.provider === 'ollama');
+    if (!hasOllama) return;
     try {
       const resp = await dedupFetch('/api/utils/ollama-status');
       if (resp.ok) set({ ollamaStatus: await resp.json() });
