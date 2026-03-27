@@ -34,8 +34,9 @@ cargo build                        # Build
 cargo test                         # Run all tests
 cargo test check::tests            # Run tests in a specific module
 cargo test test_name               # Run a single test by name
-cargo run                          # Start TUI + embedded server (default)
-cargo run -- --web                 # Web UI only, no TUI
+cargo run                          # Start background daemon + open browser (default)
+cargo run -- --tui                 # TUI + embedded server (classic mode)
+cargo run -- --web                 # Web server foreground (for dev)
 cargo run -- --web --dev           # Dev mode (proxy static assets to Vite)
 cargo run -- --root /path/to/proj  # Custom workspace root
 ```
@@ -61,7 +62,7 @@ For production: `cd ui && npm run build`, then `cargo run` (embeds `ui/dist/` vi
 
 ## Architecture
 
-Linggen is a local-first, multi-agent coding assistant. The binary is `ling`. Default mode starts an HTTP server + TUI; `--web` runs the server only.
+Linggen is a local-first, multi-agent coding assistant. The binary is `ling`. Default mode starts a background daemon + opens browser; `--tui` starts TUI + server; `--web` runs the server in foreground.
 
 ### Rust Backend (`src/`)
 

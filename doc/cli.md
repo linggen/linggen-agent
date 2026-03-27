@@ -19,9 +19,9 @@ The `ling` binary — Linggen AI coding agent.
 ## Quick reference
 
 ```
-ling                              # Start server + TUI (default)
-ling --web                        # Web UI only, no TUI
-ling -d                           # Run as background daemon
+ling                              # Start background daemon + open browser (default)
+ling --tui                        # TUI + embedded server (classic mode)
+ling --web                        # Web server foreground (for dev/debugging)
 ling --port 8080                  # Custom port
 ling --root /path/to/project      # Custom workspace
 
@@ -45,7 +45,8 @@ ling eval                         # Run eval tasks
 
 | Command | Purpose | Needs full runtime? |
 |:--------|:--------|:--------------------|
-| *(none)* | Interactive TUI + embedded server | Yes |
+| *(none)* | Background daemon + open browser | No |
+| `--tui` | Interactive TUI + embedded server | Yes |
 | `stop` | Stop background daemon | No |
 | `status` | Show agent server status | No |
 | `doctor` | Diagnose installation health | No |
@@ -65,7 +66,7 @@ ling eval                         # Run eval tasks
 
 ## Default (bare `ling`)
 
-Start the agent server with an interactive TUI.
+Start a background daemon and open the Web UI in the browser.
 
 ```
 ling [OPTIONS]
@@ -75,18 +76,18 @@ ling [OPTIONS]
 |:-----|:-----------|
 | `--root <PATH>` | Workspace root (default: detect `.git`) |
 | `--port <PORT>` | Server port (default: `server.port` from config) |
-| `--web` | Web UI only — foreground server, no TUI |
-| `-d, --daemon` | Run as background daemon (implies `--web`) |
+| `--tui` | Classic TUI + embedded server (foreground) |
+| `--web` | Web server foreground (for dev/debugging) |
 | `--dev` | Dev mode: proxy static assets to Vite dev server |
 
-When no flags are given, `ling` starts the HTTP server on the configured port with the embedded Web UI, then opens the interactive TUI.
+When no flags are given, `ling` spawns a detached background daemon and opens the browser. The terminal returns immediately.
 
-### Daemon mode (`-d`)
-
-Spawns a detached child running `ling --web --port <PORT>`:
 - Writes PID to `~/.linggen/ling.pid`.
 - Daemon stdout/stderr goes to `~/.linggen/ling.log`.
 - Polls TCP connect (up to 3 s) and reports readiness.
+- Opens `http://localhost:<PORT>` in the default browser.
+
+Use `ling --tui` for the classic interactive TUI experience.
 
 ## stop
 
@@ -249,7 +250,7 @@ These flags can be used with any command:
 
 | File | Purpose |
 |:-----|:--------|
-| `~/.linggen/ling.pid` | Agent daemon PID (created by `-d`, removed by `stop`) |
+| `~/.linggen/ling.pid` | Agent daemon PID (created by bare `ling`, removed by `stop`) |
 | `~/.linggen/ling.log` | Agent daemon stdout/stderr log |
 
 ## Configuration

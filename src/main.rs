@@ -38,13 +38,17 @@ struct Cli {
     #[arg(long, global = true)]
     port: Option<u16>,
 
-    /// Web UI only, no TUI
+    /// Web UI only (foreground, no TUI). For dev/debugging.
     #[arg(long, default_value_t = false)]
     web: bool,
 
-    /// Run as background daemon
-    #[arg(short, long, default_value_t = false)]
+    /// Run as background daemon (legacy, same as bare `ling`)
+    #[arg(short, long, default_value_t = false, hide = true)]
     daemon: bool,
+
+    /// Start TUI + embedded server (classic mode)
+    #[arg(long, default_value_t = false)]
+    tui: bool,
 
     /// Enable dev mode (proxy static assets from Vite dev server)
     #[arg(long, default_value_t = false)]
@@ -265,14 +269,26 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
-    // Daemon mode: spawn self in background and exit
-    if cli.daemon {
-        return cli::daemon::start_agent(&config, global_port, global_root).await;
+    // Default (bare `ling`) or --daemon: start background daemon + open browser
+    if cli.daemon || (!cli.web && !cli.tui && cli.cmd.is_none()) {
+        cli::daemon::start_agent(&config, global_port, global_root).await?;
+        // Open browser on macOS
+        let port = global_port.unwrap_or(config.server.port);
+        let url = format!("http://localhost:{}", port);
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(&url).spawn();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        }
+        return Ok(());
     }
 
     // Full commands — need tracing.
     // Suppress stdout logging in TUI mode — ratatui owns the terminal.
-    let will_run_tui = !cli.web && cli.cmd.is_none();
+    let will_run_tui = cli.tui;
     let log_dir = match logging::setup_tracing_with_settings(logging::LoggingSettings {
         level: config.logging.level.as_deref(),
         directory: config.logging.directory.as_deref(),
@@ -308,7 +324,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Default: bare `ling` → TUI + embedded server (or web-only with --web)
+        // --tui or --web (foreground modes)
         None => {
             let ws_root = workspace::resolve_workspace_root(global_root)?;
             let port = global_port.unwrap_or(config.server.port);
@@ -325,10 +341,10 @@ async fn main() -> Result<()> {
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()));
             let interface_mode = if cli.web {
                 engine::InterfaceMode::Web
-            } else if cli.cmd.is_some() {
-                engine::InterfaceMode::Tui
-            } else {
+            } else if cli.tui {
                 engine::InterfaceMode::Both
+            } else {
+                engine::InterfaceMode::Web
             };
 
             let (manager, rx) =
@@ -391,7 +407,7 @@ async fn main() -> Result<()> {
 
                 server::start_server(manager, skill_manager, port, cli.dev, rx).await?;
             } else {
-                // TUI + embedded server (default)
+                // TUI + embedded server (--tui)
                 let handle =
                     server::prepare_server(manager, skill_manager, port, cli.dev, rx).await?;
                 let result =
