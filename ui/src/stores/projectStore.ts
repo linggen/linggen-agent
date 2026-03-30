@@ -194,9 +194,11 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         let next = s.activeSessionId;
 
         if (next && data.some((sess) => sess.id === next)) {
-          // Current session still valid — keep it
+          // Current session still valid in this project's list — keep it
         } else if (next && (s.isMissionSession || s.isSkillSession)) {
           // Mission/skill session — keep even if not in the regular sessions list
+        } else if (next && s.allSessions.some((sess) => sess.id === next)) {
+          // Session exists globally (e.g. user session from a different project) — keep it
         } else {
           // Try restoring from localStorage
           const persisted = typeof window !== 'undefined'
@@ -218,7 +220,14 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         if (!sessionsChanged && !sessionChanged) return {};
         const patch: Partial<ProjectState> = {};
         if (sessionsChanged) patch.sessions = data;
-        if (sessionChanged) patch.activeSessionId = next;
+        if (sessionChanged) {
+          patch.activeSessionId = next;
+          // Set selectedProjectRoot from the session so the session-change effect fires
+          const sess = data.find((d) => d.id === next);
+          if (sess) {
+            patch.selectedProjectRoot = sess.project || sess.cwd || sess.repo_path || '~';
+          }
+        }
         return patch;
       });
     } catch (e) {
@@ -243,7 +252,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
           patch.isSkillSession = !!isSkill;
           patch.activeMissionId = isMission && first.mission_id ? first.mission_id : null;
           patch.activeSkillName = isSkill && first.skill ? first.skill : null;
-          if (first.project) patch.selectedProjectRoot = first.project;
+          patch.selectedProjectRoot = first.project || first.cwd || first.repo_path || '~';
           window.localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, first.id);
         }
         return patch;

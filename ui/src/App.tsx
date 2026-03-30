@@ -104,8 +104,8 @@ const App: React.FC = () => {
   );
   const agentWork = useMemo(() => buildAgentWorkInfo(agentTree), [agentTree]);
 
-  // --- Run info (for sidebar AgentsCard) ---
-  const { agentRunSummary, runningMainRunIds } = useRunInfo();
+  // --- Run info ---
+  const { runningMainRunIds } = useRunInfo();
 
   // --- Chat actions (for header clear/copy) ---
   const scrollToBottomNoop = useCallback(() => {}, []);
@@ -226,6 +226,10 @@ const App: React.FC = () => {
         selectedProjectRoot: '',
         ...(compactSkill ? { isSkillSession: true, activeSkillName: compactSkill } : {}),
       });
+      // Fetch state after setting skill session flag — avoids race with session-change effect
+      const cs = useChatStore.getState();
+      cs.setActiveSession(compactSession);
+      cs.fetchWorkspaceState();
       return;
     }
 
@@ -468,8 +472,9 @@ const App: React.FC = () => {
                   projectStore.setIsSkillSession(!!isSkill);
                   projectStore.setActiveSkillName(isSkill && session.skill ? session.skill : null);
                   projectStore.setActiveMissionId(isMission && session.mission_id ? session.mission_id : null);
-                  if (session.project && session.project !== selectedProjectRoot) {
-                    projectStore.setSelectedProjectRoot(session.project);
+                  const sessionRoot = session.project || session.cwd || session.repo_path || '~';
+                  if (sessionRoot !== selectedProjectRoot) {
+                    projectStore.setSelectedProjectRoot(sessionRoot);
                   }
                   window.localStorage.setItem('linggen:active-session', session.id);
                   setMobileMenuOpen(false);
@@ -495,9 +500,10 @@ const App: React.FC = () => {
               projectStore.setIsSkillSession(!!isSkill);
               projectStore.setActiveSkillName(isSkill && session.skill ? session.skill : null);
               projectStore.setActiveMissionId(isMission && session.mission_id ? session.mission_id : null);
-              // Switch project context if session belongs to a different project
-              if (session.project && session.project !== selectedProjectRoot) {
-                projectStore.setSelectedProjectRoot(session.project);
+              // Switch project context to match the selected session
+              const sessionRoot = session.project || session.cwd || session.repo_path || '~';
+              if (sessionRoot !== selectedProjectRoot) {
+                projectStore.setSelectedProjectRoot(sessionRoot);
               }
               window.localStorage.setItem('linggen:active-session', session.id);
             }}

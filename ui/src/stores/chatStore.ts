@@ -184,8 +184,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set(mutate((msgs) => [...msgs, message]));
   },
 
-  removeLastUserMessage: (text, agentId) => set(mutate((msgs) => {
-    const idx = msgs.findLastIndex((m) => m.role === 'user' && m.text === text && m.to === agentId);
+  removeLastUserMessage: (text, _agentId) => set(mutate((msgs) => {
+    // Match last user message by trimmed text (agentId match relaxed for robustness)
+    const trimmed = text.trim();
+    const idx = msgs.findLastIndex((m) => m.role === 'user' && m.text.trim() === trimmed);
     if (idx < 0) return msgs;
     const next = [...msgs];
     next.splice(idx, 1);

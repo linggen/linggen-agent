@@ -8,6 +8,17 @@ use axum::{
 };
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
+
+/// Expand `~` to the user's home directory.
+fn expand_project_root(raw: &str) -> PathBuf {
+    if raw == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+    } else if raw.starts_with("~/") {
+        dirs::home_dir().unwrap_or_default().join(&raw[2..])
+    } else {
+        PathBuf::from(raw)
+    }
+}
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,7 +33,7 @@ pub(crate) async fn list_files(
     State(_state): State<Arc<ServerState>>,
     Query(query): Query<FileQuery>,
 ) -> impl IntoResponse {
-    let project_root = PathBuf::from(&query.project_root);
+    let project_root = expand_project_root(&query.project_root);
     let canonical_root = match project_root.canonicalize() {
         Ok(r) => r,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -69,7 +80,7 @@ pub(crate) async fn search_files(
     State(_state): State<Arc<ServerState>>,
     Query(query): Query<FileSearchQuery>,
 ) -> impl IntoResponse {
-    let project_root = PathBuf::from(&query.project_root);
+    let project_root = expand_project_root(&query.project_root);
     let canonical_root = match project_root.canonicalize() {
         Ok(r) => r,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -149,7 +160,7 @@ pub(crate) async fn read_file_api(
     if rel_path.contains("..") {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let project_root = PathBuf::from(&query.project_root);
+    let project_root = expand_project_root(&query.project_root);
     let canonical_root = match project_root.canonicalize() {
         Ok(r) => r,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -184,7 +195,7 @@ pub(crate) async fn get_workspace_state(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<ProjectQuery>,
 ) -> impl IntoResponse {
-    let root = PathBuf::from(&query.project_root);
+    let root = expand_project_root(&query.project_root);
     if let Ok(ctx) = state.manager.get_or_create_project(root).await {
         let active_task = ctx.state_fs.read_file("active.md").ok();
         let user_stories = ctx.state_fs.read_file("user-stories.md").ok();
@@ -230,7 +241,7 @@ pub(crate) async fn get_agent_tree(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<ProjectQuery>,
 ) -> impl IntoResponse {
-    let root_path = PathBuf::from(&query.project_root);
+    let root_path = expand_project_root(&query.project_root);
     let repo_name = root_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -311,6 +322,8 @@ pub(crate) async fn get_agent_tree(
 pub(crate) struct BashRequest {
     pub project_root: String,
     pub command: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
     #[serde(default = "default_bash_timeout")]
     pub timeout_ms: u64,
 }
@@ -320,29 +333,49 @@ fn default_bash_timeout() -> u64 {
 }
 
 /// POST /api/bash — run a shell command directly (CC `!` shortcut).
+///
+/// Tracks cwd per session (same sentinel as the agent Bash tool) so that
+/// `! cd /path` persists for subsequent `!` commands.
 pub(crate) async fn run_bash_api(
-    State(_state): State<Arc<ServerState>>,
+    State(state): State<Arc<ServerState>>,
     Json(req): Json<BashRequest>,
 ) -> impl IntoResponse {
+    use crate::engine::tools::search_exec_find_git_root;
+    use crate::server::ServerEvent;
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    let cwd = PathBuf::from(&req.project_root);
-    if !cwd.is_dir() {
+    const CWD_SENTINEL: &str = "__LINGGEN_CWD__";
+
+    // Resolve cwd: use per-session stored cwd if available, else project_root.
+    let base_cwd: PathBuf = if let Some(sid) = &req.session_id {
+        let guard = state.user_bash_cwd.lock().await;
+        guard.get(sid).cloned()
+            .unwrap_or_else(|| expand_project_root(&req.project_root))
+    } else {
+        expand_project_root(&req.project_root)
+    };
+
+    if !base_cwd.is_dir() {
         return (
             StatusCode::BAD_REQUEST,
-            format!("Directory does not exist: {}", req.project_root),
+            format!("Directory does not exist: {}", base_cwd.display()),
         )
             .into_response();
     }
 
     let timeout = Duration::from_millis(req.timeout_ms);
 
-    // Spawn the command
+    // Wrap command with cwd sentinel (same as agent Bash tool).
+    let wrapped_cmd = format!(
+        "{}; __linggen_ec=$?; echo '{}'; pwd; exit $__linggen_ec",
+        &req.command, CWD_SENTINEL
+    );
+
     let child = Command::new("sh")
         .arg("-c")
-        .arg(&req.command)
-        .current_dir(&cwd)
+        .arg(&wrapped_cmd)
+        .current_dir(&base_cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
@@ -359,41 +392,76 @@ pub(crate) async fn run_bash_api(
         }
     };
 
-    // Wait with timeout
-    let result = tokio::task::spawn_blocking(move || {
-        let output = child.wait_with_output();
-        output
-    });
+    let result = tokio::task::spawn_blocking(move || child.wait_with_output());
 
-    match tokio::time::timeout(timeout, result).await {
+    let (code, mut stdout, stderr) = match tokio::time::timeout(timeout, result).await {
         Ok(Ok(Ok(output))) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
             let code = output.status.code().unwrap_or(-1);
-            Json(serde_json::json!({
-                "exit_code": code,
-                "stdout": stdout,
-                "stderr": stderr,
-            }))
-            .into_response()
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            (code, stdout, stderr)
         }
-        Ok(Ok(Err(e))) => Json(serde_json::json!({
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": format!("Command error: {e}"),
-        }))
-        .into_response(),
-        Ok(Err(e)) => Json(serde_json::json!({
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": format!("Task error: {e}"),
-        }))
-        .into_response(),
-        Err(_) => Json(serde_json::json!({
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": "Command timed out",
-        }))
-        .into_response(),
+        Ok(Ok(Err(e))) => (-1, String::new(), format!("Command error: {e}")),
+        Ok(Err(e)) => (-1, String::new(), format!("Task error: {e}")),
+        Err(_) => (-1, String::new(), "Command timed out".to_string()),
+    };
+
+    // Strip the cwd sentinel and update per-session cwd.
+    let lines: Vec<&str> = stdout.lines().collect();
+    if let Some(pos) = lines.iter().rposition(|l| *l == CWD_SENTINEL) {
+        if pos + 1 < lines.len() {
+            let new_cwd = PathBuf::from(lines[pos + 1]);
+            if new_cwd.is_absolute() && new_cwd.exists() {
+                if let Some(sid) = &req.session_id {
+                    let old_cwd: Option<PathBuf> = {
+                        let guard = state.user_bash_cwd.lock().await;
+                        guard.get(sid).cloned()
+                    };
+                    {
+                        let mut guard = state.user_bash_cwd.lock().await;
+                        guard.insert(sid.clone(), new_cwd.clone());
+                    }
+
+                    // Emit WorkingFolderChanged if cwd actually changed.
+                    if old_cwd.as_ref() != Some(&new_cwd) {
+                        let git_root = search_exec_find_git_root(&new_cwd);
+                        let project = git_root.as_ref()
+                            .map(|p| p.to_string_lossy().to_string());
+                        let project_name = git_root.as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().to_string());
+                        // Update session metadata
+                        let cwd_str = new_cwd.to_string_lossy().to_string();
+                        if let Ok(Some(mut meta)) = state.manager.global_sessions.get_session_meta(sid) {
+                            meta.cwd = Some(cwd_str.clone());
+                            meta.project = project.clone();
+                            meta.project_name = project_name.clone();
+                            let _ = state.manager.global_sessions.update_session_meta(&meta);
+                        }
+                        let _ = state.events_tx.send(ServerEvent::WorkingFolderChanged {
+                            session_id: sid.clone(),
+                            cwd: cwd_str,
+                            project,
+                            project_name,
+                        });
+                    }
+                }
+            }
+        }
+        // Remove sentinel + pwd lines from output.
+        let mut clean_lines: Vec<&str> = lines.clone();
+        let drain_end = (pos + 2).min(clean_lines.len());
+        clean_lines.drain(pos..drain_end);
+        stdout = clean_lines.join("\n");
+        if !stdout.is_empty() && !stdout.ends_with('\n') {
+            stdout.push('\n');
+        }
     }
+
+    Json(serde_json::json!({
+        "exit_code": code,
+        "stdout": stdout,
+        "stderr": stderr,
+    }))
+    .into_response()
 }

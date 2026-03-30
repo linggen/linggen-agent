@@ -659,4 +659,13 @@ function handleWorkingFolder(item: UiEvent): void {
     return s;
   });
   useProjectStore.setState({ allSessions: sessions });
+
+  // If this is the active session, update the global project root so
+  // API calls, file tree, and sidebar reflect the new working folder.
+  if (item.session_id === store.activeSessionId) {
+    const newRoot = (data.project as string) || (data.cwd as string);
+    if (newRoot && newRoot !== store.selectedProjectRoot) {
+      store.setSelectedProjectRoot(newRoot);
+    }
+  }
 }

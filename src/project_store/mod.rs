@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::state_fs::SessionStore;
 use path_encoding::encode_project_path;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -93,11 +92,6 @@ impl ProjectStore {
         Ok(())
     }
 
-    pub fn run_store(&self, project_path: &str) -> RunStore {
-        let runs_dir = self.project_dir(project_path).join("runs");
-        RunStore::new(runs_dir)
-    }
-
     pub fn memory_dir(&self, project_path: &str) -> PathBuf {
         self.project_dir(project_path).join("memory")
     }
@@ -135,10 +129,8 @@ mod tests {
     }
 
     #[test]
-    fn test_run_store_returns_valid_store() {
-        let (store, _dir) = temp_store();
-        store.add_project("/tmp/p".into(), "p".into()).unwrap();
-        let runs = store.run_store("/tmp/p");
+    fn test_in_memory_run_store() {
+        let runs = RunStore::new();
         let record = AgentRunRecord {
             run_id: "r1".into(),
             repo_path: "/tmp/p".into(),
@@ -151,8 +143,8 @@ mod tests {
             started_at: 1000,
             ended_at: None,
         };
-        runs.add_run(&record).unwrap();
-        let list = runs.list_runs(None).unwrap();
+        runs.add_run(&record);
+        let list = runs.list_runs(None);
         assert_eq!(list.len(), 1);
     }
 }

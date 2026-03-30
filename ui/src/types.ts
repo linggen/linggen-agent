@@ -178,7 +178,7 @@ export interface OllamaPsResponse {
 
 export interface AppConfig {
   models: ModelConfigUI[];
-  server: { port: number };
+  server: { port: number; host: string };
   agent: { max_iters: number; write_safety_mode: string; tool_permission_mode: string; prompt_loop_breaker?: string | null };
   logging: { level?: string | null; directory?: string | null; retention_days?: number | null };
   agents: { id: string; spec_path: string; model?: string | null }[];
@@ -232,42 +232,6 @@ export interface AgentRunInfo {
   detail?: string | null;
   started_at: number;
   ended_at?: number | null;
-}
-
-export interface AgentRunSummary {
-  run_id: string;
-  status: string;
-  started_at: number;
-  ended_at?: number | null;
-  child_count: number;
-  timeline_events: number;
-  last_event_at: number;
-}
-
-export interface AgentRunContextSummary {
-  message_count: number;
-  user_messages: number;
-  agent_messages: number;
-  system_messages: number;
-  started_at: number;
-  ended_at?: number | null;
-}
-
-export interface AgentRunContextMessage {
-  repo_path: string;
-  session_id: string;
-  agent_id: string;
-  from_id: string;
-  to_id: string;
-  content: string;
-  timestamp: number;
-  is_observation: boolean;
-}
-
-export interface AgentRunContextResponse {
-  run: AgentRunInfo;
-  summary: AgentRunContextSummary;
-  messages?: AgentRunContextMessage[] | null;
 }
 
 export interface SkillToolParamDef {

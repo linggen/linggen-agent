@@ -47,8 +47,8 @@ pub struct AgentManager {
     events: mpsc::UnboundedSender<AgentEvent>,
     /// Pending plans awaiting user approval, keyed by "{project_root}|{agent_id}".
     pending_plans: Mutex<HashMap<String, Plan>>,
-    /// Maps run_id → repo_path for O(1) lookups in finish/get/cancel.
-    run_project_map: Mutex<HashMap<String, String>>,
+    /// In-memory run store — replaces file-based RunStore. Shared across all operations.
+    pub run_store: Arc<crate::project_store::RunStore>,
     /// Last activity time per agent, keyed by "{project_root}|{agent_id}".
     last_activity: Mutex<HashMap<String, Instant>>,
     /// Interface mode (Web, TUI, or Both) passed into every EngineConfig.
@@ -176,9 +176,7 @@ impl AgentManager {
     }
 
     fn canonical_project_root(project_root: &PathBuf) -> PathBuf {
-        project_root
-            .canonicalize()
-            .unwrap_or_else(|_| project_root.clone())
+        crate::util::resolve_path(project_root)
     }
 
     fn agent_specs_dir(project_root: &PathBuf) -> PathBuf {
@@ -413,7 +411,7 @@ impl AgentManager {
                 tool_cancel_flags: std::sync::Mutex::new(HashMap::new()),
                 events: tx,
                 pending_plans: Mutex::new(HashMap::new()),
-                run_project_map: Mutex::new(HashMap::new()),
+                run_store: Arc::new(crate::project_store::RunStore::new()),
                 last_activity: Mutex::new(HashMap::new()),
                 interface_mode,
                 global_sessions: SessionStore::with_sessions_dir(crate::paths::global_sessions_dir()),
@@ -697,7 +695,13 @@ impl AgentManager {
         engine.set_memory_dir(self.store.memory_dir(&repo_path_str));
 
         let agent = Arc::new(Mutex::new(engine));
-        self.session_engines.lock().await.insert(session_id.to_string(), agent.clone());
+        // Re-check under lock to handle concurrent creation race.
+        // If another task created the engine while we were building ours, use theirs.
+        let mut engines = self.session_engines.lock().await;
+        if let Some(existing) = engines.get(session_id) {
+            return Ok(existing.clone());
+        }
+        engines.insert(session_id.to_string(), agent.clone());
         Ok(agent)
     }
 
@@ -930,11 +934,7 @@ impl AgentManager {
             started_at,
             ended_at: None,
         };
-        self.store.run_store(&repo_path).add_run(&record)?;
-        self.run_project_map
-            .lock()
-            .await
-            .insert(run_id.clone(), repo_path.clone());
+        self.run_store.add_run(&record);
         self.clear_working_place_for_agent(&repo_path, agent_id)
             .await;
         self.cancelled_runs.lock().await.remove(&run_id);
@@ -948,86 +948,40 @@ impl AgentManager {
         detail: Option<String>,
     ) -> Result<()> {
         let ended_at = Some(crate::util::now_ts_secs());
-        let repo_path = self.run_project_map.lock().await.get(run_id).cloned();
-        if let Some(repo_path) = &repo_path {
-            self.store
-                .run_store(repo_path)
-                .update_run(run_id, status, detail, ended_at)?;
-        }
+        self.run_store.update_run(run_id, status, detail, ended_at);
         self.clear_working_place_for_run(run_id).await;
         let _ = self.events.send(AgentEvent::StateUpdated);
         self.cancelled_runs.lock().await.remove(run_id);
         // Record activity for the agent that just finished
-        if let Some(repo_path) = &repo_path {
-            // Look up agent_id from the run record
-            if let Ok(Some(run)) = self.store.run_store(repo_path).get_run(run_id) {
-                self.update_agent_activity(repo_path, &run.agent_id).await;
-            }
+        if let Some(run) = self.run_store.get_run(run_id) {
+            self.update_agent_activity(&run.repo_path, &run.agent_id).await;
         }
-        self.run_project_map.lock().await.remove(run_id);
+        self.run_store.remove_run(run_id);
         Ok(())
     }
 
     pub async fn list_agent_runs(
         &self,
-        project_root: &PathBuf,
+        _project_root: &PathBuf,
         session_id: Option<&str>,
     ) -> Result<Vec<crate::project_store::AgentRunRecord>> {
-        let project_root = project_root
-            .canonicalize()
-            .unwrap_or_else(|_| project_root.clone());
-        self.store
-            .run_store(&project_root.to_string_lossy())
-            .list_runs(session_id)
+        Ok(self.run_store.list_runs(session_id))
     }
 
     pub async fn list_agent_children(
         &self,
         parent_run_id: &str,
-        project_root: Option<&str>,
+        _project_root: Option<&str>,
     ) -> Result<Vec<crate::project_store::AgentRunRecord>> {
-        let repo_path = self
-            .run_project_map
-            .lock()
-            .await
-            .get(parent_run_id)
-            .cloned();
-        let repo_path = repo_path.or_else(|| {
-            project_root.map(|p| {
-                std::path::Path::new(p)
-                    .canonicalize()
-                    .map(|c| c.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| p.to_string())
-            })
-        });
-        if let Some(repo_path) = repo_path {
-            self.store
-                .run_store(&repo_path)
-                .list_children(parent_run_id)
-        } else {
-            Ok(Vec::new())
-        }
+        Ok(self.run_store.list_children(parent_run_id))
     }
 
     pub async fn get_agent_run(
         &self,
         run_id: &str,
-        project_root: Option<&str>,
+        _project_root: Option<&str>,
     ) -> Result<Option<crate::project_store::AgentRunRecord>> {
-        let repo_path = self.run_project_map.lock().await.get(run_id).cloned();
-        let repo_path = repo_path.or_else(|| {
-            project_root.map(|p| {
-                std::path::Path::new(p)
-                    .canonicalize()
-                    .map(|c| c.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| p.to_string())
-            })
-        });
-        if let Some(repo_path) = repo_path {
-            self.store.run_store(&repo_path).get_run(run_id)
-        } else {
-            Ok(None)
-        }
+        Ok(self.run_store.get_run(run_id))
     }
 
     pub async fn is_run_cancelled(&self, run_id: &str) -> bool {
@@ -1040,12 +994,6 @@ impl AgentManager {
     ) -> Result<Vec<crate::project_store::AgentRunRecord>> {
         use crate::project_store::AgentRunStatus;
 
-        let repo_path = self.run_project_map.lock().await.get(run_id).cloned();
-        let Some(repo_path) = repo_path else {
-            return Ok(Vec::new());
-        };
-        let run_store = self.store.run_store(&repo_path);
-
         let mut stack = vec![run_id.to_string()];
         let mut seen = HashSet::new();
         let mut runs = Vec::new();
@@ -1054,10 +1002,10 @@ impl AgentManager {
             if !seen.insert(id.clone()) {
                 continue;
             }
-            let Some(run) = run_store.get_run(&id)? else {
+            let Some(run) = self.run_store.get_run(&id) else {
                 continue;
             };
-            for child in run_store.list_children(&id)? {
+            for child in self.run_store.list_children(&id) {
                 stack.push(child.run_id.clone());
             }
             runs.push(run);
@@ -1076,7 +1024,7 @@ impl AgentManager {
             }
         }
         for run in &to_cancel {
-            let _ = run_store.update_run(
+            self.run_store.update_run(
                 &run.run_id,
                 AgentRunStatus::Cancelled,
                 Some("cancelled by user".to_string()),

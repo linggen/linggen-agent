@@ -9,15 +9,12 @@ import { AskUserCard } from '../AskUserCard';
 import { ToolPermissionCard } from '../ToolPermissionCard';
 import type {
   AgentInfo,
-  AgentRunInfo,
-  AgentRunContextResponse,
   ChatMessage,
   QueuedChatItem,
   SkillInfo,
   SubagentInfo,
 } from '../../types';
-import { normalizeAgentKey, sortMessagesByTime, contextMessageToChatMessage, mergeMessageStreams, collapseProgressMessages } from './utils/message';
-import { formatRunLabel, formatTs, buildRunTimeline } from './utils/timeline';
+import { normalizeAgentKey, sortMessagesByTime, collapseProgressMessages } from './utils/message';
 import { getMessagePhase } from './MessagePhase';
 import { AgentMessage } from './AgentMessage';
 import { ChatInput } from './ChatInput';
@@ -173,12 +170,7 @@ export const ChatPanel: React.FC<{
   agents: AgentInfo[];
   mainAgents: AgentInfo[];
   subagents: SubagentInfo[];
-  mainRunIds?: Record<string, string>;
-  subagentRunIds?: Record<string, string>;
   runningMainRunIds?: Record<string, string>;
-  runningSubagentRunIds?: Record<string, string>;
-  mainRunHistory?: Record<string, AgentRunInfo[]>;
-  subagentRunHistory?: Record<string, AgentRunInfo[]>;
   cancellingRunIds?: Record<string, boolean>;
   onCancelRun?: (runId: string) => void | Promise<void>;
   onSendMessage: (message: string, targetAgent?: string, images?: string[]) => void;
@@ -215,12 +207,7 @@ export const ChatPanel: React.FC<{
   agents,
   mainAgents,
   subagents,
-  mainRunIds,
-  subagentRunIds,
   runningMainRunIds,
-  runningSubagentRunIds,
-  mainRunHistory,
-  subagentRunHistory,
   cancellingRunIds,
   onCancelRun,
   onSendMessage,
@@ -247,36 +234,8 @@ export const ChatPanel: React.FC<{
   mobile,
 }) => {
   const [openSubagentId, setOpenSubagentId] = useState<string | null>(null);
-  const [selectedMainRunByAgent, setSelectedMainRunByAgent] = useState<Record<string, string>>({});
-  const [selectedSubagentRunById, setSelectedSubagentRunById] = useState<Record<string, string>>({});
-  const [pinnedMainRunByAgent, setPinnedMainRunByAgent] = useState<Record<string, boolean>>({});
-  const [pinnedSubagentRunById, setPinnedSubagentRunById] = useState<Record<string, boolean>>({});
   const [mainMessageFilter, setMainMessageFilter] = useState('');
   const [subagentMessageFilter, setSubagentMessageFilter] = useState('');
-  const [runContextById, setRunContextById] = useState<Record<string, AgentRunContextResponse>>({});
-  const [loadingContextByRunId, setLoadingContextByRunId] = useState<Record<string, boolean>>({});
-  const [contextErrorByRunId, setContextErrorByRunId] = useState<Record<string, string>>({});
-  const [childrenByRunId, setChildrenByRunId] = useState<Record<string, AgentRunInfo[]>>({});
-  const [loadingChildrenByRunId, setLoadingChildrenByRunId] = useState<Record<string, boolean>>({});
-  const [childrenErrorByRunId, setChildrenErrorByRunId] = useState<Record<string, string>>({});
-  const notFoundRunIds = useRef<Set<string>>(new Set());
-  // Refs for guard checks in fetch callbacks to avoid infinite render loops.
-  // Using state values in useCallback deps causes: fetch fails → state update →
-  // callback recreated → useEffect re-fires → fetch again → infinite loop.
-  const runContextByIdRef = useRef(runContextById);
-  runContextByIdRef.current = runContextById;
-  const loadingContextByRunIdRef = useRef(loadingContextByRunId);
-  loadingContextByRunIdRef.current = loadingContextByRunId;
-  const childrenByRunIdRef = useRef(childrenByRunId);
-  childrenByRunIdRef.current = childrenByRunId;
-  const loadingChildrenByRunIdRef = useRef(loadingChildrenByRunId);
-  loadingChildrenByRunIdRef.current = loadingChildrenByRunId;
-  const prevProjectRootRef = useRef(projectRoot);
-
-  if (projectRoot !== prevProjectRootRef.current) {
-    notFoundRunIds.current.clear();
-    prevProjectRootRef.current = projectRoot;
-  }
 
   const [expandedMessages, setExpandedMessages] = useState<Set<string>>(new Set());
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -285,18 +244,6 @@ export const ChatPanel: React.FC<{
   const [showLastUserMsg, setShowLastUserMsg] = useState(false);
   const thinkingStartRef = useRef<number | null>(null);
   const [thinkingElapsed, setThinkingElapsed] = useState(0);
-
-  // When chat is cleared (chatMessages becomes empty), also clear cached run
-  // context so stale messages from previous runs don't keep showing.
-  useEffect(() => {
-    if (chatMessages.length === 0) {
-      setRunContextById({});
-      setContextErrorByRunId({});
-      setChildrenByRunId({});
-      setChildrenErrorByRunId({});
-      notFoundRunIds.current.clear();
-    }
-  }, [chatMessages.length]);
 
   useEffect(() => {
     if (pendingAskUser) {
@@ -417,74 +364,8 @@ export const ChatPanel: React.FC<{
     [subagents, openSubagentId]
   );
   const selectedAgentKey = normalizeAgentKey(selectedAgent);
-  const selectedMainRunOptions = useMemo(
-    () => mainRunHistory?.[selectedAgentKey] || [],
-    [mainRunHistory, selectedAgentKey]
-  );
-  const selectedMainRunOverride = selectedMainRunByAgent[selectedAgentKey];
-  const selectedMainPinned = !!pinnedMainRunByAgent[selectedAgentKey];
-  const selectedMainRunId =
-    selectedMainPinned &&
-    selectedMainRunOverride &&
-    selectedMainRunOptions.some((run) => run.run_id === selectedMainRunOverride)
-      ? selectedMainRunOverride
-      : mainRunIds?.[selectedAgentKey] || selectedMainRunOptions[0]?.run_id;
   const selectedMainRunningRunId = runningMainRunIds?.[selectedAgentKey];
   const selectedSubagentKey = selectedSubagent ? normalizeAgentKey(selectedSubagent.id) : '';
-  const selectedSubagentRunOptions = useMemo(
-    () => (selectedSubagent ? subagentRunHistory?.[selectedSubagentKey] || [] : []),
-    [selectedSubagent, subagentRunHistory, selectedSubagentKey]
-  );
-  const selectedSubagentRunOverride = selectedSubagentKey
-    ? selectedSubagentRunById[selectedSubagentKey]
-    : undefined;
-  const selectedSubagentPinned = selectedSubagentKey
-    ? !!pinnedSubagentRunById[selectedSubagentKey]
-    : false;
-  const selectedSubagentRunId =
-    selectedSubagent &&
-    selectedSubagentPinned &&
-    selectedSubagentRunOverride &&
-    selectedSubagentRunOptions.some((run) => run.run_id === selectedSubagentRunOverride)
-      ? selectedSubagentRunOverride
-      : selectedSubagent
-        ? subagentRunIds?.[selectedSubagentKey] || selectedSubagentRunOptions[0]?.run_id
-        : undefined;
-  const selectedSubagentRunningRunId = selectedSubagent
-    ? runningSubagentRunIds?.[selectedSubagentKey]
-    : undefined;
-  const selectedMainContext = selectedMainRunId ? runContextById[selectedMainRunId] : undefined;
-  const selectedSubagentContext = selectedSubagentRunId ? runContextById[selectedSubagentRunId] : undefined;
-  const selectedMainContextError = selectedMainRunId ? contextErrorByRunId[selectedMainRunId] : undefined;
-  const selectedSubagentContextError = selectedSubagentRunId
-    ? contextErrorByRunId[selectedSubagentRunId]
-    : undefined;
-  const selectedMainContextLoading = selectedMainRunId
-    ? !!loadingContextByRunId[selectedMainRunId]
-    : false;
-  const selectedSubagentContextLoading = selectedSubagentRunId
-    ? !!loadingContextByRunId[selectedSubagentRunId]
-    : false;
-  const selectedMainChildren = useMemo(
-    () => (selectedMainRunId ? childrenByRunId[selectedMainRunId] || [] : []),
-    [selectedMainRunId, childrenByRunId]
-  );
-  const selectedSubagentChildren = useMemo(
-    () => (selectedSubagentRunId ? childrenByRunId[selectedSubagentRunId] || [] : []),
-    [selectedSubagentRunId, childrenByRunId]
-  );
-  const selectedMainChildrenLoading = selectedMainRunId
-    ? !!loadingChildrenByRunId[selectedMainRunId]
-    : false;
-  const selectedSubagentChildrenLoading = selectedSubagentRunId
-    ? !!loadingChildrenByRunId[selectedSubagentRunId]
-    : false;
-  const selectedMainChildrenError = selectedMainRunId
-    ? childrenErrorByRunId[selectedMainRunId]
-    : undefined;
-  const selectedSubagentChildrenError = selectedSubagentRunId
-    ? childrenErrorByRunId[selectedSubagentRunId]
-    : undefined;
   const subagentMessages = useMemo(() => {
     if (!selectedSubagent) return [];
     const id = normalizeAgentKey(selectedSubagent.id);
@@ -495,21 +376,9 @@ export const ChatPanel: React.FC<{
     });
     return sortMessagesByTime(filtered);
   }, [chatMessages, selectedSubagent]);
-  const mainContextMessages = useMemo(
-    () => (selectedMainContext?.messages || []).map(contextMessageToChatMessage).filter((m): m is ChatMessage => m !== null),
-    [selectedMainContext]
-  );
-  const selectedSubagentContextMessages = useMemo(
-    () => (selectedSubagentContext?.messages || []).map(contextMessageToChatMessage).filter((m): m is ChatMessage => m !== null),
-    [selectedSubagentContext]
-  );
   const displayedMainMessages = useMemo(
-    () => collapseProgressMessages(mergeMessageStreams(mainContextMessages, sortMessagesByTime(visibleMessages))),
-    [mainContextMessages, visibleMessages]
-  );
-  const displayedSubagentMessages = useMemo(
-    () => mergeMessageStreams(selectedSubagentContextMessages, subagentMessages),
-    [selectedSubagentContextMessages, subagentMessages]
+    () => collapseProgressMessages(sortMessagesByTime(visibleMessages)),
+    [visibleMessages]
   );
   const filteredMainMessages = useMemo(() => {
     const q = mainMessageFilter.trim().toLowerCase();
@@ -550,8 +419,8 @@ export const ChatPanel: React.FC<{
   }, [filteredMainMessages]);
   const filteredSubagentMessages = useMemo(() => {
     const q = subagentMessageFilter.trim().toLowerCase();
-    if (!q) return displayedSubagentMessages;
-    return displayedSubagentMessages.filter((msg) => {
+    if (!q) return subagentMessages;
+    return subagentMessages.filter((msg) => {
       const from = normalizeAgentKey(msg.from || msg.role);
       const to = normalizeAgentKey(msg.to || '');
       return (
@@ -560,90 +429,7 @@ export const ChatPanel: React.FC<{
         to.includes(q)
       );
     });
-  }, [displayedSubagentMessages, subagentMessageFilter]);
-  const selectedMainTimeline = useMemo(
-    () => buildRunTimeline(selectedMainContext?.run, selectedMainContext?.messages || [], selectedMainChildren),
-    [selectedMainContext, selectedMainChildren]
-  );
-  const selectedSubagentTimeline = useMemo(
-    () => buildRunTimeline(selectedSubagentContext?.run, selectedSubagentContext?.messages || [], selectedSubagentChildren),
-    [selectedSubagentContext, selectedSubagentChildren]
-  );
-
-  const fetchRunContext = useCallback(
-    (runId?: string, force = false) => {
-      if (!runId) return;
-      if (notFoundRunIds.current.has(runId)) return;
-      if (loadingContextByRunIdRef.current[runId]) return;
-      if (!force && runContextByIdRef.current[runId]) return;
-      setLoadingContextByRunId((prev) => ({ ...prev, [runId]: true }));
-      setContextErrorByRunId((prev) => {
-        const next = { ...prev };
-        delete next[runId];
-        return next;
-      });
-      void (async () => {
-        try {
-          const url = new URL('/api/agent-context', window.location.origin);
-          url.searchParams.append('run_id', runId);
-          url.searchParams.append('view', 'raw');
-          if (projectRoot) url.searchParams.append('project_root', projectRoot);
-          const resp = await fetch(url.toString());
-          if (resp.status === 404) { notFoundRunIds.current.add(runId); return; }
-          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-          const data = (await resp.json()) as AgentRunContextResponse;
-          setRunContextById((prev) => ({ ...prev, [runId]: data }));
-        } catch (e) {
-          const errorMessage = e instanceof Error ? e.message : String(e);
-          setContextErrorByRunId((prev) => ({ ...prev, [runId]: errorMessage }));
-        } finally {
-          setLoadingContextByRunId((prev) => {
-            const next = { ...prev };
-            delete next[runId];
-            return next;
-          });
-        }
-      })();
-    },
-    [projectRoot]
-  );
-
-  const fetchRunChildren = useCallback(
-    (runId?: string, force = false) => {
-      if (!runId) return;
-      if (notFoundRunIds.current.has(runId)) return;
-      if (loadingChildrenByRunIdRef.current[runId]) return;
-      if (!force && childrenByRunIdRef.current[runId]) return;
-      setLoadingChildrenByRunId((prev) => ({ ...prev, [runId]: true }));
-      setChildrenErrorByRunId((prev) => {
-        const next = { ...prev };
-        delete next[runId];
-        return next;
-      });
-      void (async () => {
-        try {
-          const url = new URL('/api/agent-children', window.location.origin);
-          url.searchParams.append('run_id', runId);
-          if (projectRoot) url.searchParams.append('project_root', projectRoot);
-          const resp = await fetch(url.toString());
-          if (resp.status === 404) { notFoundRunIds.current.add(runId); return; }
-          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-          const data = (await resp.json()) as AgentRunInfo[];
-          setChildrenByRunId((prev) => ({ ...prev, [runId]: Array.isArray(data) ? data : [] }));
-        } catch (e) {
-          const errorMessage = e instanceof Error ? e.message : String(e);
-          setChildrenErrorByRunId((prev) => ({ ...prev, [runId]: errorMessage }));
-        } finally {
-          setLoadingChildrenByRunId((prev) => {
-            const next = { ...prev };
-            delete next[runId];
-            return next;
-          });
-        }
-      })();
-    },
-    [projectRoot]
-  );
+  }, [subagentMessages, subagentMessageFilter]);
 
   useEffect(() => {
     if (!openSubagentId) return;
@@ -652,78 +438,10 @@ export const ChatPanel: React.FC<{
     }
   }, [openSubagentId, subagents]);
 
-  useEffect(() => {
-    if (!selectedMainPinned || !selectedMainRunOverride) return;
-    if (selectedMainRunOptions.some((run) => run.run_id === selectedMainRunOverride)) return;
-    setPinnedMainRunByAgent((prev) => {
-      const next = { ...prev };
-      delete next[selectedAgentKey];
-      return next;
-    });
-    setSelectedMainRunByAgent((prev) => {
-      const next = { ...prev };
-      delete next[selectedAgentKey];
-      return next;
-    });
-  }, [selectedMainPinned, selectedMainRunOverride, selectedMainRunOptions, selectedAgentKey]);
-
-  useEffect(() => {
-    if (!selectedSubagentKey || !selectedSubagentPinned || !selectedSubagentRunOverride) return;
-    if (selectedSubagentRunOptions.some((run) => run.run_id === selectedSubagentRunOverride)) return;
-    setPinnedSubagentRunById((prev) => {
-      const next = { ...prev };
-      delete next[selectedSubagentKey];
-      return next;
-    });
-    setSelectedSubagentRunById((prev) => {
-      const next = { ...prev };
-      delete next[selectedSubagentKey];
-      return next;
-    });
-  }, [selectedSubagentKey, selectedSubagentPinned, selectedSubagentRunOverride, selectedSubagentRunOptions]);
-
-  useEffect(() => {
-    fetchRunContext(selectedMainRunId);
-  }, [selectedMainRunId, fetchRunContext]);
-
-  useEffect(() => {
-    fetchRunContext(selectedSubagentRunId);
-  }, [selectedSubagentRunId, fetchRunContext]);
-
-  useEffect(() => {
-    fetchRunChildren(selectedMainRunId);
-  }, [selectedMainRunId, fetchRunChildren]);
-
-  useEffect(() => {
-    fetchRunChildren(selectedSubagentRunId);
-  }, [selectedSubagentRunId, fetchRunChildren]);
-
-  useEffect(() => {
-    if (!selectedMainRunningRunId && !selectedSubagentRunningRunId) return;
-    const id = window.setInterval(() => {
-      if (selectedMainRunningRunId) fetchRunContext(selectedMainRunningRunId, true);
-      if (selectedSubagentRunningRunId) fetchRunContext(selectedSubagentRunningRunId, true);
-      if (selectedMainRunningRunId) fetchRunChildren(selectedMainRunningRunId, true);
-      if (selectedSubagentRunningRunId) fetchRunChildren(selectedSubagentRunningRunId, true);
-    }, 2000);
-    return () => window.clearInterval(id);
-  }, [selectedMainRunningRunId, selectedSubagentRunningRunId, fetchRunContext, fetchRunChildren]);
-
-  const prevMainRunningRef = useRef(selectedMainRunningRunId);
-  const prevSubRunningRef = useRef(selectedSubagentRunningRunId);
-  useEffect(() => {
-    const prevMain = prevMainRunningRef.current;
-    const prevSub = prevSubRunningRef.current;
-    prevMainRunningRef.current = selectedMainRunningRunId;
-    prevSubRunningRef.current = selectedSubagentRunningRunId;
-    if (prevMain && !selectedMainRunningRunId) fetchRunContext(prevMain, true);
-    if (prevSub && !selectedSubagentRunningRunId) fetchRunContext(prevSub, true);
-  }, [selectedMainRunningRunId, selectedSubagentRunningRunId, fetchRunContext]);
-
   return (
     <section className="h-full flex flex-col bg-white dark:bg-[#0f0f0f] rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden min-h-0 relative">
       <div className="px-1.5 py-1 border-b border-slate-200 dark:border-white/5 bg-slate-50/70 dark:bg-white/[0.02] space-y-1">
-        {(sessionId || selectedMainRunId) && (
+        {sessionId && (
           <details className="rounded-md border border-slate-200 dark:border-white/10 bg-white/80 dark:bg-black/20 px-2 py-1 text-[11px] text-slate-600 dark:text-slate-300">
             <summary className="cursor-pointer flex flex-wrap items-center gap-2">
               {sessionId && (() => {
@@ -753,60 +471,9 @@ export const ChatPanel: React.FC<{
                   </>
                 );
               })()}
-              {selectedMainContext?.run?.status && (
-                <span className={cn('px-1.5 py-0.5 rounded-full uppercase tracking-wide', statusBadgeClass(selectedMainContext.run.status))}>
-                  {selectedMainContext.run.status}
-                </span>
-              )}
               <SessionModelSelector />
             </summary>
             <div className="mt-1.5 flex flex-wrap items-center gap-2">
-              {selectedMainRunOptions.length > 1 && (
-                <select
-                  value={selectedMainRunId}
-                  onChange={(e) => {
-                    const runId = e.target.value;
-                    setSelectedMainRunByAgent((prev) => ({ ...prev, [selectedAgentKey]: runId }));
-                    setPinnedMainRunByAgent((prev) => ({ ...prev, [selectedAgentKey]: true }));
-                  }}
-                  className="text-[11px] bg-white dark:bg-black/30 border border-slate-200 dark:border-white/10 rounded px-2 py-1 outline-none min-w-[10rem]"
-                  title="Select run context"
-                >
-                  {selectedMainRunOptions.map((run) => (
-                    <option key={run.run_id} value={run.run_id}>
-                      {formatRunLabel(run)}
-                    </option>
-                  ))}
-                </select>
-              )}
-              <button
-                onClick={() => {
-                  if (selectedMainPinned) {
-                    setPinnedMainRunByAgent((prev) => {
-                      const next = { ...prev };
-                      delete next[selectedAgentKey];
-                      return next;
-                    });
-                    setSelectedMainRunByAgent((prev) => {
-                      const next = { ...prev };
-                      delete next[selectedAgentKey];
-                      return next;
-                    });
-                  } else {
-                    setSelectedMainRunByAgent((prev) => ({ ...prev, [selectedAgentKey]: selectedMainRunId }));
-                    setPinnedMainRunByAgent((prev) => ({ ...prev, [selectedAgentKey]: true }));
-                  }
-                }}
-                className={cn(
-                  'px-2 py-1 rounded border text-[11px] font-semibold',
-                  selectedMainPinned
-                    ? 'bg-slate-100 text-slate-600 border-slate-300'
-                    : 'bg-blue-50 text-blue-600 border-blue-200'
-                )}
-                title={selectedMainPinned ? 'Unpin run selection' : 'Pin this run selection'}
-              >
-                {selectedMainPinned ? 'Unpin' : 'Pin'}
-              </button>
               {selectedMainRunningRunId && onCancelRun && (
                 <button
                   onClick={() => onCancelRun(selectedMainRunningRunId)}
@@ -822,16 +489,7 @@ export const ChatPanel: React.FC<{
                   {cancellingRunIds?.[selectedMainRunningRunId] ? 'Cancelling...' : 'Cancel Run'}
                 </button>
               )}
-              {selectedMainContextLoading && <span className="text-blue-500">Loading context...</span>}
-              {selectedMainContextError && <span className="text-red-500">Context error: {selectedMainContextError}</span>}
-              {selectedMainChildrenLoading && <span className="text-blue-500">Loading child runs...</span>}
-              {selectedMainChildrenError && <span className="text-red-500">Children error: {selectedMainChildrenError}</span>}
             </div>
-            {selectedMainContext?.summary && (
-              <div className="mt-1 text-slate-500 dark:text-slate-400">
-                msgs {selectedMainContext.summary.message_count} • user {selectedMainContext.summary.user_messages} • agent {selectedMainContext.summary.agent_messages} • system {selectedMainContext.summary.system_messages}
-              </div>
-            )}
           </details>
         )}
 
@@ -877,22 +535,7 @@ export const ChatPanel: React.FC<{
             </p>
           </div>
         )}
-        <div className="flex items-center justify-between gap-2 mb-1">
-          {selectedMainTimeline.length > 0 ? (
-            <details className="text-[11px] text-slate-500">
-              <summary className="cursor-pointer">Timeline ({selectedMainTimeline.length})</summary>
-              <div className="mt-1 space-y-1 max-h-28 overflow-auto custom-scrollbar pr-2">
-                {selectedMainTimeline.map((evt, idx) => (
-                  <div key={`${evt.ts}-${evt.label}-${idx}`} className="text-[11px] text-slate-500 dark:text-slate-400">
-                    {formatTs(evt.ts)} • {evt.label}
-                    {evt.detail ? ` • ${evt.detail}` : ''}
-                  </div>
-                ))}
-              </div>
-            </details>
-          ) : (
-            <div />
-          )}
+        <div className="flex items-center justify-end gap-2 mb-1">
           <input
             value={mainMessageFilter}
             onChange={(e) => setMainMessageFilter(e.target.value)}
@@ -1014,25 +657,12 @@ export const ChatPanel: React.FC<{
       {selectedSubagent && (
         <SubagentDrawer
           selectedSubagent={selectedSubagent}
-          selectedSubagentKey={selectedSubagentKey}
-          selectedSubagentRunId={selectedSubagentRunId}
-          selectedSubagentRunningRunId={selectedSubagentRunningRunId}
-          selectedSubagentRunOptions={selectedSubagentRunOptions}
-          selectedSubagentPinned={selectedSubagentPinned}
-          selectedSubagentContext={selectedSubagentContext}
-          selectedSubagentContextLoading={selectedSubagentContextLoading}
-          selectedSubagentContextError={selectedSubagentContextError}
-          selectedSubagentChildrenLoading={selectedSubagentChildrenLoading}
-          selectedSubagentChildrenError={selectedSubagentChildrenError}
-          selectedSubagentTimeline={selectedSubagentTimeline}
           filteredSubagentMessages={filteredSubagentMessages}
           subagentMessageFilter={subagentMessageFilter}
           setSubagentMessageFilter={setSubagentMessageFilter}
           cancellingRunIds={cancellingRunIds}
           onCancelRun={onCancelRun}
           onClose={() => setOpenSubagentId(null)}
-          setSelectedSubagentRunById={setSelectedSubagentRunById}
-          setPinnedSubagentRunById={setPinnedSubagentRunById}
         />
       )}
     </section>

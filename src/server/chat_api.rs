@@ -1067,12 +1067,15 @@ pub(crate) async fn chat_handler(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
-    let root = if req.project_root.is_empty() || req.project_root == "~" {
-        dirs::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-    } else if req.project_root.starts_with("~/") {
-        dirs::home_dir().unwrap_or_default().join(&req.project_root[2..])
-    } else {
-        PathBuf::from(&req.project_root)
+    let root = {
+        let expanded = if req.project_root.is_empty() || req.project_root == "~" {
+            dirs::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+        } else if req.project_root.starts_with("~/") {
+            dirs::home_dir().unwrap_or_default().join(&req.project_root[2..])
+        } else {
+            PathBuf::from(&req.project_root)
+        };
+        crate::util::resolve_path(&expanded)
     };
     let project_root_str = root.to_string_lossy().to_string();
 
@@ -1212,17 +1215,9 @@ pub(crate) async fn chat_handler(
             let req_model_id = req.model_id.clone();
             let req_images = req.images.clone();
             if was_busy {
-                // When queued, only persist to disk — don't emit via SSE.
-                let sid = session_id.as_deref().unwrap_or("default");
-                let msg = crate::state_fs::sessions::ChatMsg {
-                    agent_id: target_id.to_string(),
-                    from_id: "user".to_string(),
-                    to_id: target_id.to_string(),
-                    content: clean_msg.clone(),
-                    timestamp: crate::util::now_ts_secs(),
-                    is_observation: false,
-                };
-                let _ = global_sessions.add_chat_message(sid, &msg);
+                // Don't persist queued messages yet — they'll be persisted
+                // when dequeued and processed (avoids showing them in chat
+                // before the agent sees them).
             } else {
                 // Emit + persist plain text. Images are ephemeral (sent inline
                 // as base64 for the current turn only, not persisted to disk).
@@ -1270,13 +1265,18 @@ pub(crate) async fn chat_handler(
                         &target_id_clone,
                     )
                     .await;
-                    // Emit the queued user message via SSE now that it's being processed.
-                    let _ = events_tx_clone.send(ServerEvent::Message {
-                        from: "user".to_string(),
-                        to: target_id_clone.clone(),
-                        content: clean_msg_clone.clone(),
-                        session_id: session_id.clone(),
-                    });
+                    // Persist + emit the queued user message now that it's being processed.
+                    persist_and_emit_to_store(
+                        &state_clone.manager.global_sessions,
+                        &events_tx_clone,
+                        &target_id_clone,
+                        "user",
+                        &target_id_clone,
+                        &clean_msg_clone,
+                        session_id.as_deref(),
+                        false,
+                    )
+                    .await;
                 }
 
                 // agent_sessions already registered before spawn — no need to repeat here.
@@ -1444,12 +1444,11 @@ pub(crate) async fn chat_handler(
 /// Scans the session history backwards for the last plan message with status "planned".
 async fn recover_plan_from_session(
     state: &Arc<ServerState>,
-    root: &std::path::Path,
+    _root: &std::path::Path,
     agent_id: &str,
     session_id: Option<&str>,
 ) -> Option<crate::engine::Plan> {
     let sid = session_id.unwrap_or("default");
-    let ctx = state.manager.get_or_create_project(root.to_path_buf()).await.ok()?;
     let messages = state.manager.global_sessions.get_chat_history(sid).ok()?;
     // Scan backwards for the last plan message. Stop at the first plan found
     // regardless of status — if the most recent plan is "approved" or "completed",
@@ -1689,6 +1688,7 @@ pub(crate) async fn reject_plan_handler(
     let _ = state.events_tx.send(ServerEvent::PlanUpdate {
         agent_id: req.agent_id.clone(),
         plan: rejected_plan.clone(),
+        session_id: req.session_id.clone(),
     });
 
     // Persist the rejected plan so recover_plan_from_session sees the updated

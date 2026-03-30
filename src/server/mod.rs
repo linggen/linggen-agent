@@ -91,6 +91,9 @@ pub struct ServerState {
     /// Random token required for WHIP endpoint authentication.
     /// Generated at startup, passed to the UI via /api/status.
     pub whip_token: String,
+    /// Per-session cwd for user `!` bash commands. Key = session_id.
+    /// Mirrors the agent's cwd_by_session but for direct user shell commands.
+    pub user_bash_cwd: Arc<Mutex<HashMap<String, std::path::PathBuf>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -223,6 +226,7 @@ pub enum ServerEvent {
     PlanUpdate {
         agent_id: String,
         plan: crate::engine::Plan,
+        session_id: Option<String>,
     },
     MissionTriggered {
         mission_id: String,
@@ -341,7 +345,8 @@ impl ServerEvent {
                 compressed, summary_count,
             }),
             AgentEvent::PlanUpdate { agent_id, plan } => {
-                Some(Self::PlanUpdate { agent_id, plan })
+                // session_id will be filled in by the event bridge using agent_sessions lookup.
+                Some(Self::PlanUpdate { agent_id, plan, session_id: None })
             }
             AgentEvent::TextSegment { agent_id, text, parent_id } => {
                 Some(Self::TextSegment { agent_id, text, parent_id })
@@ -636,7 +641,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             project_root: None,
             data: if thinking { Some(json!({ "thinking": true })) } else { None },
         }),
-        ServerEvent::PlanUpdate { agent_id, plan } => Some(UiEvent {
+        ServerEvent::PlanUpdate { agent_id, plan, session_id } => Some(UiEvent {
             id: format!("run-plan-{agent_id}-{seq}"),
             seq,
             rev: seq,
@@ -645,7 +650,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             phase: Some(UI_PHASE_PLAN_UPDATE.to_string()),
             text: Some("Plan updated".to_string()),
             agent_id: Some(agent_id),
-            session_id: None,
+            session_id,
             project_root: None,
             data: Some(json!({ "plan": plan })),
         }),
@@ -1058,11 +1063,12 @@ pub struct ServerHandle {
 pub async fn prepare_server(
     manager: Arc<AgentManager>,
     skill_manager: Arc<crate::skills::SkillManager>,
+    host: &str,
     port: u16,
     dev_mode: bool,
     mut agent_events_rx: mpsc::UnboundedReceiver<crate::agent_manager::AgentEvent>,
 ) -> anyhow::Result<ServerHandle> {
-    info!("linggen server starting on port {}...", port);
+    info!("linggen server starting on {}:{}...", host, port);
 
     // SSE can be bursty (tool/status steps). Use a larger buffer to reduce lag drops.
     let (events_tx, _) = broadcast::channel(4096);
@@ -1088,6 +1094,7 @@ pub async fn prepare_server(
         session_tokens: Arc::new(Mutex::new(HashMap::new())),
         agent_sessions: Arc::new(std::sync::RwLock::new(HashMap::new())),
         whip_token: uuid::Uuid::new_v4().to_string(),
+        user_bash_cwd: Arc::new(Mutex::new(HashMap::new())),
     });
 
     // Bridge internal AgentManager events to SSE for the UI.
@@ -1283,9 +1290,9 @@ pub async fn prepare_server(
     // Spawn remote relay tasks (heartbeat + offer polling) if remote.toml exists.
     rtc::relay::spawn_relay_tasks(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
     let actual_port = listener.local_addr()?.port();
-    info!("Server running on http://localhost:{}", actual_port);
+    info!("Server running on http://{}:{}", host, actual_port);
 
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await?;
@@ -1301,11 +1308,12 @@ pub async fn prepare_server(
 pub async fn start_server(
     manager: Arc<AgentManager>,
     skill_manager: Arc<crate::skills::SkillManager>,
+    host: &str,
     port: u16,
     dev_mode: bool,
     agent_events_rx: mpsc::UnboundedReceiver<crate::agent_manager::AgentEvent>,
 ) -> anyhow::Result<()> {
-    let handle = prepare_server(manager, skill_manager, port, dev_mode, agent_events_rx).await?;
+    let handle = prepare_server(manager, skill_manager, host, port, dev_mode, agent_events_rx).await?;
     handle.task.await??;
     Ok(())
 }
@@ -1654,6 +1662,7 @@ mod tests {
                     plan_text: String::new(),
                     items: Vec::new(),
                 },
+                session_id: None,
             },
             ServerEvent::MissionTriggered {
                 mission_id: "mission-1".into(),

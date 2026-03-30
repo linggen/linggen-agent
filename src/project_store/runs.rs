@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -27,21 +27,35 @@ pub struct AgentRunRecord {
     pub ended_at: Option<u64>,
 }
 
+/// In-memory run store. No file persistence — runs are ephemeral process records
+/// that exist only while the server is running.
 pub struct RunStore {
-    runs_dir: PathBuf,
+    runs: Mutex<HashMap<String, AgentRunRecord>>,
+    /// Parent run_id → list of child run_ids, for cancel cascade.
+    children: Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl RunStore {
-    pub fn new(runs_dir: PathBuf) -> Self {
-        Self { runs_dir }
+    pub fn new() -> Self {
+        Self {
+            runs: Mutex::new(HashMap::new()),
+            children: Mutex::new(HashMap::new()),
+        }
     }
 
-    pub fn add_run(&self, record: &AgentRunRecord) -> Result<()> {
-        fs::create_dir_all(&self.runs_dir)?;
-        let path = self.runs_dir.join(format!("{}.json", record.run_id));
-        let json = serde_json::to_string_pretty(record)?;
-        fs::write(path, json)?;
-        Ok(())
+    pub fn add_run(&self, record: &AgentRunRecord) {
+        if let Some(ref parent_id) = record.parent_run_id {
+            self.children
+                .lock()
+                .unwrap()
+                .entry(parent_id.clone())
+                .or_default()
+                .push(record.run_id.clone());
+        }
+        self.runs
+            .lock()
+            .unwrap()
+            .insert(record.run_id.clone(), record.clone());
     }
 
     pub fn update_run(
@@ -50,96 +64,73 @@ impl RunStore {
         status: AgentRunStatus,
         detail: Option<String>,
         ended_at: Option<u64>,
-    ) -> Result<()> {
-        let path = self.runs_dir.join(format!("{}.json", run_id));
-        if !path.exists() {
-            return Ok(());
+    ) {
+        let mut runs = self.runs.lock().unwrap();
+        if let Some(run) = runs.get_mut(run_id) {
+            run.status = status;
+            if detail.is_some() {
+                run.detail = detail;
+            }
+            if ended_at.is_some() {
+                run.ended_at = ended_at;
+            }
         }
-        let json = fs::read_to_string(&path)?;
-        let mut run: AgentRunRecord = serde_json::from_str(&json)?;
-        run.status = status;
-        if detail.is_some() {
-            run.detail = detail;
-        }
-        if ended_at.is_some() {
-            run.ended_at = ended_at;
-        }
-        let updated = serde_json::to_string_pretty(&run)?;
-        fs::write(path, updated)?;
-        Ok(())
     }
 
-    pub fn get_run(&self, run_id: &str) -> Result<Option<AgentRunRecord>> {
-        let path = self.runs_dir.join(format!("{}.json", run_id));
-        if !path.exists() {
-            return Ok(None);
-        }
-        let json = fs::read_to_string(&path)?;
-        let run: AgentRunRecord = serde_json::from_str(&json)?;
-        Ok(Some(run))
+    pub fn get_run(&self, run_id: &str) -> Option<AgentRunRecord> {
+        self.runs.lock().unwrap().get(run_id).cloned()
     }
 
-    pub fn list_runs(&self, session_id: Option<&str>) -> Result<Vec<AgentRunRecord>> {
-        if !self.runs_dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut runs = Vec::new();
-        for entry in fs::read_dir(&self.runs_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().map_or(true, |ext| ext != "json") {
-                continue;
-            }
-            let json = match fs::read_to_string(&path) {
-                Ok(j) => j,
-                Err(_) => continue,
-            };
-            let run: AgentRunRecord = match serde_json::from_str(&json) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("Skipping corrupt run file {}: {}", path.display(), e);
-                    continue;
-                }
-            };
-            if let Some(sid) = session_id {
-                if run.session_id != sid {
-                    continue;
+    pub fn remove_run(&self, run_id: &str) {
+        let mut runs = self.runs.lock().unwrap();
+        if let Some(run) = runs.remove(run_id) {
+            // Also clean up the children index.
+            if let Some(ref parent_id) = run.parent_run_id {
+                let mut children = self.children.lock().unwrap();
+                if let Some(siblings) = children.get_mut(parent_id) {
+                    siblings.retain(|id| id != run_id);
+                    if siblings.is_empty() {
+                        children.remove(parent_id);
+                    }
                 }
             }
-            runs.push(run);
+            // Remove any children entries for this run.
+            self.children.lock().unwrap().remove(run_id);
         }
-        runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-        Ok(runs)
     }
 
-    pub fn list_children(&self, parent_run_id: &str) -> Result<Vec<AgentRunRecord>> {
-        if !self.runs_dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut runs = Vec::new();
-        for entry in fs::read_dir(&self.runs_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().map_or(true, |ext| ext != "json") {
-                continue;
-            }
-            let json = match fs::read_to_string(&path) {
-                Ok(j) => j,
-                Err(_) => continue,
-            };
-            let run: AgentRunRecord = match serde_json::from_str(&json) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("Skipping corrupt run file {}: {}", path.display(), e);
-                    continue;
+    pub fn list_runs(&self, session_id: Option<&str>) -> Vec<AgentRunRecord> {
+        let runs = self.runs.lock().unwrap();
+        let mut result: Vec<AgentRunRecord> = runs
+            .values()
+            .filter(|r| {
+                if let Some(sid) = session_id {
+                    r.session_id == sid
+                } else {
+                    true
                 }
-            };
-            if run.parent_run_id.as_deref() == Some(parent_run_id) {
-                runs.push(run);
-            }
-        }
-        runs.sort_by(|a, b| a.started_at.cmp(&b.started_at));
-        Ok(runs)
+            })
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        result
+    }
+
+    pub fn list_children(&self, parent_run_id: &str) -> Vec<AgentRunRecord> {
+        let child_ids = self
+            .children
+            .lock()
+            .unwrap()
+            .get(parent_run_id)
+            .cloned()
+            .unwrap_or_default();
+        let runs = self.runs.lock().unwrap();
+        let mut result: Vec<AgentRunRecord> = child_ids
+            .iter()
+            .filter_map(|id| runs.get(id).cloned())
+            .collect();
+        result.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+        result
     }
 }
 
@@ -147,14 +138,12 @@ impl RunStore {
 mod tests {
     use super::*;
 
-    fn temp_run_store() -> (RunStore, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let runs_dir = dir.path().join("runs");
-        let store = RunStore::new(runs_dir);
-        (store, dir)
-    }
-
-    fn make_run(run_id: &str, session_id: &str, parent: Option<&str>, started_at: u64) -> AgentRunRecord {
+    fn make_run(
+        run_id: &str,
+        session_id: &str,
+        parent: Option<&str>,
+        started_at: u64,
+    ) -> AgentRunRecord {
         AgentRunRecord {
             run_id: run_id.into(),
             repo_path: "/tmp/p".into(),
@@ -171,23 +160,23 @@ mod tests {
 
     #[test]
     fn test_add_and_get_run() {
-        let (store, _dir) = temp_run_store();
+        let store = RunStore::new();
         let run = make_run("r1", "s1", None, 1000);
-        store.add_run(&run).unwrap();
+        store.add_run(&run);
 
-        let fetched = store.get_run("r1").unwrap().unwrap();
+        let fetched = store.get_run("r1").unwrap();
         assert_eq!(fetched.status, AgentRunStatus::Running);
         assert_eq!(fetched.run_id, "r1");
     }
 
     #[test]
     fn test_update_run() {
-        let (store, _dir) = temp_run_store();
+        let store = RunStore::new();
         let run = make_run("r1", "s1", None, 1000);
-        store.add_run(&run).unwrap();
+        store.add_run(&run);
 
-        store.update_run("r1", AgentRunStatus::Completed, Some("done".into()), Some(2000)).unwrap();
-        let fetched = store.get_run("r1").unwrap().unwrap();
+        store.update_run("r1", AgentRunStatus::Completed, Some("done".into()), Some(2000));
+        let fetched = store.get_run("r1").unwrap();
         assert_eq!(fetched.status, AgentRunStatus::Completed);
         assert_eq!(fetched.detail.as_deref(), Some("done"));
         assert_eq!(fetched.ended_at, Some(2000));
@@ -195,44 +184,54 @@ mod tests {
 
     #[test]
     fn test_list_runs() {
-        let (store, _dir) = temp_run_store();
-        store.add_run(&make_run("r1", "s1", None, 1000)).unwrap();
-        store.add_run(&make_run("r2", "s1", None, 2000)).unwrap();
-        store.add_run(&make_run("r3", "s2", None, 3000)).unwrap();
+        let store = RunStore::new();
+        store.add_run(&make_run("r1", "s1", None, 1000));
+        store.add_run(&make_run("r2", "s1", None, 2000));
+        store.add_run(&make_run("r3", "s2", None, 3000));
 
-        let all = store.list_runs(None).unwrap();
+        let all = store.list_runs(None);
         assert_eq!(all.len(), 3);
-        // Sorted desc by started_at
         assert_eq!(all[0].run_id, "r3");
 
-        let s1_runs = store.list_runs(Some("s1")).unwrap();
+        let s1_runs = store.list_runs(Some("s1"));
         assert_eq!(s1_runs.len(), 2);
 
-        let s2_runs = store.list_runs(Some("s2")).unwrap();
+        let s2_runs = store.list_runs(Some("s2"));
         assert_eq!(s2_runs.len(), 1);
 
-        let empty = store.list_runs(Some("nonexistent")).unwrap();
+        let empty = store.list_runs(Some("nonexistent"));
         assert_eq!(empty.len(), 0);
     }
 
     #[test]
     fn test_list_children() {
-        let (store, _dir) = temp_run_store();
-        store.add_run(&make_run("parent", "s1", None, 1000)).unwrap();
-        store.add_run(&make_run("child1", "s1", Some("parent"), 1001)).unwrap();
-        store.add_run(&make_run("child2", "s1", Some("parent"), 1002)).unwrap();
-        store.add_run(&make_run("other", "s1", None, 1003)).unwrap();
+        let store = RunStore::new();
+        store.add_run(&make_run("parent", "s1", None, 1000));
+        store.add_run(&make_run("child1", "s1", Some("parent"), 1001));
+        store.add_run(&make_run("child2", "s1", Some("parent"), 1002));
+        store.add_run(&make_run("other", "s1", None, 1003));
 
-        let children = store.list_children("parent").unwrap();
+        let children = store.list_children("parent");
         assert_eq!(children.len(), 2);
-        // Sorted asc by started_at
         assert_eq!(children[0].run_id, "child1");
         assert_eq!(children[1].run_id, "child2");
     }
 
     #[test]
     fn test_get_nonexistent_run() {
-        let (store, _dir) = temp_run_store();
-        assert!(store.get_run("nonexistent").unwrap().is_none());
+        let store = RunStore::new();
+        assert!(store.get_run("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_remove_run() {
+        let store = RunStore::new();
+        store.add_run(&make_run("parent", "s1", None, 1000));
+        store.add_run(&make_run("child1", "s1", Some("parent"), 1001));
+        assert_eq!(store.list_children("parent").len(), 1);
+
+        store.remove_run("child1");
+        assert!(store.get_run("child1").is_none());
+        assert_eq!(store.list_children("parent").len(), 0);
     }
 }

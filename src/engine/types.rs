@@ -386,6 +386,9 @@ impl AgentEngine {
                 new_ws_root.display()
             );
             self.cfg.ws_root = new_ws_root.clone();
+            // Update the tools root so Read/Write/Edit/Glob/Grep resolve
+            // relative paths from the new workspace root.
+            self.tools.builtins.set_workspace_root(new_ws_root.clone());
             self.cached_system_prompt = None; // Force rebuild with new CLAUDE.md
             // Reload permissions from new project
             let linggen_dir = new_ws_root.join(".linggen");

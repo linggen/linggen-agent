@@ -24,7 +24,7 @@ export const AgentMessage: React.FC<{
   isExpanded: boolean;
   onToggle: () => void;
   planProps: SpecialBlockProps;
-}> = ({ msg, isExpanded, onToggle, planProps }) => {
+}> = React.memo(({ msg, isExpanded, onToggle, planProps }) => {
   const phase = getMessagePhase(msg);
   const contentBlocks = msg.content || [];
   const hasToolBlocks = contentBlocks.some(b => b.type === 'tool_use');
@@ -125,4 +125,4 @@ export const AgentMessage: React.FC<{
       <TurnSummaryFooter msg={msg} />
     </>
   );
-};
+});

@@ -145,7 +145,7 @@ export function useChatActions(
       try {
         const resp = await fetch('/api/bash', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ project_root: root, command: cmd }),
+          body: JSON.stringify({ project_root: root, command: cmd, session_id: sid }),
         });
         const data = await resp.json();
         const output = [data.stdout, data.stderr].filter(Boolean).join('\n').trim();

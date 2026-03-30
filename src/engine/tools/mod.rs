@@ -274,6 +274,12 @@ impl Tools {
         &self.root
     }
 
+    /// Update the workspace root (e.g. when the agent enters a new git project).
+    /// This makes Read/Write/Edit/Glob/Grep resolve relative paths from the new root.
+    pub fn set_workspace_root(&mut self, new_root: PathBuf) {
+        self.root = new_root;
+    }
+
     pub fn cwd(&self) -> PathBuf {
         let map = self.cwd_by_session.lock().unwrap();
         if let Some(sid) = &self.session_id {

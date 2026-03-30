@@ -56,14 +56,7 @@ export const ChatWidget: React.FC<ChatWidgetProps> = ({
   const { chatEndRef, scrollToBottom } = useAutoScroll(chatMessages, lastMsg);
 
   // --- Run info ---
-  const {
-    mainRunIds,
-    subagentRunIds,
-    runningMainRunIds,
-    runningSubagentRunIds,
-    mainRunHistory,
-    subagentRunHistory,
-  } = useRunInfo();
+  const { runningMainRunIds } = useRunInfo();
 
   // --- Derived ---
   const effectiveRoot = projectRoot || selectedProjectRoot;
@@ -131,12 +124,7 @@ export const ChatWidget: React.FC<ChatWidgetProps> = ({
       agents={agents}
       mainAgents={agents}
       subagents={subagents}
-      mainRunIds={mainRunIds}
-      subagentRunIds={subagentRunIds}
       runningMainRunIds={runningMainRunIds}
-      runningSubagentRunIds={runningSubagentRunIds}
-      mainRunHistory={mainRunHistory}
-      subagentRunHistory={subagentRunHistory}
       cancellingRunIds={cancellingRunIds}
       onCancelRun={(id) => useAgentStore.getState().cancelAgentRun(id)}
       onCancelAgentRun={(id) => useAgentStore.getState().cancelAgentRun(id)}

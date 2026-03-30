@@ -74,7 +74,7 @@ pub(crate) struct CancelRunRequest {
 
 #[derive(Serialize)]
 struct CancelRunResponse {
-    cancelled_run_ids: Vec<String>,
+    status: String,
 }
 
 pub(crate) async fn run_agent(
@@ -218,7 +218,7 @@ pub(crate) async fn cancel_agent_run(
             }
             let _ = state.events_tx.send(ServerEvent::StateUpdated);
             Json(CancelRunResponse {
-                cancelled_run_ids: runs.into_iter().map(|r| r.run_id).collect(),
+                status: "ok".to_string(),
             })
             .into_response()
         }

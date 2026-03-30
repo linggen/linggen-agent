@@ -1,4 +1,4 @@
-import type { AgentRunContextMessage, ChatMessage } from '../../../types';
+import type { ChatMessage } from '../../../types';
 import { dedupeActivityEntries, isProgressLineText, summarizeCollapsedActivity } from './activity';
 
 export const normalizeAgentKey = (value?: string) => (value || '').trim().toLowerCase();
@@ -169,92 +169,6 @@ export const sanitizeAgentMessageText = (text: string) => {
     kept.push(line);
   }
   return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-};
-
-/** Returns null for messages that should be hidden entirely. */
-export const contextMessageToChatMessage = (msg: AgentRunContextMessage): ChatMessage | null => {
-  const timestampMs = Number(msg.timestamp || 0) * 1000;
-  const role = roleFromSender(msg.from_id);
-  if (role !== 'user') {
-    const raw = (msg.content || '').trim();
-    if (/^Tool\s+\w+:/i.test(raw)) return null;
-    if (raw.startsWith('Used tool:')) return null;
-    if (raw.startsWith('Delegated task:')) return null;
-  }
-  const content = role === 'user' ? msg.content : sanitizeAgentMessageText(msg.content);
-  if (role !== 'user') {
-    const stripped = content.split('\n').filter(l => {
-      const t = l.trim();
-      return t && !t.startsWith('Used tool:') && !t.startsWith('Delegated task:');
-    }).join('\n').trim();
-    if (!stripped) return null;
-  }
-  return {
-    role,
-    from: msg.from_id,
-    to: msg.to_id || undefined,
-    text: content,
-    timestamp: timestampMs > 0 ? new Date(timestampMs).toLocaleTimeString() : '',
-    timestampMs,
-  };
-};
-
-export const sameMessageIdentity = (a: ChatMessage, b: ChatMessage) => {
-  const aFrom = normalizeAgentKey(a.from || a.role);
-  const bFrom = normalizeAgentKey(b.from || b.role);
-  const aTo = normalizeAgentKey(a.to || '');
-  const bTo = normalizeAgentKey(b.to || '');
-  if (aFrom !== bFrom || aTo !== bTo) return false;
-  const aText = normalizeMessageTextForDedup(a.text);
-  const bText = normalizeMessageTextForDedup(b.text);
-  if (!hasStrongContentOverlap(aText, bText)) return false;
-  const ta = a.timestampMs ?? 0;
-  const tb = b.timestampMs ?? 0;
-  if (ta <= 0 || tb <= 0) return true;
-  return Math.abs(ta - tb) <= 120_000;
-};
-
-export const mergeMessageStreams = (contextMessages: ChatMessage[], liveMessages: ChatMessage[]) => {
-  if (contextMessages.length === 0) return liveMessages;
-  if (liveMessages.length === 0) return contextMessages;
-  const usedLiveIndices = new Set<number>();
-  const merged = contextMessages.map((ctxMsg) => {
-    const liveIdx = liveMessages.findIndex(
-      (live, i) => !usedLiveIndices.has(i) && sameMessageIdentity(ctxMsg, live)
-    );
-    if (liveIdx < 0) return ctxMsg;
-    usedLiveIndices.add(liveIdx);
-    const live = liveMessages[liveIdx];
-    // Preserve the earlier timestamp for correct chronological ordering.
-    const cTs = ctxMsg.timestampMs ?? 0;
-    const lTs = live.timestampMs ?? 0;
-    const useEarlierTs = cTs > 0 && lTs > 0 && lTs < cTs;
-    return {
-      ...ctxMsg,
-      ...(useEarlierTs ? { timestampMs: lTs, timestamp: live.timestamp } : {}),
-      content: live.content || ctxMsg.content,
-      subagentTree: live.subagentTree || ctxMsg.subagentTree,
-      segments: live.segments || ctxMsg.segments,
-      activityEntries: live.activityEntries || ctxMsg.activityEntries,
-      activitySummary: live.activitySummary || ctxMsg.activitySummary,
-      toolCount: live.toolCount || ctxMsg.toolCount,
-      durationMs: live.durationMs || ctxMsg.durationMs,
-      contextTokens: live.contextTokens || ctxMsg.contextTokens,
-    };
-  });
-  for (let i = 0; i < liveMessages.length; i++) {
-    if (!usedLiveIndices.has(i)) {
-      merged.push(liveMessages[i]);
-    }
-  }
-  return merged.sort((a, b) => {
-    const ta = a.timestampMs ?? 0;
-    const tb = b.timestampMs ?? 0;
-    if (ta <= 0 && tb <= 0) return 0;
-    if (ta <= 0) return 1;
-    if (tb <= 0) return -1;
-    return ta - tb;
-  });
 };
 
 export const collapseProgressMessages = (messages: ChatMessage[]): ChatMessage[] => {
