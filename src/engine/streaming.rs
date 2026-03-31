@@ -277,11 +277,10 @@ impl AgentEngine {
                     }
                     // Stream content tokens so the UI shows progress in real time.
                     // Skip tokens inside <think> blocks.
-                    // Skip tokens in plan mode — plan text is captured in
-                    // accumulated_text and emitted as a PlanUpdate event by
-                    // finalize_plan_mode. Streaming it as content tokens would
-                    // create a duplicate text message that hides the PlanBlock.
-                    if !in_think_block && !self.plan_mode {
+                    // Plan mode tokens stream normally — the UI shows them as
+                    // a generating message. When PlanUpdate arrives the frontend
+                    // replaces the streaming text with the PlanBlock.
+                    if !in_think_block {
                         if let Some(tx) = &self.thinking_tx {
                             let _ = tx.send(ThinkingEvent::ContentToken(token));
                         }
@@ -478,7 +477,7 @@ impl AgentEngine {
                 preferred_model: preferred.to_string(),
                 actual_model: actual.to_string(),
                 reason: reason.to_string(),
-            })
+            }, self.session_id.clone())
             .await;
     }
 
@@ -497,7 +496,7 @@ impl AgentEngine {
                     tool,
                     line,
                     stream,
-                })
+                }, self.session_id.clone())
                 .await;
         }
     }

@@ -254,7 +254,7 @@ export function useChatActions(
     } catch (e) { console.error('Error responding to AskUser:', e); }
   }, []);
 
-  const approvePlan = useCallback(async (clearContext = false) => {
+  const approvePlan = useCallback(async () => {
     const { pendingPlanAgentId: planAgent } = useUiStore.getState();
     const root = getProjectRoot(projectRootRef.current);
     const { activeSessionId: sid } = useProjectStore.getState();
@@ -265,16 +265,10 @@ export function useChatActions(
         project_root: root,
         agent_id: planAgent,
         session_id: sid,
-        clear_context: clearContext,
       });
       const ui = useUiStore.getState();
-      ui.setPendingPlan(null);
-      ui.setPendingPlanAgentId(null);
-      if (clearContext) {
-        // Server cleared context — sync the UI to match
-        useChatStore.getState().clear(false);
-        useChatStore.getState().fetchWorkspaceState();
-      }
+      // Optimistically mark plan as approved so content stays visible but buttons hide
+      ui.setPendingPlan((p) => p ? { ...p, status: 'approved' } : null);
     } catch (e) { console.error('Error approving plan:', e); }
   }, []);
 
@@ -291,20 +285,21 @@ export function useChatActions(
         session_id: sid,
       });
       const ui = useUiStore.getState();
-      ui.setPendingPlan(null);
-      ui.setPendingPlanAgentId(null);
+      ui.setPendingPlan((p) => p ? { ...p, status: 'rejected' } : null);
     } catch (e) { console.error('Error rejecting plan:', e); }
   }, []);
 
   const editPlan = useCallback(async (text: string) => {
     const { pendingPlanAgentId: planAgent } = useUiStore.getState();
     const root = getProjectRoot(projectRootRef.current);
+    const { activeSessionId: sid } = useProjectStore.getState();
     if (!planAgent || !root) return;
     try {
       await getTransport().sendPlanAction({
         type: 'edit',
         project_root: root,
         agent_id: planAgent,
+        session_id: sid,
         edited_plan: text,
       });
       useUiStore.getState().setPendingPlan((prev) => prev ? { ...prev, plan_text: text } : prev);

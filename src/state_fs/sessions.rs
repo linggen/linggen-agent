@@ -36,6 +36,9 @@ pub struct SessionMeta {
     /// Who created this session: "user", "skill", "mission", "agent"
     #[serde(default = "default_creator", skip_serializing_if = "is_default_creator")]
     pub creator: String,
+    /// Session-level model override. Persisted so it survives reload/session switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
     /// Current working directory of the agent in this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -258,6 +261,40 @@ impl SessionStore {
         Ok(messages)
     }
 
+    /// Replace the last plan message in the session's messages.jsonl.
+    /// A plan message has content containing `"type":"plan"`.
+    pub fn update_last_plan_message(&self, session_id: &str, updated: &ChatMsg) -> Result<bool> {
+        Self::validate_id(session_id)?;
+        let msgs_path = self.session_dir(session_id).join("messages.jsonl");
+        if !msgs_path.exists() {
+            return Ok(false);
+        }
+        let file = fs::File::open(&msgs_path)?;
+        let reader = BufReader::new(file);
+        let mut lines: Vec<String> = Vec::new();
+        let mut last_plan_idx: Option<usize> = None;
+        for line in reader.lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+            if trimmed.contains("\"type\":\"plan\"") && trimmed.contains("\"plan\":{") {
+                last_plan_idx = Some(lines.len());
+            }
+            lines.push(line);
+        }
+        let Some(idx) = last_plan_idx else { return Ok(false) };
+        lines[idx] = serde_json::to_string(updated)?;
+        let tmp_path = msgs_path.with_extension("jsonl.tmp");
+        {
+            let mut tmp = fs::File::create(&tmp_path)?;
+            for l in &lines {
+                writeln!(tmp, "{}", l)?;
+            }
+        }
+        fs::rename(&tmp_path, &msgs_path)?;
+        Ok(true)
+    }
+
     pub fn clear_chat_history(&self, session_id: &str) -> Result<usize> {
         Self::validate_id(session_id)?;
         let msgs_path = self.session_dir(session_id).join("messages.jsonl");
@@ -330,7 +367,7 @@ mod tests {
             created_at: 1000,
             skill: None,
             creator: "user".into(),
-            cwd: None, project: None, project_name: None, mission_id: None,
+            cwd: None, project: None, project_name: None, mission_id: None, model_id: None,
         };
         store.add_session(&meta).unwrap();
 
@@ -360,7 +397,7 @@ mod tests {
                     created_at: ts,
                     skill: None,
                     creator: "user".into(),
-                    cwd: None, project: None, project_name: None, mission_id: None,
+                    cwd: None, project: None, project_name: None, mission_id: None, model_id: None,
                 })
                 .unwrap();
         }
@@ -378,7 +415,7 @@ mod tests {
             created_at: 1000,
             skill: None,
             creator: "user".into(),
-            cwd: None, project: None, project_name: None, mission_id: None,
+            cwd: None, project: None, project_name: None, mission_id: None, model_id: None,
         };
         store.add_session(&meta).unwrap();
 
@@ -417,7 +454,7 @@ mod tests {
                 created_at: 1000,
                 skill: None,
                 creator: "user".into(),
-                cwd: None, project: None, project_name: None, mission_id: None,
+                cwd: None, project: None, project_name: None, mission_id: None, model_id: None,
             })
             .unwrap();
 
@@ -465,7 +502,7 @@ mod tests {
                 created_at: 1000,
                 skill: None,
                 creator: "user".into(),
-                cwd: None, project: None, project_name: None, mission_id: None,
+                cwd: None, project: None, project_name: None, mission_id: None, model_id: None,
             })
             .unwrap();
         store
@@ -497,7 +534,7 @@ mod tests {
                 created_at: 1000,
                 skill: None,
                 creator: "user".into(),
-                cwd: None, project: None, project_name: None, mission_id: None,
+                cwd: None, project: None, project_name: None, mission_id: None, model_id: None,
             })
             .unwrap();
         store
@@ -529,7 +566,7 @@ mod tests {
                 created_at: 1000,
                 skill: None,
                 creator: "user".into(),
-                cwd: None, project: None, project_name: None, mission_id: None,
+                cwd: None, project: None, project_name: None, mission_id: None, model_id: None,
             })
             .is_err());
         assert!(store
@@ -539,7 +576,7 @@ mod tests {
                 created_at: 1000,
                 skill: None,
                 creator: "user".into(),
-                cwd: None, project: None, project_name: None, mission_id: None,
+                cwd: None, project: None, project_name: None, mission_id: None, model_id: None,
             })
             .is_err());
         assert!(store
@@ -549,7 +586,7 @@ mod tests {
                 created_at: 1000,
                 skill: None,
                 creator: "user".into(),
-                cwd: None, project: None, project_name: None, mission_id: None,
+                cwd: None, project: None, project_name: None, mission_id: None, model_id: None,
             })
             .is_err());
     }

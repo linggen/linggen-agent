@@ -33,7 +33,7 @@ const ChatMessageRow = React.memo<{
   planProps: {
     pendingPlanAgentId?: string | null;
     agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
-    onApprovePlan?: (clearContext: boolean) => void;
+    onApprovePlan?: () => void;
     onRejectPlan?: () => void;
     onEditPlan?: (text: string) => void;
     inputRef: React.RefObject<HTMLTextAreaElement | null>;
@@ -85,7 +85,7 @@ const ChatMessageList = React.memo<{
   selectedAgent: string;
   pendingPlanAgentId?: string | null;
   agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
-  onApprovePlan?: (clearContext: boolean) => void;
+  onApprovePlan?: () => void;
   onRejectPlan?: () => void;
   onEditPlan?: (text: string) => void;
   inputRef: React.RefObject<HTMLTextAreaElement | null>;
@@ -178,7 +178,7 @@ export const ChatPanel: React.FC<{
   pendingPlan?: import('../../types').Plan | null;
   pendingPlanAgentId?: string | null;
   agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
-  onApprovePlan?: (clearContext: boolean) => void;
+  onApprovePlan?: () => void;
   onRejectPlan?: () => void;
   onEditPlan?: (text: string) => void;
   pendingAskUser?: import('../../types').PendingAskUser | null;

@@ -84,10 +84,6 @@ pub struct ServerState {
     /// Accumulated token usage per session (in-memory, resets on restart).
     /// Key: "{project_root}:{session_id}", Value: (prompt_tokens, completion_tokens).
     pub session_tokens: Arc<Mutex<HashMap<String, (usize, usize)>>>,
-    /// Maps running agent_id → session_id so SSE events can be tagged with their session.
-    /// Uses `std::sync::RwLock` so SSE readers never block on each other and only
-    /// briefly contend with writers (register/deregister are single insert/remove).
-    pub agent_sessions: Arc<std::sync::RwLock<HashMap<String, String>>>,
     /// Random token required for WHIP endpoint authentication.
     /// Generated at startup, passed to the UI via /api/status.
     pub whip_token: String,
@@ -173,11 +169,13 @@ pub enum ServerEvent {
         parent_id: String,
         subagent_id: String,
         task: String,
+        session_id: Option<String>,
     },
     SubagentResult {
         parent_id: String,
         subagent_id: String,
         outcome: crate::engine::AgentOutcome,
+        session_id: Option<String>,
     },
     AgentStatus {
         agent_id: String,
@@ -189,6 +187,7 @@ pub enum ServerEvent {
         lifecycle: Option<String>, // "doing" | "done"
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_agent_id: Option<String>,
+        session_id: Option<String>,
     },
     QueueUpdated {
         project_root: String,
@@ -210,10 +209,12 @@ pub enum ServerEvent {
         actual_completion_tokens: Option<usize>,
         compressed: bool,
         summary_count: usize,
+        session_id: Option<String>,
     },
     Outcome {
         agent_id: String,
         outcome: crate::engine::AgentOutcome,
+        session_id: Option<String>,
     },
     Token {
         agent_id: String,
@@ -232,6 +233,7 @@ pub enum ServerEvent {
         mission_id: String,
         agent_id: String,
         project_root: String,
+        session_id: Option<String>,
     },
     Notification(NotificationPayload),
     /// A new session was created — used to update the unified session list in real-time.
@@ -248,6 +250,7 @@ pub enum ServerEvent {
         agent_id: String,
         text: String,
         parent_id: Option<String>,
+        session_id: Option<String>,
     },
     AskUser {
         agent_id: String,
@@ -260,12 +263,14 @@ pub enum ServerEvent {
         preferred_model: String,
         actual_model: String,
         reason: String,
+        session_id: Option<String>,
     },
     ToolProgress {
         agent_id: String,
         tool: String,
         line: String,
         stream: String, // "stdout" | "stderr"
+        session_id: Option<String>,
     },
     Resync {
         reason: String,
@@ -279,6 +284,7 @@ pub enum ServerEvent {
         title: String,
         width: Option<u32>,
         height: Option<u32>,
+        session_id: Option<String>,
     },
     /// A new content block started within the current assistant turn.
     ContentBlockStart {
@@ -288,6 +294,7 @@ pub enum ServerEvent {
         tool: Option<String>,
         args: Option<String>,
         parent_id: Option<String>,
+        session_id: Option<String>,
     },
     /// Update an existing content block (status change, result summary).
     ContentBlockUpdate {
@@ -299,6 +306,7 @@ pub enum ServerEvent {
         parent_id: Option<String>,
         /// Optional extra payload (e.g. diff data for Edit/Write tools).
         extra: Option<serde_json::Value>,
+        session_id: Option<String>,
     },
     /// Signal that the assistant turn is complete (single finalizer).
     TurnComplete {
@@ -306,6 +314,7 @@ pub enum ServerEvent {
         duration_ms: Option<u64>,
         context_tokens: Option<usize>,
         parent_id: Option<String>,
+        session_id: Option<String>,
     },
     /// Working folder changed — agent cd'd to a new directory.
     WorkingFolderChanged {
@@ -319,21 +328,21 @@ pub enum ServerEvent {
 impl ServerEvent {
     /// Convert a 1:1 `AgentEvent` variant into the corresponding `ServerEvent`.
     /// Returns `None` for variants that require special handling (AgentStatus, TaskUpdate).
-    fn from_agent_event(event: crate::agent_manager::AgentEvent) -> Option<Self> {
+    fn from_agent_event(event: crate::agent_manager::AgentEvent, session_id: Option<String>) -> Option<Self> {
         use crate::agent_manager::AgentEvent;
         match event {
             AgentEvent::StateUpdated => Some(Self::StateUpdated),
             AgentEvent::Message { from, to, content } => {
-                Some(Self::Message { from, to, content, session_id: None })
+                Some(Self::Message { from, to, content, session_id })
             }
             AgentEvent::SubagentSpawned { parent_id, subagent_id, task } => {
-                Some(Self::SubagentSpawned { parent_id, subagent_id, task })
+                Some(Self::SubagentSpawned { parent_id, subagent_id, task, session_id })
             }
             AgentEvent::SubagentResult { parent_id, subagent_id, outcome } => {
-                Some(Self::SubagentResult { parent_id, subagent_id, outcome })
+                Some(Self::SubagentResult { parent_id, subagent_id, outcome, session_id })
             }
             AgentEvent::Outcome { agent_id, outcome } => {
-                Some(Self::Outcome { agent_id, outcome })
+                Some(Self::Outcome { agent_id, outcome, session_id })
             }
             AgentEvent::ContextUsage {
                 agent_id, stage, message_count, char_count, estimated_tokens,
@@ -342,30 +351,29 @@ impl ServerEvent {
             } => Some(Self::ContextUsage {
                 agent_id, stage, message_count, char_count, estimated_tokens,
                 token_limit, actual_prompt_tokens, actual_completion_tokens,
-                compressed, summary_count,
+                compressed, summary_count, session_id,
             }),
             AgentEvent::PlanUpdate { agent_id, plan } => {
-                // session_id will be filled in by the event bridge using agent_sessions lookup.
-                Some(Self::PlanUpdate { agent_id, plan, session_id: None })
+                Some(Self::PlanUpdate { agent_id, plan, session_id })
             }
             AgentEvent::TextSegment { agent_id, text, parent_id } => {
-                Some(Self::TextSegment { agent_id, text, parent_id })
+                Some(Self::TextSegment { agent_id, text, parent_id, session_id })
             }
             AgentEvent::ModelFallback { agent_id, preferred_model, actual_model, reason } => {
-                Some(Self::ModelFallback { agent_id, preferred_model, actual_model, reason })
+                Some(Self::ModelFallback { agent_id, preferred_model, actual_model, reason, session_id })
             }
             AgentEvent::ToolProgress { agent_id, tool, line, stream } => {
-                Some(Self::ToolProgress { agent_id, tool, line, stream })
+                Some(Self::ToolProgress { agent_id, tool, line, stream, session_id })
             }
             AgentEvent::ContentBlockStart { agent_id, block_id, block_type, tool, args, parent_id } => {
                 tracing::debug!("SSE ContentBlockStart: agent={} type={} tool={:?}", agent_id, block_type, tool);
-                Some(Self::ContentBlockStart { agent_id, block_id, block_type, tool, args, parent_id })
+                Some(Self::ContentBlockStart { agent_id, block_id, block_type, tool, args, parent_id, session_id })
             }
             AgentEvent::ContentBlockUpdate { agent_id, block_id, status, summary, is_error, parent_id, extra } => {
-                Some(Self::ContentBlockUpdate { agent_id, block_id, status, summary, is_error, parent_id, extra })
+                Some(Self::ContentBlockUpdate { agent_id, block_id, status, summary, is_error, parent_id, extra, session_id })
             }
             AgentEvent::TurnComplete { agent_id, duration_ms, context_tokens, parent_id } => {
-                Some(Self::TurnComplete { agent_id, duration_ms, context_tokens, parent_id })
+                Some(Self::TurnComplete { agent_id, duration_ms, context_tokens, parent_id, session_id })
             }
             // AgentStatus and TaskUpdate need special handling — return None.
             AgentEvent::AgentStatus { .. } | AgentEvent::TaskUpdate { .. } => None,
@@ -457,6 +465,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             status_id,
             lifecycle,
             parent_agent_id,
+            session_id,
         } => {
             if status.eq_ignore_ascii_case("idle") && lifecycle.is_none() {
                 // Still emit the idle event so the UI can transition agent status.
@@ -469,7 +478,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
                     phase: Some(UI_PHASE_DONE.to_string()),
                     text: None,
                     agent_id: Some(agent_id),
-                    session_id: None,
+                    session_id,
                     project_root: None,
                     data: Some(json!({ "status": "idle", "parent_id": parent_agent_id })),
                 });
@@ -500,7 +509,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
                 phase,
                 text: Some(text),
                 agent_id: Some(agent_id),
-                session_id: None,
+                session_id,
                 project_root: None,
                 data: Some(json!({ "status": status, "parent_id": parent_agent_id })),
             })
@@ -540,7 +549,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             project_root: None,
             data: None,
         }),
-        ServerEvent::Outcome { agent_id, outcome } => Some(UiEvent {
+        ServerEvent::Outcome { agent_id, outcome, session_id } => Some(UiEvent {
             id: format!("run-outcome-{agent_id}-{seq}"),
             seq,
             rev: seq,
@@ -549,7 +558,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             phase: Some(UI_PHASE_OUTCOME.to_string()),
             text: Some("Run outcome".to_string()),
             agent_id: Some(agent_id),
-            session_id: None,
+            session_id,
             project_root: None,
             data: Some(json!({ "outcome": outcome })),
         }),
@@ -564,6 +573,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             actual_completion_tokens,
             compressed,
             summary_count,
+            session_id,
         } => Some(UiEvent {
             id: format!("run-context-{agent_id}"),
             seq,
@@ -573,7 +583,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             phase: Some(UI_PHASE_CONTEXT_USAGE.to_string()),
             text: None,
             agent_id: Some(agent_id.clone()),
-            session_id: None,
+            session_id,
             project_root: None,
             data: Some(json!({
                 "agent_id": agent_id,
@@ -592,6 +602,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             parent_id,
             subagent_id,
             task,
+            session_id,
         } => Some(UiEvent {
             id: format!("run-subagent-spawned-{subagent_id}-{seq}"),
             seq,
@@ -601,7 +612,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             phase: Some(UI_PHASE_SUBAGENT_SPAWNED.to_string()),
             text: Some(format!("Spawned subagent {}", subagent_id)),
             agent_id: Some(parent_id),
-            session_id: None,
+            session_id,
             project_root: None,
             data: Some(json!({ "subagent_id": subagent_id, "task": task })),
         }),
@@ -609,6 +620,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             parent_id,
             subagent_id,
             outcome,
+            session_id,
         } => Some(UiEvent {
             id: format!("run-subagent-result-{subagent_id}-{seq}"),
             seq,
@@ -618,7 +630,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             phase: Some(UI_PHASE_SUBAGENT_RESULT.to_string()),
             text: Some(format!("Subagent {} returned", subagent_id)),
             agent_id: Some(parent_id),
-            session_id: None,
+            session_id,
             project_root: None,
             data: Some(json!({ "subagent_id": subagent_id, "outcome": outcome })),
         }),
@@ -658,6 +670,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             mission_id,
             agent_id,
             project_root,
+            session_id,
         } => Some(UiEvent {
             id: format!("mission-trigger-{mission_id}-{seq}"),
             seq,
@@ -667,7 +680,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             phase: Some(UI_PHASE_DOING.to_string()),
             text: Some("Mission triggered".to_string()),
             agent_id: Some(agent_id),
-            session_id: None,
+            session_id,
             project_root: Some(project_root),
             data: Some(json!({ "status": "mission_triggered", "mission_id": mission_id })),
         }),
@@ -731,6 +744,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             agent_id,
             text,
             parent_id,
+            session_id,
         } => Some(UiEvent {
             id: format!("text-seg-{agent_id}-{seq}"),
             seq,
@@ -740,7 +754,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             phase: None,
             text: Some(text),
             agent_id: Some(agent_id),
-            session_id: None,
+            session_id,
             project_root: None,
             data: Some(json!({ "parent_id": parent_id })),
         }),
@@ -770,6 +784,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             preferred_model,
             actual_model,
             reason,
+            session_id,
         } => Some(UiEvent {
             id: format!("model-fallback-{agent_id}-{seq}"),
             seq,
@@ -782,7 +797,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
                 actual_model, preferred_model, reason
             )),
             agent_id: Some(agent_id),
-            session_id: None,
+            session_id,
             project_root: None,
             data: Some(json!({
                 "preferred_model": preferred_model,
@@ -795,6 +810,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             tool,
             line,
             stream,
+            session_id,
         } => Some(UiEvent {
             id: format!("tool-progress-{agent_id}-{seq}"),
             seq,
@@ -804,7 +820,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             phase: None,
             text: Some(line.clone()),
             agent_id: Some(agent_id),
-            session_id: None,
+            session_id,
             project_root: None,
             data: Some(json!({
                 "tool": tool,
@@ -838,6 +854,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             title,
             width,
             height,
+            session_id,
         } => Some(UiEvent {
             id: format!("app-launched-{skill}-{seq}"),
             seq,
@@ -847,7 +864,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             phase: None,
             text: Some(format!("Launched app: {}", title)),
             agent_id: None,
-            session_id: Some("global".to_string()),
+            session_id: Some(session_id.unwrap_or_else(|| "global".to_string())),
             project_root: None,
             data: Some(json!({
                 "skill": skill,
@@ -865,6 +882,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             tool,
             args,
             parent_id,
+            session_id,
         } => {
             let phase = if block_type == "tool_use" { "start" } else { "start" };
             Some(UiEvent {
@@ -876,7 +894,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
                 phase: Some(phase.to_string()),
                 text: None,
                 agent_id: Some(agent_id),
-                session_id: None,
+                session_id,
                 project_root: None,
                 data: Some(json!({
                     "block_id": block_id,
@@ -895,6 +913,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             is_error,
             parent_id,
             extra,
+            session_id,
         } => {
             let mut data_obj = json!({
                 "block_id": block_id,
@@ -920,7 +939,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
                 phase: Some("update".to_string()),
                 text: summary.clone(),
                 agent_id: Some(agent_id),
-                session_id: None,
+                session_id,
                 project_root: None,
                 data: Some(data_obj),
             })
@@ -930,6 +949,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             duration_ms,
             context_tokens,
             parent_id,
+            session_id,
         } => Some(UiEvent {
             id: format!("turn-complete-{agent_id}-{seq}"),
             seq,
@@ -939,7 +959,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             phase: None,
             text: None,
             agent_id: Some(agent_id),
-            session_id: None,
+            session_id,
             project_root: None,
             data: Some(json!({
                 "duration_ms": duration_ms,
@@ -979,15 +999,22 @@ impl ServerState {
         status: AgentStatusKind,
         detail: Option<String>,
         parent_agent_id: Option<String>,
+        session_id: Option<String>,
     ) {
         let mut done_event: Option<ServerEvent> = None;
         let mut status_id: Option<String> = None;
         let mut lifecycle: Option<String> = None;
 
+        // Key by session_id|agent_id so concurrent sessions don't clobber each other.
+        let status_key = match &session_id {
+            Some(sid) => format!("{}|{}", sid, agent_id),
+            None => agent_id.clone(),
+        };
+
         {
             let mut active = self.active_statuses.lock().await;
             if status == AgentStatusKind::Idle {
-                if let Some(prev) = active.remove(&agent_id) {
+                if let Some(prev) = active.remove(&status_key) {
                     done_event = Some(ServerEvent::AgentStatus {
                         agent_id: agent_id.clone(),
                         status: prev.status.as_str().to_string(),
@@ -995,10 +1022,11 @@ impl ServerState {
                         status_id: Some(prev.status_id),
                         lifecycle: Some(UI_PHASE_DONE.to_string()),
                         parent_agent_id: parent_agent_id.clone(),
+                        session_id: session_id.clone(),
                     });
                 }
             } else {
-                if let Some(prev) = active.get(&agent_id).cloned() {
+                if let Some(prev) = active.get(&status_key).cloned() {
                     if prev.status != status {
                         done_event = Some(ServerEvent::AgentStatus {
                             agent_id: agent_id.clone(),
@@ -1007,13 +1035,14 @@ impl ServerState {
                             status_id: Some(prev.status_id),
                             lifecycle: Some(UI_PHASE_DONE.to_string()),
                             parent_agent_id: parent_agent_id.clone(),
+                            session_id: session_id.clone(),
                         });
-                        active.remove(&agent_id);
+                        active.remove(&status_key);
                     } else {
                         status_id = Some(prev.status_id.clone());
                         lifecycle = Some(UI_PHASE_DOING.to_string());
                         active.insert(
-                            agent_id.clone(),
+                            status_key.clone(),
                             ActiveStatusRecord {
                                 status_id: prev.status_id,
                                 status,
@@ -1029,7 +1058,7 @@ impl ServerState {
                     status_id = Some(next_id.clone());
                     lifecycle = Some(UI_PHASE_DOING.to_string());
                     active.insert(
-                        agent_id.clone(),
+                        status_key.clone(),
                         ActiveStatusRecord {
                             status_id: next_id,
                             status,
@@ -1051,6 +1080,7 @@ impl ServerState {
             status_id,
             parent_agent_id,
             lifecycle,
+            session_id,
         });
     }
 }
@@ -1066,7 +1096,7 @@ pub async fn prepare_server(
     host: &str,
     port: u16,
     dev_mode: bool,
-    mut agent_events_rx: mpsc::UnboundedReceiver<crate::agent_manager::AgentEvent>,
+    mut agent_events_rx: mpsc::UnboundedReceiver<(crate::agent_manager::AgentEvent, Option<String>)>,
 ) -> anyhow::Result<ServerHandle> {
     info!("linggen server starting on {}:{}...", host, port);
 
@@ -1092,7 +1122,6 @@ pub async fn prepare_server(
         queue_seq: AtomicU64::new(1),
         event_seq: AtomicU64::new(1),
         session_tokens: Arc::new(Mutex::new(HashMap::new())),
-        agent_sessions: Arc::new(std::sync::RwLock::new(HashMap::new())),
         whip_token: uuid::Uuid::new_v4().to_string(),
         user_bash_cwd: Arc::new(Mutex::new(HashMap::new())),
     });
@@ -1101,14 +1130,14 @@ pub async fn prepare_server(
     {
         let state_clone = state.clone();
         tokio::spawn(async move {
-            while let Some(event) = agent_events_rx.recv().await {
+            while let Some((event, session_id)) = agent_events_rx.recv().await {
                 match event {
                     // Special cases that need extra logic beyond a 1:1 mapping.
                     crate::agent_manager::AgentEvent::AgentStatus {
                         agent_id, status, detail, parent_id,
                     } => {
                         state_clone
-                            .send_agent_status(agent_id, AgentStatusKind::from_str_loose(&status), detail, parent_id)
+                            .send_agent_status(agent_id, AgentStatusKind::from_str_loose(&status), detail, parent_id, session_id)
                             .await;
                     }
                     crate::agent_manager::AgentEvent::TaskUpdate { .. } => {
@@ -1118,7 +1147,7 @@ pub async fn prepare_server(
                     other => {
                         // Intercept __cwd_changed__ progress events → WorkingFolderChanged
                         if let crate::agent_manager::AgentEvent::ToolProgress {
-                            ref agent_id, ref tool, ref line, ..
+                            ref tool, ref line, ..
                         } = &other {
                             if tool == "__cwd_changed__" {
                                 // line = cwd, stream = "project|project_name"
@@ -1127,20 +1156,16 @@ pub async fn prepare_server(
                                     let parts: Vec<&str> = stream.splitn(2, '|').collect();
                                     let project = parts.first().filter(|s| !s.is_empty()).map(|s| s.to_string());
                                     let project_name = parts.get(1).filter(|s| !s.is_empty()).map(|s| s.to_string());
-                                    // Find session_id for this agent
-                                    let sid = state_clone.agent_sessions.read().unwrap()
-                                        .get(agent_id).cloned()
-                                        .unwrap_or_default();
-                                    if !sid.is_empty() {
+                                    if let Some(ref sid) = session_id {
                                         // Update session metadata
-                                        if let Ok(Some(mut meta)) = state_clone.manager.global_sessions.get_session_meta(&sid) {
+                                        if let Ok(Some(mut meta)) = state_clone.manager.global_sessions.get_session_meta(sid) {
                                             meta.cwd = Some(cwd.clone());
                                             meta.project = project.clone();
                                             meta.project_name = project_name.clone();
                                             let _ = state_clone.manager.global_sessions.update_session_meta(&meta);
                                         }
                                         let _ = state_clone.events_tx.send(ServerEvent::WorkingFolderChanged {
-                                            session_id: sid,
+                                            session_id: sid.clone(),
                                             cwd,
                                             project,
                                             project_name,
@@ -1152,44 +1177,17 @@ pub async fn prepare_server(
                         }
                         // Accumulate token usage from ContextUsage events.
                         if let crate::agent_manager::AgentEvent::ContextUsage {
-                            agent_id: ctx_agent_id,
                             actual_prompt_tokens: Some(prompt),
                             actual_completion_tokens: Some(completion),
                             ..
                         } = &other {
-                            let sid = state_clone.agent_sessions.read().unwrap()
-                                .get(ctx_agent_id).cloned()
-                                .unwrap_or_else(|| "current".to_string());
+                            let sid = session_id.clone().unwrap_or_else(|| "current".to_string());
                             let mut tokens = state_clone.session_tokens.lock().await;
                             let entry = tokens.entry(sid).or_insert((0, 0));
                             entry.0 += prompt;
                             entry.1 += completion;
                         }
-                        // Register subagent → parent's session_id so SSE events
-                        // from subagents are tagged with the correct session.
-                        if let crate::agent_manager::AgentEvent::SubagentSpawned {
-                            parent_id, subagent_id, ..
-                        } = &other {
-                            let sid = state_clone.agent_sessions.read().unwrap()
-                                .get(parent_id).cloned();
-                            if let Some(sid) = sid {
-                                state_clone.agent_sessions.write().unwrap()
-                                    .insert(subagent_id.clone(), sid);
-                            }
-                        }
-                        // Deregister subagent when it finishes (delayed so final
-                        // events like idle AgentStatus still get enriched).
-                        if let crate::agent_manager::AgentEvent::SubagentResult {
-                            subagent_id, ..
-                        } = &other {
-                            let sessions_ref = state_clone.agent_sessions.clone();
-                            let key = subagent_id.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                sessions_ref.write().unwrap().remove(&key);
-                            });
-                        }
-                        if let Some(se) = ServerEvent::from_agent_event(other) {
+                        if let Some(se) = ServerEvent::from_agent_event(other, session_id) {
                             let _ = state_clone.events_tx.send(se);
                         }
                     }
@@ -1311,7 +1309,7 @@ pub async fn start_server(
     host: &str,
     port: u16,
     dev_mode: bool,
-    agent_events_rx: mpsc::UnboundedReceiver<crate::agent_manager::AgentEvent>,
+    agent_events_rx: mpsc::UnboundedReceiver<(crate::agent_manager::AgentEvent, Option<String>)>,
 ) -> anyhow::Result<()> {
     let handle = prepare_server(manager, skill_manager, host, port, dev_mode, agent_events_rx).await?;
     handle.task.await??;
@@ -1454,7 +1452,6 @@ async fn events_handler(
     axum::extract::Query(query): axum::extract::Query<EventsQuery>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let rx = state.events_tx.subscribe();
-    let agent_sessions = state.agent_sessions.clone();
     let filter_session = query.session_id;
     let stream = BroadcastStream::new(rx).filter_map(move |msg| {
         let event = match msg {
@@ -1465,22 +1462,7 @@ async fn events_handler(
             },
         };
         let seq = state.event_seq.fetch_add(1, Ordering::Relaxed);
-        let mut ui_msg = map_server_event_to_ui_message(event, seq)?;
-        // Enrich with session_id from agent_sessions map if not already set.
-        if ui_msg.session_id.is_none() {
-            if let Some(aid) = &ui_msg.agent_id {
-                if let Ok(map) = agent_sessions.read() {
-                    if let Some(sid) = map.get(aid) {
-                        ui_msg.session_id = Some(sid.clone());
-                    } else if filter_session.is_some() {
-                        tracing::debug!(
-                            "SSE enrich: agent '{}' not in agent_sessions (kind={}, keys={:?})",
-                            aid, ui_msg.kind, map.keys().collect::<Vec<_>>(),
-                        );
-                    }
-                }
-            }
-        }
+        let ui_msg = map_server_event_to_ui_message(event, seq)?;
         // Server-side session filter.
         // Events with session_id "global" always pass through to all clients.
         let is_global_event = ui_msg.session_id.as_deref() == Some("global");
@@ -1493,10 +1475,7 @@ async fn events_handler(
                         return None;
                     }
                     None => {
-                        // Events without session_id after enrichment: this means
-                        // the agent isn't registered for any session (e.g. a mission
-                        // event before agent_sessions registration). Drop it to
-                        // prevent cross-session bleed.
+                        // Events without session_id — drop to prevent cross-session bleed.
                         return None;
                     }
                     _ => {} // session matches — pass through
@@ -1611,11 +1590,13 @@ mod tests {
                 parent_id: "ling".into(),
                 subagent_id: "coder".into(),
                 task: "fix bug".into(),
+                session_id: None,
             },
             ServerEvent::SubagentResult {
                 parent_id: "ling".into(),
                 subagent_id: "coder".into(),
                 outcome: crate::engine::AgentOutcome::None,
+                session_id: None,
             },
             ServerEvent::AgentStatus {
                 agent_id: "ling".into(),
@@ -1624,6 +1605,7 @@ mod tests {
                 status_id: None,
                 lifecycle: Some("doing".into()),
                 parent_agent_id: None,
+                session_id: None,
             },
             ServerEvent::QueueUpdated {
                 project_root: "/tmp".into(),
@@ -1642,10 +1624,12 @@ mod tests {
                 actual_completion_tokens: None,
                 compressed: false,
                 summary_count: 0,
+                session_id: None,
             },
             ServerEvent::Outcome {
                 agent_id: "ling".into(),
                 outcome: crate::engine::AgentOutcome::None,
+                session_id: None,
             },
             ServerEvent::Token {
                 session_id: None,
@@ -1668,11 +1652,13 @@ mod tests {
                 mission_id: "mission-1".into(),
                 agent_id: "ling".into(),
                 project_root: "/tmp".into(),
+                session_id: None,
             },
             ServerEvent::TextSegment {
                 agent_id: "ling".into(),
                 text: "some text".into(),
                 parent_id: None,
+                session_id: None,
             },
             ServerEvent::AskUser {
                 agent_id: "ling".into(),
@@ -1685,12 +1671,14 @@ mod tests {
                 preferred_model: "gpt-4".into(),
                 actual_model: "gpt-3.5".into(),
                 reason: "rate_limited".into(),
+                session_id: None,
             },
             ServerEvent::ToolProgress {
                 agent_id: "ling".into(),
                 tool: "Bash".into(),
                 line: "building...".into(),
                 stream: "stdout".into(),
+                session_id: None,
             },
             ServerEvent::Resync {
                 reason: "broadcast_lag".into(),
@@ -1703,6 +1691,7 @@ mod tests {
                 tool: Some("Read".into()),
                 args: Some("foo.rs".into()),
                 parent_id: None,
+                session_id: None,
             },
             ServerEvent::ContentBlockUpdate {
                 agent_id: "ling".into(),
@@ -1712,12 +1701,14 @@ mod tests {
                 is_error: Some(false),
                 parent_id: None,
                 extra: None,
+                session_id: None,
             },
             ServerEvent::TurnComplete {
                 agent_id: "ling".into(),
                 duration_ms: Some(1200),
                 context_tokens: Some(5000),
                 parent_id: None,
+                session_id: None,
             },
         ];
 

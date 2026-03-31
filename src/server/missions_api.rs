@@ -206,6 +206,7 @@ pub(crate) async fn trigger_mission(
         mission_id: mission.id.clone(),
         agent_id: MISSION_AGENT_ID.to_string(),
         project_root: project_path.clone(),
+        session_id: None,
     });
 
     state

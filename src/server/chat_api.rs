@@ -42,13 +42,13 @@ pub(crate) struct PlanActionRequest {
     project_root: String,
     agent_id: String,
     session_id: Option<String>,
-    clear_context: Option<bool>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct EditPlanRequest {
     project_root: String,
     agent_id: String,
+    session_id: Option<String>,
     text: String,
 }
 
@@ -357,6 +357,7 @@ async fn run_skill_dispatch(
                                 title: skill.description.clone(),
                                 width: app.width,
                                 height: app.height,
+                                session_id: ctx.session_id.clone(),
                             });
                             if ctx.events_tx.receiver_count() <= 1 {
                                 let _ = open_in_browser(&full_url);
@@ -370,6 +371,7 @@ async fn run_skill_dispatch(
                                 title: skill.description.clone(),
                                 width: app.width,
                                 height: app.height,
+                                session_id: ctx.session_id.clone(),
                             });
                             if ctx.events_tx.receiver_count() <= 1 {
                                 let _ = open_in_browser(&app.entry);
@@ -447,6 +449,7 @@ async fn run_skill_dispatch(
             AgentStatusKind::Thinking,
             Some(format!("Running skill: {}", cmd)),
             None,
+            ctx.session_id.clone(),
         )
         .await;
 
@@ -541,6 +544,7 @@ async fn run_trigger_dispatch(
             AgentStatusKind::Thinking,
             Some(format!("Running skill: {}", skill_name)),
             None,
+            ctx.session_id.clone(),
         )
         .await;
 
@@ -583,6 +587,7 @@ async fn run_plan_dispatch(
             AgentStatusKind::Thinking,
             Some("Planning".to_string()),
             None,
+            ctx.session_id.clone(),
         )
         .await;
 
@@ -697,6 +702,7 @@ async fn run_plan_dispatch(
                     .set_pending_plan(
                         &ctx.root.to_string_lossy(),
                         &ctx.agent_id,
+                        ctx.session_id.as_deref(),
                         plan.clone(),
                     )
                     .await;
@@ -761,6 +767,7 @@ async fn run_plan_execution(
             AgentStatusKind::Thinking,
             Some("Executing plan".to_string()),
             None,
+            ctx.session_id.clone(),
         )
         .await;
 
@@ -896,7 +903,7 @@ async fn run_structured_loop(
     }
 
     ctx.state
-        .send_agent_status(ctx.agent_id.clone(), AgentStatusKind::Thinking, Some("Thinking".to_string()), None)
+        .send_agent_status(ctx.agent_id.clone(), AgentStatusKind::Thinking, Some("Thinking".to_string()), None, ctx.session_id.clone())
         .await;
     engine.observations.clear();
     // Clear stale "planned" plan from a previous plan-mode run so it doesn't
@@ -995,6 +1002,7 @@ async fn run_structured_loop(
             .set_pending_plan(
                 &ctx.root.to_string_lossy(),
                 &ctx.agent_id,
+                ctx.session_id.as_deref(),
                 plan.clone(),
             )
             .await;
@@ -1103,6 +1111,7 @@ pub(crate) async fn chat_handler(
                 cwd: Some(project_root_str.clone()),
                 project: None, project_name: None,
                 mission_id: req.mission_id.clone(),
+                model_id: req.model_id.clone(),
             };
             let _ = global_sessions.add_session(&meta);
         }
@@ -1119,6 +1128,7 @@ pub(crate) async fn chat_handler(
             cwd: Some(project_root_str.clone()),
             project: None, project_name: None,
             mission_id: req.mission_id.clone(),
+            model_id: req.model_id.clone(),
         };
         let _ = global_sessions.add_session(&meta);
         // Emit session_created so the unified session list updates in real-time
@@ -1184,11 +1194,14 @@ pub(crate) async fn chat_handler(
                 emit_queue_updated(&state, &project_root_str, &effective_session_id, &target_id)
                     .await;
 
-                // Cancel any pending AskUser for this agent so the tool
+                // Cancel any pending AskUser for this agent+session so the tool
                 // unblocks immediately and the loop can pick up the new message.
                 {
                     let mut pending = state.pending_ask_user.lock().await;
-                    pending.retain(|_, entry| entry.agent_id != target_id);
+                    pending.retain(|_, entry| {
+                        !(entry.agent_id == target_id
+                            && entry.session_id.as_deref() == Some(&effective_session_id))
+                    });
                 }
 
                 // Send through interrupt channel so the running loop sees the message.
@@ -1234,13 +1247,6 @@ pub(crate) async fn chat_handler(
                 .await;
             }
 
-            // Register agent → session mapping BEFORE spawn so SSE events are
-            // tagged correctly even while awaiting the agent lock.
-            if let Some(sid) = &session_id {
-                state.agent_sessions.write().unwrap()
-                    .insert(target_id.clone(), sid.clone());
-            }
-
             tokio::spawn(async move {
                 let mut engine = agent.lock().await;
                 if let Some(queued_id) = queued_item_id.as_deref() {
@@ -1279,12 +1285,19 @@ pub(crate) async fn chat_handler(
                     .await;
                 }
 
-                // agent_sessions already registered before spawn — no need to repeat here.
-
                 // Apply session-level model override if provided.
                 if let Some(ref mid) = req_model_id {
                     if engine.model_manager.has_model(mid) {
                         engine.model_id = mid.clone();
+                        // Persist model choice to session metadata
+                        if let Some(ref sid) = session_id {
+                            if let Ok(Some(mut meta)) = state.manager.global_sessions.get_session_meta(sid) {
+                                if meta.model_id.as_deref() != Some(mid) {
+                                    meta.model_id = Some(mid.clone());
+                                    let _ = state.manager.global_sessions.update_session_meta(&meta);
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1324,6 +1337,7 @@ pub(crate) async fn chat_handler(
                         target_id_clone.clone(), AgentStatusKind::ModelLoading,
                         Some(format!("Loading model: {model_label}")),
                         None,
+                        session_id.clone(),
                     )
                     .await;
                 let ctx = ChatRunCtx {
@@ -1406,31 +1420,16 @@ pub(crate) async fn chat_handler(
                     duration_ms: None,
                     context_tokens: None,
                     parent_id: None,
+                    session_id: session_id.clone(),
                 });
                 state_clone
                     .send_agent_status(
                         target_id_clone.clone(), AgentStatusKind::Idle,
                         Some("Idle".to_string()),
                         None,
+                        session_id.clone(),
                     )
                     .await;
-                // Deregister agent → session mapping after a short delay so the
-                // SSE filter can still enrich the TurnComplete and idle AgentStatus
-                // events with the correct session_id before they are streamed out.
-                // Only remove if the session_id still matches — a newer run may have
-                // re-registered the same agent with a different session.
-                let sessions_ref = state_clone.agent_sessions.clone();
-                let agent_key = target_id_clone.clone();
-                let old_sid = session_id.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let mut map = sessions_ref.write().unwrap();
-                    if let Some(current_sid) = map.get(&agent_key) {
-                        if old_sid.as_ref() == Some(current_sid) {
-                            map.remove(&agent_key);
-                        }
-                    }
-                });
             });
 
             let status = if was_busy { "queued" } else { "started" };
@@ -1479,11 +1478,9 @@ pub(crate) async fn approve_plan_handler(
     let root = PathBuf::from(&req.project_root);
     let root_str = root.to_string_lossy().to_string();
     let session_id = req.session_id.clone();
-    let clear_context = req.clear_context.unwrap_or(false);
-
     let plan = state
         .manager
-        .take_pending_plan(&root_str, &req.agent_id)
+        .take_pending_plan(&root_str, &req.agent_id, req.session_id.as_deref())
         .await;
     // Fallback: after server restart the in-memory pending_plans map is empty.
     // Reconstruct from the last persisted plan message in the session.
@@ -1535,70 +1532,36 @@ pub(crate) async fn approve_plan_handler(
     let root_clone = root.clone();
 
     tokio::spawn(async move {
-        // Register agent → session mapping so SSE events get tagged with
-        // the correct session_id (same as chat_handler does).
-        if let Some(ref sid) = session_id {
-            state_clone.agent_sessions.write().unwrap()
-                .insert(agent_id.clone(), sid.clone());
-        }
-
         let mut engine = agent.lock().await;
 
         // Set the approved plan on the engine.
         engine.plan = Some(plan);
         engine.plan_mode = false;
 
-        if clear_context {
-            // Clear old messages on disk but keep plan messages,
-            // so the session file starts fresh with just the plan.
-            let sid = session_id.as_deref().unwrap_or("default");
-            if let Ok(ctx) = manager.get_or_create_project(root_clone.clone()).await {
-                if let Ok(msgs) = state.manager.global_sessions.get_chat_history(sid) {
-                    let plan_msgs: Vec<_> = msgs.into_iter().filter(|m| {
-                        serde_json::from_str::<serde_json::Value>(&m.content)
-                            .ok()
-                            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t == "plan"))
-                            .unwrap_or(false)
-                    }).collect();
-                    let _ = state.manager.global_sessions.rewrite_chat_history(sid, &plan_msgs);
-                }
-            }
-            engine.observations.clear();
-            engine.context_records.clear();
-            engine.next_context_id = 1;
-            engine.chat_history.clear();
-            engine.task = Some(format!(
-                "Execute the approved plan: {}",
-                engine.plan.as_ref().map(|p| p.summary.as_str()).unwrap_or("Plan")
-            ));
-        } else {
-            // Keep context, just clear observations
-            engine.observations.clear();
-            if engine.task.is_none() {
-                if let Some(ref p) = engine.plan {
-                    engine.task = Some(format!("Execute the approved plan: {}", p.summary));
-                }
-            }
-        }
+        engine.observations.clear();
+        engine.task = Some(format!(
+            "Execute the approved plan: {}",
+            engine.plan.as_ref().map(|p| p.summary.as_str()).unwrap_or("Plan")
+        ));
 
-        // Persist the approved plan to disk AND emit to UI.
-        // persist_and_emit_plan only emits — we also need to write to messages.jsonl
-        // so the status is correct on reload.
+        // Emit PlanUpdate SSE event and update the existing plan message in
+        // messages.jsonl (instead of appending a duplicate).
         let plan_snapshot = engine.plan.clone().unwrap();
         engine.persist_and_emit_plan(plan_snapshot.clone()).await;
         let plan_json = serde_json::json!({ "type": "plan", "plan": plan_snapshot });
-        persist_and_emit_message(
-            &manager,
-            &events_tx,
-            &root_clone,
-            &agent_id,
-            &agent_id,
-            "user",
-            &plan_json.to_string(),
-            session_id.as_deref(),
-            false,
-        )
-        .await;
+        let sid = session_id.as_deref().unwrap_or("default");
+        let updated_msg = crate::state_fs::sessions::ChatMsg {
+            agent_id: agent_id.clone(),
+            from_id: agent_id.clone(),
+            to_id: "user".to_string(),
+            content: plan_json.to_string(),
+            timestamp: crate::util::now_ts_secs(),
+            is_observation: false,
+        };
+        if !manager.update_last_plan_message(sid, &updated_msg).await {
+            // Fallback: append if no existing plan message found
+            manager.add_chat_message(&root_clone, sid, &updated_msg).await;
+        }
 
         // Build a ChatRunCtx so we can reuse run_plan_execution.
         let session_id_for_cleanup = session_id.clone();
@@ -1615,14 +1578,25 @@ pub(crate) async fn approve_plan_handler(
 
         run_plan_execution(&ctx, &mut engine).await;
 
-        // Mark plan as completed and persist so reload shows correct status.
+        // Mark plan as completed and update the existing plan message in messages.jsonl.
         if let Some(ref mut plan) = engine.plan {
             if plan.status == crate::engine::PlanStatus::Executing
                 || plan.status == crate::engine::PlanStatus::Approved
             {
                 plan.status = crate::engine::PlanStatus::Completed;
                 let plan_snapshot = plan.clone();
-                engine.persist_and_emit_plan(plan_snapshot).await;
+                engine.persist_and_emit_plan(plan_snapshot.clone()).await;
+                let plan_json = serde_json::json!({ "type": "plan", "plan": plan_snapshot });
+                let completed_msg = crate::state_fs::sessions::ChatMsg {
+                    agent_id: agent_id.clone(),
+                    from_id: agent_id.clone(),
+                    to_id: "user".to_string(),
+                    content: plan_json.to_string(),
+                    timestamp: crate::util::now_ts_secs(),
+                    is_observation: false,
+                };
+                let sid = session_id_for_cleanup.as_deref().unwrap_or("default");
+                ctx.manager.update_last_plan_message(sid, &completed_msg).await;
             }
         }
 
@@ -1632,27 +1606,12 @@ pub(crate) async fn approve_plan_handler(
             duration_ms: None,
             context_tokens: None,
             parent_id: None,
+            session_id: session_id_for_cleanup.clone(),
         });
         state_clone
-            .send_agent_status(agent_id.clone(), AgentStatusKind::Idle, Some("Idle".to_string()), None)
+            .send_agent_status(agent_id.clone(), AgentStatusKind::Idle, Some("Idle".to_string()), None, session_id_for_cleanup.clone())
             .await;
 
-        // Deregister agent → session mapping after a short delay so the
-        // TurnComplete and idle events still get enriched with session_id.
-        // Only remove if the session_id still matches — a newer run may have
-        // re-registered the same agent with a different session.
-        let sessions_ref = state_clone.agent_sessions.clone();
-        let agent_key = agent_id.clone();
-        let old_sid = session_id_for_cleanup;
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let mut map = sessions_ref.write().unwrap();
-            if let Some(current_sid) = map.get(&agent_key) {
-                if old_sid.as_ref() == Some(current_sid) {
-                    map.remove(&agent_key);
-                }
-            }
-        });
     });
 
     Json(serde_json::json!({ "status": "approved" })).into_response()
@@ -1667,7 +1626,7 @@ pub(crate) async fn reject_plan_handler(
 
     let removed = state
         .manager
-        .take_pending_plan(&root_str, &req.agent_id)
+        .take_pending_plan(&root_str, &req.agent_id, req.session_id.as_deref())
         .await;
     let removed = match removed {
         Some(p) => Some(p),
@@ -1721,7 +1680,7 @@ pub(crate) async fn edit_plan_handler(
 
     let updated = state
         .manager
-        .edit_pending_plan(&root_str, &req.agent_id, &req.text)
+        .edit_pending_plan(&root_str, &req.agent_id, req.session_id.as_deref(), &req.text)
         .await;
 
     if updated {

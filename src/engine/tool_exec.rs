@@ -743,7 +743,7 @@ impl AgentEngine {
                     tool: Some(canonical_tool.clone()),
                     args: Some(compact_args),
                     parent_id: self.parent_agent_id.clone(),
-                })
+                }, self.session_id.clone())
                 .await;
             // Persist tool call to session store as an observation (not loaded
             // into chat history on reload — tool results are ephemeral context).
@@ -877,10 +877,10 @@ impl AgentEngine {
                             is_error: Some(false),
                             parent_id: self.parent_agent_id.clone(),
                             extra,
-                        })
+                        }, self.session_id.clone())
                         .await;
                     manager
-                        .send_event(crate::agent_manager::AgentEvent::StateUpdated)
+                        .send_event(crate::agent_manager::AgentEvent::StateUpdated, self.session_id.clone())
                         .await;
                     manager
                         .send_event(crate::agent_manager::AgentEvent::AgentStatus {
@@ -888,7 +888,7 @@ impl AgentEngine {
                             status: "thinking".to_string(),
                             detail: Some(format!("Thinking ({})", self.model_id)),
                             parent_id: self.parent_agent_id.clone(),
-                        })
+                        }, self.session_id.clone())
                         .await;
                 }
 
@@ -994,7 +994,7 @@ impl AgentEngine {
                             is_error: Some(true),
                             parent_id: self.parent_agent_id.clone(),
                             extra: None,
-                        })
+                        }, self.session_id.clone())
                         .await;
                     manager
                         .send_event(crate::agent_manager::AgentEvent::AgentStatus {
@@ -1002,7 +1002,7 @@ impl AgentEngine {
                             status: "thinking".to_string(),
                             detail: Some(format!("Thinking ({})", self.model_id)),
                             parent_id: self.parent_agent_id.clone(),
-                        })
+                        }, self.session_id.clone())
                         .await;
                 }
                 let err_content = self.prompt_store.render_or_fallback(

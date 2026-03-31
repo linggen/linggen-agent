@@ -114,6 +114,7 @@ pub(crate) async fn run_agent(
                         AgentStatusKind::Working,
                         Some("Running".to_string()),
                         None,
+                        None,
                     )
                     .await;
                 let mut engine = agent.lock().await;
@@ -147,12 +148,14 @@ pub(crate) async fn run_agent(
                 let _ = events_tx.send(ServerEvent::Outcome {
                     agent_id: agent_id.clone(),
                     outcome,
+                    session_id: session_id.clone(),
                 });
                 state_clone
                     .send_agent_status(
                         agent_id.clone(),
                         AgentStatusKind::Idle,
                         Some("Idle".to_string()),
+                        None,
                         None,
                     )
                     .await;
@@ -201,6 +204,7 @@ pub(crate) async fn cancel_agent_run(
                         run.agent_id.clone(),
                         AgentStatusKind::Idle,
                         Some("Cancelled".to_string()),
+                        None,
                         None,
                     )
                     .await;

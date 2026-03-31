@@ -93,7 +93,7 @@ impl AgentEngine {
                     from: agent_id.clone(),
                     to: target.clone(),
                     content: content.to_string(),
-                })
+                }, self.session_id.clone())
                 .await;
             manager
                 .add_chat_message(
@@ -112,7 +112,7 @@ impl AgentEngine {
 
             // Nudge UI to refresh immediately.
             manager
-                .send_event(crate::agent_manager::AgentEvent::StateUpdated)
+                .send_event(crate::agent_manager::AgentEvent::StateUpdated, self.session_id.clone())
                 .await;
         }
         Ok(())
@@ -294,7 +294,7 @@ impl AgentEngine {
                 actual_completion_tokens: actual_completion,
                 compressed: summary_count > 0,
                 summary_count,
-            })
+            }, self.session_id.clone())
             .await;
     }
 

@@ -8,7 +8,7 @@ export const PlanBlock: React.FC<{
   statusColor: Record<string, string>;
   pendingPlanAgentId?: string | null;
   agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
-  onApprovePlan?: (clearContext: boolean) => void;
+  onApprovePlan?: () => void;
   onRejectPlan?: () => void;
   onEditPlan?: (text: string) => void;
   inputRef?: React.RefObject<HTMLTextAreaElement | null>;
@@ -89,34 +89,22 @@ export const PlanBlock: React.FC<{
           ))}
         </div>
       )}
-      {plan.status === 'planned' && onApprovePlan && onRejectPlan && !editing && (() => {
-        const ctx = pendingPlanAgentId ? agentContext?.[pendingPlanAgentId.toLowerCase()] : undefined;
-        const pct = ctx?.tokenLimit && ctx.tokenLimit > 0
-          ? Math.round((ctx.tokens / ctx.tokenLimit) * 100)
-          : null;
-        return (
-          <div className="flex flex-wrap gap-2 pt-1">
-            <button
-              onClick={() => onApprovePlan(true)}
-              className="px-3 py-1 text-[12px] font-semibold rounded-md bg-emerald-600 text-white hover:bg-emerald-700"
-            >
-              Start building, clear context{pct !== null ? ` (${pct}% used)` : ''}
-            </button>
-            <button
-              onClick={() => onApprovePlan(false)}
-              className="px-3 py-1 text-[12px] font-semibold rounded-md bg-blue-600 text-white hover:bg-blue-700"
-            >
-              Start building, keep context
-            </button>
-            <button
-              onClick={onRejectPlan}
-              className="px-3 py-1 text-[12px] font-semibold rounded-md border border-red-200 dark:border-red-500/20 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20"
-            >
-              Reject
-            </button>
-          </div>
-        );
-      })()}
+      {plan.status === 'planned' && onApprovePlan && onRejectPlan && !editing && (
+        <div className="flex flex-wrap gap-2 pt-1">
+          <button
+            onClick={() => onApprovePlan()}
+            className="px-3 py-1 text-[12px] font-semibold rounded-md bg-emerald-600 text-white hover:bg-emerald-700"
+          >
+            Start building
+          </button>
+          <button
+            onClick={onRejectPlan}
+            className="px-3 py-1 text-[12px] font-semibold rounded-md border border-red-200 dark:border-red-500/20 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20"
+          >
+            Reject
+          </button>
+        </div>
+      )}
     </div>
   );
 };

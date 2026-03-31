@@ -159,6 +159,9 @@ pub struct AgentEngine {
     pub available_agents_metadata: Vec<(String, String)>,
     pub parent_agent_id: Option<String>,
     pub run_id: Option<String>,
+    /// Session this engine is running in — threaded into every emitted event
+    /// so the server can route events without a shared mutable map.
+    pub session_id: Option<String>,
     pub thinking_tx: Option<mpsc::UnboundedSender<ThinkingEvent>>,
     /// Receiver for user interrupt messages injected while the agent loop is running.
     pub interrupt_rx: Option<mpsc::UnboundedReceiver<String>>,
@@ -351,6 +354,7 @@ impl AgentEngine {
             available_agents_metadata: Vec::new(),
             parent_agent_id: None,
             run_id: None,
+            session_id: None,
             thinking_tx: None,
             interrupt_rx: None,
             plan_mode: false,

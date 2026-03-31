@@ -47,7 +47,7 @@ impl AgentEngine {
                 .send_event(crate::agent_manager::AgentEvent::PlanUpdate {
                     agent_id,
                     plan,
-                })
+                }, self.session_id.clone())
                 .await;
         }
     }

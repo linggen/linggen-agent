@@ -119,6 +119,49 @@ function mutate(fn: (msgs: ChatMessage[]) => ChatMessage[]): (s: ChatState) => P
   };
 }
 
+/**
+ * Fast-path mutation for token streaming: updates only the last message in
+ * both `messages` and `displayMessages` without running `computeDisplay` over
+ * the full array.  Falls back to `mutate` when the last message changes identity
+ * (new message added, message removed, etc.).
+ */
+function mutateLast(fn: (msgs: ChatMessage[]) => ChatMessage[]): (s: ChatState) => Partial<ChatState> {
+  return (s) => {
+    const sid = s._activeSessionId || '__none__';
+    const currentMsgs = s._messagesBySession[sid] || [];
+    const messages = fn(currentMsgs);
+
+    // Fast path: if the array length is the same and only the last element changed,
+    // patch displayMessages in-place instead of recomputing from scratch.
+    if (
+      messages.length === currentMsgs.length &&
+      messages.length > 0 &&
+      s.displayMessages.length > 0
+    ) {
+      const lastNew = messages[messages.length - 1];
+      const lastDisplay = s.displayMessages[s.displayMessages.length - 1];
+      // Match by identity: same role+from means we're updating the same bubble.
+      if (lastDisplay && lastNew.role === lastDisplay.role && lastNew.from === lastDisplay.from) {
+        const displayMessages = [...s.displayMessages];
+        displayMessages[displayMessages.length - 1] = lastNew;
+        return {
+          messages,
+          displayMessages,
+          _messagesBySession: { ...s._messagesBySession, [sid]: messages },
+        };
+      }
+    }
+
+    // Fallback: full recompute (new message was added, etc.)
+    const displayMessages = computeDisplay(messages);
+    return {
+      messages,
+      displayMessages,
+      _messagesBySession: { ...s._messagesBySession, [sid]: messages },
+    };
+  };
+}
+
 // Client-side image cache: images are ephemeral (never persisted to disk),
 // so we cache them here keyed by "from::normalizedText" to survive merges
 // and state reloads. Cleared on /clear.
@@ -219,7 +262,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     return next;
   })),
 
-  setPlaceholder: (agentId, text) => set(mutate((state) => {
+  setPlaceholder: (agentId, text) => set(mutateLast((state) => {
     const idx = findLastGeneratingMessageIndex(state, agentId);
     if (idx >= 0 && state[idx].segments) return state;
     const updated = upsertGeneratingAgentMessage(state, agentId, text);
@@ -232,7 +275,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     return updated;
   })),
 
-  appendToken: (agentId, tokenText, isThinking) => set(mutate((state) => {
+  appendToken: (agentId, tokenText, isThinking) => set(mutateLast((state) => {
     const idx = findLastGeneratingMessageIndex(state, agentId);
     if (idx >= 0) {
       const next = [...state];
@@ -313,7 +356,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       };
       return next;
     }
-    return [...state, {
+    // Remove the generating message that streamed plan tokens — the plan
+    // block replaces it so we don't show duplicate content.
+    const genIdx = findLastGeneratingMessageIndex(state, agentId);
+    const filtered = genIdx >= 0
+      ? state.filter((_, i) => i !== genIdx)
+      : state;
+    return [...filtered, {
       role: 'agent' as const,
       from: agentId,
       to: 'user',
@@ -537,7 +586,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     return next;
   })),
 
-  toolProgress: (agentId, line) => set(mutate((state) => {
+  toolProgress: (agentId, line) => set(mutateLast((state) => {
     let idx = findLastGeneratingMessageIndex(state, agentId);
     if (idx < 0) {
       for (let i = state.length - 1; i >= 0; i--) {

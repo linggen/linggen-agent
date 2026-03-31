@@ -196,6 +196,7 @@ pub fn create_mission_session(mission: &Mission) -> Option<String> {
             std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string())
         }),
         mission_id: Some(mission.id.clone()),
+        model_id: None,
     };
     match store.add_session(&meta) {
         Ok(_) => Some(session_id),
@@ -316,19 +317,12 @@ async fn dispatch_mission_prompt(
         }
     }
 
-    // Register agent → session mapping so SSE events get tagged with session_id.
-    // Must happen before any events are emitted for this run.
-    if let Some(ref sid) = session_id {
-        state.agent_sessions.write().unwrap()
-            .insert(agent_id.to_string(), sid.clone());
-    }
-
-    // Emit MissionTriggered AFTER agent_sessions registration so the event
-    // gets enriched with the correct session_id and doesn't leak to other sessions.
+    // Emit MissionTriggered — session_id is carried directly on the event.
     let _ = state.events_tx.send(ServerEvent::MissionTriggered {
         mission_id: mission.id.clone(),
         agent_id: agent_id.to_string(),
         project_root: project_path.to_string(),
+        session_id: session_id.clone(),
     });
 
     state
@@ -337,6 +331,7 @@ async fn dispatch_mission_prompt(
             AgentStatusKind::Working,
             Some("Processing mission".to_string()),
             None,
+            session_id.clone(),
         )
         .await;
 
@@ -398,6 +393,7 @@ async fn dispatch_mission_prompt(
             let _ = events_tx.send(ServerEvent::Outcome {
                 agent_id: agent_id.to_string(),
                 outcome,
+                session_id: session_id.clone(),
             });
             "completed"
         }
@@ -421,6 +417,7 @@ async fn dispatch_mission_prompt(
             AgentStatusKind::Idle,
             Some("Idle".to_string()),
             None,
+            session_id.clone(),
         )
         .await;
 
@@ -430,17 +427,6 @@ async fn dispatch_mission_prompt(
 
     // Record mission run
     record_mission_run(&state, mission, &run_id, session_id.as_deref(), status, false);
-
-    // Deregister agent → session mapping after a short delay so the
-    // idle AgentStatus event still gets enriched with session_id.
-    {
-        let sessions_ref = state.agent_sessions.clone();
-        let agent_key = agent_id.to_string();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            sessions_ref.write().unwrap().remove(&agent_key);
-        });
-    }
 
     // Notify UI that the mission finished.
     let _ = state.events_tx.send(ServerEvent::Notification(

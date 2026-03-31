@@ -117,6 +117,7 @@ impl Tools {
                                 title: skill.description.clone(),
                                 width: app.width,
                                 height: app.height,
+                                session_id: bridge.session_id.clone(),
                             });
                         }
                         Ok(ToolResult::Success(format!(
@@ -133,6 +134,7 @@ impl Tools {
                                 title: skill.description.clone(),
                                 width: app.width,
                                 height: app.height,
+                                session_id: bridge.session_id.clone(),
                             });
                         }
                         Ok(ToolResult::Success(format!(
@@ -244,7 +246,7 @@ pub(crate) async fn run_delegation(
     let run_id = manager
         .begin_agent_run(
             &ws_root,
-            None,
+            session_id.as_deref(),
             &target_agent_id,
             parent_run_id,
             Some(format!("delegated by {}", caller_id)),
@@ -256,7 +258,7 @@ pub(crate) async fn run_delegation(
             from: caller_id.clone(),
             to: target_agent_id.clone(),
             content: format!("Delegated task: {}", task),
-        })
+        }, session_id.clone())
         .await;
 
     manager
@@ -264,7 +266,7 @@ pub(crate) async fn run_delegation(
             parent_id: caller_id.clone(),
             subagent_id: target_agent_id.clone(),
             task: task.clone(),
-        })
+        }, session_id.clone())
         .await;
 
     let engine_result = manager
@@ -321,7 +323,7 @@ pub(crate) async fn run_delegation(
             parent_id: caller_id,
             subagent_id: target_agent_id,
             outcome: outcome.clone(),
-        })
+        }, session_id.clone())
         .await;
 
     // When the sub-agent finished normally (AgentOutcome::None), surface its

@@ -219,6 +219,7 @@ export interface SessionInfo {
   skill?: string | null;    // bound skill name
   mission_id?: string | null; // mission ID if creator is "mission"
   cwd?: string;             // current working directory
+  model_id?: string | null; // session-level model override
 }
 
 export interface AgentRunInfo {

@@ -685,6 +685,7 @@ pub(crate) fn emit_outcome_event(
     let _ = events_tx.send(ServerEvent::Outcome {
         agent_id: from_id.to_string(),
         outcome: outcome.clone(),
+        session_id: sid.clone(),
     });
 }
 

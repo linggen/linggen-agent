@@ -44,8 +44,8 @@ pub struct AgentManager {
     cancelled_runs: Mutex<HashSet<String>>,
     /// Per-tool-block cancellation flags (block_id → AtomicBool).
     tool_cancel_flags: std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>,
-    events: mpsc::UnboundedSender<AgentEvent>,
-    /// Pending plans awaiting user approval, keyed by "{project_root}|{agent_id}".
+    events: mpsc::UnboundedSender<(AgentEvent, Option<String>)>,
+    /// Pending plans awaiting user approval, keyed by "{project_root}|{session_id}|{agent_id}".
     pending_plans: Mutex<HashMap<String, Plan>>,
     /// In-memory run store — replaces file-based RunStore. Shared across all operations.
     pub run_store: Arc<crate::project_store::RunStore>,
@@ -393,7 +393,7 @@ impl AgentManager {
         store: Arc<ProjectStore>,
         skill_manager: Arc<SkillManager>,
         interface_mode: InterfaceMode,
-    ) -> (Arc<Self>, mpsc::UnboundedReceiver<AgentEvent>) {
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<(AgentEvent, Option<String>)>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let models = Arc::new(ModelManager::new(config.models.clone()));
         (
@@ -502,7 +502,7 @@ impl AgentManager {
                         EventKind::Remove(_) => {
                             let has_relevant = event.paths.iter().any(|p| !is_ignored(p));
                             if has_relevant {
-                                let _ = events_tx.send(AgentEvent::StateUpdated);
+                                let _ = events_tx.send((AgentEvent::StateUpdated, None));
                             }
                         }
                         EventKind::Modify(notify::event::ModifyKind::Name(
@@ -512,7 +512,7 @@ impl AgentManager {
                                 let old = &event.paths[0];
                                 let new = &event.paths[1];
                                 if !is_ignored(old) || !is_ignored(new) {
-                                    let _ = events_tx.send(AgentEvent::StateUpdated);
+                                    let _ = events_tx.send((AgentEvent::StateUpdated, None));
                                 }
                             }
                         }
@@ -871,13 +871,17 @@ impl AgentManager {
         };
         let mut places = self.working_places.lock().await;
         let repo = places.entry(repo_path.to_string()).or_default();
-        repo.insert(agent_id.to_string(), entry);
+        // Key by run_id when available to avoid collision when the same agent runs
+        // in multiple sessions simultaneously.
+        let key = entry.run_id.as_deref().unwrap_or(agent_id).to_string();
+        repo.insert(key, entry);
     }
 
     pub async fn clear_working_place_for_agent(&self, repo_path: &str, agent_id: &str) {
         let mut places = self.working_places.lock().await;
         if let Some(repo_map) = places.get_mut(repo_path) {
-            repo_map.remove(agent_id);
+            // Remove entries matching this agent_id (the key might be agent_id or run_id).
+            repo_map.retain(|_, entry| entry.agent_id != agent_id);
             if repo_map.is_empty() {
                 places.remove(repo_path);
             }
@@ -950,7 +954,7 @@ impl AgentManager {
         let ended_at = Some(crate::util::now_ts_secs());
         self.run_store.update_run(run_id, status, detail, ended_at);
         self.clear_working_place_for_run(run_id).await;
-        let _ = self.events.send(AgentEvent::StateUpdated);
+        let _ = self.events.send((AgentEvent::StateUpdated, None));
         self.cancelled_runs.lock().await.remove(run_id);
         // Record activity for the agent that just finished
         if let Some(run) = self.run_store.get_run(run_id) {
@@ -1033,7 +1037,7 @@ impl AgentManager {
             self.clear_working_place_for_run(&run.run_id).await;
         }
         if !to_cancel.is_empty() {
-            let _ = self.events.send(AgentEvent::StateUpdated);
+            let _ = self.events.send((AgentEvent::StateUpdated, None));
         }
 
         Ok(to_cancel)
@@ -1066,7 +1070,7 @@ impl AgentManager {
             let _ = self.invalidate_agent_cache(&root, None).await;
         }
 
-        let _ = self.events.send(AgentEvent::StateUpdated);
+        let _ = self.events.send((AgentEvent::StateUpdated, None));
         Ok(())
     }
 
@@ -1082,17 +1086,34 @@ impl AgentManager {
         }
     }
 
-    pub async fn send_event(&self, event: AgentEvent) {
-        let _ = self.events.send(event);
+    /// Update the last plan message in the session store (instead of appending a duplicate).
+    pub async fn update_last_plan_message(
+        &self,
+        session_id: &str,
+        msg: &crate::state_fs::sessions::ChatMsg,
+    ) -> bool {
+        match self.global_sessions.update_last_plan_message(session_id, msg) {
+            Ok(updated) => updated,
+            Err(e) => {
+                tracing::warn!("Failed to update plan message: {}", e);
+                false
+            }
+        }
     }
 
-    pub async fn set_pending_plan(&self, project_root: &str, agent_id: &str, plan: Plan) {
-        let key = format!("{}|{}", project_root, agent_id);
+    pub async fn send_event(&self, event: AgentEvent, session_id: Option<String>) {
+        let _ = self.events.send((event, session_id));
+    }
+
+    pub async fn set_pending_plan(&self, project_root: &str, agent_id: &str, session_id: Option<&str>, plan: Plan) {
+        let sid = session_id.unwrap_or("default");
+        let key = format!("{}|{}|{}", project_root, sid, agent_id);
         self.pending_plans.lock().await.insert(key, plan);
     }
 
-    pub async fn take_pending_plan(&self, project_root: &str, agent_id: &str) -> Option<Plan> {
-        let key = format!("{}|{}", project_root, agent_id);
+    pub async fn take_pending_plan(&self, project_root: &str, agent_id: &str, session_id: Option<&str>) -> Option<Plan> {
+        let sid = session_id.unwrap_or("default");
+        let key = format!("{}|{}|{}", project_root, sid, agent_id);
         self.pending_plans.lock().await.remove(&key)
     }
 
@@ -1102,9 +1123,11 @@ impl AgentManager {
         &self,
         project_root: &str,
         agent_id: &str,
+        session_id: Option<&str>,
         text: &str,
     ) -> bool {
-        let key = format!("{}|{}", project_root, agent_id);
+        let sid = session_id.unwrap_or("default");
+        let key = format!("{}|{}|{}", project_root, sid, agent_id);
         let mut plans = self.pending_plans.lock().await;
         if let Some(plan) = plans.get_mut(&key) {
             plan.plan_text = text.to_string();
@@ -1161,10 +1184,10 @@ impl AgentManager {
                 if current_task.as_deref() != Some(body) {
                     tracing::info!("Syncing active task {} to {} agent", id, patch_agent_id);
                     engine.set_task(body.clone());
-                    let _ = self.events.send(AgentEvent::TaskUpdate {
+                    let _ = self.events.send((AgentEvent::TaskUpdate {
                         agent_id: patch_agent_id,
                         task: body.clone(),
-                    });
+                    }, None));
                 }
             }
         }

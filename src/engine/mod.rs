@@ -65,6 +65,8 @@ impl AgentEngine {
     }
 
     pub async fn run_agent_loop(&mut self, session_id: Option<&str>) -> Result<AgentOutcome> {
+        self.session_id = session_id.map(|s| s.to_string());
+
         if self.is_cancelled().await {
             anyhow::bail!("run cancelled");
         }
@@ -80,7 +82,7 @@ impl AgentEngine {
                     status: "working".to_string(),
                     detail: Some("Running".to_string()),
                     parent_id: self.parent_agent_id.clone(),
-                })
+                }, self.session_id.clone())
                 .await;
         }
 
@@ -215,7 +217,7 @@ impl AgentEngine {
                         status: "thinking".to_string(),
                         detail: Some(format!("Thinking ({})", self.model_id)),
                         parent_id: self.parent_agent_id.clone(),
-                    })
+                    }, self.session_id.clone())
                     .await;
             }
 
@@ -341,7 +343,7 @@ impl AgentEngine {
                             agent_id,
                             text: msg.clone(),
                             parent_id: self.parent_agent_id.clone(),
-                        }).await;
+                        }, self.session_id.clone()).await;
                     }
                     self.active_skill = None;
                     return Ok(AgentOutcome::None);
@@ -373,7 +375,7 @@ impl AgentEngine {
                                 agent_id: agent_id.clone(),
                                 text: visible_text.clone(),
                                 parent_id: self.parent_agent_id.clone(),
-                            })
+                            }, self.session_id.clone())
                             .await;
                         manager
                             .send_event(crate::agent_manager::AgentEvent::ContentBlockStart {
@@ -383,7 +385,7 @@ impl AgentEngine {
                                 tool: None,
                                 args: Some(visible_text),
                                 parent_id: self.parent_agent_id.clone(),
-                            })
+                            }, self.session_id.clone())
                             .await;
                     }
                 }
@@ -486,7 +488,7 @@ impl AgentEngine {
                                 agent_id: agent_id.clone(),
                                 text: raw.clone(),
                                 parent_id: self.parent_agent_id.clone(),
-                            })
+                            }, self.session_id.clone())
                             .await;
                         manager
                             .send_event(crate::agent_manager::AgentEvent::ContentBlockStart {
@@ -496,7 +498,7 @@ impl AgentEngine {
                                 tool: None,
                                 args: Some(raw.clone()),
                                 parent_id: self.parent_agent_id.clone(),
-                            })
+                            }, self.session_id.clone())
                             .await;
                     }
                     let _ = self.persist_assistant_message(&raw, session_id).await;
@@ -527,7 +529,7 @@ impl AgentEngine {
                                 agent_id: agent_id.clone(),
                                 text: text_before.clone(),
                                 parent_id: self.parent_agent_id.clone(),
-                            })
+                            }, self.session_id.clone())
                             .await;
                         // Also emit structured ContentBlockStart(text) for Web UI.
                         manager
@@ -538,7 +540,7 @@ impl AgentEngine {
                                 tool: None,
                                 args: Some(text_before),
                                 parent_id: self.parent_agent_id.clone(),
-                            })
+                            }, self.session_id.clone())
                             .await;
                     }
                 }

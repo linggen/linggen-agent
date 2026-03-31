@@ -51,7 +51,6 @@ export interface PlanAction {
   session_id?: string | null;
   agent_id?: string;
   edited_plan?: string;
-  clear_context?: boolean;
 }
 
 // ---------------------------------------------------------------------------

@@ -184,7 +184,7 @@ async fn run_peer(
 
                     Event::ChannelData(data) => {
                         let text = String::from_utf8_lossy(&data.data).to_string();
-                        tracing::debug!("Data channel message on {:?}: {}bytes", data.id, text.len());
+                        tracing::trace!("Data channel message on {:?}: {}bytes", data.id, text.len());
                         if Some(data.id) == control_channel_id {
                             if let Some(req) = handle_control_message(
                                 &mut rtc,
@@ -396,7 +396,11 @@ async fn process_control_request_async(
                 return serde_json::json!({ "error": "Invalid URL path" });
             }
             let url = format!("http://127.0.0.1:{port}{url_path}");
-            tracing::info!("RTC http_request: {method} {url_path}");
+            if method == "GET" {
+                tracing::trace!("RTC http_request: {method} {url_path}");
+            } else {
+                tracing::info!("RTC http_request: {method} {url_path}");
+            }
             let body_val = req.body.get("body").unwrap_or(&serde_json::Value::Null).clone();
             let resp = match method {
                 "POST" => client.post(&url).json(&body_val).send().await,
@@ -481,7 +485,11 @@ async fn handle_session_message(
             body["session_id"] = serde_json::Value::String(session_id.to_string());
             ("/api/plan/reject", body)
         }
-        "plan_edit" => ("/api/plan/edit", msg.clone()),
+        "plan_edit" => {
+            let mut body = msg.clone();
+            body["session_id"] = serde_json::Value::String(session_id.to_string());
+            ("/api/plan/edit", body)
+        }
         "clear" => {
             let mut body = msg.clone();
             body["session_id"] = serde_json::Value::String(session_id.to_string());
@@ -638,17 +646,6 @@ fn forward_event_to_channels(
         Some(msg) => msg,
         None => return,
     };
-
-    // Enrich with session_id from agent_sessions map (same as SSE path).
-    if ui_msg.session_id.is_none() {
-        if let Some(aid) = &ui_msg.agent_id {
-            if let Ok(map) = state.agent_sessions.read() {
-                if let Some(sid) = map.get(aid) {
-                    ui_msg.session_id = Some(sid.clone());
-                }
-            }
-        }
-    }
 
     let json = match serde_json::to_string(&ui_msg) {
         Ok(j) => j,

@@ -183,7 +183,6 @@ const App: React.FC = () => {
         ui.setActivePlan(null);
         ui.setPendingPlan(null);
         ui.setPendingPlanAgentId(null);
-        ui.setSessionModel(null);
       }
       // Always fetch to merge latest server state into the bucket
       chatStore.fetchWorkspaceState();
@@ -192,6 +191,12 @@ const App: React.FC = () => {
       fetchPendingAskUser();
     }
   }, [activeSessionId, selectedProjectRoot, isMissionSession, projectStore.isSkillSession, fetchPendingAskUser]);
+
+  // --- Restore persisted session-level model override ---
+  useEffect(() => {
+    const sess = sessions.find((s) => s.id === activeSessionId);
+    useUiStore.getState().setSessionModel(sess?.model_id ?? null);
+  }, [activeSessionId, sessions]);
 
   // --- Poll workspace state for mission sessions (backup; SSE also triggers reloads) ---
   useEffect(() => {
