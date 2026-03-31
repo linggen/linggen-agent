@@ -375,10 +375,12 @@ impl AgentEngine {
     pub fn check_working_folder_change(&mut self) {
         use crate::engine::tools::search_exec_find_git_root;
         let cwd = self.tools.builtins.cwd();
+        // Canonicalize to resolve symlinks (e.g. /tmp → /private/tmp on macOS)
+        let cwd = cwd.canonicalize().unwrap_or(cwd);
         let git_root = search_exec_find_git_root(&cwd);
-        let new_ws_root = git_root.unwrap_or_else(|| {
-            dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
-        });
+        // If inside a git repo, use the git root. Otherwise use the cwd itself
+        // so Read/Glob/Grep resolve relative paths from where the agent actually is.
+        let new_ws_root = git_root.unwrap_or(cwd);
         if new_ws_root != self.cfg.ws_root {
             tracing::info!(
                 "Working folder changed: {} → {}",

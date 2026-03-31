@@ -77,7 +77,7 @@ fn canonical_project_root(project_root: &str) -> PathBuf {
     } else {
         PathBuf::from(project_root)
     };
-    expanded.canonicalize().unwrap_or(expanded)
+    crate::util::resolve_path(&expanded)
 }
 
 fn normalize_agent_md_path(path: &str) -> Result<String, String> {
@@ -665,10 +665,21 @@ pub(crate) async fn list_sessions(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<ProjectQuery>,
 ) -> impl IntoResponse {
-    let total = state.manager.global_sessions.count_sessions();
-    match state.manager.global_sessions.list_sessions_paginated(query.limit, query.offset) {
-        Ok(sessions) => {
-            let api_sessions: Vec<serde_json::Value> = sessions
+    match state.manager.global_sessions.list_sessions() {
+        Ok(all_sessions) => {
+            // Filter by project_root: match sessions whose cwd or project starts with the query path.
+            let canonical = canonical_project_root(&query.project_root);
+            let canonical_str = canonical.to_string_lossy();
+            let filtered: Vec<_> = all_sessions.into_iter().filter(|s| {
+                s.cwd.as_deref().map(|c| c.starts_with(canonical_str.as_ref())).unwrap_or(false)
+                    || s.project.as_deref().map(|p| p.starts_with(canonical_str.as_ref())).unwrap_or(false)
+            }).collect();
+            let total = filtered.len();
+            // Apply pagination
+            let offset = query.offset.unwrap_or(0);
+            let limit = query.limit.unwrap_or(50);
+            let paginated: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+            let api_sessions: Vec<serde_json::Value> = paginated
                 .into_iter()
                 .map(|s| {
                     serde_json::json!({
@@ -913,7 +924,10 @@ pub(crate) async fn rename_session_api(
     Json(req): Json<RenameSessionRequest>,
 ) -> impl IntoResponse {
     match state.manager.global_sessions.rename_session(&req.session_id, &req.title) {
-        Ok(_) => StatusCode::OK,
+        Ok(_) => {
+            let _ = state.events_tx.send(crate::server::ServerEvent::StateUpdated);
+            StatusCode::OK
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

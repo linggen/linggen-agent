@@ -35,6 +35,10 @@ struct Cli {
     #[arg(long, global = true)]
     root: Option<std::path::PathBuf>,
 
+    /// Host address to bind to (overrides config; default: 127.0.0.1)
+    #[arg(long, global = true)]
+    host: Option<String>,
+
     /// Port for the server
     #[arg(long, global = true)]
     port: Option<u16>,
@@ -178,6 +182,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let global_root = cli.root;
+    let global_host = cli.host;
     let global_port = cli.port;
 
     // Lightweight subcommands — no tracing/AgentManager needed.
@@ -329,6 +334,7 @@ async fn main() -> Result<()> {
         None => {
             let ws_root = workspace::resolve_workspace_root(global_root)?;
             let port = global_port.unwrap_or(config.server.port);
+            let host = global_host.clone().unwrap_or_else(|| config.server.host.clone());
 
             // Install/update built-in agent specs to ~/.linggen/agents/
             if let Err(e) = cli::init::install_default_agents() {
@@ -406,11 +412,11 @@ async fn main() -> Result<()> {
                 }
                 tracing::info!("------------------------------");
 
-                server::start_server(manager, skill_manager, port, cli.dev, rx).await?;
+                server::start_server(manager, skill_manager, &host, port, cli.dev, rx).await?;
             } else {
                 // TUI + embedded server (--tui)
                 let handle =
-                    server::prepare_server(manager, skill_manager, port, cli.dev, rx).await?;
+                    server::prepare_server(manager, skill_manager, &host, port, cli.dev, rx).await?;
                 let result =
                     tui::run_tui(handle.port, ws_root.to_string_lossy().to_string()).await;
                 handle.task.abort();

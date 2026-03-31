@@ -11,3 +11,9 @@ pub fn now_ts_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+/// Resolve a path, following symlinks. On macOS, `/tmp` → `/private/tmp`.
+/// Falls back to the original path if canonicalization fails.
+pub fn resolve_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}

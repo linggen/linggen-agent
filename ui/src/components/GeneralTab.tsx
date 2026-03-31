@@ -64,18 +64,30 @@ export const GeneralTab: React.FC<{
       {/* Server */}
       <section className={sectionCls}>
         <h2 className="text-xs font-bold uppercase tracking-wider text-slate-700 dark:text-slate-300 mb-4">Server</h2>
-        <div>
-          <label className={labelCls}>Port</label>
-          <input
-            className={inputCls}
-            type="number"
-            min={1}
-            max={65535}
-            value={config.server.port}
-            onChange={(e) => onChange({ ...config, server: { ...config.server, port: parseInt(e.target.value) || 8080 } })}
-          />
-          <p className="text-[11px] text-amber-500 mt-1">Changing the port requires a server restart to take effect.</p>
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label className={labelCls}>Host</label>
+            <input
+              className={inputCls}
+              value={config.server.host}
+              onChange={(e) => onChange({ ...config, server: { ...config.server, host: e.target.value } })}
+              placeholder="127.0.0.1"
+            />
+            <p className="text-[11px] text-slate-400 mt-1">Use 0.0.0.0 to allow LAN access.</p>
+          </div>
+          <div>
+            <label className={labelCls}>Port</label>
+            <input
+              className={inputCls}
+              type="number"
+              min={1}
+              max={65535}
+              value={config.server.port}
+              onChange={(e) => onChange({ ...config, server: { ...config.server, port: parseInt(e.target.value) || 8080 } })}
+            />
+          </div>
         </div>
+        <p className="text-[11px] text-amber-500 mt-2">Changing host or port requires a server restart to take effect.</p>
       </section>
 
       {/* Logging */}

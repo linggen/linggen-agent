@@ -97,6 +97,12 @@ impl AgentSpec {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ServerConfig {
     pub port: u16,
+    #[serde(default = "default_server_host")]
+    pub host: String,
+}
+
+fn default_server_host() -> String {
+    "127.0.0.1".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -330,7 +336,7 @@ impl Default for Config {
                 auth_mode: Some("chatgpt_oauth".to_string()),
                 reasoning_effort: None,
             }],
-            server: ServerConfig { port: 9898 },
+            server: ServerConfig { port: 9898, host: default_server_host() },
             agent: AgentConfig {
                 max_iters: 200,
                 write_safety_mode: WriteSafetyMode::default(),
