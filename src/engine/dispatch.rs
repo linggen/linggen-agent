@@ -508,12 +508,21 @@ impl AgentEngine {
             lines.push(format!("{} {}{}", checkbox, title, suffix));
             plan_items.push(PlanItem { id, title, status });
         }
-        // Use explicit plan_text if provided, otherwise preserve existing,
-        // otherwise fall back to auto-generated checklist.
-        let plan_text = explicit_plan_text
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| self.plan.as_ref().map(|p| p.plan_text.clone()).filter(|s| !s.trim().is_empty()))
-            .unwrap_or_else(|| lines.join("\n"));
+        // Use existing plan_text if it has substantial content (from planning
+        // phase). Only replace if the model provides something longer, or if
+        // no existing plan_text exists. This prevents execution UpdatePlan
+        // calls from overwriting the full plan with a short summary.
+        let existing_text = self.plan.as_ref()
+            .map(|p| p.plan_text.clone())
+            .filter(|s| !s.trim().is_empty());
+        let plan_text = match (explicit_plan_text.filter(|s| !s.trim().is_empty()), existing_text) {
+            (Some(explicit), Some(existing)) => {
+                if explicit.len() > existing.len() { explicit } else { existing }
+            }
+            (Some(explicit), None) => explicit,
+            (None, Some(existing)) => existing,
+            (None, None) => lines.join("\n"),
+        };
         let summary = Self::extract_plan_summary(&plan_text);
 
         // Preserve pre-approval status — don't promote Planned to Executing.

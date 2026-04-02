@@ -725,9 +725,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
             try {
               const parsed = JSON.parse(bodyStr);
               if (parsed?.type === 'plan' && parsed?.plan) {
+                // Normalize the from field (strip run- prefix) so it matches
+                // the live plan message created by upsertPlan during SSE.
+                const rawFrom = String(meta.from || '');
+                const fromMatch = rawFrom.match(/^run-(.+?)-\d+/);
+                const normalizedFrom = fromMatch ? fromMatch[1] : rawFrom;
                 return [{
                   role: 'agent' as const,
-                  from: meta.from,
+                  from: normalizedFrom,
                   to: meta.to,
                   text: String(body || ''),
                   timestamp: new Date(meta.ts * 1000).toLocaleTimeString(),
