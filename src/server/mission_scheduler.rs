@@ -339,11 +339,29 @@ async fn dispatch_mission_prompt(
     engine.task = Some(message.clone());
     engine.set_parent_agent(None);
     engine.set_run_id(Some(run_id.clone()));
-    // Force Auto permission mode — missions run without human supervision,
-    // so Ask/AcceptEdits would hang forever waiting for approval.
+    // Force Auto permission mode (legacy — kept for backward compat with old check flow).
     engine.cfg.tool_permission_mode = crate::config::ToolPermissionMode::Auto;
 
-    // Apply permission tier restrictions.
+    // New permission model: lock session + set mode from tier.
+    // Locked = no prompts; actions within mode ceiling pass, everything else blocked.
+    {
+        use crate::engine::permission::PermissionMode;
+        let mode = match mission.permission_tier.as_str() {
+            "readonly" => PermissionMode::Read,
+            "standard" => PermissionMode::Edit,
+            _ => PermissionMode::Admin, // "full" or unknown
+        };
+        let cwd = mission.project.clone().unwrap_or_else(|| "~/".to_string());
+        engine.session_permissions.locked = true;
+        engine.session_permissions.set_path_mode(&cwd, mode);
+        // Persist so the UI shows the correct mode if user opens the mission session.
+        if let Some(ref sid) = session_id {
+            let sdir = crate::paths::global_sessions_dir().join(sid);
+            engine.session_permissions.save(&sdir);
+        }
+    }
+
+    // Apply legacy permission tier restrictions (bash prefixes, tool set).
     apply_permission_tier(&mut engine, &mission.permission_tier);
 
     // Wire up thinking channel so tokens are emitted as SSE events,

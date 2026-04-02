@@ -156,6 +156,19 @@ pub struct AppConfig {
     pub height: Option<u32>,
 }
 
+/// Permission request declared by a skill. See permission-spec.md → Skill invocation.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SkillPermission {
+    /// Required mode: "read", "edit", or "admin".
+    pub mode: String,
+    /// Paths to grant the mode on. E.g. ["/", "~/workspace"].
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Warning message shown to user before approval.
+    #[serde(default)]
+    pub warning: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Skill {
     pub name: String,
@@ -182,6 +195,9 @@ pub struct Skill {
     pub trigger: Option<String>,
     #[serde(default)]
     pub app: Option<AppConfig>,
+    /// Permission request — if set, user is prompted to approve before skill runs.
+    #[serde(default)]
+    pub permission: Option<SkillPermission>,
     /// Filesystem path to the skill directory (set at load time, not serialized to clients).
     #[serde(skip)]
     pub skill_dir: Option<std::path::PathBuf>,
@@ -242,6 +258,8 @@ struct SkillFrontmatter {
     trigger: Option<String>,
     #[serde(default)]
     app: Option<AppConfig>,
+    #[serde(default)]
+    permission: Option<SkillPermission>,
 }
 
 pub struct SkillManager {
@@ -374,6 +392,7 @@ impl SkillManager {
             agent: frontmatter.agent,
             trigger: frontmatter.trigger,
             app: frontmatter.app,
+            permission: frontmatter.permission,
             skill_dir: None,
         })
     }

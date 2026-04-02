@@ -67,6 +67,34 @@ impl AgentEngine {
     pub async fn run_agent_loop(&mut self, session_id: Option<&str>) -> Result<AgentOutcome> {
         self.session_id = session_id.map(|s| s.to_string());
 
+        // Load session permissions from permission.json (or initialize defaults).
+        if let Some(sid) = session_id {
+            let sdir = crate::paths::global_sessions_dir().join(sid);
+            self.session_permissions = permission::SessionPermissions::load(&sdir);
+
+            // Initialize default path_modes if empty (new session = read on cwd).
+            if self.session_permissions.path_modes.is_empty() && !self.session_permissions.locked {
+                let cwd_str = if let Some(home) = dirs::home_dir() {
+                    let ws = self.cfg.ws_root.to_string_lossy();
+                    let hs = home.to_string_lossy();
+                    if ws.starts_with(hs.as_ref()) {
+                        format!("~{}", &ws[hs.len()..])
+                    } else {
+                        ws.to_string()
+                    }
+                } else {
+                    self.cfg.ws_root.to_string_lossy().to_string()
+                };
+                self.session_permissions.set_path_mode(
+                    &cwd_str,
+                    self.cfg.permission_mode.clone(),
+                );
+                self.session_permissions.save(&sdir);
+            }
+
+            self.session_dir = Some(sdir);
+        }
+
         if self.is_cancelled().await {
             anyhow::bail!("run cancelled");
         }

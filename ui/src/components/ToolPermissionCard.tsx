@@ -27,15 +27,19 @@ export const ToolPermissionCard: React.FC<ToolPermissionCardProps> = ({ pending,
     ]);
   };
 
-  // Determine if the option is a deny action (session or project-level).
+  // Determine if the option is a deny action.
   const isDeny = (label: string) =>
     label === 'Deny' || label === 'Cancel' || label.startsWith('Deny ');
 
-  // Blanket allow options — style them muted (session or project-level).
-  const isBlanketOption = (label: string) =>
-    label.startsWith('Allow all ');
+  // Mode switch options — style them with accent color.
+  const isModeSwitch = (label: string) =>
+    label.startsWith('Switch to ') || label.startsWith('Allow read on ');
 
-  // Project-persisted option (allow or deny) — show a save indicator.
+  // Blanket allow options — style them muted.
+  const isBlanketOption = (label: string) =>
+    label.startsWith('Allow all ') || label === 'Allow for this session';
+
+  // Project-persisted option (legacy — no longer generated but kept for compat).
   const isPersistedOption = (label: string) =>
     label.includes('for this project');
 
@@ -75,9 +79,11 @@ export const ToolPermissionCard: React.FC<ToolPermissionCardProps> = ({ pending,
               className={`text-left text-[12px] px-3 py-1.5 rounded-lg border transition-colors cursor-pointer ${
                 isDeny(opt.label)
                   ? 'bg-white text-slate-400 border-slate-200 hover:border-red-300 hover:text-red-500 dark:bg-white/5 dark:text-slate-500 dark:border-white/10 dark:hover:border-red-500/40 dark:hover:text-red-400'
-                  : isBlanketOption(opt.label)
-                    ? 'bg-white text-slate-400 border-slate-200 hover:border-slate-300 hover:text-slate-500 dark:bg-white/5 dark:text-slate-500 dark:border-white/10 dark:hover:border-slate-400/30 dark:hover:text-slate-400'
-                    : 'bg-white text-slate-600 border-slate-200 hover:border-amber-300 hover:text-amber-700 hover:bg-amber-50/50 dark:bg-white/5 dark:text-slate-300 dark:border-white/10 dark:hover:border-amber-500/40 dark:hover:bg-amber-500/5'
+                  : isModeSwitch(opt.label)
+                    ? 'bg-blue-50 text-blue-700 border-blue-200 hover:border-blue-400 hover:bg-blue-100 dark:bg-blue-500/5 dark:text-blue-400 dark:border-blue-500/20 dark:hover:border-blue-500/40 dark:hover:bg-blue-500/10'
+                    : isBlanketOption(opt.label)
+                      ? 'bg-white text-slate-400 border-slate-200 hover:border-slate-300 hover:text-slate-500 dark:bg-white/5 dark:text-slate-500 dark:border-white/10 dark:hover:border-slate-400/30 dark:hover:text-slate-400'
+                      : 'bg-white text-slate-600 border-slate-200 hover:border-amber-300 hover:text-amber-700 hover:bg-amber-50/50 dark:bg-white/5 dark:text-slate-300 dark:border-white/10 dark:hover:border-amber-500/40 dark:hover:bg-amber-500/5'
               }`}
             >
               <span className="font-medium">{opt.label}</span>

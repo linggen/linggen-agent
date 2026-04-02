@@ -42,13 +42,12 @@ impl AgentEngine {
     }
 
     /// Ask the user for permission via the AskUser bridge.
-    /// `parser` converts the selected option label into a `PermissionAction`.
-    /// Returns `None` if no bridge is available (e.g. CLI mode).
-    async fn ask_permission(
+    /// Ask user for permission, returning the raw selected label and optional custom text.
+    /// Returns `None` on timeout, `Some(PermissionAction)` otherwise.
+    pub async fn ask_permission_raw(
         &self,
         tool: &str,
         question: tools::AskUserQuestion,
-        parser: fn(&str, &str) -> permission::PermissionAction,
     ) -> Option<permission::PermissionAction> {
         let bridge = match self.tools.ask_user_bridge() {
             Some(b) => Arc::clone(b),
@@ -58,7 +57,6 @@ impl AgentEngine {
         let question_id = uuid::Uuid::new_v4().to_string();
         let agent_id = self.agent_id.clone().unwrap_or_default();
 
-        // Emit SSE event to push the permission question to the UI.
         info!("Permission: awaiting user approval for '{}'", tool);
         let questions = vec![question];
         let _ = bridge.events_tx.send(crate::server::ServerEvent::AskUser {
@@ -68,7 +66,6 @@ impl AgentEngine {
             session_id: bridge.session_id.clone(),
         });
 
-        // Create a oneshot channel and register it for the response endpoint.
         let (tx, rx) = tokio::sync::oneshot::channel();
         bridge.pending.lock().await.insert(
             question_id.clone(),
@@ -80,16 +77,12 @@ impl AgentEngine {
             },
         );
 
-        // Block until the user responds or timeout (5 minutes).
         let response = tokio::time::timeout(std::time::Duration::from_secs(8 * 3600), rx).await;
-
-        // Cleanup: remove from pending map regardless of outcome.
         bridge.pending.lock().await.remove(&question_id);
 
         match response {
             Ok(Ok(answers)) => {
                 let answer = answers.first();
-                // If the user typed custom text (via "Other..."), treat as deny + relay message.
                 let custom = answer.and_then(|a| a.custom_text.as_deref()).unwrap_or("");
                 if !custom.is_empty() {
                     info!("Permission: '{}' → DenyWithMessage", tool);
@@ -99,9 +92,22 @@ impl AgentEngine {
                     .and_then(|a| a.selected.first())
                     .map(|s| s.as_str())
                     .unwrap_or("Cancel");
-                let action = parser(selected, tool);
-                info!("Permission: '{}' → {:?}", tool, action);
-                Some(action)
+                info!("Permission: '{}' → selected '{}'", tool, selected);
+                // Map common labels to actions
+                match selected {
+                    "Allow once" | "Approve" => Some(permission::PermissionAction::AllowOnce),
+                    "Deny" | "Cancel" => Some(permission::PermissionAction::Deny),
+                    "Allow for this session" | "Run in current mode" => {
+                        Some(permission::PermissionAction::AllowSession)
+                    }
+                    other => {
+                        if other.starts_with("Switch to ") || other.starts_with("Allow read on ") {
+                            Some(permission::PermissionAction::AllowSession)
+                        } else {
+                            Some(permission::PermissionAction::Deny)
+                        }
+                    }
+                }
             }
             Ok(Err(_)) => {
                 warn!("Permission: '{}' channel closed → denied", tool);
@@ -109,149 +115,13 @@ impl AgentEngine {
             }
             Err(_) => {
                 warn!("Permission: '{}' timed out → stopping agent", tool);
-                None // Timeout: no user response, signal to stop the loop
-            }
-        }
-    }
-
-    /// Ask the user for Bash permission with command-level granularity.
-    /// Returns `(PermissionAction, Option<permission_key>)`.
-    async fn ask_bash_permission(
-        &self,
-        command: &str,
-        question: tools::AskUserQuestion,
-        pattern: Option<&str>,
-    ) -> Option<(permission::PermissionAction, Option<String>)> {
-        let bridge = match self.tools.ask_user_bridge() {
-            Some(b) => Arc::clone(b),
-            None => return None,
-        };
-
-        let question_id = uuid::Uuid::new_v4().to_string();
-        let agent_id = self.agent_id.clone().unwrap_or_default();
-
-        info!(
-            "Permission: awaiting user approval for Bash '{}' (session_id={:?})",
-            command, bridge.session_id
-        );
-        let questions = vec![question];
-        let _ = bridge.events_tx.send(crate::server::ServerEvent::AskUser {
-            agent_id: agent_id.clone(),
-            question_id: question_id.clone(),
-            questions: questions.clone(),
-            session_id: bridge.session_id.clone(),
-        });
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        bridge.pending.lock().await.insert(
-            question_id.clone(),
-            tools::PendingAskUser {
-                agent_id,
-                questions,
-                sender: tx,
-                session_id: bridge.session_id.clone(),
-            },
-        );
-
-        let response = tokio::time::timeout(std::time::Duration::from_secs(8 * 3600), rx).await;
-        bridge.pending.lock().await.remove(&question_id);
-
-        match response {
-            Ok(Ok(answers)) => {
-                let answer = answers.first();
-                // If the user typed custom text (via "Other..."), treat as deny + relay message.
-                let custom = answer.and_then(|a| a.custom_text.as_deref()).unwrap_or("");
-                if !custom.is_empty() {
-                    info!("Permission: Bash '{}' → DenyWithMessage", command);
-                    return Some((permission::PermissionAction::DenyWithMessage(custom.to_string()), None));
-                }
-                let selected = answer
-                    .and_then(|a| a.selected.first())
-                    .map(|s| s.as_str())
-                    .unwrap_or("Cancel");
-                let (action, key) =
-                    permission::parse_bash_permission_answer(selected, "Bash", pattern);
-                info!("Permission: Bash '{}' → {:?} key={:?}", command, action, key);
-                Some((action, key))
-            }
-            Ok(Err(_)) => {
-                warn!("Permission: Bash channel closed → denied");
-                Some((permission::PermissionAction::Deny, None))
-            }
-            Err(_) => {
-                warn!("Permission: Bash timed out → stopping agent");
-                None // Timeout: no user response, signal to stop the loop
-            }
-        }
-    }
-
-    /// Ask the user for file-scoped Write/Edit permission.
-    /// Returns `(PermissionAction, Option<permission_key>)`.
-    async fn ask_file_permission(
-        &self,
-        file_path: &str,
-        question: tools::AskUserQuestion,
-        tool: &str,
-        pattern: &str,
-    ) -> Option<(permission::PermissionAction, Option<String>)> {
-        let bridge = match self.tools.ask_user_bridge() {
-            Some(b) => Arc::clone(b),
-            None => return None,
-        };
-
-        let question_id = uuid::Uuid::new_v4().to_string();
-        let agent_id = self.agent_id.clone().unwrap_or_default();
-
-        info!("Permission: awaiting user approval for {} '{}'", tool, file_path);
-        let questions = vec![question];
-        let _ = bridge.events_tx.send(crate::server::ServerEvent::AskUser {
-            agent_id: agent_id.clone(),
-            question_id: question_id.clone(),
-            questions: questions.clone(),
-            session_id: bridge.session_id.clone(),
-        });
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        bridge.pending.lock().await.insert(
-            question_id.clone(),
-            tools::PendingAskUser {
-                agent_id,
-                questions,
-                sender: tx,
-                session_id: bridge.session_id.clone(),
-            },
-        );
-
-        let response = tokio::time::timeout(std::time::Duration::from_secs(8 * 3600), rx).await;
-        bridge.pending.lock().await.remove(&question_id);
-
-        match response {
-            Ok(Ok(answers)) => {
-                let answer = answers.first();
-                let custom = answer.and_then(|a| a.custom_text.as_deref()).unwrap_or("");
-                if !custom.is_empty() {
-                    info!("Permission: {} '{}' → DenyWithMessage", tool, file_path);
-                    return Some((permission::PermissionAction::DenyWithMessage(custom.to_string()), None));
-                }
-                let selected = answer
-                    .and_then(|a| a.selected.first())
-                    .map(|s| s.as_str())
-                    .unwrap_or("Cancel");
-                let (action, key) =
-                    permission::parse_file_permission_answer(selected, tool, pattern);
-                info!("Permission: {} '{}' → {:?} key={:?}", tool, file_path, action, key);
-                Some((action, key))
-            }
-            Ok(Err(_)) => {
-                warn!("Permission: {} channel closed → denied", tool);
-                Some((permission::PermissionAction::Deny, None))
-            }
-            Err(_) => {
-                warn!("Permission: {} timed out → stopping agent", tool);
                 None
             }
         }
     }
+
+    // Old ask_permission / ask_bash_permission / ask_file_permission methods removed.
+    // New permission flow uses ask_permission_raw (above) + PromptKind-specific prompt builders.
 
     /// Pre-execution phase: validate permissions, record context, check caches,
     /// and emit SSE "start" events. Returns `Ready` with the prepared ToolCall
@@ -380,11 +250,9 @@ impl AgentEngine {
             }
         }
 
-        // --- tool permission gate ---
-        let is_destructive = permission::is_destructive_tool(&canonical_tool);
-        let is_web = permission::is_web_tool(&canonical_tool);
+        // --- new permission gate (permission-spec.md) ---
 
-        // Extract bash command for pattern-based permission checking.
+        // Extract bash command and file path for permission checking.
         let bash_command = if canonical_tool == "Bash" {
             args.get("cmd")
                 .or_else(|| args.get("command"))
@@ -393,66 +261,30 @@ impl AgentEngine {
         } else {
             None
         };
-
-        // Extract file path for Write/Edit pattern-based permission checking.
-        let file_path_arg = if matches!(canonical_tool.as_str(), "Write" | "Edit") {
+        let file_path_arg = if matches!(canonical_tool.as_str(), "Write" | "Edit" | "Read") {
             normalize_tool_path_arg(&self.cfg.ws_root, &args)
         } else {
             None
         };
 
-        let already_allowed = self.permission_store.check(
-            &canonical_tool,
-            bash_command.as_deref().or(file_path_arg.as_deref()),
-        );
-        let needs_permission = if already_allowed {
-            false
-        } else {
-            match self.cfg.tool_permission_mode {
-                crate::config::ToolPermissionMode::Auto => false,
-                crate::config::ToolPermissionMode::Ask => is_destructive || is_web,
-                // AcceptEdits: auto-approve Write/Edit but still prompt for Bash and web tools.
-                crate::config::ToolPermissionMode::AcceptEdits => {
-                    if matches!(canonical_tool.as_str(), "Write" | "Edit") {
-                        false
-                    } else {
-                        is_destructive || is_web
-                    }
-                }
-            }
-        };
-        if is_destructive || is_web {
-            info!(
-                "Permission check for '{}': mode={:?}, already_allowed={}, destructive={}, web={} → needs_permission={}",
-                canonical_tool, self.cfg.tool_permission_mode, already_allowed, is_destructive, is_web, needs_permission
-            );
-        }
-
-        // Hard-block project-denied tools (no prompt, immediate rejection).
-        if self.permission_store.is_denied(
-            &canonical_tool,
-            bash_command.as_deref().or(file_path_arg.as_deref()),
-        ) {
+        // Auto-block retries of denied tool calls.
+        if self.session_permissions.denied_sigs.contains(&sig) {
             let summary =
                 permission::permission_target_summary(&canonical_tool, &args, &self.cfg.ws_root);
-            let msg = format!(
-                "Permission denied: {} '{}' is blocked by a project deny rule in .linggen/permissions.json. \
-                 Edit that file to remove the deny rule if needed.",
-                canonical_tool, summary
+            let msg = self.prompt_store.render_or_fallback(
+                crate::prompts::keys::PERMISSION_DENIED,
+                &[("tool", &canonical_tool), ("summary", &summary)],
             );
             messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
             return PreExecOutcome::Blocked(LoopControl::Continue);
         }
 
-        // --- mission bash prefix restriction ---
-        // When bash_allow_prefixes is set, block bash commands not matching any prefix.
+        // --- mission bash prefix restriction (legacy, kept for backward compat) ---
         if canonical_tool == "Bash" {
             if let Some(ref prefixes) = self.cfg.bash_allow_prefixes {
                 let cmd = bash_command.as_deref().unwrap_or("");
                 let cmd_trimmed = cmd.trim();
-                let allowed = prefixes.iter().any(|prefix| {
-                    cmd_trimmed.starts_with(prefix)
-                });
+                let allowed = prefixes.iter().any(|prefix| cmd_trimmed.starts_with(prefix));
                 if !allowed {
                     let msg = format!(
                         "Bash command not allowed by this mission's permission tier. \
@@ -466,9 +298,20 @@ impl AgentEngine {
             }
         }
 
-        if needs_permission {
-            // Auto-block retries of tool calls the user already denied this session.
-            if self.denied_tool_sigs.contains(&sig) {
+        // Run the new permission check.
+        let check_result = permission::check_permission(
+            &canonical_tool,
+            bash_command.as_deref(),
+            file_path_arg.as_deref(),
+            &self.session_permissions,
+            &self.cfg.deny_rules,
+            &self.cfg.ask_rules,
+        );
+
+        match check_result {
+            permission::PermissionCheckResult::Allowed => { /* proceed */ }
+            permission::PermissionCheckResult::Blocked(reason) => {
+                info!("Permission blocked: {} — {}", canonical_tool, reason);
                 let summary =
                     permission::permission_target_summary(&canonical_tool, &args, &self.cfg.ws_root);
                 let msg = self.prompt_store.render_or_fallback(
@@ -478,194 +321,151 @@ impl AgentEngine {
                 messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
                 return PreExecOutcome::Blocked(LoopControl::Continue);
             }
+            permission::PermissionCheckResult::NeedsPrompt(prompt_kind) => {
+                let summary =
+                    permission::permission_target_summary(&canonical_tool, &args, &self.cfg.ws_root);
 
-            let summary =
-                permission::permission_target_summary(&canonical_tool, &args, &self.cfg.ws_root);
-
-            if canonical_tool == "Bash" {
-                // Bash uses command-level granularity with glob patterns.
-                let cmd = bash_command.as_deref().unwrap_or("");
-                if cmd.is_empty() {
-                    let msg = "Error: Bash tool requires a 'cmd' argument with the command to run.".to_string();
-                    messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                    return PreExecOutcome::Blocked(LoopControl::Continue);
-                }
-                let pattern = permission::derive_command_pattern(cmd);
-                let question = permission::build_bash_permission_question(
-                    cmd,
-                    pattern.as_deref(),
-                );
-                match self
-                    .ask_bash_permission(cmd, question, pattern.as_deref())
-                    .await
-                {
-                    Some((permission::PermissionAction::AllowOnce, _)) => { /* proceed */ }
-                    Some((permission::PermissionAction::AllowSession, Some(key))) => {
-                        self.permission_store.allow_for_session(&key);
-                    }
-                    Some((permission::PermissionAction::AllowProject, Some(key))) => {
-                        self.permission_store.allow_for_project(&key);
-                    }
-                    Some((permission::PermissionAction::Deny, _)) => {
-                        self.denied_tool_sigs.insert(sig.clone());
-                        let msg = self.prompt_store.render_or_fallback(
-                            crate::prompts::keys::PERMISSION_DENIED,
-                            &[("tool", "Bash"), ("summary", &summary)],
+                match prompt_kind {
+                    permission::PromptKind::ExceedsCeiling { target_mode, path, tool_summary } => {
+                        let question = permission::build_exceeds_ceiling_question(
+                            &tool_summary, &target_mode, &path,
                         );
-                        messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                        return PreExecOutcome::Blocked(LoopControl::Continue);
-                    }
-                    Some((permission::PermissionAction::DenyProject, key)) => {
-                        if let Some(k) = key {
-                            self.permission_store.deny_for_project(&k);
+                        match self.ask_permission_raw(&canonical_tool, question).await {
+                            Some(permission::PermissionAction::AllowOnce) => { /* proceed */ }
+                            Some(permission::PermissionAction::AllowSession) => {
+                                // Switch mode — update path_modes and save.
+                                self.session_permissions.set_path_mode(&path, target_mode);
+                                if let Some(ref sdir) = self.session_dir {
+                                    self.session_permissions.save(sdir);
+                                }
+                            }
+                            Some(permission::PermissionAction::Deny) => {
+                                self.session_permissions.denied_sigs.insert(sig.clone());
+                                if let Some(ref sdir) = self.session_dir {
+                                    self.session_permissions.save(sdir);
+                                }
+                                let msg = self.prompt_store.render_or_fallback(
+                                    crate::prompts::keys::PERMISSION_DENIED,
+                                    &[("tool", &canonical_tool), ("summary", &summary)],
+                                );
+                                messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
+                                return PreExecOutcome::Blocked(LoopControl::Continue);
+                            }
+                            Some(permission::PermissionAction::DenyWithMessage(user_msg)) => {
+                                self.session_permissions.denied_sigs.insert(sig.clone());
+                                if let Some(ref sdir) = self.session_dir {
+                                    self.session_permissions.save(sdir);
+                                }
+                                let msg = format!(
+                                    "Permission denied by user for {} '{}'. User says: {}",
+                                    canonical_tool, summary, user_msg
+                                );
+                                messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
+                                return PreExecOutcome::Blocked(LoopControl::Continue);
+                            }
+                            None => {
+                                let msg = self.prompt_store.render_or_fallback(
+                                    crate::prompts::keys::PERMISSION_TIMEOUT, &[],
+                                );
+                                let _ = self.persist_assistant_message(&msg, session_id).await;
+                                return PreExecOutcome::Blocked(LoopControl::Return(AgentOutcome::None));
+                            }
                         }
-                        self.denied_tool_sigs.insert(sig.clone());
-                        let msg = self.prompt_store.render_or_fallback(
-                            crate::prompts::keys::PERMISSION_DENIED,
-                            &[("tool", "Bash"), ("summary", &summary)],
-                        );
-                        messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                        return PreExecOutcome::Blocked(LoopControl::Continue);
                     }
-                    Some((permission::PermissionAction::DenyWithMessage(user_msg), _)) => {
-                        self.denied_tool_sigs.insert(sig.clone());
-                        let msg = format!(
-                            "Permission denied by user for Bash on '{}'. User says: {}",
-                            summary, user_msg
-                        );
-                        messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                        return PreExecOutcome::Blocked(LoopControl::Continue);
-                    }
-                    None => {
-                        // Timeout or no bridge — stop the loop so the agent goes idle.
-                        let msg = self.prompt_store.render_or_fallback(
-                            crate::prompts::keys::PERMISSION_TIMEOUT,
-                            &[],
-                        );
-                        let _ = self
-                            .persist_assistant_message(&msg, session_id)
-                            .await;
-                        return PreExecOutcome::Blocked(
-                            LoopControl::Return(AgentOutcome::None),
-                        );
-                    }
-                    _ => { /* proceed: AllowOnce, AllowSession/AllowProject without key */ }
-                }
-            } else if permission::is_web_tool(&canonical_tool) {
-                let question =
-                    permission::build_web_permission_question(&canonical_tool, &summary);
-                match self.ask_permission(&canonical_tool, question, permission::parse_web_permission_answer).await {
-                    Some(permission::PermissionAction::AllowOnce) => { /* proceed */ }
-                    Some(permission::PermissionAction::AllowSession) => {
-                        self.permission_store.allow_for_session(&canonical_tool);
-                    }
-                    Some(permission::PermissionAction::AllowProject) => {
-                        self.permission_store.allow_for_project(&canonical_tool);
-                    }
-                    Some(permission::PermissionAction::Deny) => {
-                        self.denied_tool_sigs.insert(sig.clone());
-                        let msg = self.prompt_store.render_or_fallback(
-                            crate::prompts::keys::PERMISSION_DENIED,
-                            &[("tool", &canonical_tool), ("summary", &summary)],
-                        );
-                        messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                        return PreExecOutcome::Blocked(LoopControl::Continue);
-                    }
-                    Some(permission::PermissionAction::DenyProject) => {
-                        self.permission_store.deny_for_project(&canonical_tool);
-                        self.denied_tool_sigs.insert(sig.clone());
-                        let msg = self.prompt_store.render_or_fallback(
-                            crate::prompts::keys::PERMISSION_DENIED,
-                            &[("tool", &canonical_tool), ("summary", &summary)],
-                        );
-                        messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                        return PreExecOutcome::Blocked(LoopControl::Continue);
-                    }
-                    Some(permission::PermissionAction::DenyWithMessage(user_msg)) => {
-                        self.denied_tool_sigs.insert(sig.clone());
-                        let msg = format!(
-                            "Permission denied by user for {} on '{}'. User says: {}",
-                            canonical_tool, summary, user_msg
-                        );
-                        messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                        return PreExecOutcome::Blocked(LoopControl::Continue);
-                    }
-                    None => {
-                        let msg = self.prompt_store.render_or_fallback(
-                            crate::prompts::keys::PERMISSION_TIMEOUT,
-                            &[],
-                        );
-                        let _ = self
-                            .persist_assistant_message(&msg, session_id)
-                            .await;
-                        return PreExecOutcome::Blocked(
-                            LoopControl::Return(AgentOutcome::None),
-                        );
-                    }
-                }
-            } else if matches!(canonical_tool.as_str(), "Write" | "Edit") {
-                // Write/Edit use file-scoped permission prompts (directory glob patterns).
-                let file_rel = file_path_arg.as_deref().unwrap_or(&summary);
-                let pattern = permission::derive_file_pattern(file_rel);
-                let question = permission::build_file_permission_question(
-                    &canonical_tool,
-                    file_rel,
-                    &pattern,
-                );
-                match self
-                    .ask_file_permission(file_rel, question, &canonical_tool, &pattern)
-                    .await
-                {
-                    Some((permission::PermissionAction::AllowOnce, _)) => { /* proceed */ }
-                    Some((permission::PermissionAction::AllowSession, Some(key))) => {
-                        self.permission_store.allow_for_session(&key);
-                    }
-                    Some((permission::PermissionAction::AllowProject, Some(key))) => {
-                        self.permission_store.allow_for_project(&key);
-                    }
-                    Some((permission::PermissionAction::Deny, _)) => {
-                        self.denied_tool_sigs.insert(sig.clone());
-                        let msg = self.prompt_store.render_or_fallback(
-                            crate::prompts::keys::PERMISSION_DENIED,
-                            &[("tool", &canonical_tool), ("summary", &summary)],
-                        );
-                        messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                        return PreExecOutcome::Blocked(LoopControl::Continue);
-                    }
-                    Some((permission::PermissionAction::DenyProject, key)) => {
-                        if let Some(k) = key {
-                            self.permission_store.deny_for_project(&k);
+                    permission::PromptKind::SystemZoneWrite { tool_summary } => {
+                        let question = permission::build_system_zone_question(&tool_summary);
+                        match self.ask_permission_raw(&canonical_tool, question).await {
+                            Some(permission::PermissionAction::AllowOnce) => { /* proceed */ }
+                            None => {
+                                let msg = self.prompt_store.render_or_fallback(
+                                    crate::prompts::keys::PERMISSION_TIMEOUT, &[],
+                                );
+                                let _ = self.persist_assistant_message(&msg, session_id).await;
+                                return PreExecOutcome::Blocked(LoopControl::Return(AgentOutcome::None));
+                            }
+                            _ => {
+                                self.session_permissions.denied_sigs.insert(sig.clone());
+                                if let Some(ref sdir) = self.session_dir {
+                                    self.session_permissions.save(sdir);
+                                }
+                                let msg = self.prompt_store.render_or_fallback(
+                                    crate::prompts::keys::PERMISSION_DENIED,
+                                    &[("tool", &canonical_tool), ("summary", &summary)],
+                                );
+                                messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
+                                return PreExecOutcome::Blocked(LoopControl::Continue);
+                            }
                         }
-                        self.denied_tool_sigs.insert(sig.clone());
-                        let msg = self.prompt_store.render_or_fallback(
-                            crate::prompts::keys::PERMISSION_DENIED,
-                            &[("tool", &canonical_tool), ("summary", &summary)],
-                        );
-                        messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                        return PreExecOutcome::Blocked(LoopControl::Continue);
                     }
-                    Some((permission::PermissionAction::DenyWithMessage(user_msg), _)) => {
-                        self.denied_tool_sigs.insert(sig.clone());
-                        let msg = format!(
-                            "Permission denied by user for {} on '{}'. User says: {}",
-                            canonical_tool, summary, user_msg
-                        );
-                        messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                        return PreExecOutcome::Blocked(LoopControl::Continue);
+                    permission::PromptKind::AskRuleOverride { rule, tool_summary } => {
+                        let question = permission::build_ask_rule_question(&tool_summary, &rule);
+                        match self.ask_permission_raw(&canonical_tool, question).await {
+                            Some(permission::PermissionAction::AllowOnce) => { /* proceed */ }
+                            Some(permission::PermissionAction::AllowSession) => {
+                                // Store the matched rule as override key so suppression
+                                // covers all commands matching the pattern.
+                                self.session_permissions.allows.insert(rule.clone());
+                                if let Some(ref sdir) = self.session_dir {
+                                    self.session_permissions.save(sdir);
+                                }
+                            }
+                            Some(permission::PermissionAction::Deny) => {
+                                self.session_permissions.denied_sigs.insert(sig.clone());
+                                if let Some(ref sdir) = self.session_dir {
+                                    self.session_permissions.save(sdir);
+                                }
+                                let msg = self.prompt_store.render_or_fallback(
+                                    crate::prompts::keys::PERMISSION_DENIED,
+                                    &[("tool", &canonical_tool), ("summary", &summary)],
+                                );
+                                messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
+                                return PreExecOutcome::Blocked(LoopControl::Continue);
+                            }
+                            None => {
+                                let msg = self.prompt_store.render_or_fallback(
+                                    crate::prompts::keys::PERMISSION_TIMEOUT, &[],
+                                );
+                                let _ = self.persist_assistant_message(&msg, session_id).await;
+                                return PreExecOutcome::Blocked(LoopControl::Return(AgentOutcome::None));
+                            }
+                            _ => {}
+                        }
                     }
-                    None => {
-                        let msg = self.prompt_store.render_or_fallback(
-                            crate::prompts::keys::PERMISSION_TIMEOUT,
-                            &[],
-                        );
-                        let _ = self
-                            .persist_assistant_message(&msg, session_id)
-                            .await;
-                        return PreExecOutcome::Blocked(
-                            LoopControl::Return(AgentOutcome::None),
-                        );
+                    permission::PromptKind::ReadOutsidePath { dir, tool_summary } => {
+                        let question = permission::build_read_outside_path_question(&tool_summary, &dir);
+                        match self.ask_permission_raw(&canonical_tool, question).await {
+                            Some(permission::PermissionAction::AllowOnce) => { /* proceed */ }
+                            Some(permission::PermissionAction::AllowSession) => {
+                                // Grant read on the directory.
+                                self.session_permissions.set_path_mode(
+                                    &dir, permission::PermissionMode::Read,
+                                );
+                                if let Some(ref sdir) = self.session_dir {
+                                    self.session_permissions.save(sdir);
+                                }
+                            }
+                            Some(permission::PermissionAction::Deny) => {
+                                self.session_permissions.denied_sigs.insert(sig.clone());
+                                if let Some(ref sdir) = self.session_dir {
+                                    self.session_permissions.save(sdir);
+                                }
+                                let msg = self.prompt_store.render_or_fallback(
+                                    crate::prompts::keys::PERMISSION_DENIED,
+                                    &[("tool", &canonical_tool), ("summary", &summary)],
+                                );
+                                messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
+                                return PreExecOutcome::Blocked(LoopControl::Continue);
+                            }
+                            None => {
+                                let msg = self.prompt_store.render_or_fallback(
+                                    crate::prompts::keys::PERMISSION_TIMEOUT, &[],
+                                );
+                                let _ = self.persist_assistant_message(&msg, session_id).await;
+                                return PreExecOutcome::Blocked(LoopControl::Return(AgentOutcome::None));
+                            }
+                            _ => {}
+                        }
                     }
-                    _ => { /* proceed: AllowOnce, AllowSession/AllowProject without key */ }
                 }
             }
         }

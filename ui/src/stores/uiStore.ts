@@ -50,6 +50,9 @@ interface UiState {
   // Session-level model override (not persisted — resets on session change)
   sessionModel: string | null;
 
+  // Session permission mode (read/edit/admin — loaded from session permission.json)
+  sessionMode: string | null;
+
   // Chat UI
   queuedMessages: QueuedChatItem[];
   pendingPlan: Plan | null;
@@ -80,6 +83,7 @@ interface UiState {
   setOverlay: (overlay: string | null) => void;
   setModelPickerOpen: (open: boolean) => void;
   setSessionModel: (model: string | null) => void;
+  setSessionMode: (mode: string | null) => void;
   setShowAgentSpecEditor: (show: boolean) => void;
   setOpenApp: (app: AppPanelState | null) => void;
 
@@ -108,6 +112,7 @@ export const useUiStore = create<UiState>((set) => ({
   overlay: null,
   modelPickerOpen: false,
   sessionModel: null,
+  sessionMode: null,
   showAgentSpecEditor: false,
   openApp: null,
   selectedFileContent: null,
@@ -145,6 +150,7 @@ export const useUiStore = create<UiState>((set) => ({
   setOverlay: (overlay) => set({ overlay }),
   setModelPickerOpen: (open) => set({ modelPickerOpen: open }),
   setSessionModel: (model) => set({ sessionModel: model }),
+  setSessionMode: (mode: string | null) => set({ sessionMode: mode }),
   setShowAgentSpecEditor: (show) => set({ showAgentSpecEditor: show }),
   setOpenApp: (app) => set({ openApp: app }),
 

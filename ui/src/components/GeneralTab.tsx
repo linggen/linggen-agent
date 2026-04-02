@@ -38,16 +38,17 @@ export const GeneralTab: React.FC<{
             </select>
           </div>
           <div>
-            <label className={labelCls}>Tool Permission Mode</label>
+            <label className={labelCls}>Default Permission Mode</label>
             <select
               className={inputCls}
               value={config.agent.tool_permission_mode}
               onChange={(e) => onChange({ ...config, agent: { ...config.agent, tool_permission_mode: e.target.value } })}
             >
-              <option value="ask">ask</option>
-              <option value="auto">auto</option>
-              <option value="accept_edits">accept_edits</option>
+              <option value="ask">read (default)</option>
+              <option value="accept_edits">edit</option>
+              <option value="auto">admin</option>
             </select>
+            <p className="text-[11px] text-slate-400 mt-0.5">Default mode for new sessions. Per-session mode can be changed in the chat header.</p>
           </div>
           <div className="col-span-2">
             <label className={labelCls}>Prompt Loop Breaker</label>

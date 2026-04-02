@@ -454,6 +454,74 @@ async fn run_skill_dispatch(
     let interrupt_key = wire_interrupt_channel(ctx, engine).await;
     wire_ask_user_bridge(&ctx.state, engine, ctx.session_id.clone());
 
+    // Skill permission approval — prompt user if skill declares permission requirements.
+    if let Some(ref skill) = engine.active_skill {
+        if let Some(ref perm) = skill.permission {
+            use crate::engine::permission::PermissionMode;
+            let mode = match perm.mode.as_str() {
+                "edit" => PermissionMode::Edit,
+                "admin" => PermissionMode::Admin,
+                _ => PermissionMode::Read,
+            };
+            let paths_str = perm.paths.join(", ");
+            let mut question_text = format!(
+                "Skill \"{}\" requests {} mode on: {}",
+                skill.name, perm.mode, paths_str
+            );
+            if let Some(ref warning) = perm.warning {
+                question_text.push_str(&format!("\n⚠️ {}", warning));
+            }
+
+            let question = crate::engine::tools::AskUserQuestion {
+                question: question_text,
+                header: "Permission".to_string(),
+                options: vec![
+                    crate::engine::tools::AskUserOption {
+                        label: "Approve".to_string(),
+                        description: Some(format!("Grant {} mode on {}", perm.mode, paths_str)),
+                        preview: None,
+                    },
+                    crate::engine::tools::AskUserOption {
+                        label: "Run in current mode".to_string(),
+                        description: Some("Skill runs with existing permissions (may fail)".to_string()),
+                        preview: None,
+                    },
+                    crate::engine::tools::AskUserOption {
+                        label: "Cancel".to_string(),
+                        description: Some("Don't run this skill".to_string()),
+                        preview: None,
+                    },
+                ],
+                multi_select: false,
+            };
+
+            match engine.ask_permission_raw(&skill.name, question).await {
+                Some(crate::engine::permission::PermissionAction::AllowOnce) => {
+                    // "Approve" — grant the requested permissions.
+                    for path in &perm.paths {
+                        engine.session_permissions.set_path_mode(path, mode.clone());
+                    }
+                    if let Some(ref sdir) = engine.session_dir {
+                        engine.session_permissions.save(sdir);
+                    }
+                }
+                Some(crate::engine::permission::PermissionAction::AllowSession) => {
+                    // "Run in current mode" — proceed without grants.
+                }
+                _ => {
+                    // "Cancel" or timeout — abort skill.
+                    let msg = format!("Skill '{}' cancelled — permission not granted.", skill.name);
+                    persist_and_emit_message(
+                        &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+                        &ctx.agent_id, "user", &msg, ctx.session_id.as_deref(), false,
+                    ).await;
+                    unwire_interrupt_channel(ctx, engine, &interrupt_key).await;
+                    return;
+                }
+            }
+        }
+    }
+
     let outcome = run_loop_with_tracking(
         &ctx.manager, &ctx.root, engine, &ctx.agent_id,
         ctx.session_id.as_deref(), "chat:skill", &ctx.events_tx,

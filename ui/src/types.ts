@@ -220,6 +220,7 @@ export interface SessionInfo {
   mission_id?: string | null; // mission ID if creator is "mission"
   cwd?: string;             // current working directory
   model_id?: string | null; // session-level model override
+  permission_mode?: string | null; // effective permission mode (read/edit/admin)
 }
 
 export interface AgentRunInfo {

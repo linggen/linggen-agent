@@ -50,6 +50,7 @@ use projects_api::{
     remove_project, remove_session_api, remove_skill_session_api,
     rename_session_api, resolve_session_api, upsert_agent_file_api, upsert_skill_file_api,
     get_user_me, auth_login, auth_callback, auth_logout,
+    get_session_permission, update_session_permission,
 };
 use marketplace_api::{builtin_skills_install, builtin_skills_install_all, builtin_skills_list, clawhub_scan, community_search, marketplace_install, marketplace_move_to_global, marketplace_uninstall};
 use missions_api::{
@@ -1236,6 +1237,7 @@ pub async fn prepare_server(
         .route("/api/sessions", post(create_session))
         .route("/api/sessions", patch(rename_session_api))
         .route("/api/sessions", delete(remove_session_api))
+        .route("/api/sessions/permission", get(get_session_permission).patch(update_session_permission))
         .route("/api/skill-sessions", get(list_skill_sessions))
         .route("/api/skill-sessions", delete(remove_skill_session_api))
         .route("/api/skill-sessions/state", get(get_skill_session_state))

@@ -181,8 +181,12 @@ pub struct AgentEngine {
     pub plan: Option<Plan>,
     /// Base64-encoded images to attach to the next user message.
     pub pending_images: Vec<String>,
-    /// Tool permission store (session + project scoped allows).
+    /// Tool permission store (session + project scoped allows). Legacy — kept during migration.
     pub permission_store: permission::PermissionStore,
+    /// New session-scoped permissions (path modes, allows, denied sigs). See permission-spec.md.
+    pub session_permissions: permission::SessionPermissions,
+    /// Directory for the current session (for persisting permission.json).
+    pub session_dir: Option<PathBuf>,
     /// Ordered list of default model IDs from routing config (for fallback chain).
     pub default_models: Vec<String>,
     /// Whether to automatically try fallback models on transient errors.
@@ -208,9 +212,7 @@ pub struct AgentEngine {
     /// Required by Ollama native tool calling — Ollama expects tool results
     /// after an assistant message with tool_calls.
     pub(crate) native_tool_mode: bool,
-    /// Tool call signatures the user has denied permission for.
-    /// Lives on AgentEngine (not LoopState) so denials persist across runs within a session.
-    pub(crate) denied_tool_sigs: HashSet<String>,
+    // denied_tool_sigs moved to session_permissions.denied_sigs (persisted per session).
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -373,6 +375,8 @@ impl AgentEngine {
             plan: None,
             pending_images: Vec::new(),
             permission_store: perm_store,
+            session_permissions: permission::SessionPermissions::default(),
+            session_dir: None,
             default_models: Vec::new(),
             auto_fallback: true,
             context_window_tokens: None,
@@ -382,7 +386,6 @@ impl AgentEngine {
             accumulated_token_estimate: 0,
             last_assistant_text: None,
             native_tool_mode: false,
-            denied_tool_sigs: HashSet::new(),
         })
     }
 

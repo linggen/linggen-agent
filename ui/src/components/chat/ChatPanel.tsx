@@ -187,6 +187,77 @@ const SessionModelSelector: React.FC = () => {
   );
 };
 
+/** Compact per-session permission mode selector shown in the run bar. */
+const SessionModeSelector: React.FC = () => {
+  const sessionMode = useUiStore((s) => s.sessionMode);
+  const setSessionMode = useUiStore((s) => s.setSessionMode);
+  const sessionId = useProjectStore((s) => s.activeSessionId);
+
+  const modes = [
+    { value: 'read', label: 'read', color: 'text-emerald-600 dark:text-emerald-400' },
+    { value: 'edit', label: 'edit', color: 'text-blue-600 dark:text-blue-400' },
+    { value: 'admin', label: 'admin', color: 'text-amber-600 dark:text-amber-400' },
+  ];
+
+  // Load effective mode from backend on mount / session change.
+  // Pass cwd so the backend resolves the most-specific matching path_mode.
+  React.useEffect(() => {
+    if (!sessionId) return;
+    const sessionMeta = useProjectStore.getState().allSessions.find((s) => s.id === sessionId);
+    const cwd = sessionMeta?.cwd || sessionMeta?.project || '';
+    const params = new URLSearchParams({ session_id: sessionId });
+    if (cwd) params.set('cwd', cwd);
+    fetch(`/api/sessions/permission?${params}`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((resp) => {
+        if (resp?.effective_mode) {
+          setSessionMode(resp.effective_mode);
+        } else if (resp?.path_modes?.length > 0) {
+          setSessionMode(resp.path_modes[0].mode);
+        } else {
+          setSessionMode('read');
+        }
+      })
+      .catch(() => setSessionMode('read'));
+  }, [sessionId, setSessionMode]);
+
+  const handleChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const value = e.target.value;
+    setSessionMode(value);
+    if (sessionId) {
+      // Get the cwd from session meta for the path grant
+      const sessionMeta = useProjectStore.getState().allSessions.find((s) => s.id === sessionId);
+      const cwd = sessionMeta?.cwd || sessionMeta?.project || '~/';
+      // Persist to backend
+      fetch('/api/sessions/permission', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId,
+          path: cwd,
+          mode: value,
+        }),
+      }).catch(() => {});
+    }
+  };
+
+  const current = modes.find((m) => m.value === (sessionMode || 'read'));
+
+  return (
+    <select
+      value={sessionMode || 'read'}
+      onChange={handleChange}
+      onClick={(e) => e.stopPropagation()}
+      className={`text-[11px] border border-slate-200 dark:border-white/10 rounded px-1.5 py-0.5 outline-none font-semibold bg-white dark:bg-black/30 ${current?.color || ''}`}
+      title="Session permission mode"
+    >
+      {modes.map((m) => (
+        <option key={m.value} value={m.value}>{m.label}</option>
+      ))}
+    </select>
+  );
+};
+
 export const ChatPanel: React.FC<{
   chatMessages: ChatMessage[];
   queuedMessages: QueuedChatItem[];
@@ -504,6 +575,7 @@ export const ChatPanel: React.FC<{
                   </>
                 );
               })()}
+              <SessionModeSelector />
               <SessionModelSelector />
             </summary>
             <div className="mt-1.5 flex flex-wrap items-center gap-2">
