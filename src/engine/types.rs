@@ -70,16 +70,12 @@ pub enum AgentRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterfaceMode {
     Web,
-    Tui,
-    Both,
 }
 
 impl std::fmt::Display for InterfaceMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InterfaceMode::Web => write!(f, "Web UI"),
-            InterfaceMode::Tui => write!(f, "TUI"),
-            InterfaceMode::Both => write!(f, "Web UI + TUI (synced)"),
         }
     }
 }

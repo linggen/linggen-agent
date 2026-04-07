@@ -5,7 +5,7 @@
  * the WebRTC control data channel instead of direct HTTP. This makes
  * every existing fetch() call work in remote mode without changes.
  *
- * For SSE transport (or non-API requests), the original fetch is used.
+ * For non-API requests (assets, signaling), the original fetch is used.
  *
  * Call `installFetchProxy()` once at app startup to activate.
  */
@@ -96,7 +96,7 @@ export function installFetchProxy(): void {
       || url === '/logo.svg'
     );
 
-    if (import.meta.env.DEV && shouldProxy && url.includes('/api/')) {
+    if (import.meta.env.DEV && shouldProxy && url.includes('/api/') && !url.includes('/api/status') && !url.includes('/ollama-status') && !url.includes('/api/workspace/tree')) {
       const isRtc = isWebRtcTransport();
       const connected = isRtc ? (() => { try { return getTransport().status() === 'connected'; } catch { return false; } })() : false;
       const isRemote = !!document.querySelector('meta[name="linggen-instance"]');

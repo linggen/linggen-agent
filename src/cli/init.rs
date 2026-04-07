@@ -31,7 +31,7 @@ pub async fn run(_global: bool, _root: Option<PathBuf>) -> Result<()> {
     // 5. Summary
     println!();
     println!("{}Done!{} Linggen is ready.", GREEN, RESET);
-    println!("  Run `ling` to start the TUI, or `ling --web` for the web UI.");
+    println!("  Run `ling` to start the server and open the web UI.");
     println!("  Run `ling doctor` to verify your setup.");
 
     Ok(())

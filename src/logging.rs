@@ -16,8 +16,6 @@ pub struct LoggingSettings<'a> {
     pub level: Option<&'a str>,
     pub directory: Option<&'a str>,
     pub retention_days: Option<u64>,
-    /// When true, suppress stdout logging (TUI mode owns the terminal).
-    pub suppress_stdout: bool,
 }
 
 /// Build an `EnvFilter` for the given application log level.
@@ -48,22 +46,15 @@ pub fn setup_tracing_with_settings(settings: LoggingSettings<'_>) -> Result<Path
     // Second-level timestamp precision to keep logs readable.
     let time_format = ChronoUtc::new("%Y-%m-%dT%H:%M:%S".to_string());
 
-    // Stdout layer is None in TUI mode — ratatui owns the terminal.
-    let stdout_layer = if settings.suppress_stdout {
-        None
-    } else {
-        Some(
-            tracing_subscriber::fmt::layer()
-                .with_target(false)
-                .with_thread_ids(false)
-                .with_thread_names(false)
-                .with_file(true)
-                .with_line_number(true)
-                .with_level(true)
-                .compact()
-                .with_timer(time_format.clone()),
-        )
-    };
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .with_file(true)
+        .with_line_number(true)
+        .with_level(true)
+        .compact()
+        .with_timer(time_format.clone());
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)

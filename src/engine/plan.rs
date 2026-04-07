@@ -3,7 +3,7 @@ use tracing::info;
 
 impl AgentEngine {
     /// Called when the model signals plan completion (via ExitPlanMode tool or
-    /// fallback: done in plan_mode). Emits a PlanUpdate SSE event so the
+    /// fallback: done in plan_mode). Emits a PlanUpdate event so the
     /// PlanBlock renders in the UI, and returns `AgentOutcome::Plan` for the
     /// server to store as pending. The user reviews and approves via PlanBlock
     /// buttons (CC-aligned — no modal AskUser dialog).
@@ -55,7 +55,7 @@ impl AgentEngine {
         AgentOutcome::Plan(plan)
     }
 
-    /// Store the plan in memory and emit a PlanUpdate SSE event.
+    /// Store the plan in memory and emit a PlanUpdate event.
     pub(crate) async fn persist_and_emit_plan(&mut self, plan: Plan) {
         info!("[plan] persist_and_emit_plan: status={:?} items={}", plan.status, plan.items.len());
         self.plan = Some(plan);

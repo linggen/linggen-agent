@@ -120,7 +120,7 @@ Interactive app skills use the existing linggen API from within the iframe (same
 1. `GET /api/models` — populate model picker
 2. `POST /api/sessions` with `skill` field — create skill-bound session
 3. `POST /api/run` — send messages to ling (shaped by skill)
-4. `GET /api/events?session_id=` — SSE stream for responses
+4. Events streamed via WebRTC data channel for the session
 
 The skill's `allowed-tools` restricts ling's tools for the session. The skill body is injected into every system prompt. No custom endpoints needed.
 
@@ -177,11 +177,44 @@ Parsed from user input only (model output is not parsed):
 
 ## Skill tools
 
-Skills can define tool functions via `tools` in their frontmatter. These register dynamically in the tool registry alongside built-in tools.
+Skills can define tool functions via `tools` in their frontmatter. These register dynamically in the tool registry alongside built-in tools. Available only when the skill is active (session-bound or transient invocation).
 
-- Skill tools execute as subprocesses (`sh -c`) with template substitution (`{{param}}`).
-- Schemas are generated dynamically from skill definitions.
-- Same command validation as Bash tool.
+### Command tools
+
+Execute a shell command with template substitution:
+
+```yaml
+tools:
+  - name: run_lint
+    description: Run project linter
+    cmd: "cd $SKILL_DIR && ./scripts/lint.sh {{path}}"
+    args:
+      path: { type: string, required: true, description: "File to lint" }
+```
+
+- Executed via `sh -c` with `{{param}}` substitution.
+- `$SKILL_DIR` resolves to the skill's directory path.
+- Same timeout and safety validation as the Bash tool.
+
+### Data tools
+
+Pass structured data from the agent to the skill's UI — no shell command, no side effects. Defined by omitting `cmd`:
+
+```yaml
+tools:
+  - name: DashboardUpdate
+    description: Send scan results to the dashboard UI
+    args:
+      system: { type: object, description: "System info" }
+      disk: { type: object, description: "Disk usage" }
+```
+
+When the agent calls a data tool:
+1. The engine emits a `content_block` event with the tool name and args.
+2. The skill app receives it via `onContentBlock` callback (see App skills).
+3. The tool returns `"ok"` — the value is in the event, not the return.
+
+Data tools enable **real-time structured updates** from agent to app UI without text-tag parsing hacks. The agent can call them multiple times for incremental updates.
 
 **Implementation**: `engine/skill_tool.rs`, `engine/tool_registry.rs`
 

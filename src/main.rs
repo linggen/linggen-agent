@@ -15,10 +15,8 @@ mod paths;
 mod prompts;
 mod project_store;
 mod server;
-mod tui;
 mod skills;
 mod state_fs;
-mod tui_client;
 mod util;
 mod workspace;
 
@@ -43,17 +41,13 @@ struct Cli {
     #[arg(long, global = true)]
     port: Option<u16>,
 
-    /// Web UI only (foreground, no TUI). For dev/debugging.
+    /// Web UI foreground (no daemon). For dev/debugging.
     #[arg(long, default_value_t = false)]
     web: bool,
 
     /// Run as background daemon (legacy, same as bare `ling`)
     #[arg(short, long, default_value_t = false, hide = true)]
     daemon: bool,
-
-    /// Start TUI + embedded server (classic mode)
-    #[arg(long, default_value_t = false)]
-    tui: bool,
 
     /// Enable dev mode (proxy static assets from Vite dev server)
     #[arg(long, default_value_t = false)]
@@ -276,7 +270,7 @@ async fn main() -> Result<()> {
     }
 
     // Default (bare `ling`) or --daemon: start background daemon + open browser
-    if cli.daemon || (!cli.web && !cli.tui && cli.cmd.is_none()) {
+    if cli.daemon || (!cli.web && cli.cmd.is_none()) {
         cli::daemon::start_agent(&config, global_port, global_root).await?;
         // Open browser on macOS
         let port = global_port.unwrap_or(config.server.port);
@@ -293,13 +287,10 @@ async fn main() -> Result<()> {
     }
 
     // Full commands — need tracing.
-    // Suppress stdout logging in TUI mode — ratatui owns the terminal.
-    let will_run_tui = cli.tui;
     let log_dir = match logging::setup_tracing_with_settings(logging::LoggingSettings {
         level: config.logging.level.as_deref(),
         directory: config.logging.directory.as_deref(),
         retention_days: config.logging.retention_days,
-        suppress_stdout: will_run_tui,
     }) {
         Ok(path) => Some(path),
         Err(err) => {
@@ -330,7 +321,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        // --tui or --web (foreground modes)
+        // --web (foreground mode)
         None => {
             let ws_root = workspace::resolve_workspace_root(global_root)?;
             let port = global_port.unwrap_or(config.server.port);
@@ -346,13 +337,7 @@ async fn main() -> Result<()> {
             let config_dir = config_path
                 .as_ref()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            let interface_mode = if cli.web {
-                engine::InterfaceMode::Web
-            } else if cli.tui {
-                engine::InterfaceMode::Both
-            } else {
-                engine::InterfaceMode::Web
-            };
+            let interface_mode = engine::InterfaceMode::Web;
 
             let (manager, rx) =
                 agent_manager::AgentManager::new(config, config_dir, store, skill_manager.clone(), interface_mode);
@@ -377,7 +362,7 @@ async fn main() -> Result<()> {
             let _ = manager.get_or_create_project(ws_root.clone()).await?;
 
             if cli.web {
-                // Web UI only (foreground, no TUI)
+                // Web UI foreground
                 tracing::info!("--- Linggen Agent Startup ---");
                 if let Some(path) = config_path.as_ref() {
                     tracing::info!("Config File: {}", path.display());
@@ -413,14 +398,6 @@ async fn main() -> Result<()> {
                 tracing::info!("------------------------------");
 
                 server::start_server(manager, skill_manager, &host, port, cli.dev, rx).await?;
-            } else {
-                // TUI + embedded server (--tui)
-                let handle =
-                    server::prepare_server(manager, skill_manager, &host, port, cli.dev, rx).await?;
-                let result =
-                    tui::run_tui(handle.port, ws_root.to_string_lossy().to_string()).await;
-                handle.task.abort();
-                result?;
             }
         }
 

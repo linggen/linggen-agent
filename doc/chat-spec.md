@@ -28,16 +28,7 @@ Backend engine → events_tx (broadcast) → transport → UI event dispatcher �
 
 ### Transport layer
 
-Two transports carry events between the server and clients:
-
-| Transport | Used by | Direction | Protocol |
-|:----------|:--------|:----------|:---------|
-| **WebRTC** (primary) | Web UI | Bidirectional (data channels) | WHIP signaling + WebRTC data channels |
-| **SSE** (legacy) | TUI | Server → client (SSE) + client → server (HTTP POST) | HTTP |
-
-The Web UI uses WebRTC by default (`?transport=webrtc`). Each session gets its own data channel for natural isolation — no broadcast + filter pattern. All API calls are proxied through the WebRTC control channel via a fetch proxy, so the entire Web UI works without direct HTTP access to the server (required for remote mode).
-
-The TUI still uses SSE (`GET /api/events`) and HTTP POST for sending messages. The SSE endpoint and broadcast channel remain active to support TUI clients.
+WebRTC data channels carry all events bidirectionally between the server and browser clients. Each session gets its own data channel for natural isolation. All API calls are proxied through the WebRTC control channel via a fetch proxy, so the entire Web UI works without direct HTTP access to the server (required for remote mode).
 
 See `webrtc-spec.md` for the full WebRTC design.
 
@@ -91,7 +82,7 @@ Each agent message progresses through rendering phases:
 ## Rendering principles
 
 Each chat conversation represents a **task journey** — from the user's question through the agent's reasoning and actions to a final answer. The UI should make this journey clear, organized, and visually rich.
-Align WebUI and TUI to Claude Code is the target. 
+Align Web UI to Claude Code is the target. 
 
 ### 1. Rich, well-ordered messages
 
@@ -169,8 +160,7 @@ A session is a single conversation thread scoped to a project. Each session has 
 
 Linggen supports multiple active sessions simultaneously. Each client creates its own session:
 
-- **TUI**: starts with no session; the server auto-creates one on the first message. All subsequent messages in that TUI instance reuse the same session.
-- **VS Code extension**: same pattern — auto-creates a session per workspace on first chat.
+- **VS Code extension**: auto-creates a session per workspace on first chat.
 - **Web UI**: can view and switch between all sessions for a project. "New Chat" creates a new session.
 
 ### Session-bound skills
@@ -227,9 +217,9 @@ When a user sends a message to a busy agent, it queues. The agent picks it up at
 
 ## API surface
 
-The server exposes REST + WebRTC + SSE endpoints for chat, sessions, agents, models, skills, missions, and workspace operations.
+The server exposes REST + WebRTC endpoints for chat, sessions, agents, models, skills, missions, and workspace operations.
 
-### Web UI (WebRTC transport)
+### WebRTC transport
 
 All Web UI communication goes through WebRTC data channels:
 
@@ -238,14 +228,9 @@ All Web UI communication goes through WebRTC data channels:
 - **Other API calls** (config, status, files, sessions, etc.): transparently proxied through the control channel's `http_request` message type via a global fetch proxy.
 - **WHIP signaling**: `POST /api/rtc/whip` — the only direct HTTP call, used to establish the WebRTC connection.
 
-### TUI (SSE transport, legacy)
-
-- **SSE**: `GET /api/events?session_id=...` streams real-time events. Each event carries an optional `session_id`; the TUI filters by active session.
-- **HTTP POST**: `POST /api/chat` and other REST endpoints for sending messages and commands.
-
 ### REST endpoints
 
-Both transports ultimately hit the same REST API handlers on the server. Key patterns:
+WebRTC proxied requests hit the same REST API handlers. Key patterns:
 
 - **Chat**: send messages, clear history, force compaction.
 - **Agent runs**: list, inspect context, cancel run trees.
@@ -256,7 +241,7 @@ Endpoints evolve frequently — see `server/mod.rs` for the authoritative route 
 
 ## Slash commands
 
-Available in both TUI and Web UI. Handled client-side (not sent to the agent).
+Handled client-side in the Web UI (not sent to the agent).
 
 | Command | Description |
 |:--------|:------------|
@@ -270,6 +255,6 @@ Available in both TUI and Web UI. Handled client-side (not sent to the agent).
 | `/plan approve` | Approve and execute the pending plan |
 | `/plan reject` | Reject the pending plan |
 | `/image <path>` | Attach an image file |
-| `/paste` | Paste image from clipboard (TUI) |
+| `/paste` | Paste image from clipboard |
 | `@path` | Mention a file (autocomplete on `@`) |
 | `@agent message` | Send to a specific agent |

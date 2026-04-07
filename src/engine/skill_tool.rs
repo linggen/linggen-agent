@@ -26,12 +26,19 @@ pub struct SkillParamDef {
     pub default: Option<Value>,
     #[serde(default)]
     pub description: String,
+    /// For array types: schema of each item. If omitted, defaults to `{"type": "object"}`.
+    #[serde(default)]
+    pub items: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillToolDef {
     pub name: String,
     pub description: String,
+    /// Shell command to execute. If empty, the tool is a **data tool** —
+    /// it returns the args as JSON without running anything. Used by app
+    /// skills to pass structured data to their UI via content_block events.
+    #[serde(default)]
     pub cmd: String,
     #[serde(default)]
     pub args: HashMap<String, SkillParamDef>,
@@ -56,6 +63,17 @@ impl SkillToolDef {
                     anyhow::bail!("missing required argument: {}", name);
                 }
             }
+        }
+
+        // Data tool: no cmd → return args as JSON. The value is in the
+        // content_block event (tool name + args), not the return value.
+        if self.cmd.is_empty() {
+            info!("Skill data tool '{}': passthrough", self.name);
+            return Ok(ToolResult::CommandOutput {
+                exit_code: Some(0),
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+            });
         }
 
         // Render command template.
@@ -140,6 +158,11 @@ impl SkillToolDef {
             if !param.description.is_empty() {
                 prop.insert("description".to_string(), Value::String(param.description.clone()));
             }
+            // OpenAI requires "items" for array types.
+            if param.param_type == "array" {
+                let items = param.items.clone().unwrap_or_else(|| serde_json::json!({"type": "object"}));
+                prop.insert("items".to_string(), items);
+            }
             properties.insert(name.clone(), Value::Object(prop));
             if param.required {
                 required.push(Value::String(name.clone()));
@@ -220,6 +243,7 @@ mod tests {
                     required: true,
                     default: None,
                     description: "Search query".to_string(),
+                    items: None,
                 },
             )]),
             returns: Some("stdout text".to_string()),

@@ -493,6 +493,10 @@ impl AgentEngine {
                         None
                     })
                     .collect::<HashSet<String>>();
+                // The active skill's own custom tools are always allowed.
+                for td in &skill.tool_defs {
+                    allowed.insert(td.name.clone());
+                }
                 // Skill tool is always allowed so the model can discover/invoke skills.
                 allowed.insert("Skill".to_string());
                 // Read/Write are always allowed when memory is enabled,

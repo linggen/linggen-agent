@@ -186,7 +186,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       const raw = await resp.json();
       const data: SessionInfo[] = raw.sessions ?? raw ?? [];
       set((s) => {
-        // Skip update if sessions list hasn't changed (prevents re-render loops from SSE)
+        // Skip update if sessions list hasn't changed (prevents re-render loops from events)
         const sessionsChanged = data.length !== s.sessions.length
           || data.some((sess, i) => sess.id !== s.sessions[i]?.id);
 

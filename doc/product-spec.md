@@ -12,7 +12,7 @@ guide: |
 
 Linggen is **the root system for AI agents**. The core runtime manages agent processes, communication, and execution — everything else grows on top as skills and agents.
 
-Users manage agents, skills, and models through Web UI and TUI. Each agent has its own context, skill set, and mission — from a social chat skill to a coding agent to a scheduled architecture guardian. Skills follow the [Agent Skills](https://agentskills.io) open standard (aligned with Claude Code) and work across AI tools.
+Users manage agents, skills, and models through the Web UI. Each agent has its own context, skill set, and mission — from a social chat skill to a coding agent to a scheduled architecture guardian. Skills follow the [Agent Skills](https://agentskills.io) open standard (aligned with Claude Code) and work across AI tools.
 
 For vision, landscape, and roadmap, see [`insight.md`](insight.md).
 
@@ -39,7 +39,7 @@ For vision, landscape, and roadmap, see [`insight.md`](insight.md).
 | `agent-spec.md` | Process management — lifecycle, delegation, scheduling |
 | `skill-spec.md` | Dynamic extensions — format, discovery, triggers |
 | `tool-spec.md` | Syscall interface — built-in tools, safety |
-| `chat-spec.md` | Chat system — SSE events, message model, rendering, APIs |
+| `chat-spec.md` | Chat system — events, message model, rendering, APIs |
 | `session-spec.md` | Session/context — creators, effective tools, prompt assembly |
 | `models.md` | Hardware abstraction — providers, routing |
 | `cli.md` | Shell — CLI reference |
@@ -66,8 +66,8 @@ Skills are the primary extension mechanism. Built-in tools only for core operati
 
 ### 3. Unified CLI and shared sessions
 
-- Single command `linggen` starts backend server + TUI.
-- Web UI and TUI share session state via same HTTP/SSE API.
+- Single command `ling` starts backend server + opens Web UI.
+- All communication over WebRTC data channels.
 - Chat messages from any client appear in real-time on all clients.
 
 ### 4. Trigger symbols
@@ -95,7 +95,7 @@ Users configure multiple providers (Ollama, OpenAI, Claude, Bedrock). Named rout
 - **Skills-first** — add capabilities by dropping a `SKILL.md`. Built-in tools only for core ops.
 - **User interrupt** — users can message a running agent; model sees it and adapts.
 - **Multi-agent concurrency** — multiple agents running simultaneously.
-- **Unified CLI** — serves both TUI and web UI from shared backend.
+- **Unified CLI** — `ling` starts the server and opens the Web UI.
 - **Multi-model routing** — named policies (local-first, cloud-first, custom).
 - **Cross-tool compatibility** — Agent Skills standard.
 
@@ -110,7 +110,7 @@ A project can have **multiple active missions**. Each mission defines a cron sch
 
 ## UX Surface
 
-- **CLI**: `ling` starts backend server + TUI.
+- **CLI**: `ling` starts backend server + opens Web UI.
 - **Web UI**: agent/skill management, session chat, agent tab views, mission page, settings, memory.
 - **Agent switching**: `/agent <name>` or tab views.
 - **Remote access**: built-in WebRTC transport for access from anywhere. `linggen.dev` provides signaling relay and bootstrap — the full UI is loaded from the linggen server via data channel. See `webrtc-spec.md`.

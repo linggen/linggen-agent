@@ -12,7 +12,7 @@ Read files under `doc/` and follow them. If you find wrong content in any doc fi
 - `doc/agent-spec.md` — process management: lifecycle, delegation, scheduling
 - `doc/skill-spec.md` — dynamic extensions: format, discovery, triggers
 - `doc/tool-spec.md` — syscall interface: built-in tools, safety
-- `doc/chat-spec.md` — chat system: SSE events, message model, rendering, APIs
+- `doc/chat-spec.md` — chat system: events, message model, rendering, APIs
 - `doc/models.md` — hardware abstraction: providers, routing
 - `doc/storage-spec.md` — filesystem layout: all persistent state, data formats
 - `doc/cli.md` — CLI reference
@@ -36,7 +36,6 @@ cargo test                         # Run all tests
 cargo test check::tests            # Run tests in a specific module
 cargo test test_name               # Run a single test by name
 cargo run                          # Start background daemon + open browser (default)
-cargo run -- --tui                 # TUI + embedded server (classic mode)
 cargo run -- --web                 # Web server foreground (for dev)
 cargo run -- --web --dev           # Dev mode (proxy static assets to Vite)
 cargo run -- --root /path/to/proj  # Custom workspace root
@@ -63,16 +62,15 @@ For production: `cd ui && npm run build`, then `cargo run` (embeds `ui/dist/` vi
 
 ## Architecture
 
-Linggen is a local-first, multi-agent coding assistant. The binary is `ling`. Default mode starts a background daemon + opens browser; `--tui` starts TUI + server; `--web` runs the server in foreground.
+Linggen is a local-first, multi-agent coding assistant. The binary is `ling`. Default mode starts a background daemon + opens browser; `--web` runs the server in foreground.
 
 ### Rust Backend (`src/`)
 
-- **`main.rs`** — CLI entry point (clap). Subcommands: `stop`, `status`, `doctor`, `eval`, `init`, `install`, `update`, `skills`. No subcommand → TUI + server.
+- **`main.rs`** — CLI entry point (clap). Subcommands: `stop`, `status`, `doctor`, `eval`, `init`, `install`, `update`, `skills`. No subcommand → daemon + open browser.
 - **`config.rs`** — Config loading from `linggen.toml` (TOML). Defines `Config`, `ModelConfig`, `AgentSpec` (parsed from markdown frontmatter).
 - **`engine/`** — Core agent execution engine. `mod.rs` is the main loop. `tools.rs` implements all model-facing tools (Read, Write, Edit, Bash, Glob, Grep, capture_screenshot, lock_paths, unlock_paths, Task, WebSearch, WebFetch, Skill, AskUser). `actions.rs` parses JSON actions from model output. `streaming.rs` handles streaming responses. `context.rs` manages token counting and compaction. `permission.rs` enforces tool permissions. `plan.rs` manages plan mode.
-- **`server/`** — Axum HTTP server. `chat_api.rs` handles chat/run endpoints + SSE streaming. `projects_api.rs` for project/session CRUD. `workspace_api.rs` serves file tree. `config_api.rs` for runtime config. `mission_scheduler.rs` for cron mission scheduling.
+- **`server/`** — Axum HTTP server. `chat_api.rs` handles chat/run endpoints. `projects_api.rs` for project/session CRUD. `workspace_api.rs` serves file tree. `config_api.rs` for runtime config. `mission_scheduler.rs` for cron mission scheduling. `rtc/` handles WebRTC transport.
 - **`agent_manager/`** — Agent lifecycle, run records, cancellation. `models.rs` handles multi-provider dispatch (Ollama, OpenAI-compatible). `routing.rs` implements model selection policies with fallback chains.
-- **`tui/`** — Ratatui terminal UI. `app.rs` is the main TUI state machine. `render.rs` draws the interface. `markdown.rs` renders markdown to terminal spans.
 - **`ollama.rs`** / **`openai.rs`** — Provider API clients (streaming and non-streaming).
 - **`project_store/`** — Persistent state using filesystem JSON files.
 - **`skills/`** — Skill discovery, loading, and marketplace integration.
@@ -85,7 +83,7 @@ Linggen is a local-first, multi-agent coding assistant. The binary is `ling`. De
 
 React 19 + TypeScript + Tailwind CSS v4 + Vite.
 
-- **`App.tsx`** — Root component. Project/session management, SSE event handling, page routing.
+- **`App.tsx`** — Root component. Project/session management, event handling, page routing.
 - **`components/ChatPanel.tsx`** — Chat interface, message rendering, tool activity display.
 - **`components/MissionPage.tsx`** — Mission management (editor, agent config, history, activity tabs).
 - **`components/SettingsPage.tsx`** — Settings (models, agents, skills, general).
@@ -118,7 +116,7 @@ Follow `doc/code-style.md`:
 - **Tool names are Claude Code-style**: `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep` (capitalized).
 - **Workspace-scoped file operations**: all paths are sandboxed to workspace root; parent traversal (`..`) is rejected.
 - **Capability = tool list**: no separate policy system. If a session has Write/Edit tools, it can patch. If it has Task, it can delegate. See `session-spec.md`.
-- **SSE events**: server publishes real-time events (`Token`, `Message`, `AgentStatus`, `SubagentSpawned`, `ToolStatus`, `PlanUpdate`, `AppLaunched`, etc.) consumed by the web UI.
+- **Real-time events**: server publishes events (`Token`, `Message`, `AgentStatus`, `SubagentSpawned`, `ToolStatus`, `PlanUpdate`, `AppLaunched`, etc.) over WebRTC data channels to the web UI.
 - **App skills**: skills with `app` frontmatter section run directly (no model). Launcher types: `web` (static files served at `/apps/{name}/`), `bash` (script execution), `url` (external link). Model can also call `RunApp` tool.
 - **Delegation depth**: configurable via `max_delegation_depth` (default 2). Any agent can delegate to any other agent.
 - **Model routing**: default model chain with health tracking and auto-fallback on errors/rate limits.

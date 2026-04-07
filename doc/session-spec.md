@@ -12,7 +12,7 @@ A session is the fundamental unit of interaction. Each session holds one context
 
 ## Related docs
 
-- `chat-spec.md`: SSE events, rendering, message model.
+- `chat-spec.md`: events, rendering, message model.
 - `agent-spec.md`: agent definitions, delegation.
 - `skill-spec.md`: skill format, activation.
 - `agentic-loop.md`: how the engine runs inside a context.

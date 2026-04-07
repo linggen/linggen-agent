@@ -108,7 +108,7 @@ impl Tools {
                 match app.launcher.as_str() {
                     "web" => {
                         let url = format!("/apps/{}/{}", skill.name, app.entry);
-                        // Emit AppLaunched SSE event if we have the bridge.
+                        // Emit AppLaunched event if we have the bridge.
                         if let Some(bridge) = &self.ask_user_bridge {
                             let _ = bridge.events_tx.send(crate::server::ServerEvent::AppLaunched {
                                 skill: skill.name.clone(),

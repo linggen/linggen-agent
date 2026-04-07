@@ -390,7 +390,7 @@ impl AgentEngine {
             if !native_tool_calls.is_empty() {
                 // Emit visible text content (strip any embedded JSON actions).
                 // In plan mode, suppress text content blocks — plan text reaches
-                // the UI via PlanUpdate SSE events instead.  Emitting it here
+                // the UI via PlanUpdate events instead.  Emitting it here
                 // would create a duplicate text message that hides the PlanBlock.
                 let visible_text = text_before_first_json(&raw);
                 if !visible_text.is_empty() && !self.plan_mode {
@@ -543,7 +543,7 @@ impl AgentEngine {
             // --- Legacy path: parse JSON actions from free-form text ---
 
             // Emit text segment event for text before the first JSON object.
-            // Suppress in plan mode — plan text is delivered via PlanUpdate SSE.
+            // Suppress in plan mode — plan text is delivered via PlanUpdate events.
             {
                 let text_before = text_before_first_json(&raw);
                 if !text_before.is_empty() && !self.plan_mode {
@@ -552,7 +552,7 @@ impl AgentEngine {
                             .agent_id
                             .clone()
                             .unwrap_or_else(|| "unknown".to_string());
-                        // Keep TextSegment for backward compat (TUI, older clients).
+                        // Emit TextSegment for streaming display in UI.
                         manager
                             .send_event(crate::agent_manager::AgentEvent::TextSegment {
                                 agent_id: agent_id.clone(),

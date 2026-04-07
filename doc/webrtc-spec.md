@@ -8,7 +8,7 @@ guide: |
 
 # WebRTC Transport
 
-The primary transport for linggen. WebRTC data channels carry all chat events bidirectionally between the linggen server and browser clients. Works for both local and remote access using the same code path. SSE is retained as a legacy fallback at `/sse`.
+The transport for linggen. WebRTC data channels carry all chat events bidirectionally between the linggen server and browser clients. Works for both local and remote access using the same code path.
 
 ## Related docs
 
@@ -34,7 +34,7 @@ The signaling overhead is minimal (a few KB of SDP/ICE candidates), cheap to rel
 
 - One transport for local, LAN, and remote access.
 - Per-session data channels for natural message isolation.
-- Bidirectional — replace SSE + POST with a single channel.
+- Bidirectional — single channel for all communication.
 - Works for 80%+ of network configurations via STUN alone.
 - Future path to real-time media (camera video, audio).
 
@@ -45,12 +45,10 @@ The signaling overhead is minimal (a few KB of SDP/ICE candidates), cheap to rel
 
 ## Architecture overview
 
-WebRTC is the primary transport. The engine's event model (`ServerEvent`, `UiSseMessage`) is unchanged. WebRTC is the pipe that carries events between server and client.
+WebRTC is the sole transport. The engine's event model (`ServerEvent`, `UiEvent`) is unchanged. WebRTC is the pipe that carries events between server and client.
 
 ```
-Engine → ServerEvent → events_tx (broadcast)
-                          ├── WebRTC handler (primary, all access modes)
-                          └── SSE handler    (legacy, at /sse)
+Engine → ServerEvent → events_tx (broadcast) → WebRTC handler
 ```
 
 ### Access modes
@@ -80,10 +78,6 @@ No UI build artifacts are deployed to `linggen.dev`. The linggen server is the s
 - `cn.linggen.dev` — Aliyun (future, for China)
 
 Same account system, same relay protocol. User configures which relay to use based on their region.
-
-### Legacy SSE
-
-SSE remains available at `localhost:9898/sse` for backward compatibility (TUI, older clients, debugging). It will be archived once WebRTC is stable and all clients have migrated.
 
 ## User accounts
 
@@ -194,7 +188,7 @@ Name: `sess-{session_id}`. One per active session. Carries all chat events for t
 
 **Inbound** (client → server): chat messages, ask-user responses, plan approvals, commands. These replace `POST /api/chat`, `POST /api/ask-user-response`, `POST /api/plan/approve`, etc.
 
-**Outbound** (server → client): the same `UiSseMessage` events currently carried by SSE — tokens, messages, activity, content blocks, turn completions. Same JSON format, same `kind`/`phase`/`seq` fields.
+**Outbound** (server → client): `UiEvent` messages — tokens, messages, activity, content blocks, turn completions. Same JSON format, same `kind`/`phase`/`seq` fields.
 
 ### Session isolation
 
@@ -354,20 +348,11 @@ api_token = "usr_xxxxxxxx"
 instance_name = "home-desktop"
 ```
 
-## SSE legacy
-
-The SSE transport (`GET /api/events`, `POST /api/chat`) remains active for:
-
-- **TUI clients** — the terminal UI uses SSE via `tui_client.rs`. The TUI subscribes to the same `events_tx` broadcast channel as WebRTC.
-- **Fallback** — `SseTransport` on the frontend, activated by `?transport=sse` URL parameter or as default when WebRTC is not selected.
-
-The SSE endpoint and broadcast channel will not be removed — they serve TUI clients and act as a fallback. The Web UI defaults to WebRTC.
-
 ## Implementation phases
 
 ### Phase 1: Transport abstraction ✅
 
-Extracted `Transport` interface on the frontend. Wrapped existing SSE + fetch in `SseTransport`. Introduced `useTransport` hook. No behavior change — pure refactor.
+Extracted `Transport` interface on the frontend. Introduced `useTransport` hook.
 
 ### Phase 2: Local WebRTC with WHIP ✅
 

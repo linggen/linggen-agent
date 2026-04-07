@@ -8,11 +8,12 @@
 import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import {
   MessageSquare, Bot, Sparkles, Plus, Search, X, Trash2,
-  Play, Pause, ChevronDown, ChevronRight, Settings,
+  Play, Pause, ChevronDown, ChevronRight, Settings, RefreshCw,
 } from 'lucide-react';
 import { cn } from '../lib/cn';
 import type { SessionInfo, CronMission } from '../types';
 import { useProjectStore } from '../stores/projectStore';
+import { useAgentStore } from '../stores/agentStore';
 import { useUiStore } from '../stores/uiStore';
 
 // ---------------------------------------------------------------------------
@@ -94,6 +95,7 @@ export const SessionList: React.FC<{
   onOpenSettings?: (tab?: string) => void;
 }> = ({ activeSessionId, onSelectSession, onCreateSession, onDeleteSession, onOpenSettings }) => {
   const allSessions = useProjectStore((s) => s.allSessions);
+  const agentStatus = useAgentStore((s) => s.agentStatus);
   const [filter, setFilter] = useState<CreatorFilter>('all');
   const [search, setSearch] = useState('');
   const [showSearch, setShowSearch] = useState(false);
@@ -189,6 +191,11 @@ export const SessionList: React.FC<{
       <div className="flex items-center justify-between px-3 py-2 border-b border-slate-200 dark:border-white/5">
         <span className="text-[11px] font-bold uppercase tracking-widest text-slate-400">Sessions</span>
         <div className="flex items-center gap-1">
+          <button onClick={() => { useProjectStore.getState().fetchAllSessions(); }}
+            className="p-1 rounded hover:bg-slate-100 dark:hover:bg-white/5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 transition-colors"
+            title="Refresh sessions">
+            <RefreshCw size={13} />
+          </button>
           <button onClick={() => setShowSearch(!showSearch)}
             className="p-1 rounded hover:bg-slate-100 dark:hover:bg-white/5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 transition-colors"
             title="Search sessions">
@@ -254,7 +261,11 @@ export const SessionList: React.FC<{
                     !isActive && 'border-l-2 border-transparent',
                     isNew && 'animate-slide-in',
                   )}>
-                  <div className="mt-0.5">{creatorIcon(session.creator)}</div>
+                  <div className="mt-0.5">
+                    {agentStatus[session.id] && agentStatus[session.id] !== 'idle'
+                      ? <div className="w-[13px] h-[13px] rounded-full border-2 border-blue-500 border-t-transparent animate-spin shrink-0" />
+                      : creatorIcon(session.creator)}
+                  </div>
                   <div className="flex-1 min-w-0">
                     <span className={cn('text-xs font-medium truncate block',
                       isActive ? 'text-blue-700 dark:text-blue-300' : 'text-slate-700 dark:text-slate-300')}>

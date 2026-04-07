@@ -311,7 +311,7 @@ impl SessionPermissions {
         match fs::read_to_string(&file) {
             Ok(content) => match serde_json::from_str(&content) {
                 Ok(p) => {
-                    debug!("Loaded session permissions from {}", file.display());
+                    tracing::trace!("Loaded session permissions from {}", file.display());
                     p
                 }
                 Err(e) => {
@@ -470,6 +470,12 @@ fn has_output_redirect(cmd: &str) -> bool {
             }
             // Exclude `>=`
             if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                continue;
+            }
+            // Exclude redirects to /dev/null (e.g. `>/dev/null`, `2>/dev/null`)
+            // — these suppress output, not write to the filesystem.
+            let after = cmd[i..].trim_start_matches('>').trim();
+            if after.starts_with("/dev/null") {
                 continue;
             }
             return true;
@@ -1375,6 +1381,11 @@ mod tests {
         assert_eq!(classify_bash_command("ls > files.txt"), BashClass::Write);
         assert_eq!(classify_bash_command("cat /etc/passwd>leak.txt"), BashClass::Write);
         assert_eq!(classify_bash_command("echo foo>>append.txt"), BashClass::Write);
+
+        // Redirect to /dev/null is NOT a write — it suppresses output
+        assert_eq!(classify_bash_command("du -sh ~/Desktop 2>/dev/null"), BashClass::Read);
+        assert_eq!(classify_bash_command("find ~ -size +100M 2> /dev/null"), BashClass::Read);
+        assert_eq!(classify_bash_command("ls >/dev/null"), BashClass::Read);
     }
 
     #[test]

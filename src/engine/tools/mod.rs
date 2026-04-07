@@ -136,7 +136,7 @@ pub struct AskUserAnswer {
 }
 
 /// Bridge between the synchronous tool executor and the async server state,
-/// allowing the AskUser tool to emit SSE events and block on user responses.
+/// allowing the AskUser tool to emit events and block on user responses.
 pub struct AskUserBridge {
     pub events_tx: broadcast::Sender<crate::server::ServerEvent>,
     pub pending: Arc<Mutex<HashMap<String, PendingAskUser>>>,
@@ -439,7 +439,7 @@ impl Tools {
                 let question_id = uuid::Uuid::new_v4().to_string();
                 let agent_id = self.agent_id.clone().unwrap_or_default();
 
-                // Emit SSE event to push the question to the UI.
+                // Emit event to push the question to the UI.
                 let questions_clone = args.questions.clone();
                 let _ = bridge.events_tx.send(crate::server::ServerEvent::AskUser {
                     agent_id: agent_id.clone(),

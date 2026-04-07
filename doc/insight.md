@@ -79,7 +79,7 @@ OpenClaw (264K stars) looks similar on the surface — local-first, personal, ex
 | | **OpenClaw** | **Linggen** |
 |---|---|---|
 | Core metaphor | AI in your messaging apps | Root system for your agents |
-| Interface | WhatsApp, Telegram, Discord (20+ channels) | Web UI, TUI, CLI, VS Code |
+| Interface | WhatsApp, Telegram, Discord (20+ channels) | Web UI, CLI |
 | Agent model | Single agent (Pi) | Multi-agent with delegation |
 | Autonomy | Cron jobs, webhooks | Missions (cron-scheduled agent tasks) |
 | Extensibility | Skills (registry) | Skills + Agents + Missions (all files) |

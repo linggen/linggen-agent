@@ -44,7 +44,7 @@ impl AgentEngine {
             .unwrap_or(3)
     }
 
-    // Persistence + event helpers (writes to session files + emits SSE events)
+    // Persistence + event helpers (writes to session files + emits UI events)
 
     pub async fn persist_observation(
         &self,
@@ -86,7 +86,7 @@ impl AgentEngine {
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
             let target = self.outbound_target();
-            // Emit to UI immediately (SSE), so structured terminal messages are visible
+            // Emit to UI immediately, so structured messages are visible
             // even when no outer chat handler emits an explicit Outcome event.
             manager
                 .send_event(crate::agent_manager::AgentEvent::Message {

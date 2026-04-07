@@ -14,7 +14,7 @@ Redesign of the plan feature, aligned with Claude Code. Separates planning (read
 
 - `agentic-loop.md`: kernel loop, termination.
 - `tool-spec.md`: syscall interface, permissions.
-- `chat-spec.md`: SSE events, APIs.
+- `chat-spec.md`: events, APIs.
 - `storage-spec.md`: session message persistence.
 
 ## Design principles
@@ -42,7 +42,7 @@ Redesign of the plan feature, aligned with Claude Code. Separates planning (read
 
 ### Kept
 
-- SSE `PlanUpdate` events.
+- `PlanUpdate` events.
 - `update_plan` action for execution-time progress (separate feature).
 - `plan_mode: bool` on engine.
 - Status lifecycle: `Planned` → `Approved` → `Executing` → `Completed`. Also `Planned` → `Rejected`.
@@ -51,7 +51,7 @@ Redesign of the plan feature, aligned with Claude Code. Separates planning (read
 
 - **`ExitPlanMode` tool** — model calls this when plan is ready, triggers approval.
 - **Fallback detection** — if model emits `done` in plan mode without calling `ExitPlanMode`, treat as implicit exit.
-- **Direct plan editing** — user can edit plan markdown before approving (TUI: `$EDITOR`, Web UI: inline editor).
+- **Direct plan editing** — user can edit plan markdown before approving (Web UI: inline editor).
 - **Approval UI** — inline: "Start building" / "Reject" / custom feedback. Web UI: approve endpoint with `clear_context` option.
 - **Self-contained plan prompts** — plan-mode prompt emphasizes code snippets and line numbers.
 - **Compaction guard** — context compaction is skipped when plan status is `Approved` or `Executing`, ensuring the model retains full tool-result context during plan execution.
@@ -60,7 +60,7 @@ Redesign of the plan feature, aligned with Claude Code. Separates planning (read
 
 ### Entry
 
-1. `/plan <task>` command in Web UI or TUI (user-initiated).
+1. `/plan <task>` command in Web UI (user-initiated).
 2. Model emits `enter_plan_mode` → engine enters plan mode directly and runs the plan dispatch loop.
 
 ### Research phase
@@ -88,7 +88,7 @@ Plan text injected into system prompt. Model executes with full tools. Progress 
 
 ### Completion
 
-Not yet implemented. Future: on `done`, mark remaining tracked items as `Skipped`, set plan status → `Completed`, emit SSE event.
+Not yet implemented. Future: on `done`, mark remaining tracked items as `Skipped`, set plan status → `Completed`, emit event.
 
 ## Progress tracking
 

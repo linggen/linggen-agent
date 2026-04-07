@@ -26,7 +26,12 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     proxy: {
-      '/api': `http://localhost:${backendPort}`,
+      '/api': {
+        target: `http://localhost:${backendPort}`,
+        // Forward all headers (Authorization for WHIP, Content-Type: application/sdp).
+        ws: true,
+        changeOrigin: false,
+      },
       '/apps': `http://localhost:${backendPort}`,
       '/sdk': `http://localhost:${backendPort}`,
     },

@@ -455,7 +455,7 @@ impl AgentEngine {
                     if let Some(text) = plan_text.filter(|s| !s.trim().is_empty()) {
                         plan.plan_text = text;
                     }
-                    info!("[plan] UpdatePlan (planning phase): stored {} items silently, no SSE", plan.items.len());
+                    info!("[plan] UpdatePlan (planning phase): stored {} items silently, no event", plan.items.len());
                     state.messages.push(self.tool_result_msg_for(
                         self.prompt_store.render_or_fallback(
                             crate::prompts::keys::PLAN_UPDATED,

@@ -124,7 +124,7 @@ impl AgentEngine {
     // New permission flow uses ask_permission_raw (above) + PromptKind-specific prompt builders.
 
     /// Pre-execution phase: validate permissions, record context, check caches,
-    /// and emit SSE "start" events. Returns `Ready` with the prepared ToolCall
+    /// and emit "start" events. Returns `Ready` with the prepared ToolCall
     /// and metadata, or `Blocked` if the call should not proceed.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn pre_execute_tool(
@@ -601,7 +601,7 @@ impl AgentEngine {
         )
     }
 
-    /// Post-execution phase: render and cache the result, emit SSE "done"/"failed"
+    /// Post-execution phase: render and cache the result, emit "done"/"failed"
     /// events, push the observation message, and track empty-search streaks.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn post_execute_tool(

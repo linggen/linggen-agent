@@ -20,7 +20,6 @@ The `ling` binary — Linggen AI coding agent.
 
 ```
 ling                              # Start background daemon + open browser (default)
-ling --tui                        # TUI + embedded server (classic mode)
 ling --web                        # Web server foreground (for dev/debugging)
 ling --port 8080                  # Custom port
 ling --root /path/to/project      # Custom workspace
@@ -46,7 +45,6 @@ ling eval                         # Run eval tasks
 | Command | Purpose | Needs full runtime? |
 |:--------|:--------|:--------------------|
 | *(none)* | Background daemon + open browser | No |
-| `--tui` | Interactive TUI + embedded server | Yes |
 | `stop` | Stop background daemon | No |
 | `status` | Show agent server status | No |
 | `doctor` | Diagnose installation health | No |
@@ -76,7 +74,6 @@ ling [OPTIONS]
 |:-----|:-----------|
 | `--root <PATH>` | Workspace root (default: detect `.git`) |
 | `--port <PORT>` | Server port (default: `server.port` from config) |
-| `--tui` | Classic TUI + embedded server (foreground) |
 | `--web` | Web server foreground (for dev/debugging) |
 | `--dev` | Dev mode: proxy static assets to Vite dev server |
 
@@ -86,8 +83,6 @@ When no flags are given, `ling` spawns a detached background daemon and opens th
 - Daemon stdout/stderr goes to `~/.linggen/ling.log`.
 - Polls TCP connect (up to 3 s) and reports readiness.
 - Opens `http://localhost:<PORT>` in the default browser.
-
-Use `ling --tui` for the classic interactive TUI experience.
 
 ## stop
 

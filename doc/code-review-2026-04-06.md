@@ -33,12 +33,10 @@ Comprehensive review of all `doc/*.md` specs against implementation.
 - **Spec:** `storage-spec.md` — `~/.linggen/runs/{run_id}.json` should be persisted.
 - **Status:** [x] SPEC DRIFT — In-memory is intentional (runs are process-level state, no cleanup needed). Update `storage-spec.md` to remove the `~/.linggen/runs/` section.
 
-### C6. `TurnComplete` emitted with all-None stats
+### ~~C6. `TurnComplete` emitted with all-None stats~~
 - **Location:** `server/chat_api.rs:1488-1495`
 - **Spec:** `chat-spec.md` — turn summary should show "total tool calls, context tokens used, elapsed time."
-- **Problem:** `duration_ms: None`, `context_tokens: None` always. UI footer renders nothing.
-- **Fix:** Capture start time before dispatch, read context tokens after loop, pass both into `TurnComplete`.
-- **Status:** [ ] TODO
+- **Status:** [x] LOW PRIORITY — Server sends `None` but the UI has client-side fallbacks: duration from `_runStartTs` (client-measured) and tokens from `ContextUsage` SSE events. Footer renders correctly in practice. Server-side stats would be marginally more accurate but not worth the plumbing now.
 
 ---
 

@@ -28,7 +28,7 @@ Linggen runs on your machine and gives you a fully-featured AI coding agent — 
 
 **Access from anywhere.** Built-in WebRTC transport lets you use your linggen from your phone, laptop, or any browser — no VPN or port forwarding needed.
 
-**Web UI + Terminal.** Full web interface and a terminal TUI, both connected to the same backend in real-time.
+**Web-native.** Full web interface with real-time streaming, visual apps, and rich skill UIs.
 
 ## Install
 
@@ -40,7 +40,7 @@ Then:
 
 ```bash
 ling init    # set up ~/.linggen/ with default config
-ling         # start (TUI + Web UI at localhost:9898)
+ling         # start server + open Web UI at localhost:9898
 ```
 
 ## Key Features

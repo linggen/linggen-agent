@@ -1,5 +1,11 @@
 /**
  * Auto-scroll hook — scrolls to bottom when new messages or content blocks arrive.
+ *
+ * Cancel: user scrolls up (wheel/touchmove — only fires from real user input).
+ * Resume: user scrolls down to the bottom (wheel/touchmove near bottom).
+ *
+ * Programmatic scrollIntoView never triggers cancel or resume — the scroll
+ * event it generates is ignored via an isProgrammaticScroll guard.
  */
 import { useEffect, useRef, useCallback } from 'react';
 
@@ -8,32 +14,76 @@ export function useAutoScroll(messages: { length: number }, lastMsg: { isGenerat
   const lastChatCountRef = useRef(0);
   const lastContentLenRef = useRef(0);
   const isNearBottomRef = useRef(true);
-  const chatScrollContainerRef = useRef<HTMLElement | null>(null);
+  const isProgrammaticScrollRef = useRef(false);
 
-  const lastScrollTopRef = useRef(0);
+  const doScrollToBottom = useCallback(() => {
+    isProgrammaticScrollRef.current = true;
+    chatEndRef.current?.scrollIntoView({ behavior: 'auto', block: 'nearest', inline: 'nearest' });
+    // Clear the flag after the browser has processed the scroll.
+    requestAnimationFrame(() => { isProgrammaticScrollRef.current = false; });
+  }, []);
 
   useEffect(() => {
     const endEl = chatEndRef.current;
     if (!endEl) return;
     const container = endEl.parentElement;
     if (!container) return;
-    chatScrollContainerRef.current = container;
-    lastScrollTopRef.current = container.scrollTop;
+
+    // wheel only fires from real user interaction.
+    const onWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0) {
+        // Scrolling up → cancel
+        isNearBottomRef.current = false;
+      } else if (e.deltaY > 0) {
+        // Scrolling down → check if at bottom to resume
+        const { scrollTop, scrollHeight, clientHeight } = container;
+        const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+        if (distanceFromBottom < 30) {
+          isNearBottomRef.current = true;
+        }
+      }
+    };
+
+    let lastTouchY = 0;
+    const onTouchStart = (e: TouchEvent) => {
+      lastTouchY = e.touches[0].clientY;
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      const currentY = e.touches[0].clientY;
+      if (currentY > lastTouchY) {
+        // Finger dragging down = scrolling up → cancel
+        isNearBottomRef.current = false;
+      } else if (currentY < lastTouchY) {
+        // Finger dragging up = scrolling down → check if at bottom
+        const { scrollTop, scrollHeight, clientHeight } = container;
+        const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+        if (distanceFromBottom < 30) {
+          isNearBottomRef.current = true;
+        }
+      }
+      lastTouchY = currentY;
+    };
+
+    // Fallback: resume on scroll-to-bottom, but only from user scrolls.
     const onScroll = () => {
+      if (isProgrammaticScrollRef.current) return;
       const { scrollTop, scrollHeight, clientHeight } = container;
       const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
-      // User scrolled up → stop auto-scroll
-      if (scrollTop < lastScrollTopRef.current) {
-        isNearBottomRef.current = false;
-      }
-      // User scrolled back to bottom → resume auto-scroll
       if (distanceFromBottom <= 1) {
         isNearBottomRef.current = true;
       }
-      lastScrollTopRef.current = scrollTop;
     };
+
+    container.addEventListener('wheel', onWheel, { passive: true });
+    container.addEventListener('touchstart', onTouchStart, { passive: true });
+    container.addEventListener('touchmove', onTouchMove, { passive: true });
     container.addEventListener('scroll', onScroll, { passive: true });
-    return () => container.removeEventListener('scroll', onScroll);
+    return () => {
+      container.removeEventListener('wheel', onWheel);
+      container.removeEventListener('touchstart', onTouchStart);
+      container.removeEventListener('touchmove', onTouchMove);
+      container.removeEventListener('scroll', onScroll);
+    };
   }, []);
 
   const lastContentLen = lastMsg?.isGenerating ? (lastMsg.content?.length || 0) : 0;
@@ -41,16 +91,16 @@ export function useAutoScroll(messages: { length: number }, lastMsg: { isGenerat
     const newMessages = messages.length > lastChatCountRef.current;
     const newContentBlocks = lastContentLen > lastContentLenRef.current;
     if ((newMessages || newContentBlocks) && isNearBottomRef.current) {
-      chatEndRef.current?.scrollIntoView({ behavior: 'auto', block: 'nearest', inline: 'nearest' });
+      doScrollToBottom();
     }
     lastChatCountRef.current = messages.length;
     lastContentLenRef.current = lastContentLen;
-  }, [messages.length, lastContentLen]);
+  }, [messages.length, lastContentLen, doScrollToBottom]);
 
   const scrollToBottom = useCallback(() => {
     isNearBottomRef.current = true;
-    chatEndRef.current?.scrollIntoView({ behavior: 'auto', block: 'nearest', inline: 'nearest' });
-  }, []);
+    doScrollToBottom();
+  }, [doScrollToBottom]);
 
   return { chatEndRef, scrollToBottom };
 }

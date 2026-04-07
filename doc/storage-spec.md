@@ -196,7 +196,7 @@ Search order for `linggen.toml`:
 | `project_store/path_encoding.rs` | Path → directory name encoding |
 | `state_fs/sessions.rs` | Sessions, chat messages (CRUD) |
 | `state_fs/mod.rs` | Workspace-level state files |
-| `engine/plan.rs` | Plan lifecycle (finalize, emit SSE) |
+| `engine/plan.rs` | Plan lifecycle (finalize, emit events) |
 | `config.rs` | Config loading/saving |
 | `logging.rs` | Log file rotation |
 

@@ -1161,7 +1161,7 @@ pub(crate) async fn chat_handler(
     let global_sessions = &state.manager.global_sessions;
 
     // Auto-create a new session when none is provided.
-    // When a session_id IS provided (e.g. from TUI), ensure it exists in the
+    // When a session_id IS provided, ensure it exists in the
     // session store so the Web UI can list it.
     let session_id: Option<String> = if let Some(sid) = req.session_id.clone() {
         // Ensure session exists in global store

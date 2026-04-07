@@ -65,7 +65,7 @@ Lets the agent pause mid-loop to ask the user structured questions. Aligned with
 - UI renders an inline card with option buttons in the chat stream.
 - Cancelling the agent run unblocks the tool gracefully.
 
-**Flow**: tool emits `AskUser` SSE event → UI renders card → user submits via `POST /api/ask-user-response` → oneshot channel delivers answer → loop continues.
+**Flow**: tool emits `AskUser` event → UI renders card → user submits via `POST /api/ask-user-response` → oneshot channel delivers answer → loop continues.
 
 **Implementation**: `engine/tools.rs` (execution), `server/chat_api.rs` (response endpoint), `ui/src/components/AskUserCard.tsx` (UI).
 
@@ -73,15 +73,15 @@ Lets the agent pause mid-loop to ask the user structured questions. Aligned with
 
 Launches an app-enabled skill. The skill must have an `app` section in its frontmatter with a `launcher` type. See `skill-spec.md` → App skills.
 
-- **`web`**: serves the skill directory as static files at `/apps/{skill-name}/`, emits `AppLaunched` SSE event, UI opens an iframe panel.
+- **`web`**: serves the skill directory as static files at `/apps/{skill-name}/`, emits `AppLaunched` event, UI opens an iframe panel.
 - **`bash`**: executes the entry script in the skill directory, returns stdout/stderr.
-- **`url`**: emits `AppLaunched` SSE event with the external URL, UI opens in panel or new tab.
+- **`url`**: emits `AppLaunched` event with the external URL, UI opens in panel or new tab.
 
 **Direct invocation**: when a user invokes an app skill via `/skill-name`, the server short-circuits the model — executes the app directly without entering the agent loop.
 
 **Model invocation**: any agent can call `RunApp` to launch an app during a conversation (e.g., "let me open the dashboard for you").
 
-**SSE event**: `AppLaunched { skill, launcher, url, title, width?, height? }` — tells the UI to open the app panel.
+**event**: `AppLaunched { skill, launcher, url, title, width?, height? }` — tells the UI to open the app panel.
 
 **Implementation**: `engine/tools/delegation.rs` (`run_app()`), `server/chat_api.rs` (direct dispatch), `server/mod.rs` (static serving at `/apps/`), `ui/src/components/AppPanel.tsx` (UI).
 
@@ -105,7 +105,7 @@ Session permission mode controls which tools are available. See `permission-spec
 - Write-safety mode: checks that file was Read before Write/Edit.
 - Redundancy detection: cache + loop-breaker for repeated calls.
 
-**Flow**: permission gate in `handle_tool_action()` → classify action tier → check deny/ask rules → check path zone + mode ceiling → emit `AskUser` SSE event if needed → proceed or block.
+**Flow**: permission gate in `handle_tool_action()` → classify action tier → check deny/ask rules → check path zone + mode ceiling → emit `AskUser` event if needed → proceed or block.
 
 **Implementation**: `engine/permission.rs`, `engine/tool_exec.rs`, `ui/src/components/ToolPermissionCard.tsx`.
 

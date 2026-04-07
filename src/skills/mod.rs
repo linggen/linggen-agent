@@ -297,12 +297,17 @@ impl SkillManager {
 
         // 3. Load Project Skills — highest priority
         //    Scan both .linggen/skills/ and .claude/skills/ (compat) in the project root.
+        //    Skip if the project root is the home directory (those are already loaded as Global).
+        let home_dir = dirs::home_dir();
         if let Some(root) = project_root {
-            for dir_name in &[".claude/skills", ".codex/skills", ".linggen/skills"] {
-                let project_dir = root.join(dir_name);
-                let _ = self
-                    .load_from_dir_nested(&project_dir, SkillSource::Project, &mut *skills)
-                    .await;
+            let is_home = home_dir.as_deref() == Some(root);
+            if !is_home {
+                for dir_name in &[".claude/skills", ".codex/skills", ".linggen/skills"] {
+                    let project_dir = root.join(dir_name);
+                    let _ = self
+                        .load_from_dir_nested(&project_dir, SkillSource::Project, &mut *skills)
+                        .await;
+                }
             }
         }
 
