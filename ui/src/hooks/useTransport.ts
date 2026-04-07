@@ -4,12 +4,10 @@
  * Manages transport lifecycle (connect, subscribe, disconnect) and
  * routes inbound events through the event dispatcher pipeline.
  *
- * Transport selection:
- * - Default: SSE (existing behavior)
- * - When URL has ?transport=webrtc or the page is served from a remote host: WebRTC
+ * Transport: WebRTC (all Web UI — local and remote).
  */
 import { useEffect, useRef } from 'react';
-import { getTransport, setTransport, type TransportCallbacks, type TransportStatus } from '../lib/transport';
+import { getTransport, setTransport, type Transport, type TransportCallbacks, type TransportStatus } from '../lib/transport';
 import { RtcTransport } from '../lib/rtcTransport';
 import { RelaySignaling } from '../lib/signaling';
 import { dispatchEvent } from '../lib/eventDispatcher';
@@ -18,44 +16,35 @@ import { useChatStore } from '../stores/chatStore';
 import { useAgentStore } from '../stores/agentStore';
 import { useProjectStore } from '../stores/projectStore';
 
-/** Refetch all critical state after connect/reconnect to fill any gaps. */
-function resyncState() {
-  useProjectStore.getState().fetchProjects();
-  useProjectStore.getState().fetchSessions();
-  useProjectStore.getState().fetchAllSessions();
-  useProjectStore.getState().fetchAllAgentTrees();
-  useAgentStore.getState().fetchModels();
-  useAgentStore.getState().fetchDefaultModels();
-  useAgentStore.getState().fetchSkills();
-  useAgentStore.getState().fetchAgentRuns();
-  useChatStore.getState().fetchWorkspaceState();
+/** Send the frontend's active view context to the server.
+ *  The server uses this to scope its page_state push. */
+export function sendViewContext() {
+  try {
+    const transport = getTransport();
+    const { activeSessionId, selectedProjectRoot } = useProjectStore.getState();
+    const isCompact = new URLSearchParams(window.location.search).get('mode') === 'compact';
+    transport.sendViewContext({
+      sessionId: activeSessionId,
+      projectRoot: selectedProjectRoot,
+      isCompact,
+    });
+  } catch { /* transport not ready */ }
+}
+
+/** Fallback: refetch critical state via HTTP if page_state push doesn't arrive.
+ *  Only used as a safety net — normally page_state handles everything. */
+function resyncStateFallback() {
+  useChatStore.getState().fetchSessionState();
   useUiStore.getState().fetchPendingAskUser();
 }
 
-/** Map transport status to the UI store's SSE status values. */
+/** Map transport status to the UI store's connection status values. */
 function mapStatus(status: TransportStatus): 'connected' | 'reconnecting' | 'disconnected' {
   switch (status) {
     case 'connected': return 'connected';
     case 'reconnecting': return 'reconnecting';
     default: return 'disconnected';
   }
-}
-
-/** Detect whether to use WebRTC transport. */
-function shouldUseWebRTC(): boolean {
-  const params = new URLSearchParams(window.location.search);
-  // Explicit opt-in via URL parameter
-  if (params.get('transport') === 'webrtc') return true;
-  // Explicit opt-out
-  if (params.get('transport') === 'sse') return false;
-  // Remote mode (instance param present) — always WebRTC
-  if (getInstanceId()) return true;
-  // Remote host (not localhost) — use WebRTC
-  const host = window.location.hostname;
-  if (host !== 'localhost' && host !== '127.0.0.1' && !host.startsWith('192.168.') && !host.startsWith('10.')) {
-    return true;
-  }
-  return false;
 }
 
 /** Get remote instance ID from URL or injected meta tag (tunnel mode). */
@@ -101,10 +90,12 @@ export function useTransport({ sessionId, onReconnect, onParseError }: UseTransp
         useUiStore.getState().setConnectionStatus(mapStatus(status));
       },
       onReconnect: () => {
+        // Send view context to trigger server-pushed page_state
+        sendViewContext();
+        // Fetch workspace state immediately (chat history — not included in page_state)
+        useChatStore.getState().fetchSessionState();
         if (onReconnectRef.current) {
           onReconnectRef.current();
-        } else {
-          resyncState();
         }
       },
       onParseError: () => {
@@ -113,27 +104,29 @@ export function useTransport({ sessionId, onReconnect, onParseError }: UseTransp
     };
 
     // Check if transport already exists (another useTransport call may have created it)
-    let transport;
+    let transport: Transport;
+    let created = false;
     try {
       transport = getTransport();
-      // Transport exists — already initialized by another component
-      return;
+      // Transport exists — reconnect if it was disconnected (React strict mode
+      // runs effects twice: mount→cleanup→mount, so the first cleanup disconnects
+      // and the second mount must reconnect).
+      if (transport.status() === 'disconnected') {
+        transport.connect();
+      }
     } catch {
-      // No transport yet — create one
-    }
-
-    if (shouldUseWebRTC()) {
+      // No transport yet — create one (always WebRTC)
       const instanceId = getInstanceId();
       const config = instanceId
         ? { signaling: new RelaySignaling(instanceId) }
         : {};
       transport = new RtcTransport(callbacks, config);
       setTransport(transport);
-    } else {
-      transport = getTransport(callbacks);
+      created = true;
+      transport.connect();
     }
 
-    transport.connect();
+    if (!created) return;
 
     return () => {
       transport.disconnect();

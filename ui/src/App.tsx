@@ -20,7 +20,7 @@ import { useChatStore } from './stores/chatStore';
 import { useUiStore } from './stores/uiStore';
 import { useRunInfo } from './hooks/useRunInfo';
 import { useChatActions } from './hooks/useChatActions';
-import { useTransport } from './hooks/useTransport';
+import { useTransport, sendViewContext } from './hooks/useTransport';
 
 // ---------------------------------------------------------------------------
 // Compact mode (VS Code sidebar)
@@ -127,10 +127,8 @@ const App: React.FC = () => {
     useAgentStore.getState().fetchModels();
     useAgentStore.getState().fetchDefaultModels();
 
-    const interval = setInterval(() => { useAgentStore.getState().fetchOllamaStatus(); useAgentStore.getState().fetchSessionTokens(); }, 5000);
     useAgentStore.getState().fetchOllamaStatus();
     useAgentStore.getState().fetchSessionTokens();
-    return () => clearInterval(interval);
   }, []);
 
   // --- React to selected project changes ---
@@ -140,12 +138,13 @@ const App: React.FC = () => {
     if (isCompact && compactSession) return;
     if (selectedProjectRoot) {
       useProjectStore.getState().fetchFiles();
-      useChatStore.getState().fetchWorkspaceState();
+      useChatStore.getState().fetchSessionState();
       useProjectStore.getState().fetchAgentTree(selectedProjectRoot);
       useAgentStore.getState().fetchAgentRuns();
       useProjectStore.getState().fetchSessions();
       useAgentStore.getState().fetchAgents(selectedProjectRoot);
-      useAgentStore.getState().resetStatus();
+      // Don't resetStatus() here — agent_status events are global and the
+      // session list needs them to show spinners for busy sessions.
       useUiStore.getState().setQueuedMessages([]);
       useUiStore.getState().setActivePlan(null);
     }
@@ -182,15 +181,18 @@ const App: React.FC = () => {
         ui.setActivePlan(null);
         ui.setPendingPlan(null);
         ui.setPendingPlanAgentId(null);
-        // Reset agent status so activity from the previous session
-        // doesn't leak into the new one (spinner, status text, etc.)
-        useAgentStore.getState().resetStatus();
+        // Clear status for the previous session only — preserve other sessions'
+        // running state so the session list can show spinners for busy sessions.
+        const prevSid = prevSessionIdRef.current;
+        if (prevSid) {
+          useAgentStore.getState().setAgentStatus((prev) => { const n = { ...prev }; delete n[prevSid]; return n; });
+          useAgentStore.getState().setAgentStatusText((prev) => { const n = { ...prev }; delete n[prevSid]; return n; });
+        }
       }
-      // Always fetch to merge latest server state into the bucket
-      chatStore.fetchWorkspaceState();
-      useAgentStore.getState().fetchAgentRuns();
-      // Restore any pending AskUser/permission widget for this session.
-      fetchPendingAskUser();
+      // Always fetch workspace state to merge latest persisted messages
+      chatStore.fetchSessionState();
+      // Notify server of view context change → triggers page_state push
+      sendViewContext();
     }
   }, [activeSessionId, selectedProjectRoot, isMissionSession, projectStore.isSkillSession, fetchPendingAskUser]);
 
@@ -200,11 +202,11 @@ const App: React.FC = () => {
     useUiStore.getState().setSessionModel(sess?.model_id ?? null);
   }, [activeSessionId, sessions]);
 
-  // --- Poll workspace state for mission sessions (backup; SSE also triggers reloads) ---
+  // --- Poll workspace state for mission sessions (backup; events also trigger reloads) ---
   useEffect(() => {
     if (!isMissionSession || !activeSessionId) return;
     const interval = setInterval(() => {
-      useChatStore.getState().fetchWorkspaceState();
+      useChatStore.getState().fetchSessionState();
     }, 5000);
     return () => clearInterval(interval);
   }, [isMissionSession, activeSessionId]);
@@ -236,7 +238,7 @@ const App: React.FC = () => {
       // Fetch state after setting skill session flag — avoids race with session-change effect
       const cs = useChatStore.getState();
       cs.setActiveSession(compactSession);
-      cs.fetchWorkspaceState();
+      cs.fetchSessionState();
       return;
     }
 
@@ -561,7 +563,7 @@ const App: React.FC = () => {
       <FilePreview selectedFilePath={selectedFilePath} selectedFileContent={selectedFileContent} onClose={() => uiStore.closeFilePreview()} />
       <AgentSpecEditorModal open={showAgentSpecEditor} projectRoot={selectedProjectRoot}
         onClose={() => uiStore.setShowAgentSpecEditor(false)}
-        onChanged={() => { agentStore.fetchAgents(selectedProjectRoot); chatStore.fetchWorkspaceState(); projectStore.fetchAllAgentTrees(); }} />
+        onChanged={() => { agentStore.fetchAgents(selectedProjectRoot); chatStore.fetchSessionState(); projectStore.fetchAllAgentTrees(); }} />
 
       {openApp && <AppPanel app={openApp} onClose={() => uiStore.setOpenApp(null)} />}
 

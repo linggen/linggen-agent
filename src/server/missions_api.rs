@@ -79,22 +79,6 @@ pub(crate) async fn create_mission(
     }
 }
 
-/// GET /api/missions/:id
-pub(crate) async fn get_mission(
-    State(state): State<Arc<ServerState>>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    match state.manager.missions.get_mission(&id) {
-        Ok(Some(mission)) => Json(mission).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to get mission: {}", e),
-        )
-            .into_response(),
-    }
-}
-
 #[derive(Deserialize)]
 pub(crate) struct UpdateMissionRequest {
     #[serde(default)]
@@ -300,40 +284,6 @@ pub(crate) struct MissionSessionQuery {
     mission_id: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
-}
-
-/// GET /api/missions/:id/sessions — list sessions for a specific mission
-pub(crate) async fn list_mission_sessions(
-    State(state): State<Arc<ServerState>>,
-    Path(mission_id): Path<String>,
-) -> impl IntoResponse {
-    let sessions: Vec<_> = state.manager.global_sessions.list_sessions()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|s| s.mission_id.as_deref() == Some(&mission_id))
-        .collect();
-    Json(serde_json::json!({ "sessions": sessions })).into_response()
-}
-
-/// DELETE /api/missions/:mission_id/sessions/:session_id — delete a mission session and its run entry
-pub(crate) async fn delete_mission_session(
-    State(state): State<Arc<ServerState>>,
-    Path((mission_id, session_id)): Path<(String, String)>,
-) -> impl IntoResponse {
-    state.manager.remove_session_engine(&session_id).await;
-    if let Err(e) = state.manager.global_sessions.remove_session(&session_id) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to delete session: {}", e),
-        )
-            .into_response();
-    }
-    // Also remove the corresponding run entry from runs.jsonl
-    let _ = state
-        .manager
-        .missions
-        .remove_run_by_session(&mission_id, &session_id);
-    Json(serde_json::json!({ "ok": true })).into_response()
 }
 
 #[derive(Deserialize)]

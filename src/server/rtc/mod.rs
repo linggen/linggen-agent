@@ -9,6 +9,7 @@
 //! in a tokio task per peer connection.
 
 mod peer;
+pub(crate) mod page_state;
 pub mod relay;
 
 use axum::{

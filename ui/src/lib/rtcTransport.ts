@@ -62,10 +62,14 @@ export class RtcTransport implements Transport {
   private pendingSubscriptions = new Set<string>();
   // Abort controller for in-flight signaling (cancelled on cleanup/disconnect)
   private signalingAbort: AbortController | null = null;
+  // Resolves when control channel opens — lets controlRequest wait instead of rejecting
+  private readyPromise: Promise<void>;
+  private readyResolve: (() => void) | null = null;
 
   constructor(callbacks: TransportCallbacks, config: RtcTransportConfig = {}) {
     this.callbacks = callbacks;
     this.config = config;
+    this.readyPromise = new Promise((resolve) => { this.readyResolve = resolve; });
   }
 
   // --- Transport interface ---
@@ -135,6 +139,31 @@ export class RtcTransport implements Transport {
     return this.controlRequest({ type: 'http_request', method, url, body });
   }
 
+  private pendingViewContext: { sessionId: string | null; projectRoot: string | null; isCompact: boolean } | null = null;
+
+  sendViewContext(ctx: { sessionId: string | null; projectRoot: string | null; isCompact: boolean }): void {
+    const msg = JSON.stringify({
+      type: 'set_view_context',
+      session_id: ctx.sessionId,
+      project_root: ctx.projectRoot,
+      is_compact: ctx.isCompact,
+    });
+    if (this.controlChannel?.readyState === 'open') {
+      this.controlChannel.send(msg);
+      this.pendingViewContext = null;
+    } else {
+      // Queue — will be sent when control channel opens
+      this.pendingViewContext = ctx;
+    }
+  }
+
+  /** Flush queued view context when control channel opens. */
+  private flushPendingViewContext(): void {
+    if (this.pendingViewContext) {
+      this.sendViewContext(this.pendingViewContext);
+    }
+  }
+
   // --- Internal: connection ---
 
   private async doConnect(): Promise<void> {
@@ -158,27 +187,29 @@ export class RtcTransport implements Transport {
         }
       };
 
-      // Connection state tracking — wait for 'failed' only.
-      // 'connected' is handled in control channel onopen (below) to ensure
-      // the data channel is ready before we start routing API calls.
+      // Connection state tracking
       this.pc.onconnectionstatechange = () => {
         const state = this.pc?.connectionState;
+        console.log(`[WebRTC] connectionState: ${state}`);
         if (state === 'failed') {
-          // Only disconnect on 'failed', not 'disconnected' (which is transient)
           this.handleDisconnect();
         }
       };
 
       this.pc.oniceconnectionstatechange = () => {
-        if (this.pc?.iceConnectionState === 'failed') {
+        const state = this.pc?.iceConnectionState;
+        console.log(`[WebRTC] iceConnectionState: ${state}`);
+        if (state === 'failed') {
           this.handleDisconnect();
         }
       };
 
       // Create offer, gather all ICE candidates (full ICE, no trickle)
+      console.log('[WebRTC] creating offer...');
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
       await this.waitForIceGathering();
+      console.log('[WebRTC] ICE gathering complete, exchanging SDP...');
 
       // Exchange SDP via the configured signaling strategy
       const signaling = this.config.signaling ?? new WhipSignaling();
@@ -189,7 +220,9 @@ export class RtcTransport implements Transport {
         controller.signal,
       );
       this.signalingAbort = null;
+      console.log('[WebRTC] got SDP answer, setting remote description...');
       await this.pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+      console.log('[WebRTC] remote description set, waiting for control channel...');
     } catch (err) {
       console.error('WebRTC connection failed:', err);
       this.handleDisconnect();
@@ -229,6 +262,9 @@ export class RtcTransport implements Transport {
       // so if we call onReconnect first, all fetches get empty stub responses.
       this.reconnectAttempt = 0;
       this.setStatus('connected');
+      // Resolve the ready promise so pending controlRequest calls proceed.
+      if (this.readyResolve) { this.readyResolve(); this.readyResolve = null; }
+      this.flushPendingViewContext();
       this.callbacks.onReconnect?.();
       this.startHeartbeat();
       for (const sid of this.pendingSubscriptions) {
@@ -328,7 +364,14 @@ export class RtcTransport implements Transport {
 
   // --- Internal: control channel RPC ---
 
-  private controlRequest(msg: Record<string, unknown>): Promise<any> {
+  private async controlRequest(msg: Record<string, unknown>): Promise<any> {
+    // Wait for the control channel to open (handles calls during WHIP exchange)
+    if (!this.controlChannel || this.controlChannel.readyState !== 'open') {
+      await Promise.race([
+        this.readyPromise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Control channel connection timeout')), 15000)),
+      ]);
+    }
     return new Promise((resolve, reject) => {
       if (!this.controlChannel || this.controlChannel.readyState !== 'open') {
         reject(new Error('Control channel not open'));
@@ -393,6 +436,9 @@ export class RtcTransport implements Transport {
 
   private cleanup(): void {
     this.stopHeartbeat();
+
+    // Reset ready promise for next connection attempt
+    this.readyPromise = new Promise((resolve) => { this.readyResolve = resolve; });
 
     // Abort any in-flight signaling (e.g. relay polling)
     if (this.signalingAbort) {

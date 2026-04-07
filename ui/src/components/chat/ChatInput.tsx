@@ -72,6 +72,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   const [fileSearchMode, setFileSearchMode] = useState(false);
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(0);
+  const [activeSkillHint, setActiveSkillHint] = useState<string | null>(null);
 
   const resizeInput = () => {
     if (!inputRef.current) return;
@@ -93,6 +94,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     setShowSkillDropdown(false);
     setShowAgentDropdown(false);
     setShowFileDropdown(false);
+    setActiveSkillHint(null);
     setFileFilter('');
     setFileBrowsePath('');
     setFileEntries([]);
@@ -207,17 +209,16 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     return entries;
   }, [fileEntries, fileFilter, fileSearchMode]);
 
-  const buildSkillSuggestions = () => {
+  const skillSuggestions = useMemo(() => {
     const suggestions: {
       key: string;
       label: string;
       description?: string;
-      apply: () => void;
+      skillName?: string;
+      argumentHint?: string | null;
+      isBuiltin: boolean;
     }[] = [];
 
-    const beforeSlash = chatInput.substring(0, chatInput.lastIndexOf('/'));
-
-    // Built-in commands (aligned with TUI)
     const builtinCommands: [string, string][] = [
       ['/help', 'Show available commands'],
       ['/clear', 'Clear chat context'],
@@ -228,41 +229,39 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     ];
 
     for (const [cmd, desc] of builtinCommands) {
-      const name = cmd.slice(1); // strip leading /
+      const name = cmd.slice(1);
       if (skillFilter === '' || name.includes(skillFilter) || desc.toLowerCase().includes(skillFilter)) {
-        suggestions.push({
-          key: `cmd-${name}`,
-          label: cmd,
-          description: desc,
-          apply: () => {
-            setChatInput(`${beforeSlash}${cmd} `);
-            setShowSkillDropdown(false);
-          },
-        });
+        suggestions.push({ key: `cmd-${name}`, label: cmd, description: desc, isBuiltin: true });
       }
     }
 
-    // Skills from API
     skills
-      .filter(
-        (skill) =>
-          skill.name.toLowerCase().includes(skillFilter) ||
-          skill.description.toLowerCase().includes(skillFilter)
+      .filter((skill) =>
+        skill.name.toLowerCase().includes(skillFilter) ||
+        skill.description.toLowerCase().includes(skillFilter)
       )
       .forEach((skill) => {
         suggestions.push({
           key: `skill-${skill.name}`,
           label: `/${skill.name}`,
           description: skill.description,
-          apply: () => {
-            setChatInput(`${beforeSlash}/${skill.name} `);
-            setShowSkillDropdown(false);
-          },
+          skillName: skill.name,
+          argumentHint: skill.argument_hint,
+          isBuiltin: false,
         });
       });
 
     return suggestions;
-  };
+  }, [skills, skillFilter]);
+
+  const applySuggestion = useCallback((suggestion: typeof skillSuggestions[number]) => {
+    const beforeSlash = chatInput.substring(0, chatInput.lastIndexOf('/'));
+    setChatInput(`${beforeSlash}${suggestion.label} `);
+    setShowSkillDropdown(false);
+    if (!suggestion.isBuiltin && suggestion.argumentHint) {
+      setActiveSkillHint(suggestion.argumentHint);
+    }
+  }, [chatInput]);
 
   return (
     <>
@@ -346,18 +345,48 @@ export const ChatInput: React.FC<ChatInputProps> = ({
             ))}
           </div>
         )}
+        {activeSkillHint && !showSkillDropdown && (() => {
+          const skillMatch = chatInput.match(/^\/([a-zA-Z0-9_-]+)\s*/);
+          const skillName = skillMatch?.[1] || '';
+          const subcommands = activeSkillHint.split('|').map(s => s.trim()).filter(Boolean);
+          return (
+            <div className="bg-white dark:bg-[#141414] border border-slate-200 dark:border-white/10 rounded-lg shadow-xl max-h-52 overflow-y-auto">
+              <div className="px-3 py-1.5 text-[11px] text-slate-500 border-b border-slate-200 dark:border-white/10">
+                /{skillName} • Click a command or type it after /{skillName}
+              </div>
+              {subcommands.map((cmd, idx) => {
+                const colonIdx = cmd.indexOf(':');
+                const cmdText = colonIdx >= 0 ? cmd.substring(0, colonIdx).trim() : cmd;
+                const desc = colonIdx >= 0 ? cmd.substring(colonIdx + 1).trim() : '';
+                const cmdName = cmdText.split(/\s/)[0];
+                return (
+                  <button
+                    key={idx}
+                    onClick={() => {
+                      setChatInput(`/${skillName} ${cmdName} `);
+                      setActiveSkillHint(null);
+                      inputRef.current?.focus();
+                    }}
+                    className="w-full px-3 py-2 text-left text-xs hover:bg-slate-100 dark:hover:bg-white/5 border-b border-slate-200 dark:border-white/5 last:border-none"
+                  >
+                    <span className="font-mono font-bold text-blue-500">{cmdText}</span>
+                    {desc && <span className="text-slate-500 dark:text-slate-400 ml-2">{desc}</span>}
+                  </button>
+                );
+              })}
+            </div>
+          );
+        })()}
         <div className="flex gap-2 bg-white dark:bg-black/20 p-1.5 rounded-xl border border-slate-300/80 dark:border-white/10 relative items-end">
           {showSkillDropdown && (
             <div className="absolute bottom-full left-0 right-0 mb-2 bg-white dark:bg-[#141414] border border-slate-200 dark:border-white/10 rounded-lg shadow-xl max-h-52 overflow-y-auto z-[70]">
               <div className="px-3 py-2 text-[11px] text-slate-500 border-b border-slate-200 dark:border-white/10">
                 Commands &amp; Skills • Type to filter
               </div>
-              {(() => {
-                const suggestions = buildSkillSuggestions();
-                return suggestions.map((item, idx) => (
+              {skillSuggestions.map((item, idx) => (
                   <button
                     key={item.key}
-                    onClick={item.apply}
+                    onClick={() => applySuggestion(item)}
                     className={cn(
                       'w-full px-3 py-2 text-left text-xs border-b border-slate-200 dark:border-white/5 last:border-none',
                       idx === selectedSuggestionIndex
@@ -368,9 +397,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                     <div className={cn('font-bold', item.key.startsWith('cmd-') ? 'text-amber-500' : 'text-blue-500')}>{item.label}</div>
                     {item.description && <div className="text-slate-500 text-[11px]">{item.description}</div>}
                   </button>
-                ));
-              })()}
-              {buildSkillSuggestions().length === 0 && (
+                ))}
+              {skillSuggestions.length === 0 && (
                 <div className="p-3 text-[11px] text-slate-500 italic">No matching commands or skills</div>
               )}
             </div>
@@ -531,25 +559,41 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                 }
               }
 
-              // No dropdown
+              // No dropdown — but check for skill argument hint
               setShowSkillDropdown(false);
               setShowAgentDropdown(false);
               setShowFileDropdown(false);
+
+              // Show argument hint when user typed "/skillname " (skill + space, no subcommand yet)
+              const skillMatch = val.match(/^\/([a-zA-Z0-9_-]+)(\s*)(.*)$/);
+              if (skillMatch && skillMatch[2]) {
+                const afterSkill = skillMatch[3].trim();
+                if (!afterSkill) {
+                  // Just "/skillname " — show hint
+                  const matched = skills.find(
+                    (s) => s.name.toLowerCase() === skillMatch[1].toLowerCase() && s.argument_hint
+                  );
+                  setActiveSkillHint(matched?.argument_hint ?? null);
+                } else {
+                  // User started typing subcommand — hide hint
+                  setActiveSkillHint(null);
+                }
+              } else {
+                setActiveSkillHint(null);
+              }
             }}
             onKeyDown={(e) => {
               // Ignore Enter during IME composition (e.g. Chinese pinyin input)
               if (e.key === 'Enter' && (e.nativeEvent.isComposing || e.keyCode === 229)) return;
               // Skill dropdown keyboard nav
-              const suggestions = showSkillDropdown ? buildSkillSuggestions() : [];
-              if (showSkillDropdown && suggestions.length > 0) {
+              if (showSkillDropdown && skillSuggestions.length > 0) {
                 if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
                   e.preventDefault();
                   const delta = e.key === 'ArrowDown' ? 1 : -1;
-                  setSelectedSuggestionIndex((prev) => (prev + delta + suggestions.length) % suggestions.length);
+                  setSelectedSuggestionIndex((prev) => (prev + delta + skillSuggestions.length) % skillSuggestions.length);
                   return;
                 }
                 if (e.key === 'Enter') {
-                  // If the input exactly matches a complete built-in command, send it directly
                   const exactCommands = ['/help', '/clear', '/compact', '/status', '/model'];
                   if (exactCommands.includes(chatInput.trim())) {
                     e.preventDefault();
@@ -558,7 +602,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                     return;
                   }
                   e.preventDefault();
-                  suggestions[selectedSuggestionIndex]?.apply();
+                  const selected = skillSuggestions[selectedSuggestionIndex];
+                  if (selected) applySuggestion(selected);
                   return;
                 }
               }

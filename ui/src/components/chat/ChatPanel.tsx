@@ -3,7 +3,6 @@ import { Sparkles, ArrowDown } from 'lucide-react';
 import 'highlight.js/styles/github.css';
 import { cn } from '../../lib/cn';
 import { useProjectStore } from '../../stores/projectStore';
-import { useUiStore } from '../../stores/uiStore';
 import { useAgentStore } from '../../stores/agentStore';
 import { AskUserCard } from '../AskUserCard';
 import { ToolPermissionCard } from '../ToolPermissionCard';
@@ -20,6 +19,7 @@ import { AgentMessage } from './AgentMessage';
 import { ChatInput } from './ChatInput';
 import { SubagentDrawer } from './SubagentDrawer';
 import { statusBadgeClass } from './MessageHelpers';
+import { SessionModelSelector, SessionModeSelector } from './SessionSelectors';
 
 /** Render a single message row. */
 const ChatMessageRow = React.memo<{
@@ -28,8 +28,8 @@ const ChatMessageRow = React.memo<{
   isUser: boolean;
   isExpanded: boolean;
   onToggle: () => void;
-  isLastUser: boolean;
-  lastUserMsgRef?: React.RefObject<HTMLDivElement | null>;
+  userMsgIndex?: number;
+  userMsgRefs?: React.RefObject<Map<number, HTMLDivElement>>;
   planProps: {
     pendingPlanAgentId?: string | null;
     agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
@@ -38,7 +38,12 @@ const ChatMessageRow = React.memo<{
     onEditPlan?: (text: string) => void;
     inputRef: React.RefObject<HTMLTextAreaElement | null>;
   };
-}>(({ msg, msgKey, isUser, isExpanded, onToggle, isLastUser, lastUserMsgRef, planProps }) => {
+}>(({ msg, msgKey, isUser, isExpanded, onToggle, userMsgIndex, userMsgRefs, planProps }) => {
+  const registerRef = useCallback((el: HTMLDivElement | null) => {
+    if (userMsgIndex == null || !userMsgRefs?.current) return;
+    if (el) userMsgRefs.current.set(userMsgIndex, el);
+    else userMsgRefs.current.delete(userMsgIndex);
+  }, [userMsgIndex, userMsgRefs]);
   const phase = isUser ? undefined : getMessagePhase(msg);
   const messageClass = isUser
     ? 'bg-slate-100 dark:bg-white/10 text-slate-900 dark:text-slate-100 rounded-md px-2.5 py-1.5'
@@ -50,7 +55,7 @@ const ChatMessageRow = React.memo<{
   return (
     <div
       key={msgKey}
-      ref={isLastUser ? lastUserMsgRef : undefined}
+      ref={userMsgIndex != null ? registerRef : undefined}
       className={cn('w-full flex', isUser ? 'justify-end' : 'justify-start')}
     >
       <div className={cn(isUser ? 'max-w-[96%]' : 'max-w-full', 'text-[14px] leading-relaxed', messageClass)}>
@@ -80,8 +85,7 @@ const ChatMessageList = React.memo<{
   expandedMessages: Set<string>;
   setExpandedMessages: React.Dispatch<React.SetStateAction<Set<string>>>;
   verboseMode?: boolean;
-  lastUserMsgInfo: { index: number; text: string } | null;
-  lastUserMsgRef: React.RefObject<HTMLDivElement | null>;
+  userMsgRefs: React.RefObject<Map<number, HTMLDivElement>>;
   selectedAgent: string;
   pendingPlanAgentId?: string | null;
   agentContext?: Record<string, { tokens: number; messages: number; tokenLimit?: number }>;
@@ -89,7 +93,7 @@ const ChatMessageList = React.memo<{
   onRejectPlan?: () => void;
   onEditPlan?: (text: string) => void;
   inputRef: React.RefObject<HTMLTextAreaElement | null>;
-}>(({ messages, expandedMessages, setExpandedMessages, verboseMode, lastUserMsgInfo, lastUserMsgRef, selectedAgent, pendingPlanAgentId, agentContext, onApprovePlan, onRejectPlan, onEditPlan, inputRef }) => {
+}>(({ messages, expandedMessages, setExpandedMessages, verboseMode, userMsgRefs, selectedAgent, pendingPlanAgentId, agentContext, onApprovePlan, onRejectPlan, onEditPlan, inputRef }) => {
   const planProps = useMemo(() => ({ pendingPlanAgentId, agentContext, onApprovePlan, onRejectPlan, onEditPlan, inputRef }), [pendingPlanAgentId, agentContext, onApprovePlan, onRejectPlan, onEditPlan, inputRef]);
   return (
     <>
@@ -107,7 +111,7 @@ const ChatMessageList = React.memo<{
         const key = `${msg.timestamp}-${i}-${msg.from || msg.role}-${msg.text.slice(0, 24)}`;
         const isUser = msg.role === 'user';
         const isExpanded = verboseMode || expandedMessages.has(key);
-        const isLastUser = isUser && lastUserMsgInfo?.index === i;
+        const userMsgIndex = isUser ? i : undefined;
         return (
           <ChatMessageRow
             key={key}
@@ -123,8 +127,8 @@ const ChatMessageList = React.memo<{
                 return next;
               });
             }}
-            isLastUser={isLastUser}
-            lastUserMsgRef={lastUserMsgRef}
+            userMsgIndex={userMsgIndex}
+            userMsgRefs={userMsgRefs}
             planProps={planProps}
           />
         );
@@ -132,142 +136,6 @@ const ChatMessageList = React.memo<{
     </>
   );
 });
-
-/** Compact per-session model selector shown in the run bar. */
-const SessionModelSelector: React.FC = () => {
-  const models = useAgentStore((s) => s.models);
-  const defaultModels = useAgentStore((s) => s.defaultModels);
-  const sessionModel = useUiStore((s) => s.sessionModel);
-  const setSessionModel = useUiStore((s) => s.setSessionModel);
-  const sessionId = useProjectStore((s) => s.activeSessionId);
-  const selectedProjectRoot = useProjectStore((s) => s.selectedProjectRoot);
-
-  const defaultLabel = defaultModels.length > 0 ? defaultModels[0] : 'default';
-
-  const handleChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    const value = e.target.value || null;
-    setSessionModel(value);
-    // Persist model choice to session metadata immediately
-    if (sessionId) {
-      // Update local session cache so switching away and back restores correctly
-      const ps = useProjectStore.getState();
-      const updated = ps.allSessions.map((s) =>
-        s.id === sessionId ? { ...s, model_id: value } : s
-      );
-      const updatedSessions = ps.sessions.map((s) =>
-        s.id === sessionId ? { ...s, model_id: value } : s
-      );
-      useProjectStore.setState({ allSessions: updated, sessions: updatedSessions });
-      // Persist to backend
-      fetch('/api/sessions', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          project_root: selectedProjectRoot || '',
-          session_id: sessionId,
-          model_id: value ?? '',
-        }),
-      }).catch(() => {});
-    }
-  };
-
-  return (
-    <select
-      value={sessionModel ?? ''}
-      onChange={handleChange}
-      onClick={(e) => e.stopPropagation()}
-      className="ml-auto text-[11px] bg-white dark:bg-black/30 border border-slate-200 dark:border-white/10 rounded px-1.5 py-0.5 outline-none max-w-[14rem] truncate"
-      title="Session model override"
-    >
-      <option value="">Default ({defaultLabel})</option>
-      {models.filter((m) => !defaultModels.includes(m.id)).map((m) => (
-        <option key={m.id} value={m.id}>{m.id}</option>
-      ))}
-    </select>
-  );
-};
-
-/** Compact per-session permission mode selector shown in the run bar. */
-const SessionModeSelector: React.FC = () => {
-  const sessionMode = useUiStore((s) => s.sessionMode);
-  const setSessionMode = useUiStore((s) => s.setSessionMode);
-  const permissionVersion = useUiStore((s) => s.permissionVersion);
-  const sessionId = useProjectStore((s) => s.activeSessionId);
-  const [zone, setZone] = React.useState<string>('home');
-
-  const modes = [
-    { value: 'read', label: 'read', color: 'text-emerald-600 dark:text-emerald-400' },
-    { value: 'edit', label: 'edit', color: 'text-blue-600 dark:text-blue-400' },
-    { value: 'admin', label: 'admin', color: 'text-amber-600 dark:text-amber-400' },
-  ];
-
-  const isSystemZone = zone === 'system';
-
-  // Load effective mode + zone from backend on mount / session change.
-  React.useEffect(() => {
-    if (!sessionId) return;
-    const sessionMeta = useProjectStore.getState().allSessions.find((s) => s.id === sessionId);
-    const cwd = sessionMeta?.cwd || sessionMeta?.project || '';
-    const params = new URLSearchParams({ session_id: sessionId });
-    if (cwd) params.set('cwd', cwd);
-    fetch(`/api/sessions/permission?${params}`)
-      .then((r) => r.ok ? r.json() : null)
-      .then((resp) => {
-        if (resp?.effective_mode) {
-          setSessionMode(resp.effective_mode);
-        } else if (resp?.path_modes?.length > 0) {
-          setSessionMode(resp.path_modes[0].mode);
-        } else {
-          setSessionMode('read');
-        }
-        setZone(resp?.zone || 'home');
-      })
-      .catch(() => { setSessionMode('read'); setZone('home'); });
-  }, [sessionId, permissionVersion, setSessionMode]);
-
-  const handleChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    const value = e.target.value;
-    setSessionMode(value);
-    if (sessionId) {
-      const sessionMeta = useProjectStore.getState().allSessions.find((s) => s.id === sessionId);
-      const cwd = sessionMeta?.cwd || sessionMeta?.project || '~/';
-      fetch('/api/sessions/permission', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sessionId, path: cwd, mode: value }),
-      }).catch(() => {});
-    }
-  };
-
-  const current = modes.find((m) => m.value === (sessionMode || 'read'));
-
-  // System zone: show read-only badge, no dropdown.
-  if (isSystemZone) {
-    return (
-      <span
-        className="text-[11px] border border-slate-200 dark:border-white/10 rounded px-1.5 py-0.5 font-semibold bg-slate-50 dark:bg-black/30 text-slate-400 dark:text-slate-500"
-        title="System path — read only, no mode switch"
-      >
-        read (system)
-      </span>
-    );
-  }
-
-  return (
-    <select
-      value={sessionMode || 'read'}
-      onChange={handleChange}
-      onClick={(e) => e.stopPropagation()}
-      className={`text-[11px] border border-slate-200 dark:border-white/10 rounded px-1.5 py-0.5 outline-none font-semibold bg-white dark:bg-black/30 ${current?.color || ''}`}
-      title="Session permission mode"
-    >
-      {modes.map((m) => (
-        <option key={m.value} value={m.value}>{m.label}</option>
-      ))}
-    </select>
-  );
-};
-
 export const ChatPanel: React.FC<{
   chatMessages: ChatMessage[];
   queuedMessages: QueuedChatItem[];
@@ -350,8 +218,8 @@ export const ChatPanel: React.FC<{
   const [expandedMessages, setExpandedMessages] = useState<Set<string>>(new Set());
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
-  const lastUserMsgRef = useRef<HTMLDivElement | null>(null);
-  const [showLastUserMsg, setShowLastUserMsg] = useState(false);
+  const userMsgRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const [floatingUserMsg, setFloatingUserMsg] = useState<{ index: number; text: string } | null>(null);
   const thinkingStartRef = useRef<number | null>(null);
   const [thinkingElapsed, setThinkingElapsed] = useState(0);
 
@@ -361,9 +229,12 @@ export const ChatPanel: React.FC<{
     }
   }, [pendingAskUser, chatEndRef]);
 
-  // Auto-scroll to bottom during streaming, but only if user is near bottom.
-  // "Near bottom" = within 10% of scroll height (respects manual scroll-up).
+  // Auto-scroll: follows streaming output by default.
+  // Detaches when the user scrolls up (negative scroll delta).
+  // Re-attaches when user scrolls back to bottom or clicks "scroll to bottom".
   const isNearBottomRef = useRef(true);
+  const lastScrollTopRef = useRef(0);
+  const programmaticScrollRef = useRef(false);
   const [showScrollButton, setShowScrollButton] = useState(false);
   useEffect(() => {
     const container = chatScrollRef.current;
@@ -371,22 +242,36 @@ export const ChatPanel: React.FC<{
     const onScroll = () => {
       const { scrollTop, scrollHeight, clientHeight } = container;
       const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
-      const nearBottom = distanceFromBottom <= scrollHeight * 0.1;
-      isNearBottomRef.current = nearBottom;
-      // Only show when content is tall enough to scroll meaningfully (> 1.5x viewport)
+      // Skip user-intent detection for programmatic scrolls (auto-scroll / scrollToBottom)
+      if (programmaticScrollRef.current) {
+        programmaticScrollRef.current = false;
+      } else {
+        const delta = scrollTop - lastScrollTopRef.current;
+        if (delta < -1) {
+          // User scrolled up — detach auto-scroll
+          isNearBottomRef.current = false;
+        } else if (distanceFromBottom <= 1) {
+          // User scrolled all the way to the bottom — re-attach
+          isNearBottomRef.current = true;
+        }
+      }
+      lastScrollTopRef.current = scrollTop;
       const contentOverflows = scrollHeight > clientHeight * 1.5;
-      setShowScrollButton(!nearBottom && distanceFromBottom > 100 && contentOverflows);
+      setShowScrollButton(!isNearBottomRef.current && distanceFromBottom > 100 && contentOverflows);
     };
     container.addEventListener('scroll', onScroll, { passive: true });
     return () => container.removeEventListener('scroll', onScroll);
   }, []);
 
   const scrollToBottom = useCallback(() => {
+    programmaticScrollRef.current = true;
+    isNearBottomRef.current = true;
     chatEndRef?.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [chatEndRef]);
 
   useEffect(() => {
     if (isNearBottomRef.current) {
+      programmaticScrollRef.current = true;
       chatEndRef?.current?.scrollIntoView({ behavior: 'auto', block: 'nearest' });
     }
   }, [chatMessages, chatEndRef]);
@@ -424,19 +309,6 @@ export const ChatPanel: React.FC<{
       setThinkingElapsed(0);
     }
   }, [isAgentActive]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Show floating banner when last user message scrolls out of view
-  useEffect(() => {
-    const el = lastUserMsgRef.current;
-    const container = chatScrollRef.current;
-    if (!el || !container) { setShowLastUserMsg(false); return; }
-    const observer = new IntersectionObserver(
-      ([entry]) => setShowLastUserMsg(!entry.isIntersecting),
-      { root: container, threshold: 0.1 }
-    );
-    observer.observe(el);
-    return () => observer.disconnect();
-  });
 
   const mainAgentIds = useMemo(
     () => mainAgents.map((agent) => normalizeAgentKey(agent.name)),
@@ -507,6 +379,48 @@ export const ChatPanel: React.FC<{
       );
     });
   }, [displayedMainMessages, mainMessageFilter]);
+
+  // Show floating banner with nearest user message scrolled above viewport
+  const filteredMainMessagesRef = useRef(filteredMainMessages);
+  filteredMainMessagesRef.current = filteredMainMessages;
+  useEffect(() => {
+    const container = chatScrollRef.current;
+    if (!container) return;
+    let rafId = 0;
+    const update = () => {
+      const containerTop = container.getBoundingClientRect().top;
+      const threshold = containerTop + 48; // account for floating bar height
+      let bestIdx = -1;
+      let bestTop = -Infinity;
+      for (const [idx, el] of userMsgRefs.current.entries()) {
+        const top = el.getBoundingClientRect().top;
+        if (top < threshold && top > bestTop) {
+          bestTop = top;
+          bestIdx = idx;
+        }
+      }
+      if (bestIdx >= 0) {
+        const msg = filteredMainMessagesRef.current[bestIdx];
+        setFloatingUserMsg((prev) => {
+          if (prev?.index === bestIdx && prev?.text === msg?.text) return prev;
+          return msg ? { index: bestIdx, text: msg.text } : null;
+        });
+      } else {
+        setFloatingUserMsg((prev) => prev === null ? prev : null);
+      }
+    };
+    const onScroll = () => {
+      cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(update);
+    };
+    container.addEventListener('scroll', onScroll, { passive: true });
+    update(); // initial check
+    return () => {
+      container.removeEventListener('scroll', onScroll);
+      cancelAnimationFrame(rafId);
+    };
+  }, []);
+
   // Split messages: historical (stable, memoized) vs streaming (re-renders per token)
   const { historicalMessages, streamingMessage } = useMemo(() => {
     const len = filteredMainMessages.length;
@@ -519,14 +433,6 @@ export const ChatPanel: React.FC<{
     return { historicalMessages: filteredMainMessages, streamingMessage: null };
   }, [filteredMainMessages]);
 
-  const lastUserMsgInfo = useMemo(() => {
-    for (let i = filteredMainMessages.length - 1; i >= 0; i--) {
-      if (filteredMainMessages[i].role === 'user') {
-        return { index: i, text: filteredMainMessages[i].text };
-      }
-    }
-    return null;
-  }, [filteredMainMessages]);
   const filteredSubagentMessages = useMemo(() => {
     const q = subagentMessageFilter.trim().toLowerCase();
     if (!q) return subagentMessages;
@@ -638,15 +544,18 @@ export const ChatPanel: React.FC<{
       </div>
 
       <div ref={chatScrollRef} className="relative flex-1 overflow-y-scroll px-2 py-1.5 flex flex-col gap-2 custom-scrollbar min-h-0">
-        {showLastUserMsg && lastUserMsgInfo && (
+        {floatingUserMsg && (
           <div
             className="sticky top-0 z-20 mx-1 mb-1 px-3 py-2 rounded-md bg-slate-100/95 dark:bg-white/10 backdrop-blur text-[13px] text-slate-700 dark:text-slate-200 border border-slate-200/60 dark:border-white/10 cursor-pointer"
-            onClick={() => lastUserMsgRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })}
-            title={lastUserMsgInfo.text}
+            onClick={() => {
+              const el = userMsgRefs.current.get(floatingUserMsg.index);
+              el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }}
+            title={floatingUserMsg.text}
           >
             <p className="line-clamp-4 whitespace-pre-wrap break-words">
               <span className="font-medium text-slate-500 dark:text-slate-400 mr-1.5">You:</span>
-              {lastUserMsgInfo.text}
+              {floatingUserMsg.text}
             </p>
           </div>
         )}
@@ -663,8 +572,7 @@ export const ChatPanel: React.FC<{
           expandedMessages={expandedMessages}
           setExpandedMessages={setExpandedMessages}
           verboseMode={verboseMode}
-          lastUserMsgInfo={lastUserMsgInfo}
-          lastUserMsgRef={lastUserMsgRef}
+          userMsgRefs={userMsgRefs}
           selectedAgent={selectedAgent}
           pendingPlanAgentId={pendingPlanAgentId}
           agentContext={agentContext}
@@ -680,7 +588,6 @@ export const ChatPanel: React.FC<{
             isUser={false}
             isExpanded={verboseMode || false}
             onToggle={() => {}}
-            isLastUser={false}
             planProps={{ pendingPlanAgentId, agentContext, onApprovePlan, onRejectPlan, onEditPlan, inputRef }}
           />
         )}

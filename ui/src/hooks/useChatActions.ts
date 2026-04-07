@@ -196,7 +196,7 @@ export function useChatActions(
         clearStatus();
         if (data.compacted) {
           useChatStore.getState().clear(false);
-          await useChatStore.getState().fetchWorkspaceState();
+          await useChatStore.getState().fetchSessionState();
           const refs = (data.referenced_files || []) as string[];
           const refsText = refs.length > 0
             ? '\n\n' + refs.map((f: string) => `Referenced file ${f}`).join('\n')

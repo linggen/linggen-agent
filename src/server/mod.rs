@@ -14,25 +14,19 @@ use crate::agent_manager::AgentManager;
 use axum::{
     extract::State,
     http::Uri,
-    response::{
-        sse::{Event, Sse},
-        IntoResponse, Response,
-    },
-    routing::{delete, get, patch, post},
+    response::{IntoResponse, Response},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
 use tracing::info;
 
 use agent_api::{
@@ -43,7 +37,7 @@ use chat_api::{approve_plan_handler, ask_user_response_handler, chat_handler, cl
 use config_api::{get_config_api, get_credentials_api, get_models_health, update_config_api, update_credentials_api, get_codex_auth_status, start_codex_auth_login, codex_auth_logout};
 use projects_api::{
     add_project, create_session, delete_agent_file_api, delete_skill_file_api,
-    get_agent_context_api, get_agent_file_api, get_skill_file_api, list_agent_children_api,
+    get_agent_file_api, get_skill_file_api,
     get_status_api,
     list_agent_files_api, list_agent_runs_api, list_agents_api, list_models_api, list_projects,
     delete_unified_session, get_skill_session_state, list_all_sessions, list_sessions, list_skill_files_api, list_skill_sessions, list_skills, reload_agents, reload_skills,
@@ -52,10 +46,10 @@ use projects_api::{
     get_user_me, auth_login, auth_callback, auth_logout,
     get_session_permission, update_session_permission,
 };
-use marketplace_api::{builtin_skills_install, builtin_skills_install_all, builtin_skills_list, clawhub_scan, community_search, marketplace_install, marketplace_move_to_global, marketplace_uninstall};
+use marketplace_api::{builtin_skills_install, builtin_skills_list, clawhub_scan, community_search, marketplace_install, marketplace_move_to_global, marketplace_uninstall};
 use missions_api::{
-    create_mission, delete_mission, delete_mission_session, get_mission,
-    get_mission_session_state, list_mission_runs, list_mission_sessions, list_missions,
+    create_mission, delete_mission,
+    get_mission_session_state, list_mission_runs, list_missions,
     trigger_mission, update_mission,
 };
 use storage_api::{storage_roots, storage_tree, storage_read_file, storage_write_file, storage_delete_file};
@@ -143,7 +137,7 @@ pub struct QueuedChatItem {
     pub timestamp: u64,
 }
 
-/// Discriminated payload for the Notification SSE event.
+/// Discriminated payload for the Notification event.
 /// Add new variants here to introduce new notification types.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -374,7 +368,7 @@ impl ServerEvent {
                 Some(Self::ToolProgress { agent_id, tool, line, stream, session_id })
             }
             AgentEvent::ContentBlockStart { agent_id, block_id, block_type, tool, args, parent_id } => {
-                tracing::debug!("SSE ContentBlockStart: agent={} type={} tool={:?}", agent_id, block_type, tool);
+                tracing::debug!("ContentBlockStart: agent={} type={} tool={:?}", agent_id, block_type, tool);
                 Some(Self::ContentBlockStart { agent_id, block_id, block_type, tool, args, parent_id, session_id })
             }
             AgentEvent::ContentBlockUpdate { agent_id, block_id, status, summary, is_error, parent_id, extra } => {
@@ -1109,12 +1103,12 @@ impl ServerState {
     }
 }
 
-pub struct ServerHandle {
-    pub task: tokio::task::JoinHandle<anyhow::Result<()>>,
-    pub port: u16,
+struct ServerHandle {
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    port: u16,
 }
 
-pub async fn prepare_server(
+async fn prepare_server(
     manager: Arc<AgentManager>,
     skill_manager: Arc<crate::skills::SkillManager>,
     host: &str,
@@ -1124,7 +1118,7 @@ pub async fn prepare_server(
 ) -> anyhow::Result<ServerHandle> {
     info!("linggen server starting on {}:{}...", host, port);
 
-    // SSE can be bursty (tool/status steps). Use a larger buffer to reduce lag drops.
+    // Events can be bursty (tool/status steps). Use a larger buffer to reduce lag drops.
     let (events_tx, _) = broadcast::channel(4096);
 
     let prompt_store = Arc::new(crate::prompts::PromptStore::load(
@@ -1150,7 +1144,7 @@ pub async fn prepare_server(
         user_bash_cwd: Arc::new(Mutex::new(HashMap::new())),
     });
 
-    // Bridge internal AgentManager events to SSE for the UI.
+    // Bridge internal AgentManager events to the UI (broadcast channel → WebRTC).
     {
         let state_clone = state.clone();
         tokio::spawn(async move {
@@ -1230,8 +1224,6 @@ pub async fn prepare_server(
         .route("/api/agent-file", post(upsert_agent_file_api))
         .route("/api/agent-file", delete(delete_agent_file_api))
         .route("/api/agent-runs", get(list_agent_runs_api))
-        .route("/api/agent-children", get(list_agent_children_api))
-        .route("/api/agent-context", get(get_agent_context_api))
         .route("/api/models", get(list_models_api))
         .route("/api/models/health", get(get_models_health))
         .route("/api/config", get(get_config_api).post(update_config_api))
@@ -1248,7 +1240,6 @@ pub async fn prepare_server(
         .route("/api/marketplace/move-to-global", post(marketplace_move_to_global))
         .route("/api/builtin-skills", get(builtin_skills_list))
         .route("/api/builtin-skills/install", post(builtin_skills_install))
-        .route("/api/builtin-skills/install-all", post(builtin_skills_install_all))
         .route("/api/clawhub/scan", get(clawhub_scan))
         .route("/api/skill-files", get(list_skill_files_api))
         .route("/api/skill-file", get(get_skill_file_api))
@@ -1270,10 +1261,8 @@ pub async fn prepare_server(
         .route("/api/tool-cancel", post(cancel_tool_execution))
         .route("/api/missions", get(list_missions).post(create_mission))
         .route("/api/missions/sessions/state", get(get_mission_session_state))
-        .route("/api/missions/{id}", get(get_mission).put(update_mission).delete(delete_mission))
+        .route("/api/missions/{id}", put(update_mission).delete(delete_mission))
         .route("/api/missions/{id}/runs", get(list_mission_runs))
-        .route("/api/missions/{id}/sessions", get(list_mission_sessions))
-        .route("/api/missions/{mission_id}/sessions/{session_id}", delete(delete_mission_session))
         .route("/api/missions/{id}/trigger", post(trigger_mission))
         .route("/api/chat", post(chat_handler))
         .route("/api/chat/clear", post(clear_chat_history_api))
@@ -1290,7 +1279,6 @@ pub async fn prepare_server(
         .route("/api/file", get(read_file_api))
         .route("/api/workspace/state", get(get_workspace_state))
         .route("/api/bash", post(run_bash_api))
-        .route("/api/events", get(events_handler))
         .route("/api/rtc/whip", post(rtc::whip_handler))
         .route("/api/rtc/token", get(rtc::whip_token_handler))
         .route("/api/status", get(get_status_api))
@@ -1467,79 +1455,6 @@ async fn static_handler(State(state): State<Arc<ServerState>>, uri: Uri) -> Resp
             }
         }
     }
-}
-
-/// Optional query parameter for session-scoped SSE filtering.
-#[derive(Deserialize, Default)]
-struct EventsQuery {
-    #[serde(default)]
-    session_id: Option<String>,
-}
-
-async fn events_handler(
-    State(state): State<Arc<ServerState>>,
-    axum::extract::Query(query): axum::extract::Query<EventsQuery>,
-) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    let rx = state.events_tx.subscribe();
-    let filter_session = query.session_id;
-    let stream = BroadcastStream::new(rx).filter_map(move |msg| {
-        let event = match msg {
-            Ok(event) => event,
-            Err(_) => ServerEvent::Resync {
-                reason: "broadcast_lag".into(),
-                lagged_count: None,
-            },
-        };
-        let seq = state.event_seq.fetch_add(1, Ordering::Relaxed);
-        let ui_msg = map_server_event_to_ui_message(event, seq)?;
-        // Server-side session filter.
-        // Events with session_id "global" always pass through to all clients.
-        let is_global_event = ui_msg.session_id.as_deref() == Some("global");
-
-        if !is_global_event {
-            if let Some(ref wanted) = filter_session {
-                // Client requested a specific session — drop events from other sessions.
-                match &ui_msg.session_id {
-                    Some(event_sid) if event_sid != wanted => {
-                        return None;
-                    }
-                    None => {
-                        // Events without session_id — drop to prevent cross-session bleed.
-                        return None;
-                    }
-                    _ => {} // session matches — pass through
-                }
-            } else {
-                // No session filter (main page with no active session).
-                // Drop content events tagged with a real session_id —
-                // they belong to app skills or scoped sessions, not the main view.
-                if let Some(ref sid) = ui_msg.session_id {
-                    if sid != "global" {
-                        let is_passthrough = matches!(ui_msg.kind.as_str(),
-                            "agent_status" | "activity" | "run" | "notification"
-                        );
-                        if !is_passthrough {
-                            return None;
-                        }
-                    }
-                }
-            }
-        }
-        let data = serde_json::to_string(&ui_msg).unwrap_or_default();
-        Some(Ok(Event::default().data(data)))
-    });
-
-    // Cap connection lifetime to 30 minutes so lingering TCP sockets are reclaimed.
-    // Clients (EventSource / TUI) auto-reconnect seamlessly.
-    let start = std::time::Instant::now();
-    let max_lifetime = std::time::Duration::from_secs(30 * 60);
-    let stream = stream.take_while(move |_| start.elapsed() < max_lifetime);
-
-    Sse::new(stream).keep_alive(
-        axum::response::sse::KeepAlive::new()
-            .interval(std::time::Duration::from_secs(15))
-            .text("ping"),
-    )
 }
 
 async fn health_handler() -> impl IntoResponse {

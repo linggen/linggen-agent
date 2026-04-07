@@ -1,9 +1,8 @@
 /**
  * Transport abstraction — decouples the UI from the underlying connection mechanism.
  *
- * Transports carry chat events bidirectionally between the linggen server and the browser.
- * The UI is transport-agnostic: it sends requests and receives events through this interface
- * regardless of whether the underlying pipe is SSE+fetch, WebRTC data channels, or anything else.
+ * Events flow bidirectionally between the linggen server and the browser over
+ * WebRTC data channels. The UI sends requests and receives events through this interface.
  */
 import type { UiEvent } from '../types';
 
@@ -69,7 +68,7 @@ export interface PlanAction {
  *   6. Call disconnect() to tear down the connection.
  */
 export interface Transport {
-  /** Establish the transport connection (SSE EventSource, WebRTC peer connection, etc.). */
+  /** Establish the transport connection. */
   connect(): void;
 
   /** Tear down the transport connection. */
@@ -104,173 +103,10 @@ export interface Transport {
   /** Proxy an HTTP request through the transport (for remote mode).
    *  Returns { status, body } where body is the raw response text. */
   httpProxy(method: string, url: string, body?: any): Promise<{ status: number; body: string }>;
-}
 
-// ---------------------------------------------------------------------------
-// SSE Transport implementation
-// ---------------------------------------------------------------------------
-
-/**
- * SSE transport — wraps the existing EventSource + fetch pattern.
- *
- * Inbound:  EventSource on /api/events?session_id=... receives server events.
- * Outbound: fetch POST to /api/chat, /api/ask-user-response, etc.
- */
-export class SseTransport implements Transport {
-  private callbacks: TransportCallbacks;
-  private eventSource: EventSource | null = null;
-  private currentSessionId: string | null = null;
-  private lastSeq = 0;
-  private hadConnection = false;
-  private _status: TransportStatus = 'disconnected';
-
-  constructor(callbacks: TransportCallbacks) {
-    this.callbacks = callbacks;
-  }
-
-  connect(): void {
-    // SSE connects per-session via subscribeSession; initial connect is a no-op.
-    // If no session is subscribed yet, open a global connection.
-    if (!this.currentSessionId) {
-      this.openEventSource(null);
-    }
-  }
-
-  disconnect(): void {
-    this.closeEventSource();
-    this.setStatus('disconnected');
-  }
-
-  subscribeSession(sessionId: string): void {
-    if (this.currentSessionId === sessionId) return;
-    this.closeEventSource();
-    this.currentSessionId = sessionId;
-    this.openEventSource(sessionId);
-  }
-
-  unsubscribeSession(_sessionId: string): void {
-    // SSE only supports one session at a time — unsubscribe is a no-op.
-    // The next subscribeSession() will reconnect.
-  }
-
-  status(): TransportStatus {
-    return this._status;
-  }
-
-  // --- Outbound ---
-
-  async sendChat(req: ChatRequest): Promise<{ session_id?: string; status?: string }> {
-    const resp = await fetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req),
-    });
-    return resp.json();
-  }
-
-  async sendAskUserResponse(req: AskUserResponse): Promise<void> {
-    await fetch('/api/ask-user-response', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req),
-    });
-  }
-
-  async sendPlanAction(req: PlanAction): Promise<void> {
-    const { type, edited_plan, ...rest } = req;
-    const url = `/api/plan/${type}`;
-    await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...rest, ...(edited_plan ? { edited_plan } : {}) }),
-    });
-  }
-
-  async sendClear(projectRoot: string, sessionId?: string | null): Promise<void> {
-    await fetch('/api/chat/clear', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project_root: projectRoot, session_id: sessionId }),
-    });
-  }
-
-  async sendCompact(projectRoot: string, sessionId: string | null, agentId: string, focus?: string): Promise<{ compacted?: boolean; referenced_files?: string[] }> {
-    const resp = await fetch('/api/chat/compact', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project_root: projectRoot, session_id: sessionId, agent_id: agentId, focus }),
-    });
-    return resp.json();
-  }
-
-  async httpProxy(_method: string, url: string, body?: any): Promise<{ status: number; body: string }> {
-    // SSE transport has direct HTTP access — just fetch normally
-    const opts: RequestInit = { method: _method };
-    if (body && _method !== 'GET') {
-      opts.headers = { 'Content-Type': 'application/json' };
-      opts.body = typeof body === 'string' ? body : JSON.stringify(body);
-    }
-    const resp = await fetch(url, opts);
-    const text = await resp.text();
-    return { status: resp.status, body: text };
-  }
-
-  // --- Internal ---
-
-  private openEventSource(sessionId: string | null): void {
-    this.setStatus('connecting');
-    const url = sessionId
-      ? `/api/events?session_id=${encodeURIComponent(sessionId)}`
-      : '/api/events';
-    const es = new EventSource(url);
-
-    es.onopen = () => {
-      const wasReconnecting = this.hadConnection;
-      this.lastSeq = 0;
-      this.hadConnection = true;
-      this.setStatus('connected');
-
-      if (wasReconnecting) {
-        this.callbacks.onReconnect?.();
-      }
-    };
-
-    es.onerror = () => {
-      if (this.hadConnection) {
-        this.setStatus('reconnecting');
-      }
-    };
-
-    es.onmessage = (e) => {
-      try {
-        const item = JSON.parse(e.data) as UiEvent;
-        if (typeof item.seq === 'number') {
-          if (item.seq <= this.lastSeq) return;
-          this.lastSeq = item.seq;
-        }
-        this.callbacks.onEvent(this.currentSessionId, item);
-      } catch (err) {
-        console.error('SSE parse error', err);
-        this.callbacks.onParseError?.();
-      }
-    };
-
-    this.eventSource = es;
-  }
-
-  private closeEventSource(): void {
-    if (this.eventSource) {
-      this.eventSource.close();
-      this.eventSource = null;
-      // Don't reset hadConnection here — preserve it across session switches
-      // so that onReconnect fires correctly after a session switch + reconnect.
-    }
-  }
-
-  private setStatus(status: TransportStatus): void {
-    this._status = status;
-    this.callbacks.onStatusChange(status);
-  }
+  /** Tell the server which session/project the frontend has active.
+   *  The server uses this to scope its page_state push. */
+  sendViewContext(ctx: { sessionId: string | null; projectRoot: string | null; isCompact: boolean }): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,18 +115,15 @@ export class SseTransport implements Transport {
 
 let _transport: Transport | null = null;
 
-/** Get or create the global transport instance. */
-export function getTransport(callbacks?: TransportCallbacks): Transport {
-  if (!_transport && callbacks) {
-    _transport = new SseTransport(callbacks);
-  }
+/** Get the global transport instance. */
+export function getTransport(): Transport {
   if (!_transport) {
-    throw new Error('Transport not initialized — call getTransport(callbacks) first');
+    throw new Error('Transport not initialized — call setTransport() first');
   }
   return _transport;
 }
 
-/** Replace the global transport (e.g., switch from SSE to WebRTC). */
+/** Set the global transport instance. */
 export function setTransport(transport: Transport): void {
   if (_transport) {
     _transport.disconnect();

@@ -5,7 +5,7 @@
  * The auto-scroll logic stays in React (needs DOM refs).
  */
 import { create } from 'zustand';
-import type { ChatMessage, ContentBlock, SubagentTreeEntry, WorkspaceState } from '../types';
+import type { ChatMessage, ContentBlock, SubagentTreeEntry, SessionState } from '../types';
 import { isToolStatusText } from '../components/chat/MessagePhase';
 import { dedupFetch } from '../lib/dedupFetch';
 import {
@@ -19,18 +19,20 @@ import {
   appendGeneratingActivity,
   updateParentSubagentTree,
   isPlanMessage,
-  dedupPlanMessages,
   mergeChatMessages,
   shouldHideInternalChatMessage,
   isPersistedToolOnlyMessage,
   reconstructContentFromText,
 } from '../lib/messageUtils';
+import { cacheImages, restoreImages, clearImageCache } from '../lib/imageCache';
+import { agentTracker } from '../lib/agentTracker';
+import { computeDisplay, mutate, mutateLast } from './chatMutationHelpers';
 import { useProjectStore } from './projectStore';
 import { useUiStore } from './uiStore';
 
 interface ChatState {
   messages: ChatMessage[];
-  workspaceState: WorkspaceState | null;
+  sessionState: SessionState | null;
 
   // Per-session message storage — avoids clear/refetch race on session switch
   _messagesBySession: Record<string, ChatMessage[]>;
@@ -70,130 +72,22 @@ interface ChatState {
   turnComplete: (agentId: string, durationMs?: number, contextTokens?: number) => void;
 
   // Workspace state
-  fetchWorkspaceState: (opts?: { projectRoot?: string; sessionId?: string }) => Promise<void>;
+  fetchSessionState: (opts?: { projectRoot?: string; sessionId?: string }) => Promise<void>;
 
   // Helpers
   isInClearCooldown: () => boolean;
 }
 
-/** Compute display messages from raw messages. */
-function computeDisplay(messages: ChatMessage[]): ChatMessage[] {
-  // Hide [BOARD_MOVE] messages — internal game state not meant for display
-  const visible = messages.filter(m => !(m.role === 'user' && m.text?.startsWith('[BOARD_MOVE]')));
-  const deduped = dedupPlanMessages(visible);
-  const plans: ChatMessage[] = [];
-  const nonPlans: ChatMessage[] = [];
-  for (const msg of deduped) {
-    if (isPlanMessage(msg)) {
-      plans.push(msg);
-    } else {
-      if ((msg.from || msg.role) !== 'user' && !(msg.content && msg.content.length > 0)) {
-        let text = msg.text || '';
-        text = stripEmbeddedStructuredJson(text);
-        if (msg.isGenerating) {
-          text = text.replace(/\{\s*"type\b[^}]*$/s, '').trim();
-        }
-        if (text !== msg.text && text) {
-          nonPlans.push({ ...msg, text });
-          continue;
-        }
-      }
-      nonPlans.push(msg);
-    }
-  }
-  return [...nonPlans, ...plans];
-}
-
-/** Apply a mutation to the active session's messages and recompute displayMessages. */
-function mutate(fn: (msgs: ChatMessage[]) => ChatMessage[]): (s: ChatState) => Partial<ChatState> {
-  return (s) => {
-    const sid = s._activeSessionId || '__none__';
-    const currentMsgs = s._messagesBySession[sid] || [];
-    const messages = fn(currentMsgs);
-    const displayMessages = computeDisplay(messages);
-    return {
-      messages,
-      displayMessages,
-      _messagesBySession: { ...s._messagesBySession, [sid]: messages },
-    };
-  };
-}
-
-/**
- * Fast-path mutation for token streaming: updates only the last message in
- * both `messages` and `displayMessages` without running `computeDisplay` over
- * the full array.  Falls back to `mutate` when the last message changes identity
- * (new message added, message removed, etc.).
- */
-function mutateLast(fn: (msgs: ChatMessage[]) => ChatMessage[]): (s: ChatState) => Partial<ChatState> {
-  return (s) => {
-    const sid = s._activeSessionId || '__none__';
-    const currentMsgs = s._messagesBySession[sid] || [];
-    const messages = fn(currentMsgs);
-
-    // Fast path: if the array length is the same and only the last element changed,
-    // patch displayMessages in-place instead of recomputing from scratch.
-    if (
-      messages.length === currentMsgs.length &&
-      messages.length > 0 &&
-      s.displayMessages.length > 0
-    ) {
-      const lastNew = messages[messages.length - 1];
-      const lastDisplay = s.displayMessages[s.displayMessages.length - 1];
-      // Match by identity: same role+from means we're updating the same bubble.
-      if (lastDisplay && lastNew.role === lastDisplay.role && lastNew.from === lastDisplay.from) {
-        const displayMessages = [...s.displayMessages];
-        displayMessages[displayMessages.length - 1] = lastNew;
-        return {
-          messages,
-          displayMessages,
-          _messagesBySession: { ...s._messagesBySession, [sid]: messages },
-        };
-      }
-    }
-
-    // Fallback: full recompute (new message was added, etc.)
-    const displayMessages = computeDisplay(messages);
-    return {
-      messages,
-      displayMessages,
-      _messagesBySession: { ...s._messagesBySession, [sid]: messages },
-    };
-  };
-}
-
-// Client-side image cache: images are ephemeral (never persisted to disk),
-// so we cache them here keyed by "from::normalizedText" to survive merges
-// and state reloads. Cleared on /clear.
-const _imageCache = new Map<string, string[]>();
-
-function imageCacheKey(from: string, text: string): string {
-  return `${from}::${normalizeMessageTextForDedup(text)}`;
-}
-
-/** Store images from a message into the cache. */
-function cacheImages(msg: ChatMessage): void {
-  if (msg.images && msg.images.length > 0) {
-    _imageCache.set(imageCacheKey(msg.from || msg.role || '', msg.text), msg.images);
-  }
-}
-
-/** Restore images from the cache onto a message if it's missing them. */
-function restoreImages(msg: ChatMessage): ChatMessage {
-  if (msg.images && msg.images.length > 0) return msg;
-  const cached = _imageCache.get(imageCacheKey(msg.from || msg.role || '', msg.text));
-  return cached ? { ...msg, images: cached } : msg;
-}
-
 export const useChatStore = create<ChatState>((set, get) => ({
   messages: [],
-  workspaceState: null,
+  sessionState: null,
   _messagesBySession: {},
   _activeSessionId: null,
   _chatClearTs: 0,
   displayMessages: [],
 
   setActiveSession: (sessionId) => {
+    agentTracker.reset();
     const sid = sessionId || '__none__';
     const msgs = get()._messagesBySession[sid] || [];
     set({
@@ -211,7 +105,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   clear: (withCooldown = true) => {
     const sid = get()._activeSessionId || '__none__';
-    _imageCache.clear();
+    clearImageCache();
+    agentTracker.reset();
     const bySession = { ...get()._messagesBySession };
     delete bySession[sid];
     set({ messages: [], displayMessages: [], _messagesBySession: bySession, ...(withCooldown ? { _chatClearTs: Date.now() } : {}) });
@@ -650,7 +545,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Recover final text from multiple sources:
     // 1. liveText (token-accumulated streaming text)
     // 2. msg.text (if not a placeholder like "Thinking...")
-    // 3. msg.segments text entries (set by addTextSegment from text_segment SSE events)
+    // 3. msg.segments text entries (set by addTextSegment from text_segment events)
     const segmentsText = (msg.segments || [])
       .filter((s: { type: string; text?: string }) => s.type === 'text' && s.text)
       .map((s: { text?: string }) => s.text)
@@ -671,7 +566,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     return next;
   })),
 
-  fetchWorkspaceState: async (opts) => {
+  fetchSessionState: async (opts) => {
     const projectState = useProjectStore.getState();
     let selectedProjectRoot = opts?.projectRoot ?? projectState.selectedProjectRoot;
     const activeSessionId = opts?.sessionId ?? projectState.activeSessionId;
@@ -705,13 +600,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const resp = await dedupFetch(url.toString());
       const data = await resp.json();
       // Skip update if workspace state hasn't meaningfully changed (prevents re-render loops)
-      const prev = get().workspaceState;
+      const prev = get().sessionState;
       const prevMsgCount = prev?.messages?.length ?? 0;
       const newMsgCount = data?.messages?.length ?? 0;
       const prevStatus = prev?.agent_status;
       const newStatus = data?.agent_status;
       if (prevMsgCount === newMsgCount && prevStatus === newStatus && prev?.plan_status === data?.plan_status) return;
-      set({ workspaceState: data });
+      set({ sessionState: data });
 
       const state = get();
       if (data.messages && !state.isInClearCooldown()) {
@@ -726,7 +621,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
               const parsed = JSON.parse(bodyStr);
               if (parsed?.type === 'plan' && parsed?.plan) {
                 // Normalize the from field (strip run- prefix) so it matches
-                // the live plan message created by upsertPlan during SSE.
+                // the live plan message created by upsertPlan during streaming.
                 const rawFrom = String(meta.from || '');
                 const fromMatch = rawFrom.match(/^run-(.+?)-\d+/);
                 const normalizedFrom = fromMatch ? fromMatch[1] : rawFrom;

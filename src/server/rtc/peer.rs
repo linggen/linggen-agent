@@ -119,6 +119,14 @@ async fn run_peer(
     // Track when ICE entered Disconnected state for timeout-based cleanup.
     let mut disconnected_since: Option<Instant> = None;
 
+    // -- Page state push (replaces HTTP polling storm) --
+    let mut view_ctx = super::page_state::ViewContext::default();
+    let mut dirty_flags: u64 = 0;
+    let mut force_page_state = false;
+    let mut last_page_state_at = Instant::now();
+    let mut page_state_interval = tokio::time::interval(Duration::from_secs(2));
+    page_state_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         // Drain ONE pending write per cycle — writing multiple crashes str0m's SCTP.
         if !dc_write_paused {
@@ -193,6 +201,8 @@ async fn run_peer(
                                 &state,
                                 &mut session_channels,
                                 &mut channel_sessions,
+                                &mut view_ctx,
+                                &mut force_page_state,
                             ) {
                                 // Spawn async processing to avoid blocking str0m's event loop.
                                 let tx = ctrl_resp_tx.clone();
@@ -248,6 +258,31 @@ async fn run_peer(
             Duration::ZERO
         };
 
+        // Immediate page state push on view context change (don't wait for 2s tick)
+        if force_page_state && control_channel_id.is_some() {
+            let now_inst = Instant::now();
+            if now_inst.duration_since(last_page_state_at) >= Duration::from_millis(200) {
+                let flags = dirty_flags | super::page_state::DIRTY_ALL;
+                dirty_flags = 0;
+                force_page_state = false;
+                last_page_state_at = now_inst;
+                let cid = control_channel_id.unwrap();
+                let st = state.clone();
+                let ctx = view_ctx.clone();
+                let tx = ctrl_resp_tx.clone();
+                tokio::spawn(async move {
+                    let ps = super::page_state::build_page_state(&st, &ctx, flags).await;
+                    if let Ok(data) = serde_json::to_value(&ps) {
+                        let msg = serde_json::json!({
+                            "kind": "page_state",
+                            "data": data
+                        });
+                        let _ = tx.send((None, cid, msg)).await;
+                    }
+                });
+            }
+        }
+
         // Keep spinning without blocking if: timeout elapsed OR we have writes ready to send.
         // But do NOT spin when paused — we need to enter select! to receive UDP (SCTP ACKs).
         if wait.is_zero() || (!dc_write_paused && !pending_dc_writes.is_empty()) {
@@ -286,6 +321,7 @@ async fn run_peer(
                             &mut pending_events,
                             &mut pending_dc_writes,
                             &state,
+                            &mut dirty_flags,
                         );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -297,8 +333,44 @@ async fn run_peer(
 
             // Receive async control request responses and send on data channel
             Some((rid, cid, result)) = ctrl_resp_rx.recv() => {
-                if let Some(rid) = rid {
-                    enqueue_response(&mut pending_dc_writes, cid, &rid, result);
+                match rid {
+                    Some(rid) => enqueue_response(&mut pending_dc_writes, cid, &rid, result),
+                    None => {
+                        // Unsolicited push (e.g. page_state) — write directly
+                        if pending_dc_writes.len() < MAX_DC_WRITE_QUEUE {
+                            pending_dc_writes.push_back((cid, result.to_string()));
+                        }
+                    }
+                }
+            }
+
+            // Page state heartbeat — push aggregated state every 2s when dirty
+            _ = page_state_interval.tick() => {
+                let should_send = (dirty_flags != 0 || force_page_state)
+                    && control_channel_id.is_some();
+                if should_send {
+                    let now_inst = Instant::now();
+                    // Debounce: skip if last push was < 200ms ago (rapid context changes)
+                    if now_inst.duration_since(last_page_state_at) >= Duration::from_millis(200) {
+                        let flags = dirty_flags;
+                        dirty_flags = 0;
+                        force_page_state = false;
+                        last_page_state_at = now_inst;
+                        let cid = control_channel_id.unwrap();
+                        let st = state.clone();
+                        let ctx = view_ctx.clone();
+                        let tx = ctrl_resp_tx.clone();
+                        tokio::spawn(async move {
+                            let ps = super::page_state::build_page_state(&st, &ctx, flags).await;
+                            if let Ok(data) = serde_json::to_value(&ps) {
+                                let msg = serde_json::json!({
+                                    "kind": "page_state",
+                                    "data": data
+                                });
+                                let _ = tx.send((None, cid, msg)).await;
+                            }
+                        });
+                    }
                 }
             }
 
@@ -328,6 +400,8 @@ fn handle_control_message(
     _state: &Arc<ServerState>,
     _session_channels: &mut HashMap<String, str0m::channel::ChannelId>,
     _channel_sessions: &mut HashMap<str0m::channel::ChannelId, String>,
+    view_ctx: &mut super::page_state::ViewContext,
+    force_page_state: &mut bool,
 ) -> Option<ControlRequest> {
     let msg: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -359,6 +433,15 @@ fn handle_control_message(
                 msg_type,
                 body: msg,
             })
+        }
+
+        "set_view_context" => {
+            view_ctx.session_id = msg.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            view_ctx.project_root = msg.get("project_root").and_then(|v| v.as_str()).map(|s| s.to_string());
+            view_ctx.is_compact = msg.get("is_compact").and_then(|v| v.as_bool()).unwrap_or(false);
+            *force_page_state = true;
+            tracing::debug!("View context updated: session={:?} project={:?} compact={}", view_ctx.session_id, view_ctx.project_root, view_ctx.is_compact);
+            None
         }
 
         _ => {
@@ -642,7 +725,13 @@ fn forward_event_to_channels(
     pending_events: &mut HashMap<String, (Instant, Vec<String>)>,
     pending_dc_writes: &mut std::collections::VecDeque<(str0m::channel::ChannelId, String)>,
     state: &Arc<ServerState>,
+    dirty_flags: &mut u64,
 ) {
+    // StateUpdated → set dirty flag for page state push, don't forward to DC
+    if matches!(event, crate::server::ServerEvent::StateUpdated) {
+        *dirty_flags |= super::page_state::DIRTY_ALL;
+        return;
+    }
     // Prune expired pending event buffers (older than 60s)
     let now = Instant::now();
     pending_events.retain(|_, (created, _)| now.duration_since(*created) < Duration::from_secs(60));

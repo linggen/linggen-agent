@@ -6,6 +6,7 @@ import type { AgentInfo, AgentRunInfo, ModelInfo, OllamaPsResponse, SkillInfo } 
 import { useProjectStore } from './projectStore';
 import { TOKEN_RATE_WINDOW_MS } from '../lib/messageUtils';
 import { dedupFetch } from '../lib/dedupFetch';
+import { agentTracker } from '../lib/agentTracker';
 
 export type AgentStatusValue = 'idle' | 'model_loading' | 'thinking' | 'calling_tool' | 'working';
 
@@ -29,14 +30,6 @@ interface AgentState {
   agentStatusText: Record<string, string>;              // key: session ID
   agentContext: Record<string, { tokens: number; messages: number; tokenLimit?: number }>; // key: session ID
   tokensPerSec: number; // global — not per-session
-
-  // Non-reactive tracking (not in React state, just plain properties)
-  _runStartTs: Record<string, number>;          // key: session ID
-  _latestContextTokens: Record<string, number>; // key: session ID
-  _subagentParentMap: Record<string, string>;
-  _subagentStats: Record<string, { toolCount: number; contextTokens: number }>;
-  _tokenRateSamples: Array<{ ts: number; tokens: number }>;
-  _lastTokenAt: number;
 
   // Derived
   isRunning: () => boolean;
@@ -86,13 +79,6 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   agentContext: {},
   tokensPerSec: 0,
 
-  _runStartTs: {},
-  _latestContextTokens: {},
-  _subagentParentMap: {},
-  _subagentStats: {},
-  _tokenRateSamples: [],
-  _lastTokenAt: 0,
-
   isRunning: () => Object.values(get().agentStatus).some((s) => s !== 'idle'),
 
   setSelectedAgent: (agent) => {
@@ -110,23 +96,11 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   })),
   resetStatus: () => set({ agentStatus: {}, agentStatusText: {} }),
   recordTokenEvent: () => {
-    // Called when a token SSE event arrives — records timestamp for rate calculation
-    get()._lastTokenAt = Date.now();
+    agentTracker.recordTokenSample(1);
   },
   recomputeTokenRate: (nowMs) => {
-    const state = get();
-    const now = nowMs ?? Date.now();
-    const cutoff = now - TOKEN_RATE_WINDOW_MS;
-    state._tokenRateSamples = state._tokenRateSamples.filter((s) => s.ts >= cutoff);
-    if (state._tokenRateSamples.length === 0) {
-      set({ tokensPerSec: 0 });
-      return;
-    }
-    const totalTokens = state._tokenRateSamples.reduce((sum, s) => sum + s.tokens, 0);
-    const oldestTs = state._tokenRateSamples[0]?.ts ?? now;
-    const elapsedSec = Math.max((now - oldestTs) / 1000, 0.25);
-    const rate = totalTokens / elapsedSec;
-    set({ tokensPerSec: Number.isFinite(rate) ? rate : 0 });
+    const rate = agentTracker.pruneAndComputeRate(TOKEN_RATE_WINDOW_MS, nowMs);
+    set({ tokensPerSec: rate });
   },
 
   fetchAgents: async (projectRootOverride) => {
@@ -270,7 +244,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       if (!resp.ok) return;
       const raw = await resp.json();
       const data = Array.isArray(raw) ? raw : [];
-      // Skip update if runs haven't changed (prevents re-render loops from SSE)
+      // Skip update if runs haven't changed (prevents re-render loops from events)
       const prev = get().agentRuns;
       if (data.length === prev.length && data.every((r: any, i: number) => r.run_id === prev[i]?.run_id && r.status === prev[i]?.status)) return;
       set({ agentRuns: data });

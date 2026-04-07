@@ -20,7 +20,7 @@ export const SubagentTreeView: React.FC<{
       className={cn('mb-1.5 font-mono text-[12px]', !isGenerating && allDone && 'cursor-pointer select-none')}
       onClick={!isGenerating && allDone ? onToggle : undefined}
     >
-      {entries.map((entry) => {
+      {entries.map((entry, entryIdx) => {
         const isRunning = entry.status === 'running';
         const bulletColor = isRunning
           ? 'text-amber-500'
@@ -30,7 +30,7 @@ export const SubagentTreeView: React.FC<{
         const taskPreview = entry.task.length > 60 ? entry.task.slice(0, 57) + '…' : entry.task;
 
         return (
-          <div key={entry.subagentId} className="mb-0.5">
+          <div key={`${entry.subagentId}-${entryIdx}`} className="mb-0.5">
             <div className="flex items-start gap-0">
               <span className="shrink-0">&nbsp;&nbsp;</span>
               <span className={cn('text-[11px] mr-0.5', bulletColor, isRunning && 'animate-pulse')}>⏺</span>

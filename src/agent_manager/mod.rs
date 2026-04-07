@@ -51,7 +51,7 @@ pub struct AgentManager {
     pub run_store: Arc<crate::project_store::RunStore>,
     /// Last activity time per agent, keyed by "{project_root}|{agent_id}".
     last_activity: Mutex<HashMap<String, Instant>>,
-    /// Interface mode (Web, TUI, or Both) passed into every EngineConfig.
+    /// Interface mode passed into every EngineConfig.
     interface_mode: InterfaceMode,
 }
 
@@ -979,14 +979,6 @@ impl AgentManager {
         session_id: Option<&str>,
     ) -> Result<Vec<crate::project_store::AgentRunRecord>> {
         Ok(self.run_store.list_runs(session_id))
-    }
-
-    pub async fn list_agent_children(
-        &self,
-        parent_run_id: &str,
-        _project_root: Option<&str>,
-    ) -> Result<Vec<crate::project_store::AgentRunRecord>> {
-        Ok(self.run_store.list_children(parent_run_id))
     }
 
     pub async fn get_agent_run(

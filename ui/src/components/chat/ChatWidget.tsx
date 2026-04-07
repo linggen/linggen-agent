@@ -1,5 +1,5 @@
 /**
- * Self-contained chat widget — owns SSE, actions, run info, auto-scroll.
+ * Self-contained chat widget — owns transport, actions, run info, auto-scroll.
  * Renders <ChatPanel> with all props derived from stores + hooks.
  */
 import React, { useCallback, useMemo } from 'react';
@@ -70,12 +70,12 @@ export const ChatWidget: React.FC<ChatWidgetProps> = ({
     editPlan,
   } = useChatActions(scrollToBottom, runningMainRunIds, effectiveRoot);
 
-  // --- Transport (SSE or WebRTC) ---
+  // --- Transport (WebRTC) ---
   const effectiveSessionId = sessionId || null;
   useTransport({
     sessionId: effectiveSessionId,
     onParseError: () => {
-      useChatStore.getState().fetchWorkspaceState();
+      useChatStore.getState().fetchSessionState();
       useAgentStore.getState().fetchAgentRuns();
     },
   });

@@ -1,5 +1,4 @@
 use crate::config::AgentSpec;
-use crate::server::chat_helpers::sanitize_message_for_ui;
 use crate::server::{ServerEvent, ServerState};
 use crate::skills::Skill;
 use axum::{
@@ -286,130 +285,6 @@ pub(crate) async fn list_agent_runs_api(
     }
 }
 
-#[derive(Deserialize)]
-pub(crate) struct AgentChildrenQuery {
-    run_id: String,
-    project_root: Option<String>,
-}
-
-pub(crate) async fn list_agent_children_api(
-    State(state): State<Arc<ServerState>>,
-    Query(query): Query<AgentChildrenQuery>,
-) -> impl IntoResponse {
-    match state.manager.list_agent_children(&query.run_id, query.project_root.as_deref()).await {
-        Ok(runs) => Json(runs).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-pub(crate) struct AgentContextQuery {
-    run_id: String,
-    view: Option<String>, // "summary" | "raw"
-    project_root: Option<String>,
-}
-
-#[derive(Serialize)]
-struct AgentContextSummary {
-    message_count: usize,
-    user_messages: usize,
-    agent_messages: usize,
-    system_messages: usize,
-    started_at: u64,
-    ended_at: Option<u64>,
-}
-
-#[derive(Serialize)]
-struct AgentContextMessage {
-    agent_id: String,
-    from_id: String,
-    to_id: String,
-    content: String,
-    timestamp: u64,
-    is_observation: bool,
-}
-
-#[derive(Serialize)]
-struct AgentContextResponse {
-    run: crate::project_store::AgentRunRecord,
-    summary: AgentContextSummary,
-    messages: Option<Vec<AgentContextMessage>>,
-}
-
-pub(crate) async fn get_agent_context_api(
-    State(state): State<Arc<ServerState>>,
-    Query(query): Query<AgentContextQuery>,
-) -> impl IntoResponse {
-    let run = match state.manager.get_agent_run(&query.run_id, query.project_root.as_deref()).await {
-        Ok(Some(run)) => run,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    let root = canonical_project_root(&run.repo_path);
-    let ctx = match state.manager.get_or_create_project(root).await {
-        Ok(ctx) => ctx,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    let all_messages = match state.manager.global_sessions
-        .get_chat_history(&run.session_id)
-    {
-        Ok(messages) => messages,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    let end_ts = run.ended_at.unwrap_or(u64::MAX);
-    let messages: Vec<AgentContextMessage> = all_messages
-        .into_iter()
-        .filter(|m| m.timestamp >= run.started_at && m.timestamp <= end_ts)
-        .map(|m| AgentContextMessage {
-            agent_id: m.agent_id,
-            from_id: m.from_id,
-            to_id: m.to_id,
-            content: m.content,
-            timestamp: m.timestamp,
-            is_observation: m.is_observation,
-        })
-        .collect();
-
-    let user_messages = messages.iter().filter(|m| m.from_id == "user").count();
-    let system_messages = messages.iter().filter(|m| m.from_id == "system").count();
-    let agent_messages = messages
-        .len()
-        .saturating_sub(user_messages)
-        .saturating_sub(system_messages);
-    let summary = AgentContextSummary {
-        message_count: messages.len(),
-        user_messages,
-        agent_messages,
-        system_messages,
-        started_at: run.started_at,
-        ended_at: run.ended_at,
-    };
-
-    let is_raw = query
-        .view
-        .as_deref()
-        .map(|v| v.eq_ignore_ascii_case("raw"))
-        .unwrap_or(false);
-
-    let ui_messages: Vec<AgentContextMessage> = messages
-        .into_iter()
-        .filter_map(|mut m| {
-            let cleaned = sanitize_message_for_ui(&m.from_id, &m.content)?;
-            m.content = cleaned;
-            Some(m)
-        })
-        .collect();
-
-    Json(AgentContextResponse {
-        run,
-        summary,
-        messages: if is_raw { Some(ui_messages) } else { None },
-    })
-    .into_response()
-}
 
 pub(crate) async fn list_models_api(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     let models_guard = state.manager.models.read().await;
@@ -744,7 +619,7 @@ pub(crate) async fn create_session(
     }
 }
 
-/// Resolve a session for the TUI (or any client) to use.
+/// Resolve a session for a client to use.
 /// Returns the most recent empty session, or creates a new one.
 #[derive(Deserialize)]
 pub(crate) struct ResolveSessionRequest {

@@ -1,6 +1,6 @@
 /**
  * Per-kind event handler functions — dispatches UiEvent events to stores.
- * Transport-agnostic: works with both SSE and WebRTC transports.
+ * Transport-agnostic: works with the WebRTC transport layer.
  * Reads/writes state directly via Zustand stores — no deps object needed.
  */
 import type { UiEvent, ContentBlock, SubagentTreeEntry, SubagentToolStep, Plan } from '../types';
@@ -9,6 +9,7 @@ import { useAgentStore } from '../stores/agentStore';
 import { useChatStore } from '../stores/chatStore';
 import { useUiStore } from '../stores/uiStore';
 import type { AgentStatusValue } from '../stores/agentStore';
+import { agentTracker } from './agentTracker';
 import {
   stripEmbeddedStructuredJson,
   isStatusLineText,
@@ -17,7 +18,7 @@ import {
 } from './messageUtils';
 
 // ---------------------------------------------------------------------------
-// Tool activity text parser (mirrors TUI parse_activity_text)
+// Tool activity text parser
 // ---------------------------------------------------------------------------
 
 const toolPrefixMap: [string, string][] = [
@@ -95,8 +96,9 @@ function getSessionId(item: UiEvent): string {
 
 export function dispatchEvent(item: UiEvent, sessionIdOverride?: string): void {
   const effectiveSessionId = sessionIdOverride ?? useProjectStore.getState().activeSessionId;
-  // Allow notifications and permission prompts through regardless — they are global events.
-  if (item.kind !== 'notification' && item.kind !== 'ask_user' && item.kind !== 'widget_resolved' && item.session_id && item.session_id !== 'global') {
+  // Allow notifications, permission prompts, and agent status through regardless — they are global events.
+  // agent_status must pass through so the session list can show spinners for busy sessions.
+  if (item.kind !== 'notification' && item.kind !== 'ask_user' && item.kind !== 'widget_resolved' && item.kind !== 'agent_status' && item.session_id && item.session_id !== 'global') {
     // Drop events from other sessions when we have an active session.
     if (effectiveSessionId && item.session_id !== effectiveSessionId) return;
     // Drop session-scoped events when no session is active — they belong to
@@ -112,6 +114,15 @@ export function dispatchEvent(item: UiEvent, sessionIdOverride?: string): void {
       const msgs = useChatStore.getState().messages;
       const lastMsg = [...msgs].reverse().find(m => m.role === 'assistant' || (m as any).role === 'agent');
       window.parent.postMessage({ type: 'linggen-skill-event', event: 'stream_end', payload: { text: lastMsg?.text || '' } }, '*');
+    } else if (item.kind === 'content_block') {
+      // Forward tool activity so skill apps can show real-time progress.
+      window.parent.postMessage({ type: 'linggen-skill-event', event: 'content_block', payload: {
+        phase: item.phase,           // 'start' | 'update' | 'done' | 'error'
+        tool: item.data?.tool,       // e.g. 'Bash', 'Read', 'Glob'
+        args: item.data?.args,       // tool arguments (may contain command text)
+        blockId: item.data?.block_id,
+        output: item.data?.output,   // tool output (on 'done'/'update')
+      } }, '*');
     }
   }
 
@@ -131,6 +142,7 @@ export function dispatchEvent(item: UiEvent, sessionIdOverride?: string): void {
     case 'notification':   handleNotification(item); return;
     case 'working_folder': handleWorkingFolder(item); return;
     case 'widget_resolved': handleWidgetResolved(item); return;
+    case 'page_state':   handlePageState(item); return;
   }
 }
 
@@ -143,13 +155,13 @@ function handleRun(item: UiEvent): void {
   const agentStore = useAgentStore.getState();
   const chatStore = useChatStore.getState();
 
-  if (item.phase === 'sync' || item.phase === 'outcome' || item.phase === 'resync') {
-    chatStore.fetchWorkspaceState();
-    projectStore.fetchFiles(projectStore.currentPath);
-    projectStore.fetchAllAgentTrees();
-    agentStore.fetchAgentRuns();
-    projectStore.fetchSessions();
-    useUiStore.getState().bumpPermissionVersion();
+  // sync/resync phases are now handled by server-pushed page_state — no HTTP fetches needed.
+  // outcome still needs workspace state fetch (persisted chat messages changed).
+  if (item.phase === 'sync' || item.phase === 'resync') {
+    return;
+  }
+  if (item.phase === 'outcome') {
+    chatStore.fetchSessionState();
     return;
   }
 
@@ -162,12 +174,24 @@ function handleRun(item: UiEvent): void {
     const sid = getSessionId(item);
 
     const estTokens = Number(item.data.estimated_tokens || 0);
-    if (sid) agentStore._latestContextTokens[sid] = estTokens;
+    if (sid) agentTracker.latestContextTokens[sid] = estTokens;
 
-    const parentId = agentStore._subagentParentMap[agentIdKey];
+    // Accumulate session token usage from actual_prompt/completion_tokens
+    const promptDelta = Number(item.data.actual_prompt_tokens || 0);
+    const completionDelta = Number(item.data.actual_completion_tokens || 0);
+    if (promptDelta > 0 || completionDelta > 0) {
+      const prev = useAgentStore.getState().sessionTokens;
+      useAgentStore.setState({
+        sessionTokens: {
+          prompt: prev.prompt + promptDelta,
+          completion: prev.completion + completionDelta,
+        },
+      });
+    }
+
+    const parentId = agentTracker.getParent(agentIdKey);
     if (parentId) {
-      const stats = agentStore._subagentStats[agentIdKey];
-      if (stats) stats.contextTokens = estTokens;
+      agentTracker.setSubagentContextTokens(agentIdKey, estTokens);
       chatStore.updateSubagentTree(parentId, agentIdKey,
         (entry) => ({ ...entry, contextTokens: estTokens }));
     } else if (sid) {
@@ -211,8 +235,7 @@ function handleRun(item: UiEvent): void {
     const subagentId = String(item.data.subagent_id || '');
     const task = String(item.data.task || '');
     if (subagentId && parentId) {
-      agentStore._subagentParentMap[subagentId.toLowerCase()] = parentId;
-      agentStore._subagentStats[subagentId.toLowerCase()] = { toolCount: 0, contextTokens: 0 };
+      agentTracker.registerSubagent(subagentId, parentId);
       const newEntry: SubagentTreeEntry = {
         subagentId,
         agentName: subagentId,
@@ -234,8 +257,7 @@ function handleRun(item: UiEvent): void {
     if (subagentId && parentId) {
       chatStore.updateSubagentTree(parentId, subagentId,
         (entry) => ({ ...entry, status: 'done', currentActivity: null }));
-      delete agentStore._subagentParentMap[subagentId.toLowerCase()];
-      delete agentStore._subagentStats[subagentId.toLowerCase()];
+      agentTracker.unregisterSubagent(subagentId);
     }
     return;
   }
@@ -267,7 +289,7 @@ export { handleAskUser };
 function handleTextSegment(item: UiEvent): void {
   const agentId = String(item.agent_id || '');
   if (!agentId) return;
-  if (useAgentStore.getState()._subagentParentMap[agentId.toLowerCase()]) return;
+  if (agentTracker.getParent(agentId)) return;
   const segText = String(item.text || '').trim();
   if (!segText) return;
   useChatStore.getState().addTextSegment(agentId, segText);
@@ -287,14 +309,13 @@ function handleActivity(item: UiEvent): void {
   // Route subagent activity to parent tree
   const parentIdFromData = item.data?.parent_id ? String(item.data.parent_id) : null;
   const parentIdForSubagent =
-    agentStore._subagentParentMap[agentId.toLowerCase()] ||
+    agentTracker.getParent(agentId) ||
     (parentIdFromData ? parentIdFromData.toLowerCase() : null);
 
   if (parentIdForSubagent && statusRaw !== 'mission_triggered') {
     if (nextStatus === 'calling_tool') {
       if (item.phase !== 'done') {
-        const stats = agentStore._subagentStats[agentId.toLowerCase()];
-        if (stats) stats.toolCount += 1;
+        const toolCount = agentTracker.incrementToolCount(agentId);
         const newStep: SubagentToolStep | null = statusText
           ? (() => {
               for (const [prefix, toolName] of toolPrefixMap) {
@@ -308,7 +329,7 @@ function handleActivity(item: UiEvent): void {
         chatStore.updateSubagentTree(parentIdForSubagent, agentId,
           (entry) => ({
             ...entry,
-            toolCount: (stats?.toolCount ?? entry.toolCount + 1),
+            toolCount: toolCount || entry.toolCount + 1,
             currentActivity: statusText || entry.currentActivity,
             toolSteps: newStep ? [...(entry.toolSteps || []), newStep] : (entry.toolSteps || []),
           }));
@@ -360,9 +381,7 @@ function handleActivity(item: UiEvent): void {
     }
   }
 
-  if (sid && !agentStore._runStartTs[sid]) {
-    agentStore._runStartTs[sid] = Date.now();
-  }
+  if (sid) agentTracker.ensureRunStarted(sid);
 
   if (statusText.length > 0 && item.phase !== 'done') {
     if (nextStatus === 'model_loading' || nextStatus === 'thinking') {
@@ -376,13 +395,7 @@ function handleActivity(item: UiEvent): void {
   }
 
   if (nextStatus === 'idle' || item.phase === 'failed') {
-    const startTs = sid ? agentStore._runStartTs[sid] : undefined;
-    const elapsed = startTs ? Date.now() - startTs : undefined;
-    const ctxTokens = (sid ? agentStore._latestContextTokens[sid] : undefined) || undefined;
-    if (sid) {
-      delete agentStore._runStartTs[sid];
-      delete agentStore._latestContextTokens[sid];
-    }
+    const { elapsed, contextTokens: ctxTokens } = sid ? agentTracker.clearRun(sid) : {};
     chatStore.finalizeOnIdle(agentId, elapsed, ctxTokens);
     uiStore.setActivePlan(null);
   }
@@ -401,6 +414,7 @@ function flushTokenBuffer() {
     if (text) chatStore.appendToken(agentId, text, isThinking);
   }
   _tokenBuffer.clear();
+  useAgentStore.getState().recomputeTokenRate();
 }
 
 function handleToken(item: UiEvent): void {
@@ -408,8 +422,7 @@ function handleToken(item: UiEvent): void {
   const isThinking = item.data?.thinking === true;
   if (!agentId) return;
 
-  const agentStore = useAgentStore.getState();
-  if (agentStore._subagentParentMap[agentId.toLowerCase()]) return;
+  if (agentTracker.getParent(agentId)) return;
 
   if (item.phase === 'done') {
     // Flush any pending tokens before marking thinking done
@@ -421,6 +434,9 @@ function handleToken(item: UiEvent): void {
   }
 
   const tokenText = String(item.text || '');
+  if (!isThinking && tokenText) {
+    useAgentStore.getState().recordTokenEvent();
+  }
   const existing = _tokenBuffer.get(agentId);
   if (existing && existing.isThinking === isThinking) {
     existing.text += tokenText;
@@ -443,8 +459,7 @@ function handleMessage(item: UiEvent): void {
   if (!content) return;
   if (shouldHideInternalChatMessage(from, content)) return;
 
-  const agentStore = useAgentStore.getState();
-  if (agentStore._subagentParentMap[from.toLowerCase()]) return;
+  if (agentTracker.getParent(from)) return;
 
   try {
     const parsed = JSON.parse(content);
@@ -464,10 +479,7 @@ function handleMessage(item: UiEvent): void {
 
   const tsMs = Number(item.ts_ms || Date.now());
   const sid = getSessionId(item);
-  const msgStartTs = sid ? agentStore._runStartTs[sid] : undefined;
-  const msgElapsed = msgStartTs ? Date.now() - msgStartTs : undefined;
-  const msgCtxTokens = (sid ? agentStore._latestContextTokens[sid] : undefined) || undefined;
-  if (sid) delete agentStore._runStartTs[sid];
+  const { elapsed: msgElapsed, contextTokens: msgCtxTokens } = sid ? agentTracker.clearRun(sid) : {};
 
   const isError = from !== 'user' && content.startsWith('Error:');
 
@@ -479,15 +491,13 @@ function handleContentBlock(item: UiEvent): void {
   if (!agentId) return;
   const data = item.data || {};
 
-  const agentStore = useAgentStore.getState();
   const chatStore = useChatStore.getState();
 
   // Route subagent content blocks to parent tree
-  const parentId = agentStore._subagentParentMap[agentId.toLowerCase()];
+  const parentId = agentTracker.getParent(agentId);
   if (parentId) {
     if (item.phase === 'start' && data.block_type === 'tool_use') {
-      const stats = agentStore._subagentStats[agentId.toLowerCase()];
-      if (stats) stats.toolCount += 1;
+      const toolCount = agentTracker.incrementToolCount(agentId);
       const newStep: SubagentToolStep = {
         toolName: data.tool || 'Tool',
         args: data.args || '',
@@ -496,7 +506,7 @@ function handleContentBlock(item: UiEvent): void {
       chatStore.updateSubagentTree(parentId, agentId,
         (entry) => ({
           ...entry,
-          toolCount: (stats?.toolCount ?? entry.toolCount + 1),
+          toolCount: toolCount || entry.toolCount + 1,
           currentActivity: `${data.tool || 'Tool'}: ${data.args || ''}`,
           toolSteps: [...(entry.toolSteps || []), newStep],
         }));
@@ -534,11 +544,10 @@ function handleContentBlock(item: UiEvent): void {
 
       const sid = getSessionId(item);
       if (sid) {
+        const agentStore = useAgentStore.getState();
         agentStore.setAgentStatus((prev) => ({ ...prev, [sid]: 'calling_tool' as AgentStatusValue }));
         agentStore.setAgentStatusText((prev) => ({ ...prev, [sid]: activityLine }));
-        if (!agentStore._runStartTs[sid]) {
-          agentStore._runStartTs[sid] = Date.now();
-        }
+        agentTracker.ensureRunStarted(sid);
       }
     }
   } else if (item.phase === 'update') {
@@ -573,21 +582,16 @@ function handleTurnComplete(item: UiEvent): void {
   const agentId = String(item.agent_id || '');
   if (!agentId) return;
 
-  const agentStore = useAgentStore.getState();
-  if (agentStore._subagentParentMap[agentId.toLowerCase()]) return;
+  if (agentTracker.getParent(agentId)) return;
 
   const data = item.data || {};
   const durationMs = typeof data.duration_ms === 'number' ? data.duration_ms : undefined;
   const contextTokens = typeof data.context_tokens === 'number' ? data.context_tokens : undefined;
 
   const sid = getSessionId(item);
-  const startTs = sid ? agentStore._runStartTs[sid] : undefined;
-  const elapsed = durationMs || (startTs ? Date.now() - startTs : undefined);
-  const ctxTokens = contextTokens || (sid ? agentStore._latestContextTokens[sid] : undefined) || undefined;
-  if (sid) {
-    delete agentStore._runStartTs[sid];
-    delete agentStore._latestContextTokens[sid];
-  }
+  const cleared = sid ? agentTracker.clearRun(sid) : {};
+  const elapsed = durationMs || cleared.elapsed;
+  const ctxTokens = contextTokens || cleared.contextTokens;
 
   useChatStore.getState().turnComplete(agentId, elapsed, ctxTokens);
   useUiStore.getState().setPendingAskUser(null);
@@ -595,6 +599,7 @@ function handleTurnComplete(item: UiEvent): void {
   // Ensure status transitions to idle — the subsequent AgentStatus(idle)
   // event may arrive late or be missed, leaving the spinner stuck on "Thinking…".
   if (sid) {
+    const agentStore = useAgentStore.getState();
     agentStore.setAgentStatus((prev) => ({ ...prev, [sid]: 'idle' }));
     agentStore.setAgentStatusText((prev) => ({ ...prev, [sid]: 'Idle' }));
   }
@@ -603,7 +608,7 @@ function handleTurnComplete(item: UiEvent): void {
 function handleToolProgress(item: UiEvent): void {
   const agentId = String(item.agent_id || '');
   if (!agentId) return;
-  if (useAgentStore.getState()._subagentParentMap[agentId.toLowerCase()]) return;
+  if (agentTracker.getParent(agentId)) return;
   const data = item.data || {};
   const line = String(data.line || item.text || '');
   if (!line) return;
@@ -660,8 +665,8 @@ function handleNotification(item: UiEvent): void {
       return;
     }
     case 'session_created': {
-      // Refresh the unified session list so the new session appears with animation
-      useProjectStore.getState().fetchAllSessions();
+      // page_state push will deliver the updated session list within 2s.
+      // No HTTP fetch needed.
       return;
     }
     default:
@@ -709,5 +714,54 @@ function handleWidgetResolved(item: UiEvent): void {
   if (uiStore.pendingPlanAgentId === widgetId) {
     uiStore.setPendingPlan(null);
     uiStore.setPendingPlanAgentId(null);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Server-pushed page state — replaces individual HTTP polling
+// ---------------------------------------------------------------------------
+
+function handlePageState(item: UiEvent): void {
+  const ps = item.data;
+  if (!ps) return;
+
+  // -- Global fields --
+  if (ps.projects) useProjectStore.setState({ projects: ps.projects });
+  if (ps.all_sessions) useProjectStore.setState({ allSessions: ps.all_sessions });
+  if (ps.session_counts_by_project) useProjectStore.setState({ sessionCountsByProject: ps.session_counts_by_project });
+  if (ps.models) useAgentStore.setState({ models: ps.models });
+  if (ps.default_models) useAgentStore.setState({ defaultModels: ps.default_models });
+  if (ps.skills) useAgentStore.setState({ skills: ps.skills });
+  if (ps.missions) useUiStore.getState().bumpMissionRefreshKey();
+  if (ps.pending_ask_user !== undefined) {
+    // Restore pending ask-user from server state (array of pending items).
+    // Only set if there are actually pending items and none is already active.
+    const items = Array.isArray(ps.pending_ask_user) ? ps.pending_ask_user : [];
+    const uiStore = useUiStore.getState();
+    if (items.length > 0 && !uiStore.pendingAskUser) {
+      const first = items[0];
+      uiStore.setPendingAskUser({
+        questionId: first.question_id,
+        agentId: first.agent_id || '',
+        questions: first.questions || [],
+      });
+    }
+  }
+
+  // -- Scoped fields --
+  if (ps.agents) useAgentStore.setState({ agents: ps.agents });
+  if (ps.agent_runs) {
+    // Skip update if runs haven't changed (prevents re-render loops)
+    const prev = useAgentStore.getState().agentRuns;
+    const data = Array.isArray(ps.agent_runs) ? ps.agent_runs : [];
+    if (data.length !== prev.length || !data.every((r: any, i: number) => r.run_id === prev[i]?.run_id && r.status === prev[i]?.status)) {
+      useAgentStore.setState({ agentRuns: data });
+    }
+  }
+  if (ps.sessions) useProjectStore.setState({ sessions: ps.sessions });
+  if (ps.session_permission) {
+    const perm = ps.session_permission;
+    const uiStore = useUiStore.getState();
+    if (perm.effective_mode) uiStore.setSessionMode(perm.effective_mode);
   }
 }

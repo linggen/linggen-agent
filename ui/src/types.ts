@@ -97,7 +97,7 @@ export interface FileEntry {
   path: string;
 }
 
-export interface WorkspaceState {
+export interface SessionState {
   active_task: [any, string] | null;
   user_stories: [any, string] | null;
   tasks: [any, string][];
