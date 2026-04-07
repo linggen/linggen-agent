@@ -728,7 +728,6 @@ function handlePageState(item: UiEvent): void {
   // -- Global fields --
   if (ps.projects) useProjectStore.setState({ projects: ps.projects });
   if (ps.all_sessions) useProjectStore.setState({ allSessions: ps.all_sessions });
-  if (ps.session_counts_by_project) useProjectStore.setState({ sessionCountsByProject: ps.session_counts_by_project });
   if (ps.models) useAgentStore.setState({ models: ps.models });
   if (ps.default_models) useAgentStore.setState({ defaultModels: ps.default_models });
   if (ps.skills) useAgentStore.setState({ skills: ps.skills });

@@ -102,25 +102,18 @@ pub async fn build_page_state(
     if include_global && !ctx.is_compact {
         // Projects
         if let Ok(projects) = state.manager.store.list_projects() {
-            // Compute session counts per project from the unified session list
-            let all_sessions = state.manager.global_sessions.list_sessions().unwrap_or_default();
-            let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-            for s in &all_sessions {
-                if let Some(ref p) = s.project {
-                    *counts.entry(p.clone()).or_default() += 1;
-                } else if let Some(ref cwd) = s.cwd {
-                    *counts.entry(cwd.clone()).or_default() += 1;
-                }
-            }
-            ps.session_counts_by_project = Some(counts);
             ps.projects = Some(
                 projects
                     .into_iter()
                     .filter_map(|p| serde_json::to_value(p).ok())
                     .collect(),
             );
+        }
+
+        // All sessions (unified list for sidebar)
+        if let Ok(sessions) = state.manager.global_sessions.list_sessions() {
             ps.all_sessions = Some(
-                all_sessions
+                sessions
                     .into_iter()
                     .filter_map(|s| serde_json::to_value(s).ok())
                     .collect(),

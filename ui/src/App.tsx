@@ -111,53 +111,30 @@ const App: React.FC = () => {
   const { clearChat, copyChat, sendChatMessage } = useChatActions(scrollToBottomNoop, runningMainRunIds);
 
   // --- Initial data load ---
+  // Most data is delivered via server-pushed page_state after WebRTC connects.
+  // Only fetch data not covered by page_state, or needed before WebRTC is ready.
   useEffect(() => {
-    // In compact skill mode, only fetch models (for the model picker).
-    // Skip projects, sessions, skills, etc. — the iframe is a clean slate.
-    if (isCompact && compactSession) {
-      useAgentStore.getState().fetchModels();
-      useAgentStore.getState().fetchSkills();
-      useAgentStore.getState().fetchAgents();
-      return;
-    }
-    useProjectStore.getState().fetchProjects();
-    useProjectStore.getState().fetchAllSessions();
-    useAgentStore.getState().fetchSkills();
-    useAgentStore.getState().fetchAgents();
-    useAgentStore.getState().fetchModels();
-    useAgentStore.getState().fetchDefaultModels();
-
+    if (isCompact && compactSession) return;
     useAgentStore.getState().fetchOllamaStatus();
     useAgentStore.getState().fetchSessionTokens();
   }, []);
 
   // --- React to selected project changes ---
   useEffect(() => {
-    // In compact skill mode, skip all project-related fetching — the iframe
-    // only needs the skill session, not the project's sessions/files/agents.
     if (isCompact && compactSession) return;
     if (selectedProjectRoot) {
+      // Fetch file tree (not in page_state) and session state (chat history)
       useProjectStore.getState().fetchFiles();
       useChatStore.getState().fetchSessionState();
-      useProjectStore.getState().fetchAgentTree(selectedProjectRoot);
-      useAgentStore.getState().fetchAgentRuns();
-      useProjectStore.getState().fetchSessions();
-      useAgentStore.getState().fetchAgents(selectedProjectRoot);
-      // Don't resetStatus() here — agent_status events are global and the
-      // session list needs them to show spinners for busy sessions.
+      // Other scoped data (agents, sessions, agentRuns, permission) delivered by page_state
+      sendViewContext();
       useUiStore.getState().setQueuedMessages([]);
       useUiStore.getState().setActivePlan(null);
     }
   }, [selectedProjectRoot]);
 
-  // --- React to projects list changes ---
-  useEffect(() => {
-    if (isCompact && compactSession) return;
-    if (projects.length > 0) {
-      useProjectStore.getState().fetchAllAgentTrees();
-      useProjectStore.getState().fetchAllSessionCounts();
-    }
-  }, [projects]);
+  // Agent trees and session counts are now delivered via server-pushed page_state.
+  // No per-project HTTP fan-out needed.
 
   const fetchPendingAskUser = useCallback(() => {
     useUiStore.getState().fetchPendingAskUser();
