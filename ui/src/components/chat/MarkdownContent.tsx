@@ -52,6 +52,9 @@ export const MarkdownContent: React.FC<{ text: string }> = ({ text }) => (
       remarkPlugins={[remarkGfm]}
       rehypePlugins={[rehypeHighlight]}
       components={{
+        a: ({ href, children, ...props }: any) => (
+          <a href={href} target="_blank" rel="noopener noreferrer" {...props}>{children}</a>
+        ),
         pre: ({ children }) => <>{children}</>,
         code: ({ inline, className, children, node: _node, ...props }: any) => {
           // Extract raw text from children (may be React elements from rehype-highlight).
