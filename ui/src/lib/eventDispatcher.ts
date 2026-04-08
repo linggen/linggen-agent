@@ -108,7 +108,7 @@ function getSessionId(item: UiEvent): string {
 
 export function dispatchEvent(item: UiEvent, sessionIdOverride?: string): void {
   const effectiveSessionId = sessionIdOverride ?? useProjectStore.getState().activeSessionId;
-  // Allow notifications and agent status through regardless — they are global events.
+  // Allow notifications and agent_status through regardless — they are global events.
   // agent_status must pass through so the session list can show spinners for busy sessions.
   // ask_user and widget_resolved are session-scoped — they should only show in their own session.
   if (item.kind !== 'notification' && item.kind !== 'agent_status' && item.session_id && item.session_id !== 'global') {
@@ -760,6 +760,29 @@ function handlePageState(item: UiEvent): void {
         questions: first.questions || [],
       });
     }
+  }
+
+  // Busy sessions — merge into agentStatus so session list shows spinners.
+  // Only set status for sessions not already tracked (real-time activity events
+  // are authoritative for the active session).
+  if (ps.busy_sessions) {
+    const agentStore = useAgentStore.getState();
+    agentStore.setAgentStatus((prev) => {
+      const next = { ...prev };
+      // Clear sessions that are no longer busy
+      for (const sid of Object.keys(next)) {
+        if (!(sid in ps.busy_sessions) && next[sid] !== 'idle') {
+          next[sid] = 'idle';
+        }
+      }
+      // Add/update busy sessions
+      for (const [sid, status] of Object.entries(ps.busy_sessions)) {
+        if (!next[sid] || next[sid] === 'idle') {
+          next[sid] = status as any;
+        }
+      }
+      return next;
+    });
   }
 
   // -- Scoped fields --

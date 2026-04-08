@@ -173,6 +173,8 @@ export const ChatPanel: React.FC<{
   onSwitchModel?: (modelId: string) => void;
   tokensPerSec?: number;
   mobile?: boolean;
+  scrollToBottom?: () => void;
+  showScrollButton?: boolean;
 }> = ({
   chatMessages,
   queuedMessages,
@@ -210,6 +212,8 @@ export const ChatPanel: React.FC<{
   onSwitchModel,
   tokensPerSec,
   mobile,
+  scrollToBottom: scrollToBottomProp,
+  showScrollButton: showScrollButtonProp,
 }) => {
   const [openSubagentId, setOpenSubagentId] = useState<string | null>(null);
   const [mainMessageFilter, setMainMessageFilter] = useState('');
@@ -229,54 +233,12 @@ export const ChatPanel: React.FC<{
     }
   }, [pendingAskUser, chatEndRef]);
 
-  // Auto-scroll: follows streaming output by default.
-  // Detaches when the user scrolls up (negative scroll delta).
-  // Re-attaches when user scrolls back to bottom or clicks "scroll to bottom".
-  const isNearBottomRef = useRef(true);
-  const lastScrollTopRef = useRef(0);
-  const programmaticScrollRef = useRef(false);
-  const [showScrollButton, setShowScrollButton] = useState(false);
-  useEffect(() => {
-    const container = chatScrollRef.current;
-    if (!container) return;
-    const onScroll = () => {
-      const { scrollTop, scrollHeight, clientHeight } = container;
-      const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
-      // Skip user-intent detection for programmatic scrolls (auto-scroll / scrollToBottom)
-      if (programmaticScrollRef.current) {
-        programmaticScrollRef.current = false;
-      } else {
-        const delta = scrollTop - lastScrollTopRef.current;
-        if (delta < -1 && distanceFromBottom > 150) {
-          // User scrolled up AND is far from bottom — detach auto-scroll.
-          // The distanceFromBottom check prevents false detach from layout
-          // reflows during streaming (content growth can cause small negative deltas).
-          isNearBottomRef.current = false;
-        } else if (distanceFromBottom <= 1) {
-          // User scrolled all the way to the bottom — re-attach
-          isNearBottomRef.current = true;
-        }
-      }
-      lastScrollTopRef.current = scrollTop;
-      const contentOverflows = scrollHeight > clientHeight * 1.5;
-      setShowScrollButton(!isNearBottomRef.current && distanceFromBottom > 100 && contentOverflows);
-    };
-    container.addEventListener('scroll', onScroll, { passive: true });
-    return () => container.removeEventListener('scroll', onScroll);
-  }, []);
-
-  const scrollToBottom = useCallback(() => {
-    programmaticScrollRef.current = true;
-    isNearBottomRef.current = true;
+  // Auto-scroll is handled by useAutoScroll hook in ChatWidget.
+  // We just receive scrollToBottom and showScrollButton as props.
+  const showScrollButton = showScrollButtonProp ?? false;
+  const scrollToBottom = scrollToBottomProp ?? (() => {
     chatEndRef?.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [chatEndRef]);
-
-  useEffect(() => {
-    if (isNearBottomRef.current) {
-      programmaticScrollRef.current = true;
-      chatEndRef?.current?.scrollIntoView({ behavior: 'auto', block: 'nearest' });
-    }
-  }, [chatMessages, chatEndRef]);
+  });
 
   // Track agent active state and elapsed time — keyed by session ID
   const agentStatusText = useAgentStore((s) => s.agentStatusText);

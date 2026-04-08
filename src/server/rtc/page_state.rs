@@ -49,6 +49,11 @@ pub struct PageState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_counts_by_project: Option<std::collections::HashMap<String, usize>>,
 
+    /// Map of session_id → agent status string for all currently-busy sessions.
+    /// Lets the session list show spinners without needing per-session event channels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub busy_sessions: Option<std::collections::HashMap<String, String>>,
+
     // -- Scoped (based on ViewContext) --
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,6 +96,7 @@ pub async fn build_page_state(
         missions: None,
         pending_ask_user: None,
         session_counts_by_project: None,
+        busy_sessions: None,
         agents: None,
         agent_runs: None,
         sessions: None,
@@ -171,6 +177,20 @@ pub async fn build_page_state(
             })
             .collect();
         ps.pending_ask_user = Some(items);
+
+        // Busy sessions — derive from active_statuses (key = "session_id|agent_id")
+        let active = state.active_statuses.lock().await;
+        let mut busy: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for (key, record) in active.iter() {
+            if let Some(sid) = key.split('|').next() {
+                if !sid.is_empty() {
+                    busy.entry(sid.to_string())
+                        .or_insert_with(|| record.status.as_str().to_string());
+                }
+            }
+        }
+        drop(active);
+        ps.busy_sessions = Some(busy);
     }
 
     // -- Scoped data (based on active project/session) --

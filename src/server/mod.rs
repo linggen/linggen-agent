@@ -74,7 +74,7 @@ pub struct ServerState {
     /// Keyed by unique question_id. The oneshot sender delivers the user's answer.
     pub pending_ask_user: Arc<Mutex<HashMap<String, crate::engine::tools::PendingAskUser>>>,
     status_seq: AtomicU64,
-    active_statuses: Arc<Mutex<HashMap<String, ActiveStatusRecord>>>,
+    pub(crate) active_statuses: Arc<Mutex<HashMap<String, ActiveStatusRecord>>>,
     pub queue_seq: AtomicU64,
     pub event_seq: AtomicU64,
     /// Accumulated token usage per session (in-memory, resets on restart).
@@ -122,9 +122,9 @@ impl AgentStatusKind {
 }
 
 #[derive(Debug, Clone)]
-struct ActiveStatusRecord {
+pub(crate) struct ActiveStatusRecord {
     status_id: String,
-    status: AgentStatusKind,
+    pub(crate) status: AgentStatusKind,
     detail: Option<String>,
 }
 

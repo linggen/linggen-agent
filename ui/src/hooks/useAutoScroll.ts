@@ -7,7 +7,7 @@
  * Programmatic scrollIntoView never triggers cancel or resume — the scroll
  * event it generates is ignored via an isProgrammaticScroll guard.
  */
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef, useCallback, useState } from 'react';
 
 export function useAutoScroll(messages: { length: number }, lastMsg: { isGenerating?: boolean; content?: any[] } | undefined) {
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -15,12 +15,20 @@ export function useAutoScroll(messages: { length: number }, lastMsg: { isGenerat
   const lastContentLenRef = useRef(0);
   const isNearBottomRef = useRef(true);
   const isProgrammaticScrollRef = useRef(false);
+  const [showScrollButton, setShowScrollButton] = useState(false);
 
   const doScrollToBottom = useCallback(() => {
     isProgrammaticScrollRef.current = true;
     chatEndRef.current?.scrollIntoView({ behavior: 'auto', block: 'nearest', inline: 'nearest' });
     // Clear the flag after the browser has processed the scroll.
     requestAnimationFrame(() => { isProgrammaticScrollRef.current = false; });
+  }, []);
+
+  const updateScrollButton = useCallback((container: Element) => {
+    const { scrollTop, scrollHeight, clientHeight } = container;
+    const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+    const contentOverflows = scrollHeight > clientHeight * 1.5;
+    setShowScrollButton(!isNearBottomRef.current && distanceFromBottom > 100 && contentOverflows);
   }, []);
 
   useEffect(() => {
@@ -42,6 +50,7 @@ export function useAutoScroll(messages: { length: number }, lastMsg: { isGenerat
           isNearBottomRef.current = true;
         }
       }
+      updateScrollButton(container);
     };
 
     let lastTouchY = 0;
@@ -62,6 +71,7 @@ export function useAutoScroll(messages: { length: number }, lastMsg: { isGenerat
         }
       }
       lastTouchY = currentY;
+      updateScrollButton(container);
     };
 
     // Fallback: resume on scroll-to-bottom, but only from user scrolls.
@@ -72,6 +82,7 @@ export function useAutoScroll(messages: { length: number }, lastMsg: { isGenerat
       if (distanceFromBottom <= 1) {
         isNearBottomRef.current = true;
       }
+      updateScrollButton(container);
     };
 
     container.addEventListener('wheel', onWheel, { passive: true });
@@ -84,7 +95,7 @@ export function useAutoScroll(messages: { length: number }, lastMsg: { isGenerat
       container.removeEventListener('touchmove', onTouchMove);
       container.removeEventListener('scroll', onScroll);
     };
-  }, []);
+  }, [updateScrollButton]);
 
   const lastContentLen = lastMsg?.isGenerating ? (lastMsg.content?.length || 0) : 0;
   useEffect(() => {
@@ -99,8 +110,9 @@ export function useAutoScroll(messages: { length: number }, lastMsg: { isGenerat
 
   const scrollToBottom = useCallback(() => {
     isNearBottomRef.current = true;
+    setShowScrollButton(false);
     doScrollToBottom();
   }, [doScrollToBottom]);
 
-  return { chatEndRef, scrollToBottom };
+  return { chatEndRef, scrollToBottom, showScrollButton };
 }

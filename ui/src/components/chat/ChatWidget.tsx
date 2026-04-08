@@ -53,7 +53,7 @@ export const ChatWidget: React.FC<ChatWidgetProps> = ({
 
   // --- Auto-scroll ---
   const lastMsg = chatMessages[chatMessages.length - 1];
-  const { chatEndRef, scrollToBottom } = useAutoScroll(chatMessages, lastMsg);
+  const { chatEndRef, scrollToBottom, showScrollButton } = useAutoScroll(chatMessages, lastMsg);
 
   // --- Run info ---
   const { runningMainRunIds } = useRunInfo();
@@ -149,6 +149,8 @@ export const ChatWidget: React.FC<ChatWidgetProps> = ({
       tokensPerSec={tokensPerSec}
       onSwitchModel={switchModel}
       mobile={mode === 'mobile'}
+      scrollToBottom={scrollToBottom}
+      showScrollButton={showScrollButton}
     />
   );
 };
