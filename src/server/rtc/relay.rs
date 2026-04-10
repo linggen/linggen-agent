@@ -138,12 +138,26 @@ async fn offer_poll_loop(config: &RemoteConfig, state: Arc<ServerState>) {
                         let sdp = data["sdp"].as_str().unwrap_or("").to_string();
 
                         if !nonce.is_empty() && !sdp.is_empty() {
-                            info!("Received remote offer (nonce: {nonce})");
+                            // Build consumer context if this is a proxy room connection
+                            let consumer_ctx = data["consumer_type"].as_str().map(|ct| {
+                                super::ConsumerContext {
+                                    consumer_type: ct.to_string(),
+                                    token_budget_daily: data["token_budget_daily"].as_i64(),
+                                    consumer_user_id: data["consumer_user_id"].as_str().map(|s| s.to_string()),
+                                }
+                            });
+
+                            if consumer_ctx.is_some() {
+                                info!("Received proxy room offer (nonce: {nonce}, type: {})", data["consumer_type"]);
+                            } else {
+                                info!("Received remote offer (nonce: {nonce})");
+                            }
+
                             let cfg = config.clone();
                             let st = state.clone();
                             let cl = client.clone();
                             tokio::spawn(async move {
-                                handle_remote_offer(&cfg, &st, &cl, &nonce, &sdp).await;
+                                handle_remote_offer(&cfg, &st, &cl, &nonce, &sdp, consumer_ctx).await;
                             });
                         }
                     }
@@ -181,9 +195,10 @@ async fn handle_remote_offer(
     client: &reqwest::Client,
     nonce: &str,
     offer_sdp: &str,
+    consumer_ctx: Option<super::ConsumerContext>,
 ) {
     // Create peer connection for remote offer (binds to 0.0.0.0, ICE-lite)
-    match super::peer::create_remote_peer(offer_sdp.to_string(), state.clone()).await {
+    match super::peer::create_remote_peer(offer_sdp.to_string(), state.clone(), consumer_ctx).await {
         Ok(answer_sdp) => {
             info!("Created peer connection for remote offer, posting answer");
 

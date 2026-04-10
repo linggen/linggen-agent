@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 pub mod locks;
 pub mod models;
+pub mod proxy_provider;
 pub mod routing;
 
 pub struct ProjectContext {
@@ -519,6 +520,8 @@ impl AgentManager {
                 interface_mode: self.interface_mode,
                 bash_allow_prefixes: None,
                 mission_allowed_tools: None,
+                consumer_allowed_tools: None,
+                consumer_allowed_skills: None,
             },
             models,
             model_id,
@@ -605,6 +608,8 @@ impl AgentManager {
                 interface_mode: self.interface_mode,
                 bash_allow_prefixes: None,
                 mission_allowed_tools: None,
+                consumer_allowed_tools: None,
+                consumer_allowed_skills: None,
             },
             models,
             model_id,
@@ -699,6 +704,8 @@ impl AgentManager {
                 interface_mode: self.interface_mode,
                 bash_allow_prefixes: None,
                 mission_allowed_tools: None,
+                consumer_allowed_tools: None,
+                consumer_allowed_skills: None,
             },
             models,
             model_id,

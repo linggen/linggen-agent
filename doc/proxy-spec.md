@@ -189,60 +189,160 @@ Proxy rooms use the proxy owner's API keys. This is technically sharing API acce
 - If a provider objects, their models can be excluded from open rooms.
 - Local models (Ollama) have no TOS concerns — ideal for open rooms.
 
+## Consumer modes
+
+Two ways consumers can use a proxy room:
+
+### Browser mode
+
+Consumer opens linggen.dev, connects via WebRTC, and the owner's linggen UI is tunneled through the data channel. The consumer gets the full chat experience (markdown rendering, tool activity, skill results) running in their browser — but restricted by the owner's permission settings.
+
+No separate consumer chat page needed. The owner's UI detects consumer mode (via `consumer_mode` message on the control channel) and hides irrelevant panels (settings, file browser, project selector).
+
+### Linggen server mode
+
+Consumer runs their own linggen instance and uses the owner's linggen as a remote model provider. The consumer's agent engine runs locally with tools, but inference is proxied through WebRTC to the owner. Consumer's files stay local — the owner only sees inference requests.
+
+Proxy models appear in the consumer's model selector with the owner's name: `gpt-5.4 (By Tom)`.
+
+## Consumer permissions
+
+The owner controls what consumers can do via the Sharing tab in local settings. Permissions are stored in `~/.linggen/room_config.toml` and loaded server-side — consumers cannot override them.
+
+### Tool allowlist
+
+Owner selects which tools are available to consumers. Preset modes for convenience:
+
+| Preset | Tools allowed |
+|:-------|:-------------|
+| Chat only | None — conversation only |
+| Read (default) | WebSearch, WebFetch |
+| Edit | WebSearch, WebFetch, Read, Write, Edit, Glob, Grep, Bash |
+
+Owner can fine-tune individual tools beyond presets. For trusted consumers (family), the owner can enable all tools including Bash.
+
+### How it's enforced
+
+1. **System prompt**: only allowed tools appear in the agent's tool list. The agent never sees blocked tools, so it won't attempt to call them.
+2. **Execution gate**: defense-in-depth — if the agent hallucates a blocked tool call, the engine blocks it at execution time.
+3. **Server-side only**: permissions are loaded from `room_config.toml` by the server. The HTTP API and WebRTC layer cannot inject or override permissions.
+
+### Skill allowlist
+
+Owner selects which skills consumers can trigger. Default: none. Owner adds specific skills (e.g. weather, translator).
+
+### Shared models
+
+Owner selects which of their configured models consumers can use. Default: none. The `list_models` and `inference` data channel handlers only serve shared models.
+
 ## Proxy owner controls
 
-The proxy owner configures their room through linggen settings or CLI:
+The proxy owner configures their room through linggen Settings > Sharing tab:
 
-- **Models exposed**: which of their configured models are available to consumers.
-- **Max consumers**: 1–5 concurrent users.
-- **Token budget**: daily or monthly cap.
-- **Room type**: open or closed.
-- **Allowed users** (closed rooms): invite list.
-- **Auto-pause**: pause room when proxy owner is actively using linggen.
-- **Session persistence**: whether consumer chat history is saved on the proxy.
+- **Shared models**: which of their configured models are available to consumers.
+- **Allowed tools**: which tools consumers can use (preset modes + individual checkboxes).
+- **Allowed skills**: which skills consumers can trigger.
+- **Max consumers**: 1–4 concurrent users.
+- **Token budget**: daily cap.
+- **Room type**: public (anyone) or private (invite only).
+- **Instance**: which of their instances powers the room (one instance per room).
+- **Allowed users** (private rooms): invite link, member list with remove.
+
+Room metadata (name, type, members, budget) is stored on linggen.dev (D1). Local-only settings (shared models, allowed tools/skills) are stored in `~/.linggen/room_config.toml`.
+
+## Auth and verification
+
+### Three-layer verification
+
+```
+Layer 1: SIGNALING (linggen.dev CF Worker)
+  ├─ Consumer authenticated by session cookie (browser) or API token (linggen server)
+  ├─ Room membership verified in DB (room_members table)
+  ├─ Consumer metadata (type, budget) attached to signaling payload from DB
+  └─ Consumer cannot fake their type or budget — set by the relay from DB
+
+Layer 2: OWNER'S LINGGEN (peer connection)
+  ├─ Receives ConsumerContext from signaling envelope
+  ├─ list_models → only returns owner's shared_models
+  ├─ inference → rejects models not in shared_models
+  ├─ Token budget enforcement (rejects if exhausted)
+  └─ Sends consumer_mode message so UI adapts
+
+Layer 3: ENGINE (per-request)
+  ├─ mode="consumer" triggers server-side permission loading
+  ├─ Allowed tools loaded from room_config.toml (not from request body)
+  ├─ System prompt built with only allowed tools — agent never sees blocked tools
+  └─ Execution gate blocks hallucinated tool calls as defense-in-depth
+```
+
+### Consumer identity
+
+- Browser consumers: identified by linggen.dev session cookie (JWT)
+- Linggen server consumers: identified by API token (from `ling login`)
+- Both verified against `room_members` table at the signaling layer
+- Room membership established at join time (invite link or public join)
+- Owner can remove members at any time — next connection attempt fails
 
 ## Infrastructure
 
-### What's new on linggen.dev (CF Worker + D1)
+### What's on linggen.dev (CF Worker + D1)
 
-- **Rooms table**: room_id, proxy_user_id, instance_id, model, region, max_consumers, current_consumers, token_budget, tokens_used, open, online.
-- **Room browser page**: list open rooms, filter by model/region.
-- **Dispatcher endpoint**: auto-match consumer to best available room.
-- **Credit ledger**: per-user credit balance, transaction log (earn/spend).
-- **Signaling**: same relay as remote access, but routes to room's instance instead of user's own instance.
+- **rooms table**: id, owner_id, instance_id, name, room_type (private/public), invite_token, max_consumers, token_budget_daily, tokens_used_today.
+- **room_members table**: room_id, user_id, consumer_type (browser/linggen).
+- **Room API**: create, update, delete, join (invite token or public), leave, regenerate invite, list public rooms, preview room by invite token.
+- **Room browser page** (`/rooms`): list public rooms with join button.
+- **Join page** (`/join/{token}`): invite landing page with consumer type selection and privacy warning.
+- **Dashboard**: owner room management (create/edit/members/invite) + joined rooms list for consumers.
+- **Signaling**: same relay as remote access. Authenticates both cookie (browser) and bearer token (linggen server) consumers. Attaches consumer metadata from DB.
 
-### What's new on linggen server (Rust)
+### What's on linggen server (Rust)
 
-- **Room mode**: linggen server can advertise itself as a room proxy.
-- **Consumer session isolation**: consumer sessions are sandboxed — no access to proxy owner's files, projects, or sessions.
-- **Token counting**: track tokens per consumer session, report to linggen.dev for credit accounting.
-- **Concurrent session management**: handle multiple consumer WebRTC connections.
+- **Room config** (`~/.linggen/room_config.toml`): shared_models, allowed_tools, allowed_skills.
+- **Inference endpoint**: `list_models` and `inference` data channel handlers for linggen server proxy mode. Filters by shared_models. Streams StreamChunk tokens back.
+- **Outbound WebRTC client** (`proxy_client.rs`): consumer's linggen initiates WebRTC to owner's linggen via relay signaling.
+- **Proxy model provider**: new `ProviderClient::Proxy` variant. Sends inference over WebRTC data channel, yields StreamChunk stream. Registered with `proxy:` prefix + owner name.
+- **Consumer permission enforcement**: mode="consumer" triggers server-side loading of allowed tools/skills from room_config. Filters system prompt and execution gate.
+- **Room API proxy**: `/api/rooms/*` proxied to linggen.dev with API token. Auto-injects instance_id.
+- **Settings > Sharing tab**: room management, shared models checkboxes, allowed tools presets.
 
 ### What's reused
 
-- WebRTC transport (data channels, signaling relay).
-- Session system (multi-session support).
+- WebRTC transport (data channels, signaling relay, tunnel loading).
+- Session system (multi-session support, each consumer gets independent session).
 - Control channel RPC (chat, API proxy).
 - Instance registration and heartbeat.
+- Permission system (EngineConfig.effective_tool_restrictions for cascading intersections).
 
 ## Implementation phases
 
-### Phase 6a: Closed rooms (family sharing)
+### Phase 6a: Private rooms + browser consumer — DONE
 
-Proxy owner creates a closed room, invites specific users. Invited users connect and chat. No credits, no auto-dispatch — just direct sharing with trusted people.
+- DB: rooms + room_members tables, room_type (private/public), invite tokens.
+- CF Worker API: room CRUD, join/leave, signaling with consumer auth (cookie + bearer token).
+- Rust backend: ConsumerContext on peer connections, consumer permission enforcement, room_config.toml (shared models, allowed tools).
+- linggen.dev frontend: dashboard room sections, join page, public rooms browser.
+- linggen local UI: Settings > Sharing tab (room management, shared models, member list).
+- Browser consumer mode: tunnel owner's UI via WebRTC, consumer_mode message on control channel, server-side permission loading.
 
-This validates the core proxy flow: consumer connects to someone else's linggen and chats.
+### Phase 6b: Linggen server proxy mode — DONE
 
-### Phase 6b: Open rooms + room browser
+- Outbound WebRTC client (proxy_client.rs): consumer's linggen initiates connection to owner via relay signaling.
+- Inference endpoint on owner (peer.rs): list_models + inference data channel handlers, filters by shared_models.
+- Proxy model provider (proxy_provider.rs): ProviderClient::Proxy variant, streams StreamChunk over WebRTC, request/response demuxing.
+- Auto-configure: connect_proxy_room discovers models, registers as proxy:id with owner name.
+- Model selector: proxy models show "gpt-5.4 (By Tom)" in the UI.
 
-Open rooms visible on linggen.dev. Room browser page. Any user can join open rooms. Clear privacy warnings.
+### Phase 6c: UI polish + integration testing
 
-### Phase 6c: Credits + auto-dispatch
+- Consumer UI mode: detect consumer_mode on control channel, hide settings/tools/project panels, show privacy banner.
+- Sharing tab: tool permission presets (chat/read/edit) with individual checkboxes.
+- End-to-end testing: create room → join → connect → chat with tools → token budget → permission enforcement.
+- Deploy DB migration + CF Worker + linggensite.
+
+### Phase 6d: Credits + auto-dispatch
 
 Credit system: earn by proxying, spend by consuming. Starter credits for new users. Auto-dispatch matches consumers to best available proxy.
 
-This is the "zero-setup onboarding" milestone — new users chat immediately.
+### Phase 6e: Polish
 
-### Phase 6d: Polish
-
-Usage dashboard for proxy owners. Abuse reporting. Proxy owner analytics (tokens shared, credits earned). Priority dispatch for high-credit users.
+Usage dashboard for proxy owners. Abuse reporting. Proxy owner analytics (tokens shared, credits earned). Priority dispatch for high-credit users. Cancellation token for clean proxy disconnect.

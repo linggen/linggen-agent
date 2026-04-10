@@ -25,16 +25,26 @@ use crate::server::ServerState;
 /// Returns the SDP answer string to send back to the client.
 /// Spawns a background task to run the peer connection event loop.
 pub async fn create_peer(offer_sdp: String, state: Arc<ServerState>) -> Result<String> {
-    create_peer_inner(offer_sdp, state, false).await
+    create_peer_inner(offer_sdp, state, false, None).await
 }
 
 /// Create a peer for a remote offer (via signaling relay).
 /// Binds to 0.0.0.0 so STUN can discover the public address.
-pub async fn create_remote_peer(offer_sdp: String, state: Arc<ServerState>) -> Result<String> {
-    create_peer_inner(offer_sdp, state, true).await
+/// If `consumer_ctx` is Some, this is a proxy room consumer with restricted permissions.
+pub async fn create_remote_peer(
+    offer_sdp: String,
+    state: Arc<ServerState>,
+    consumer_ctx: Option<super::ConsumerContext>,
+) -> Result<String> {
+    create_peer_inner(offer_sdp, state, true, consumer_ctx).await
 }
 
-async fn create_peer_inner(offer_sdp: String, state: Arc<ServerState>, remote: bool) -> Result<String> {
+async fn create_peer_inner(
+    offer_sdp: String,
+    state: Arc<ServerState>,
+    remote: bool,
+    consumer_ctx: Option<super::ConsumerContext>,
+) -> Result<String> {
     // Parse the SDP offer (raw SDP text from WHIP POST body)
     let offer = SdpOffer::from_sdp_string(&offer_sdp)
         .context("Failed to parse SDP offer")?;
@@ -74,7 +84,7 @@ async fn create_peer_inner(offer_sdp: String, state: Arc<ServerState>, remote: b
     // Spawn the peer event loop
     let events_rx = state.events_tx.subscribe();
     tokio::spawn(async move {
-        if let Err(e) = run_peer(rtc, socket, candidate_addr, state, events_rx).await {
+        if let Err(e) = run_peer(rtc, socket, candidate_addr, state, events_rx, consumer_ctx).await {
             tracing::warn!("WebRTC peer exited: {e:#}");
         }
     });
@@ -93,9 +103,12 @@ async fn run_peer(
     local_candidate_addr: std::net::SocketAddr,
     state: Arc<ServerState>,
     mut events_rx: tokio::sync::broadcast::Receiver<crate::server::ServerEvent>,
+    consumer_ctx: Option<super::ConsumerContext>,
 ) -> Result<()> {
     let mut buf = vec![0u8; 65536];
     let mut control_channel_id = None;
+    // Track token usage for proxy room consumers with budgets
+    let mut consumer_tokens_used: i64 = 0;
     let mut session_channels: HashMap<String, str0m::channel::ChannelId> = HashMap::new();
     let mut channel_sessions: HashMap<str0m::channel::ChannelId, String> = HashMap::new();
     // Buffer events for sessions whose data channels aren't open yet.
@@ -168,6 +181,31 @@ async fn run_peer(
                         tracing::info!("Data channel opened: {label} (id: {id:?})");
                         if label == "control" {
                             control_channel_id = Some(id);
+                            // Send consumer mode info + privacy warning to proxy room consumers
+                            if let Some(ref ctx) = consumer_ctx {
+                                let room_cfg = super::room_config::load_room_config();
+                                let mode_msg = serde_json::json!({
+                                    "kind": "consumer_mode",
+                                    "data": {
+                                        "consumer_type": ctx.consumer_type,
+                                        "token_budget_daily": ctx.token_budget_daily,
+                                        "allowed_tools": room_cfg.allowed_tools,
+                                        "allowed_skills": room_cfg.allowed_skills,
+                                    }
+                                });
+                                let warning = serde_json::json!({
+                                    "kind": "notification",
+                                    "data": {
+                                        "type": "privacy_warning",
+                                        "message": "You are chatting via a proxy room. The proxy owner can see your messages.",
+                                        "persistent": true
+                                    }
+                                });
+                                if pending_dc_writes.len() + 2 <= MAX_DC_WRITE_QUEUE {
+                                    pending_dc_writes.push_back((id, mode_msg.to_string()));
+                                    pending_dc_writes.push_back((id, warning.to_string()));
+                                }
+                            }
                         } else if let Some(session_id) = label.strip_prefix("sess-") {
                             session_channels.insert(session_id.to_string(), id);
                             channel_sessions.insert(id, session_id.to_string());
@@ -198,23 +236,71 @@ async fn run_peer(
                                 &mut view_ctx,
                                 &mut force_page_state,
                             ) {
+                                // Enforce consumer permissions: browser consumers can only chat
+                                if let Some(ref ctx) = consumer_ctx {
+                                    if ctx.consumer_type == "browser" && req.msg_type == "http_request" {
+                                        // Only allow read-only API endpoints for browser consumers
+                                        let url = req.body.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                        let allowed = url.starts_with("/api/sessions")
+                                            || url.starts_with("/api/projects")
+                                            || url.starts_with("/api/models")
+                                            || url.starts_with("/api/config")
+                                            || url == "/index.html"
+                                            || url.starts_with("/assets/");
+                                        let method = req.body.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+                                        if !allowed || method != "GET" {
+                                            if let Some(rid) = &req.request_id {
+                                                let err = serde_json::json!({
+                                                    "request_id": rid,
+                                                    "data": { "status": 403, "body": "{\"error\":\"Not allowed in proxy room (browser consumer)\"}" }
+                                                });
+                                                if pending_dc_writes.len() < MAX_DC_WRITE_QUEUE {
+                                                    pending_dc_writes.push_back((data.id, err.to_string()));
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+
                                 // Spawn async processing to avoid blocking str0m's event loop.
                                 let tx = ctrl_resp_tx.clone();
                                 let st = state.clone();
                                 let client = http_client.clone();
                                 let rid = req.request_id.clone();
                                 let cid = req.channel_id;
-                                tokio::spawn(async move {
-                                    let result = process_control_request_async(&req, &st, &client).await;
-                                    let _ = tx.send((rid, cid, result)).await;
-                                });
+                                let ctx_clone = consumer_ctx.clone();
+                                let tokens_used = consumer_tokens_used;
+
+                                if req.msg_type == "inference" || req.msg_type == "list_models" {
+                                    // Inference/model-list: may stream multiple responses
+                                    tokio::spawn(async move {
+                                        process_inference_request(&req, &st, ctx_clone.as_ref(), tokens_used, &tx, cid).await;
+                                    });
+                                } else {
+                                    tokio::spawn(async move {
+                                        let result = process_control_request_async(&req, &st, &client, ctx_clone.as_ref(), tokens_used).await;
+                                        let _ = tx.send((rid, cid, result)).await;
+                                    });
+                                }
                             }
                         } else if let Some(session_id) = channel_sessions.get(&data.id).cloned() {
+                            // Enforce consumer permissions on session messages
+                            if let Some(ref ctx) = consumer_ctx {
+                                // Check token budget
+                                if let Some(budget) = ctx.token_budget_daily {
+                                    if consumer_tokens_used >= budget {
+                                        tracing::info!("Consumer token budget exhausted, rejecting session message");
+                                        continue;
+                                    }
+                                }
+                            }
                             // Spawn session message handling to avoid blocking str0m.
                             let st = state.clone();
                             let client = http_client.clone();
+                            let ctx_clone = consumer_ctx.clone();
                             tokio::spawn(async move {
-                                handle_session_message(&text, &session_id, &st, &client).await;
+                                handle_session_message(&text, &session_id, &st, &client, ctx_clone.as_ref()).await;
                             });
                         }
                     }
@@ -419,7 +505,8 @@ fn handle_control_message(
 
         "http_request" | "chat" | "clear" | "compact"
         | "plan_approve" | "plan_reject" | "plan_edit"
-        | "ask_user_response" => {
+        | "ask_user_response"
+        | "inference" | "list_models" => {
             // These need async processing — return as pending request
             Some(ControlRequest {
                 request_id,
@@ -461,8 +548,21 @@ async fn process_control_request_async(
     req: &ControlRequest,
     state: &Arc<ServerState>,
     client: &reqwest::Client,
+    consumer_ctx: Option<&super::ConsumerContext>,
+    consumer_tokens_used: i64,
 ) -> serde_json::Value {
     let port = state.port;
+
+    // Check token budget for proxy room consumers before chat calls
+    if let Some(ctx) = consumer_ctx {
+        if let Some(budget) = ctx.token_budget_daily {
+            if consumer_tokens_used >= budget && matches!(req.msg_type.as_str(), "chat") {
+                return serde_json::json!({
+                    "error": "Token budget exhausted for today. Please try again tomorrow or ask the proxy owner to increase the budget."
+                });
+            }
+        }
+    }
 
     match req.msg_type.as_str() {
         "http_request" => {
@@ -529,6 +629,173 @@ async fn process_control_request_async(
     }
 }
 
+/// Process inference and list_models requests from proxy room consumers.
+/// These are used by the "linggen server proxy" mode where a consumer's linggen
+/// uses the owner's linggen as a model provider.
+///
+/// Protocol:
+/// - list_models: returns { request_id, data: { models: [...] } }
+/// - inference: streams { request_id, chunk: { type, ... } } then { request_id, done: true }
+async fn process_inference_request(
+    req: &ControlRequest,
+    state: &Arc<ServerState>,
+    consumer_ctx: Option<&super::ConsumerContext>,
+    consumer_tokens_used: i64,
+    tx: &tokio::sync::mpsc::Sender<(Option<String>, str0m::channel::ChannelId, serde_json::Value)>,
+    cid: str0m::channel::ChannelId,
+) {
+    use futures_util::StreamExt;
+
+    let rid = req.request_id.clone();
+
+    // Only allow inference from linggen-type consumers (not browser consumers)
+    if let Some(ctx) = consumer_ctx {
+        if ctx.consumer_type != "linggen" {
+            let _ = tx.send((rid.clone(), cid, serde_json::json!({
+                "error": "Inference endpoint is only available for linggen server consumers"
+            }))).await;
+            return;
+        }
+    }
+
+    match req.msg_type.as_str() {
+        "list_models" => {
+            let room_cfg = super::room_config::load_room_config();
+            let models = state.manager.models.read().await;
+            let model_list: Vec<serde_json::Value> = models.list_models().iter()
+                .filter(|m| {
+                    // Only expose models the owner has explicitly shared
+                    room_cfg.shared_models.contains(&m.id)
+                })
+                .map(|m| {
+                    serde_json::json!({
+                        "id": m.id,
+                        "model": m.model,
+                        "provider": m.provider,
+                        "supports_tools": m.supports_tools,
+                    })
+                }).collect();
+            let _ = tx.send((rid, cid, serde_json::json!({
+                "data": { "models": model_list }
+            }))).await;
+        }
+
+        "inference" => {
+            // Check token budget
+            if let Some(ctx) = consumer_ctx {
+                if let Some(budget) = ctx.token_budget_daily {
+                    if consumer_tokens_used >= budget {
+                        let _ = tx.send((rid.clone(), cid, serde_json::json!({
+                            "error": "Token budget exhausted"
+                        }))).await;
+                        return;
+                    }
+                }
+            }
+
+            let model_id = req.body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+            if model_id.is_empty() {
+                let _ = tx.send((rid.clone(), cid, serde_json::json!({ "error": "model required" }))).await;
+                return;
+            }
+
+            // Verify the model is in the shared list
+            let room_cfg = super::room_config::load_room_config();
+            if !room_cfg.shared_models.contains(&model_id.to_string()) {
+                let _ = tx.send((rid.clone(), cid, serde_json::json!({
+                    "error": format!("Model '{model_id}' is not shared in this room")
+                }))).await;
+                return;
+            }
+
+            // Parse messages
+            let messages: Vec<crate::ollama::ChatMessage> = match req.body.get("messages") {
+                Some(m) => match serde_json::from_value(m.clone()) {
+                    Ok(msgs) => msgs,
+                    Err(e) => {
+                        let _ = tx.send((rid.clone(), cid, serde_json::json!({
+                            "error": format!("Invalid messages: {e}")
+                        }))).await;
+                        return;
+                    }
+                },
+                None => {
+                    let _ = tx.send((rid.clone(), cid, serde_json::json!({ "error": "messages required" }))).await;
+                    return;
+                }
+            };
+
+            let tools: Option<Vec<serde_json::Value>> = req.body.get("tools")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+            tracing::info!("Inference request: model={model_id}, messages={}, tools={}", messages.len(), tools.as_ref().map(|t| t.len()).unwrap_or(0));
+
+            let models = state.manager.models.read().await;
+
+            let stream_result = if let Some(tools) = tools {
+                if !tools.is_empty() {
+                    models.chat_tool_stream(model_id, &messages, tools).await
+                } else {
+                    models.chat_text_stream(model_id, &messages).await
+                }
+            } else {
+                models.chat_text_stream(model_id, &messages).await
+            };
+
+            let mut stream = match stream_result {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send((rid.clone(), cid, serde_json::json!({
+                        "error": format!("Model error: {e}")
+                    }))).await;
+                    return;
+                }
+            };
+
+            // Stream chunks back
+            while let Some(item) = stream.next().await {
+                let chunk_json = match item {
+                    Ok(crate::agent_manager::models::StreamChunk::Token(text)) => {
+                        serde_json::json!({ "chunk": { "type": "token", "text": text } })
+                    }
+                    Ok(crate::agent_manager::models::StreamChunk::Usage(usage)) => {
+                        serde_json::json!({ "chunk": { "type": "usage",
+                            "prompt_tokens": usage.prompt_tokens,
+                            "completion_tokens": usage.completion_tokens,
+                            "total_tokens": usage.total_tokens,
+                        }})
+                    }
+                    Ok(crate::agent_manager::models::StreamChunk::ToolCall(tc)) => {
+                        serde_json::json!({ "chunk": { "type": "tool_call",
+                            "index": tc.index,
+                            "id": tc.id,
+                            "name": tc.name,
+                            "arguments_delta": tc.arguments_delta,
+                            "thought_signature": tc.thought_signature,
+                        }})
+                    }
+                    Err(e) => {
+                        let _ = tx.send((rid.clone(), cid, serde_json::json!({
+                            "error": format!("Stream error: {e}")
+                        }))).await;
+                        return;
+                    }
+                };
+                if tx.send((rid.clone(), cid, chunk_json)).await.is_err() {
+                    return; // Connection closed
+                }
+            }
+
+            // Signal stream end
+            let _ = tx.send((rid.clone(), cid, serde_json::json!({ "done": true }))).await;
+        }
+
+        _ => {
+            let _ = tx.send((rid, cid, serde_json::json!({ "error": "unknown inference type" }))).await;
+        }
+    }
+}
+
 /// Handle a message on a session data channel (chat, plan actions, etc.).
 ///
 /// Proxies to the local HTTP API to reuse existing handler logic.
@@ -538,6 +805,7 @@ async fn handle_session_message(
     session_id: &str,
     state: &Arc<ServerState>,
     client: &reqwest::Client,
+    consumer_ctx: Option<&super::ConsumerContext>,
 ) {
     let msg: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -555,6 +823,11 @@ async fn handle_session_message(
         "chat" => {
             let mut body = msg.clone();
             body["session_id"] = serde_json::Value::String(session_id.to_string());
+            // Enforce consumer permission mode for proxy room consumers.
+            // chat_api.rs loads allowed tools from room_config.toml server-side.
+            if consumer_ctx.is_some() {
+                body["mode"] = serde_json::Value::String("consumer".to_string());
+            }
             ("/api/chat", body)
         }
         "ask_user_response" => ("/api/ask-user-response", msg.clone()),
@@ -702,7 +975,7 @@ fn enqueue_response(
 /// Get the local (non-loopback) IP address for WebRTC host candidates.
 /// Connects a UDP socket to a public address to determine the local IP
 /// (no actual packets are sent).
-fn get_local_ip() -> Option<std::net::IpAddr> {
+pub(crate) fn get_local_ip() -> Option<std::net::IpAddr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     socket.local_addr().ok().map(|a| a.ip())

@@ -236,18 +236,16 @@ impl AgentEngine {
             }
         }
 
-        // --- mission tool restriction gate ---
-        // Block tools not in mission_allowed_tools (set by permission tier).
-        if let Some(ref allowed) = self.cfg.mission_allowed_tools {
-            if !allowed.contains(&canonical_tool) {
-                let msg = format!(
-                    "Tool '{}' is not allowed by this mission's permission tier. Available tools: {}",
-                    canonical_tool,
-                    allowed.iter().cloned().collect::<Vec<_>>().join(", ")
-                );
-                messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                return PreExecOutcome::Blocked(LoopControl::Continue);
-            }
+        // --- config-level tool restriction gate (defense-in-depth) ---
+        // Blocks tools not allowed by mission tiers or consumer room settings.
+        // The prompt already excludes these tools, but this catches hallucinations.
+        if !self.cfg.is_tool_allowed(&canonical_tool) {
+            let available = self.cfg.effective_tool_restrictions()
+                .map(|s| s.into_iter().collect::<Vec<_>>().join(", "))
+                .unwrap_or_default();
+            let msg = format!("Tool '{}' is not available. Allowed: {}", canonical_tool, available);
+            messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
+            return PreExecOutcome::Blocked(LoopControl::Continue);
         }
 
         // --- new permission gate (permission-spec.md) ---

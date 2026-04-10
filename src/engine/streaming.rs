@@ -5,12 +5,8 @@ use crate::ollama::ChatMessage;
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::Path;
-use tokio::time::{timeout, Duration};
 use tokio_stream::StreamExt as TokioStreamExt;
 use tracing::{debug, info, warn};
-
-const FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
-const INTER_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Unescape common JSON string escape sequences so streamed plan text
 /// renders as readable markdown in the UI.
@@ -179,22 +175,9 @@ impl AgentEngine {
         let mut first_action: Option<(actions::ModelAction, usize)> = None;
 
         loop {
-            let chunk_timeout = if accumulated.is_empty() {
-                FIRST_CHUNK_TIMEOUT
-            } else {
-                INTER_CHUNK_TIMEOUT
-            };
-            let chunk_result = match timeout(chunk_timeout, TokioStreamExt::next(&mut stream)).await
-            {
-                Ok(Some(result)) => result,
-                Ok(None) => break, // stream ended
-                Err(_) => {
-                    let secs = chunk_timeout.as_secs();
-                    anyhow::bail!(
-                        "Model streaming timed out after {}s (no data received)",
-                        secs
-                    );
-                }
+            let chunk_result = match TokioStreamExt::next(&mut stream).await {
+                Some(result) => result,
+                None => break, // stream ended
             };
             let chunk = chunk_result?;
             match chunk {
@@ -279,21 +262,9 @@ impl AgentEngine {
         let mut had_content_tokens = false;
 
         loop {
-            let chunk_timeout = if accumulated_text.is_empty() && tc_ids.is_empty() {
-                FIRST_CHUNK_TIMEOUT
-            } else {
-                INTER_CHUNK_TIMEOUT
-            };
-            let chunk_result = match timeout(chunk_timeout, TokioStreamExt::next(&mut stream)).await
-            {
-                Ok(Some(result)) => result,
-                Ok(None) => break,
-                Err(_) => {
-                    anyhow::bail!(
-                        "Model streaming timed out after {}s (no data received)",
-                        chunk_timeout.as_secs()
-                    );
-                }
+            let chunk_result = match TokioStreamExt::next(&mut stream).await {
+                Some(result) => result,
+                None => break,
             };
             let chunk = chunk_result?;
             match chunk {
@@ -408,39 +379,7 @@ impl AgentEngine {
         })
     }
 
-    /// Build an ordered model chain for fallback attempts.
-    ///
-    /// Order: primary model → `routing.default_models` → remaining configured models.
-    /// Filters out models marked unavailable by the health tracker (keeps at least one).
-    pub(crate) fn build_model_chain(&self) -> Vec<String> {
-        let primary = self.model_id.clone();
-
-        // When auto_fallback is disabled, only try the primary model.
-        if !self.auto_fallback {
-            return vec![primary];
-        }
-
-        let all_ids = self.model_manager.model_ids();
-
-        // Start with the primary, then default_models from config, then remaining.
-        let mut chain = vec![primary.clone()];
-        for dm in &self.default_models {
-            if !chain.contains(dm) && all_ids.contains(dm) {
-                chain.push(dm.clone());
-            }
-        }
-        for id in &all_ids {
-            if !chain.contains(id) {
-                chain.push(id.clone());
-            }
-        }
-        chain
-    }
-
-    /// Call the LLM with automatic fallback to other configured models
-    /// on transient errors (rate limit, context limit, timeout, 502/503, connection failures).
-    /// Controlled by `routing.auto_fallback` config (default: true).
-    /// Uses the health tracker to skip models known to be down/quota-exhausted.
+    /// Call the LLM using the configured model (no fallback).
     ///
     /// When `tools` is `Some`, uses native function calling via `stream_with_tool_calling()`.
     /// When `tools` is `None`, uses legacy JSON action format via `stream_with_thinking_model()`.
@@ -449,58 +388,22 @@ impl AgentEngine {
         messages: &[ChatMessage],
         tools: Option<Vec<serde_json::Value>>,
     ) -> Result<StreamResult> {
-        use crate::agent_manager::models;
+        let model_id = self.model_id.clone();
 
-        let chain = self.build_model_chain();
-        let primary = self.model_id.clone();
-        let health = self.model_manager.health.clone();
-        let mut last_err: Option<anyhow::Error> = None;
+        let result = if let Some(ref tool_defs) = tools {
+            self.stream_with_tool_calling(&model_id, messages, tool_defs.clone())
+                .await
+        } else {
+            self.stream_with_thinking_model(&model_id, messages).await
+        };
 
-        for model_id in &chain {
-            // Skip models known to be unavailable (but always try at least the primary).
-            if model_id != &primary && !health.is_available(model_id).await {
-                debug!("Skipping model '{}': unavailable", model_id);
-                continue;
+        match result {
+            Ok(result) => {
+                self.last_token_usage = result.token_usage.clone();
+                Ok(result)
             }
-
-            let result = if let Some(ref tool_defs) = tools {
-                self.stream_with_tool_calling(model_id, messages, tool_defs.clone())
-                    .await
-            } else {
-                self.stream_with_thinking_model(model_id, messages).await
-            };
-
-            match result {
-                Ok(result) => {
-                    health.mark_healthy(model_id).await;
-                    self.last_token_usage = result.token_usage.clone();
-                    if model_id != &primary {
-                        let reason = last_err
-                            .as_ref()
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "unavailable".to_string());
-                        info!("Model fallback: {} → {} ({})", primary, model_id, reason);
-                        self.model_id = model_id.clone();
-                        self.emit_model_fallback_event(&primary, model_id, &reason).await;
-                    }
-                    return Ok(result);
-                }
-                Err(e) if models::is_fallback_worthy_error(&e) => {
-                    warn!("Model '{}' error (will fallback): {}", model_id, e);
-                    health.mark_error(model_id, &e.to_string()).await;
-                    last_err = Some(e);
-                    continue;
-                }
-                Err(e) => {
-                    // Non-fallback-worthy error (e.g. network down, bad config) — don't try others.
-                    health.mark_error(model_id, &e.to_string()).await;
-                    return Err(e);
-                }
-            }
+            Err(e) => Err(e),
         }
-
-        // All models exhausted — return the last error.
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No models available")))
     }
 
     /// Emit a ModelFallback event via the agent manager.

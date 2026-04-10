@@ -159,6 +159,7 @@ export interface ModelInfo {
   model: string;
   url: string;
   reasoning_effort?: string | null;
+  provided_by?: string | null;
 }
 
 export interface OllamaPsModel {
@@ -298,7 +299,7 @@ export interface BuiltInSkillInfo {
   installed: boolean;
 }
 
-export type ManagementTab = 'models' | 'agents' | 'skills' | 'tools' | 'general' | 'mission' | 'storage';
+export type ManagementTab = 'models' | 'agents' | 'skills' | 'tools' | 'general' | 'mission' | 'storage' | 'sharing';
 
 // --- Mission types (cron-based) ---
 

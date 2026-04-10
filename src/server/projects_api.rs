@@ -1272,3 +1272,111 @@ pub(crate) async fn auth_logout() -> impl IntoResponse {
         Json(serde_json::json!({ "ok": true, "message": "Not logged in" })).into_response()
     }
 }
+
+/// GET /api/room-config — get local room config (shared models, allowed tools).
+pub(crate) async fn get_room_config() -> impl IntoResponse {
+    let config = crate::server::rtc::room_config::load_room_config();
+    Json(serde_json::json!({
+        "shared_models": config.shared_models,
+        "allowed_tools": config.allowed_tools,
+        "allowed_skills": config.allowed_skills,
+    }))
+}
+
+/// POST /api/room-config — update local room config (shared models).
+pub(crate) async fn update_room_config(
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // Load current config as base, then merge incoming fields
+    let mut config = crate::server::rtc::room_config::load_room_config();
+    if let Some(v) = body.get("shared_models") {
+        config.shared_models = serde_json::from_value(v.clone()).unwrap_or_default();
+    }
+    if let Some(v) = body.get("allowed_tools") {
+        config.allowed_tools = serde_json::from_value(v.clone()).unwrap_or_default();
+    }
+    if let Some(v) = body.get("allowed_skills") {
+        config.allowed_skills = serde_json::from_value(v.clone()).unwrap_or_default();
+    }
+    match crate::server::rtc::room_config::save_room_config(&config) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("{e}") }))).into_response(),
+    }
+}
+
+/// POST /api/proxy/connect — connect to a proxy room as a linggen consumer.
+/// Body: { "instance_id": "...", "owner_name": "Tom" }
+pub(crate) async fn connect_proxy_room_api(
+    State(state): State<Arc<ServerState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let instance_id = match body.get("instance_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "instance_id required" }))).into_response(),
+    };
+    let owner_name = body.get("owner_name").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    match crate::server::rtc::proxy_room::connect_proxy_room(state, &instance_id, owner_name).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("{e}") }))).into_response(),
+    }
+}
+
+/// POST /api/proxy/disconnect — disconnect from proxy room, remove proxy models.
+pub(crate) async fn disconnect_proxy_room_api(
+    State(state): State<Arc<ServerState>>,
+) -> impl IntoResponse {
+    crate::server::rtc::proxy_room::disconnect_proxy_room(state).await;
+    Json(serde_json::json!({ "ok": true }))
+}
+
+/// Proxy linggen.dev room APIs — forwards GET/POST/PATCH/DELETE to /api/rooms/*.
+/// Uses the API token from remote.toml for auth.
+pub(crate) async fn proxy_rooms(
+    method: axum::http::Method,
+    axum::extract::Path(path): axum::extract::Path<String>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let config = match crate::cli::login::load_remote_config() {
+        Some(c) => c,
+        None => return (StatusCode::UNAUTHORIZED, "Not logged in to linggen.dev").into_response(),
+    };
+
+    let url = format!("{}/api/rooms/{}", config.relay_url, path);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
+
+    let mut req = match method {
+        axum::http::Method::GET => client.get(&url),
+        axum::http::Method::POST => client.post(&url),
+        axum::http::Method::PATCH => client.patch(&url),
+        axum::http::Method::DELETE => client.delete(&url),
+        _ => return (StatusCode::METHOD_NOT_ALLOWED, "Method not allowed").into_response(),
+    };
+
+    req = req.bearer_auth(&config.api_token);
+    if !body.is_empty() {
+        // Auto-inject instance_id for room creation/update if not already present
+        if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body) {
+            if json.get("instance_id").is_none() || json["instance_id"].is_null() {
+                json["instance_id"] = serde_json::Value::String(config.instance_id.clone());
+            }
+            req = req.header("Content-Type", "application/json").json(&json);
+        } else {
+            req = req.header("Content-Type", "application/json").body(body.to_vec());
+        }
+    }
+
+    match req.send().await {
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            match resp.json::<serde_json::Value>().await {
+                Ok(body) => (status, Json(body)).into_response(),
+                Err(_) => (status, "{}").into_response(),
+            }
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("Relay error: {}", e)).into_response(),
+    }
+}

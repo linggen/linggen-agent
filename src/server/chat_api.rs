@@ -1290,7 +1290,7 @@ pub(crate) async fn chat_handler(
             let queued_item_id = queued_item.as_ref().map(|q| q.id.clone());
             let session_id_for_queue = effective_session_id.clone();
             let project_root_for_queue = project_root_str.clone();
-            let _req_mode = req.mode.clone();
+            let req_mode = req.mode.clone();
             let req_model_id = req.model_id.clone();
             let req_images = req.images.clone();
             if was_busy {
@@ -1400,6 +1400,24 @@ pub(crate) async fn chat_handler(
                             engine.cached_system_prompt = None;
                         }
                     }
+                }
+
+                // Apply session mode override for proxy room consumers.
+                match req_mode.as_deref() {
+                    Some("chat") => {
+                        // Chat mode: no tools at all.
+                        engine.cfg.permission_mode = crate::engine::permission::PermissionMode::Chat;
+                        engine.cached_system_prompt = None;
+                    }
+                    Some("consumer") => {
+                        // Consumer mode: load allowed tools/skills from room_config.toml
+                        // server-side. Never trust the request body for permissions.
+                        let room_cfg = crate::server::rtc::room_config::load_room_config();
+                        engine.cfg.consumer_allowed_tools = Some(room_cfg.allowed_tools.into_iter().collect());
+                        engine.cfg.consumer_allowed_skills = Some(room_cfg.allowed_skills.into_iter().collect());
+                        engine.cached_system_prompt = None;
+                    }
+                    _ => {}
                 }
 
                 let model_label = &engine.model_id;

@@ -54,6 +54,10 @@ pub struct ModelConfig {
     /// - Others: ignored (no-op)
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Display name of the proxy room owner providing this model.
+    /// Only set for proxy models (provider = "proxy").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provided_by: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -369,6 +373,7 @@ impl Default for Config {
                 supports_tools: None,
                 auth_mode: Some("chatgpt_oauth".to_string()),
                 reasoning_effort: None,
+                provided_by: None,
             }],
             server: ServerConfig { port: 9898, host: default_server_host() },
             agent: AgentConfig {

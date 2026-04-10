@@ -145,6 +145,7 @@ fn is_rate_limit_error_str(msg: &str) -> bool {
 enum ProviderClient {
     Ollama(OllamaClient),
     OpenAi(OpenAiClient),
+    Proxy(Arc<super::proxy_provider::ProxyModelClient>),
 }
 
 pub struct ModelManager {
@@ -357,6 +358,18 @@ impl ModelManager {
                     },
                 )))
             }
+            ProviderClient::Proxy(client) => {
+                let stream = client.inference_stream(&instance.config.model, messages, None).await?;
+                Ok(Box::pin(futures_util::stream::unfold(
+                    (stream, _permit),
+                    |(mut stream, permit)| async move {
+                        match stream.next().await {
+                            Some(item) => Some((item, (stream, permit))),
+                            None => None,
+                        }
+                    },
+                )))
+            }
         }
     }
 
@@ -444,11 +457,66 @@ impl ModelManager {
                     },
                 )))
             }
+            ProviderClient::Proxy(client) => {
+                let stream = client.inference_stream(&instance.config.model, messages, Some(tools)).await?;
+                Ok(Box::pin(futures_util::stream::unfold(
+                    (stream, _permit),
+                    |(mut stream, permit)| async move {
+                        match stream.next().await {
+                            Some(item) => Some((item, (stream, permit))),
+                            None => None,
+                        }
+                    },
+                )))
+            }
         }
     }
 
     pub fn list_models(&self) -> Vec<&ModelConfig> {
         self.models.values().map(|m| &m.config).collect()
+    }
+
+    /// Register proxy models from a remote room owner.
+    /// Each model is backed by the ProxyModelClient and routes inference
+    /// through a WebRTC data channel.
+    pub fn register_proxy_models(
+        &mut self,
+        proxy_client: Arc<super::proxy_provider::ProxyModelClient>,
+        remote_models: Vec<serde_json::Value>,
+        owner_name: Option<String>,
+    ) {
+        for model_info in remote_models {
+            let id = model_info.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let model_name = model_info.get("model").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
+            let supports_tools = model_info.get("supports_tools").and_then(|v| v.as_bool()).unwrap_or(true);
+            if id.is_empty() { continue; }
+
+            let proxy_id = format!("proxy:{id}");
+            tracing::info!("Registering proxy model: {proxy_id} (remote: {model_name}, by: {:?})", owner_name);
+
+            let config = crate::config::ModelConfig {
+                id: proxy_id.clone(),
+                provider: "proxy".to_string(),
+                url: String::new(),
+                api_key: None,
+                model: model_name,
+                context_window: None,
+                tags: vec!["proxy".to_string()],
+                supports_tools: Some(supports_tools),
+                keep_alive: None,
+                auth_mode: None,
+                reasoning_effort: None,
+                provided_by: owner_name.clone(),
+            };
+
+            self.models.insert(proxy_id, ModelInstance {
+                config,
+                client: ProviderClient::Proxy(proxy_client.clone()),
+                semaphore: Arc::new(Semaphore::new(1)),
+                context_window: OnceCell::new(),
+                has_vision: OnceCell::new(),
+            });
+        }
     }
 
     /// Return all registered model IDs (for fallback iteration).
@@ -502,6 +570,10 @@ impl ModelManager {
                     })
                     .await;
                 Ok(*value?)
+            }
+            ProviderClient::Proxy(_) => {
+                // Proxy models: use config context_window or a conservative default
+                Ok(instance.config.context_window.or(Some(128000)))
             }
         }
     }
@@ -574,6 +646,7 @@ impl ModelManager {
                     Ok(instance.config.tags.iter().any(|t| t.eq_ignore_ascii_case("vision")))
                 }
             }
+            ProviderClient::Proxy(_) => Ok(false),
         }
     }
 

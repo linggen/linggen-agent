@@ -10,7 +10,23 @@
 
 mod peer;
 pub(crate) mod page_state;
+pub mod proxy_client;
+pub mod proxy_room;
 pub mod relay;
+pub mod room_config;
+
+/// Context for a proxy room consumer connection.
+/// When present, the peer is a consumer (not the instance owner) and
+/// permissions/tools are restricted accordingly.
+#[derive(Debug, Clone)]
+pub struct ConsumerContext {
+    /// "browser" = chat mode only (no tools), "linggen" = read mode (capped)
+    pub consumer_type: String,
+    /// Optional daily token budget from the room config
+    pub token_budget_daily: Option<i64>,
+    /// Consumer's user ID on linggen.dev
+    pub consumer_user_id: Option<String>,
+}
 
 use axum::{
     body::Bytes,

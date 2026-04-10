@@ -45,6 +45,8 @@ use projects_api::{
     rename_session_api, resolve_session_api, upsert_agent_file_api, upsert_skill_file_api,
     get_user_me, auth_login, auth_callback, auth_logout,
     get_session_permission, update_session_permission,
+    proxy_rooms, connect_proxy_room_api, disconnect_proxy_room_api,
+    get_room_config, update_room_config,
 };
 use marketplace_api::{builtin_skills_install, builtin_skills_list, clawhub_scan, community_search, marketplace_install, marketplace_move_to_global, marketplace_uninstall};
 use missions_api::{
@@ -1286,6 +1288,10 @@ async fn prepare_server(
         .route("/api/auth/login", get(auth_login))
         .route("/api/auth/callback", get(auth_callback))
         .route("/api/auth/logout", post(auth_logout))
+        .route("/api/rooms/{*path}", axum::routing::any(proxy_rooms))
+        .route("/api/proxy/connect", post(connect_proxy_room_api))
+        .route("/api/proxy/disconnect", post(disconnect_proxy_room_api))
+        .route("/api/room-config", get(get_room_config).post(update_room_config))
         .route("/api/health", get(health_handler))
         .route("/api/utils/pick-folder", get(pick_folder))
         .route("/api/utils/ollama-status", get(get_ollama_status))

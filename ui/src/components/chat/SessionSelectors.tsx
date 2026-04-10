@@ -1,5 +1,5 @@
 /**
- * Compact per-session model and permission mode selectors.
+ * Compact per-session model and permission mode selectors + stats.
  * Extracted from ChatPanel.tsx.
  */
 import React from 'react';
@@ -7,6 +7,27 @@ import { useAgentStore } from '../../stores/agentStore';
 import { useUiStore } from '../../stores/uiStore';
 import { useProjectStore } from '../../stores/projectStore';
 import { suppressPermissionSync } from '../../lib/eventDispatcher';
+
+const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+
+/** Compact context usage display for the session top bar. */
+export const SessionStats: React.FC = () => {
+  const sessionId = useProjectStore((s) => s.activeSessionId) || '';
+  const ctx = useAgentStore((s) => s.agentContext[sessionId]);
+
+  const tokens = ctx?.tokens || 0;
+  const limit = ctx?.tokenLimit && ctx.tokenLimit > 0 ? ctx.tokenLimit : 0;
+  const pct = limit ? Math.round((tokens / limit) * 100) : 0;
+
+  if (!tokens) return null;
+
+  return (
+    <span className="text-[10px] font-mono text-slate-400 ml-auto shrink-0" title={`Context: ${tokens} / ${limit || '?'} tokens (${pct}%)`}>
+      <span className={pct > 80 ? 'text-red-400' : pct > 50 ? 'text-amber-400' : ''}>{fmt(tokens)}</span>
+      {limit > 0 && <span className="text-slate-300 dark:text-slate-600">/{fmt(limit)}</span>}
+    </span>
+  );
+};
 
 /** Compact per-session model selector shown in the run bar. */
 export const SessionModelSelector: React.FC = () => {
@@ -53,7 +74,9 @@ export const SessionModelSelector: React.FC = () => {
     >
       <option value="">Default ({defaultLabel})</option>
       {models.filter((m) => !defaultModels.includes(m.id)).map((m) => (
-        <option key={m.id} value={m.id}>{m.id}</option>
+        <option key={m.id} value={m.id}>
+          {m.id}{m.provided_by ? ` (By ${m.provided_by})` : ''}
+        </option>
       ))}
     </select>
   );

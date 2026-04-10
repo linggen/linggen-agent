@@ -28,6 +28,8 @@ guide: |
 - Avoid deep nested `if/else` and nested `match` chains where flattening is possible.
 - Extract nested logic into helper functions with clear names.
 - Keep async control flow explicit and easy to trace.
+- Use design patterns (dispatch, composition, traits) instead of long conditional chains.
+- Name functions to describe their purpose (e.g. `build_consumer_prompt`, `build_owner_prompt` instead of one function with mode flags).
 
 ## Clean Code Policy
 

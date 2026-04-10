@@ -100,6 +100,32 @@ pub struct EngineConfig {
     /// When set, restricts available tools to this set (mission permission tiers).
     /// This is applied at engine level, before the agent spec tool list.
     pub mission_allowed_tools: Option<std::collections::HashSet<String>>,
+    /// When set, restricts available tools for proxy room consumers.
+    /// Owner configures which tools consumers can use via room_config.toml.
+    pub consumer_allowed_tools: Option<std::collections::HashSet<String>>,
+    /// When set, restricts available skills for proxy room consumers.
+    pub consumer_allowed_skills: Option<std::collections::HashSet<String>>,
+}
+
+impl EngineConfig {
+    /// Compute the cascading intersection of mission + consumer tool restrictions.
+    /// Returns None if no restrictions apply (all tools allowed from config perspective).
+    pub fn effective_tool_restrictions(&self) -> Option<std::collections::HashSet<String>> {
+        match (&self.mission_allowed_tools, &self.consumer_allowed_tools) {
+            (None, None) => None,
+            (Some(m), None) => Some(m.clone()),
+            (None, Some(c)) => Some(c.clone()),
+            (Some(m), Some(c)) => Some(m.intersection(c).cloned().collect()),
+        }
+    }
+
+    /// Check if a specific tool is allowed by config-level restrictions.
+    pub fn is_tool_allowed(&self, tool: &str) -> bool {
+        match self.effective_tool_restrictions() {
+            None => true,
+            Some(ref allowed) => allowed.contains(tool),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
