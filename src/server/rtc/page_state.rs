@@ -37,6 +37,10 @@ pub struct PageState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub room_name: Option<String>,
 
+    /// Whether the owner's room is enabled (accepting consumers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room_enabled: Option<bool>,
+
     // -- Global (always included unless compact mode) --
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -100,10 +104,14 @@ pub async fn build_page_state(
     let is_admin = user.permission.is_admin();
     let user_id = &user.user_id;
 
+    // Load room config — needed for consumer filtering and owner room_enabled status.
+    let room_cfg = super::room_config::load_room_config();
+
     let mut ps = PageState {
         user_type: Some(user.user_type().to_string()),
         permission: Some(user.permission.as_str().to_string()),
         room_name: user.room_name.clone(),
+        room_enabled: if !user.is_consumer { Some(room_cfg.room_enabled) } else { None },
         all_sessions: None,
         models: None,
         default_models: None,
@@ -135,12 +143,8 @@ pub async fn build_page_state(
             std::collections::HashSet::new()
         };
 
-    // Load room config for consumer filtering (room_config is the consumer ceiling)
-    let room_cfg = if user.is_consumer {
-        Some(super::room_config::load_room_config())
-    } else {
-        None
-    };
+    // Wrap room config for consumer filtering
+    let room_cfg = if user.is_consumer { Some(room_cfg) } else { None };
 
     // -- Global data (skip in compact/skill mode) --
     if include_global && !ctx.is_compact {

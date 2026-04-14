@@ -128,24 +128,39 @@ export const HeaderBar: React.FC<{
   const connectionStatus = useUserStore((s) => s.connectionStatus);
   const userRoomName = useUserStore((s) => s.userRoomName);
   const userType = useUserStore((s) => s.userType);
+  const roomEnabled = useUserStore((s) => s.roomEnabled);
 
-  // Fetch room name for owner — the backend doesn't include it in page_state
+  // Fetch room name for owner — room_enabled comes from page_state, but
+  // room_name requires an HTTP call since it's stored on linggen.dev.
   useEffect(() => {
     if (userType !== 'owner') return;
     let cancelled = false;
-    fetch('/api/rooms/mine')
-      .then(r => r.ok ? r.json() : null)
-      .then(data => {
-        if (cancelled) return;
-        const name = data?.room?.name ?? null;
-        const store = useUserStore.getState();
-        if (store.userRoomName !== name) {
-          store.setUserInfo(store.userPermission, name, store.userTokenBudget);
-        }
-      })
-      .catch(() => {});
+    let retryCount = 0;
+    const fetchRoomName = () => {
+      fetch('/api/rooms/mine')
+        .then(r => r.ok ? r.json() : null)
+        .then(data => {
+          if (cancelled) return;
+          const name = data?.room?.name ?? null;
+          const store = useUserStore.getState();
+          if (store.userRoomName !== name) {
+            store.setUserInfo(store.userPermission, name, store.userTokenBudget);
+          }
+          if (!name && retryCount < 3) {
+            retryCount++;
+            setTimeout(() => { if (!cancelled) fetchRoomName(); }, 2000);
+          }
+        })
+        .catch(() => {
+          if (!cancelled && retryCount < 3) {
+            retryCount++;
+            setTimeout(fetchRoomName, 2000);
+          }
+        });
+    };
+    fetchRoomName();
     return () => { cancelled = true; };
-  }, [userType]);
+  }, [userType, connectionStatus]);
 
   return (
     <header className="flex items-center justify-between px-4 md:px-6 py-2.5 border-b border-slate-200 dark:border-white/5 bg-white/90 dark:bg-[#0f0f0f]/90 backdrop-blur-md z-50">
@@ -165,9 +180,14 @@ export const HeaderBar: React.FC<{
             onClick={() => {
               useUiStore.getState().openSettings('room');
             }}
-            className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-500 font-medium hover:bg-amber-500/20 transition-colors"
-            title="Open Sharing settings"
+            className={`flex items-center gap-1.5 text-[10px] px-1.5 py-0.5 rounded font-medium transition-colors ${
+              roomEnabled
+                ? 'bg-green-500/10 text-green-600 hover:bg-green-500/20'
+                : 'bg-slate-200 dark:bg-white/10 text-slate-400 hover:bg-slate-300 dark:hover:bg-white/20'
+            }`}
+            title="Room settings"
           >
+            <span className={`w-1.5 h-1.5 rounded-full ${roomEnabled ? 'bg-green-500' : 'bg-slate-400'}`} />
             {userRoomName}
           </button>
         )}

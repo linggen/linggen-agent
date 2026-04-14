@@ -25,7 +25,7 @@ function shortTime(ms: number): string {
 
 /** Generate initials from a name. */
 function initials(name: string): string {
-  return name.slice(0, 2).toUpperCase();
+  return [...name].slice(0, 2).join('').toUpperCase();
 }
 
 /** Pick a consistent colour for a sender. */
@@ -93,8 +93,8 @@ export const RoomChatPanel: React.FC = () => {
     const text = input.trim();
     if (!text) return;
     const transport = getTransport();
-    const { userId, userType } = useUserStore.getState();
-    const userName = userType === 'owner' ? 'Owner' : (userId || 'Me');
+    const { userName: storedName } = useUserStore.getState();
+    const userName = storedName || 'Me';
     transport.sendRoomChat?.(text, userName);
     setInput('');
     inputRef.current?.focus();
@@ -153,9 +153,13 @@ export const RoomChatPanel: React.FC = () => {
         )}
         {messages.map((msg) => (
           <div key={msg.id} className={`flex items-start gap-1.5 ${msg.isMine ? 'flex-row-reverse' : ''}`}>
-            <div className={`shrink-0 w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold text-white ${avatarColor(msg.senderId)}`}>
-              {initials(msg.senderName)}
-            </div>
+            {msg.avatarUrl ? (
+              <img src={msg.avatarUrl} alt={msg.senderName} className="shrink-0 w-5 h-5 rounded-full object-cover" />
+            ) : (
+              <div className={`shrink-0 w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold text-white ${avatarColor(msg.senderId)}`}>
+                {initials(msg.senderName)}
+              </div>
+            )}
             <div className={`max-w-[80%] ${msg.isMine ? 'items-end' : 'items-start'}`}>
               {!msg.isMine && (
                 <span className="text-[9px] text-slate-400 ml-0.5">{msg.senderName}</span>

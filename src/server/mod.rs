@@ -333,6 +333,7 @@ pub enum ServerEvent {
     RoomChat {
         sender_id: String,
         sender_name: String,
+        avatar_url: Option<String>,
         text: String,
     },
 }
@@ -1020,6 +1021,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
         ServerEvent::RoomChat {
             sender_id,
             sender_name,
+            avatar_url,
             text,
         } => Some(UiEvent {
             id: format!("room-chat-{seq}"),
@@ -1035,6 +1037,7 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             data: Some(json!({
                 "sender_id": sender_id,
                 "sender_name": sender_name,
+                "avatar_url": avatar_url,
                 "text": text,
             })),
         }),
@@ -1338,14 +1341,18 @@ async fn prepare_server(
     // Spawn remote relay tasks (heartbeat + offer polling) if remote.toml exists.
     rtc::relay::spawn_relay_tasks(state.clone());
 
-    // Auto-connect to joined proxy rooms (linggen server consumer mode).
+    // Auto-connect to joined proxy rooms (linggen server consumer mode)
+    // if auto_connect is enabled in room_config.toml.
     {
-        let auto_state = state.clone();
-        tokio::spawn(async move {
-            // Small delay to let relay establish first.
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            rtc::proxy_room::auto_connect_joined_rooms(auto_state).await;
-        });
+        let room_cfg = rtc::room_config::load_room_config();
+        if room_cfg.auto_connect {
+            let auto_state = state.clone();
+            tokio::spawn(async move {
+                // Small delay to let relay establish first.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                rtc::proxy_room::auto_connect_joined_rooms(auto_state).await;
+            });
+        }
     }
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
@@ -1700,6 +1707,7 @@ mod tests {
             ServerEvent::RoomChat {
                 sender_id: "user-1".into(),
                 sender_name: "Alice".into(),
+                avatar_url: None,
                 text: "Hello room!".into(),
             },
         ];

@@ -31,7 +31,18 @@ pub struct RoomConfig {
     /// Default: empty (no skills). Owner adds specific skills.
     #[serde(default)]
     pub allowed_skills: Vec<String>,
+
+    /// Whether the room is currently active (accepting connections).
+    /// When false, heartbeat stops and room appears offline.
+    #[serde(default = "default_true")]
+    pub room_enabled: bool,
+
+    /// Auto-connect to room on linggen startup.
+    #[serde(default = "default_true")]
+    pub auto_connect: bool,
 }
+
+fn default_true() -> bool { true }
 
 impl Default for RoomConfig {
     fn default() -> Self {
@@ -39,6 +50,8 @@ impl Default for RoomConfig {
             shared_models: Vec::new(),
             allowed_tools: default_allowed_tools(),
             allowed_skills: Vec::new(),
+            room_enabled: true,
+            auto_connect: true,
         }
     }
 }

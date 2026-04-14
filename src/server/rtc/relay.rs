@@ -140,8 +140,13 @@ async fn offer_poll_loop(config: &RemoteConfig, state: Arc<ServerState>) {
                         if !nonce.is_empty() && !sdp.is_empty() {
                             // Build UserContext for this peer
                             let user_ctx = if let Some(ct) = data["consumer_type"].as_str() {
-                                // Consumer — derive permission from room_config
+                                // Consumer — check if room is enabled first
                                 let room_cfg = super::room_config::load_room_config();
+                                if !room_cfg.room_enabled {
+                                    info!("Rejecting consumer offer (room disabled, nonce: {nonce})");
+                                    continue;
+                                }
+                                // Derive permission from room_config
                                 let permission = super::room_config::tools_to_permission(&room_cfg.allowed_tools);
                                 let user_id = data["consumer_user_id"].as_str().unwrap_or("").to_string();
                                 info!("Received proxy room offer (nonce: {nonce}, type: {ct}, perm: {:?})", permission);

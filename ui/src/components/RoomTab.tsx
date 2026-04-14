@@ -142,8 +142,8 @@ const BudgetInput: React.FC<{
 // ---------------------------------------------------------------------------
 
 const sectionCls = 'bg-white dark:bg-white/[0.02] border border-slate-200 dark:border-white/5 rounded-xl p-4 space-y-3';
-const labelCls = 'text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400';
-const inputCls = 'w-full bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:ring-1 focus:ring-blue-500/50';
+const labelCls = 'text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400';
+const inputCls = 'w-full bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-blue-500/50';
 const btnPrimary = 'px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg transition-colors disabled:opacity-50';
 const btnDanger = 'px-3 py-1.5 text-xs text-red-500 hover:text-red-600 font-medium';
 
@@ -185,6 +185,10 @@ export const RoomTab: React.FC = () => {
   const [formType, setFormType] = useState('private');
   const [formMaxConsumers, setFormMaxConsumers] = useState(4);
   const [formBudget, setFormBudget] = useState<number | null>(500000);
+
+  // Room connect state
+  const [roomEnabled, setRoomEnabled] = useState(true);
+  const [autoConnect, setAutoConnect] = useState(true);
 
   // --- Consumer state (new) ---
   const [joinedRooms, setJoinedRooms] = useState<JoinedRoom[]>([]);
@@ -261,13 +265,19 @@ export const RoomTab: React.FC = () => {
         ]);
         if (modelsResp.ok) {
           const data = await modelsResp.json();
-          setAllModels(data.models || []);
+          // /api/models returns a raw array, not { models: [...] }
+          setAllModels(Array.isArray(data) ? data : data.models || []);
         }
         if (configResp.ok) {
           const data = await configResp.json();
           setSharedModels(data.shared_models || []);
           setAllowedTools(data.allowed_tools || TOOL_PRESETS.read);
           setAllowedSkills(data.allowed_skills || []);
+          const enabled = data.room_enabled ?? true;
+          setRoomEnabled(enabled);
+          setAutoConnect(data.auto_connect ?? true);
+          // Sync to global store so HeaderBar shows correct status
+          useUserStore.getState().setRoomEnabled(enabled);
         }
         if (skillsResp.ok) {
           const data: SkillInfoFull[] = await skillsResp.json();
@@ -328,6 +338,20 @@ export const RoomTab: React.FC = () => {
     });
     setAllowedSkills(filtered);
     saveRoomConfig({ allowed_tools: next, allowed_skills: filtered });
+  };
+
+  const toggleRoomEnabled = () => {
+    const next = !roomEnabled;
+    setRoomEnabled(next);
+    // Sync to global store so HeaderBar updates immediately
+    useUserStore.getState().setRoomEnabled(next);
+    saveRoomConfig({ room_enabled: next } as any);
+  };
+
+  const toggleAutoConnect = () => {
+    const next = !autoConnect;
+    setAutoConnect(next);
+    saveRoomConfig({ auto_connect: next } as any);
   };
 
   const toggleSkill = (name: string) => {
@@ -550,7 +574,7 @@ export const RoomTab: React.FC = () => {
   }
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-4">
 
       {error && (
         <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg">
@@ -558,487 +582,441 @@ export const RoomTab: React.FC = () => {
         </div>
       )}
 
-      {/* ================================================================= */}
-      {/* SECTION 1: MY ROOM (Owner)                                        */}
-      {/* ================================================================= */}
-      <div>
-        <div className="flex items-center justify-between mb-3">
-          <div>
-            <h2 className="text-sm font-bold text-slate-900 dark:text-white">My Room</h2>
-            <p className="text-[10px] text-slate-500 mt-0.5">Share your AI models with others.</p>
-          </div>
-        </div>
+      {/* ═══════════════════════════════════════════════════════════════ */}
+      {/* Two-panel layout                                               */}
+      {/* Left: My Room (owner config)   Right: Rooms (joined + public)  */}
+      {/* ═══════════════════════════════════════════════════════════════ */}
+      <div className="flex flex-col lg:flex-row gap-6 lg:items-start">
 
-        {/* No room — show create */}
-        {!room && !creating && (
-          <div className="p-5 border border-dashed border-slate-300 dark:border-white/10 rounded-xl text-center space-y-3">
-            <Users size={20} className="mx-auto text-slate-400" />
-            <p className="text-xs text-slate-500">No room yet.</p>
-            <button onClick={() => setCreating(true)} className={btnPrimary}>
-              Create Room
-            </button>
-          </div>
-        )}
+        {/* ─────────────────────────────────────────────────────────── */}
+        {/* LEFT PANEL: My Room                                         */}
+        {/* ─────────────────────────────────────────────────────────── */}
+        <div className="lg:w-1/2 lg:shrink-0 space-y-3">
+          <h3 className={labelCls}>My Room</h3>
 
-        {/* Create form */}
-        {creating && !room && (
-          <div className={sectionCls}>
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className={labelCls}>Room Name</label>
-                <input value={formName} onChange={e => setFormName(e.target.value)} className={inputCls + ' mt-1'} />
-              </div>
-              <div>
-                <label className={labelCls}>Type</label>
-                <select value={formType} onChange={e => setFormType(e.target.value)} className={inputCls + ' mt-1'}>
-                  <option value="private">Private (invite only)</option>
-                  <option value="public">Public (anyone can join)</option>
-                </select>
-              </div>
+          {/* No room — compact CTA */}
+          {!room && !creating && (
+            <div className={`${sectionCls} !space-y-2 text-center`}>
+              <Users size={18} className="mx-auto text-slate-400" />
+              <p className="text-[10px] text-slate-500">Share your models with others.</p>
+              <button onClick={() => setCreating(true)} className={btnPrimary}>Create Room</button>
             </div>
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className={labelCls}>Max Consumers</label>
-                <select value={formMaxConsumers} onChange={e => setFormMaxConsumers(parseInt(e.target.value))} className={inputCls + ' mt-1'}>
-                  {[1, 2, 3, 4].map(n => <option key={n} value={n}>{n}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className={labelCls}>Daily Token Budget</label>
-                <div className="mt-1">
-                  <BudgetInput value={formBudget} onChange={setFormBudget} />
-                </div>
-              </div>
-            </div>
-            <div className="flex gap-2 pt-1">
-              <button onClick={createRoom} disabled={saving} className={btnPrimary}>
-                {saving ? 'Creating...' : 'Create'}
-              </button>
-              <button onClick={() => { setCreating(false); setError(null); }} className="px-4 py-2 text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300">
-                Cancel
-              </button>
-            </div>
-          </div>
-        )}
+          )}
 
-        {/* Room exists — full settings */}
-        {room && (
-          <div className="space-y-4">
-
-            {/* Room Info */}
+          {/* Create form */}
+          {creating && !room && (
             <div className={sectionCls}>
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <h3 className="font-bold text-sm text-slate-900 dark:text-white">{room.name}</h3>
-                  <span className={`px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider rounded ${
-                    room.room_type === 'public' ? 'bg-blue-500/10 text-blue-500' : 'bg-slate-200 dark:bg-white/10 text-slate-500'
-                  }`}>{room.room_type}</span>
-                </div>
-                <div className={`flex items-center gap-1.5 text-[11px] font-medium ${room.online ? 'text-green-500' : 'text-slate-400'}`}>
-                  <div className={onlineDot(room.online)} />
-                  {room.online ? 'Online' : 'Offline'}
-                </div>
-              </div>
-
-              <div className="grid grid-cols-3 gap-3">
+              <div className="space-y-3">
                 <div>
-                  <label className="block text-[10px] font-bold text-slate-400 mb-1">Type</label>
-                  <select value={room.room_type} onChange={e => updateRoom({ room_type: e.target.value })} className="w-full px-2 py-1.5 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded text-xs">
-                    <option value="private">Private</option>
-                    <option value="public">Public</option>
-                  </select>
+                  <label className="block text-[10px] font-bold text-slate-400 mb-1">Name</label>
+                  <input value={formName} onChange={e => setFormName(e.target.value)} className={inputCls} />
                 </div>
-                <div>
-                  <label className="block text-[10px] font-bold text-slate-400 mb-1">Max Consumers</label>
-                  <select value={room.max_consumers} onChange={e => updateRoom({ max_consumers: parseInt(e.target.value) })} className="w-full px-2 py-1.5 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded text-xs">
-                    {[1, 2, 3, 4].map(n => <option key={n} value={n}>{n}</option>)}
-                  </select>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-400 mb-1">Type</label>
+                    <select value={formType} onChange={e => setFormType(e.target.value)} className={inputCls}>
+                      <option value="private">Private</option>
+                      <option value="public">Public</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-400 mb-1">Max Users</label>
+                    <select value={formMaxConsumers} onChange={e => setFormMaxConsumers(parseInt(e.target.value))} className={inputCls}>
+                      {[1, 2, 3, 4].map(n => <option key={n} value={n}>{n}</option>)}
+                    </select>
+                  </div>
                 </div>
                 <div>
                   <label className="block text-[10px] font-bold text-slate-400 mb-1">Daily Budget</label>
-                  <BudgetInput
-                    value={room.token_budget_daily}
-                    onChange={val => { if (val !== room.token_budget_daily) updateRoom({ token_budget_daily: val }); }}
-                  />
+                  <BudgetInput value={formBudget} onChange={setFormBudget} />
                 </div>
               </div>
-
-              {/* Invite link */}
-              {room.room_type === 'private' && room.invite_token && (
-                <div>
-                  <label className="block text-[10px] font-bold text-slate-400 mb-1">Invite Link</label>
-                  <div className="flex items-center gap-2">
-                    <input readOnly value={`https://linggen.dev/join/${room.invite_token}`} className="flex-1 px-2 py-1.5 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded text-[11px] font-mono text-slate-500" />
-                    <button onClick={copyInvite} className="p-1.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded transition-colors">
-                      {copied ? <Check size={14} className="text-green-500" /> : <Copy size={14} className="text-slate-400" />}
-                    </button>
-                    <button onClick={regenerateInvite} disabled={saving} className="p-1.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded transition-colors">
-                      <RefreshCw size={14} className="text-slate-400" />
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {/* Token usage */}
-              {room.token_budget_daily != null && (
-                <div>
-                  <div className="flex items-center justify-between text-[10px] mb-1">
-                    <span className="text-slate-400">Token usage today</span>
-                    <span className="font-mono text-slate-500">
-                      {(room.tokens_used_today || 0).toLocaleString()} / {room.token_budget_daily.toLocaleString()}
-                    </span>
-                  </div>
-                  <div className="w-full h-1 bg-slate-200 dark:bg-white/10 rounded-full overflow-hidden">
-                    <div className="h-full bg-blue-500 rounded-full" style={{ width: `${Math.min(100, ((room.tokens_used_today || 0) / room.token_budget_daily) * 100)}%` }} />
-                  </div>
-                </div>
-              )}
+              <div className="flex gap-2 pt-1">
+                <button onClick={createRoom} disabled={saving} className={btnPrimary}>
+                  {saving ? 'Creating...' : 'Create'}
+                </button>
+                <button onClick={() => { setCreating(false); setError(null); }} className="text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300">
+                  Cancel
+                </button>
+              </div>
             </div>
+          )}
 
-            {/* Shared Models */}
-            <div className={sectionCls}>
-              <div className="flex items-center justify-between">
-                <h4 className={labelCls}>Shared Models</h4>
-                <span className="text-[10px] text-slate-500">{sharedModels.length} of {ownModels.length} shared</span>
-              </div>
-              <p className="text-[10px] text-slate-400">Which models consumers can use.</p>
-              {ownModels.length === 0 ? (
-                <p className="text-xs text-slate-400">No models configured.</p>
-              ) : (
-                <div className="space-y-1">
-                  {ownModels.map(m => (
-                    <label key={m.id} className="flex items-center gap-2 py-1.5 px-2 rounded-lg hover:bg-white dark:hover:bg-white/5 cursor-pointer transition-colors">
-                      <input type="checkbox" checked={sharedModels.includes(m.id)} onChange={() => toggleSharedModel(m.id)} className="accent-blue-500" />
-                      <span className="text-xs text-slate-700 dark:text-slate-300">{m.id}</span>
-                      <span className="text-[9px] text-slate-400 font-mono">{m.model}</span>
-                    </label>
-                  ))}
+          {/* Room exists — settings card */}
+          {room && (
+            <div className="space-y-3">
+
+              {/* Room header card */}
+              <div className={sectionCls}>
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <div className={onlineDot(room.online && roomEnabled)} />
+                    <span className="text-sm font-bold text-slate-900 dark:text-white truncate">{room.name}</span>
+                    <span className={`px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded shrink-0 ${
+                      room.room_type === 'public' ? 'bg-blue-500/10 text-blue-500' : 'bg-slate-200 dark:bg-white/10 text-slate-500'
+                    }`}>{room.room_type}</span>
+                  </div>
+                  <button
+                    onClick={toggleRoomEnabled}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold rounded-lg transition-colors ${
+                      roomEnabled
+                        ? 'bg-green-500/10 text-green-600 hover:bg-green-500/20'
+                        : 'bg-slate-200 dark:bg-white/10 text-slate-500 hover:bg-slate-300 dark:hover:bg-white/20'
+                    }`}
+                  >
+                    {roomEnabled ? <><Wifi size={12} /> Enabled</> : <><WifiOff size={12} /> Disabled</>}
+                  </button>
                 </div>
-              )}
-              {sharedModels.length === 0 && ownModels.length > 0 && (
-                <p className="text-[10px] text-amber-500">No models shared. Consumers won't be able to use inference.</p>
-              )}
-            </div>
 
-            {/* Consumer Permissions */}
-            <div className={sectionCls}>
-              <div className="flex items-center gap-2">
-                <Shield size={14} className="text-slate-400" />
-                <h4 className={labelCls}>Consumer Permissions</h4>
+                <div className="grid grid-cols-3 gap-3">
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-400 mb-1">Type</label>
+                    <select value={room.room_type} onChange={e => updateRoom({ room_type: e.target.value })} className="w-full px-2 py-1.5 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded text-xs">
+                      <option value="private">Private</option>
+                      <option value="public">Public</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-400 mb-1">Max</label>
+                    <select value={room.max_consumers} onChange={e => updateRoom({ max_consumers: parseInt(e.target.value) })} className="w-full px-2 py-1.5 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded text-xs">
+                      {[1, 2, 3, 4].map(n => <option key={n} value={n}>{n}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-400 mb-1">Budget</label>
+                    <BudgetInput
+                      value={room.token_budget_daily}
+                      onChange={val => { if (val !== room.token_budget_daily) updateRoom({ token_budget_daily: val }); }}
+                      className="w-full px-2 py-1.5 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded text-xs outline-none"
+                    />
+                  </div>
+                </div>
+
+                {/* Token usage bar */}
+                {room.token_budget_daily != null && (
+                  <div>
+                    <div className="flex items-center justify-between text-[10px] mb-0.5">
+                      <span className="text-slate-400">Usage</span>
+                      <span className="font-mono text-slate-500">
+                        {Math.round((room.tokens_used_today || 0) / 1000).toLocaleString()}K / {Math.round(room.token_budget_daily / 1000).toLocaleString()}K
+                      </span>
+                    </div>
+                    <div className="w-full h-1 bg-slate-200 dark:bg-white/10 rounded-full overflow-hidden">
+                      <div className="h-full bg-blue-500 rounded-full" style={{ width: `${Math.min(100, ((room.tokens_used_today || 0) / room.token_budget_daily) * 100)}%` }} />
+                    </div>
+                  </div>
+                )}
+
+                {/* Invite link */}
+                {room.room_type === 'private' && room.invite_token && (
+                  <div className="flex items-center gap-1.5">
+                    <input readOnly value={`https://linggen.dev/join/${room.invite_token}`} className="flex-1 px-2 py-1.5 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded text-xs font-mono text-slate-500 truncate" />
+                    <button onClick={copyInvite} className="p-1 hover:bg-slate-100 dark:hover:bg-white/5 rounded transition-colors shrink-0">
+                      {copied ? <Check size={12} className="text-green-500" /> : <Copy size={12} className="text-slate-400" />}
+                    </button>
+                    <button onClick={regenerateInvite} disabled={saving} className="p-1 hover:bg-slate-100 dark:hover:bg-white/5 rounded transition-colors shrink-0">
+                      <RefreshCw size={12} className="text-slate-400" />
+                    </button>
+                  </div>
+                )}
               </div>
-              <p className="text-[10px] text-slate-400">What consumers can do in your room.</p>
 
-              {/* Tool Presets */}
-              <div className="space-y-2">
-                <label className="text-[10px] font-bold text-slate-400">Tool Preset</label>
-                <div className="grid grid-cols-3 gap-2">
+              {/* Shared Models */}
+              <div className={sectionCls}>
+                <div className="flex items-center justify-between">
+                  <h4 className={labelCls}>Shared Models</h4>
+                  <span className="text-[10px] text-slate-500">{sharedModels.length}/{ownModels.length}</span>
+                </div>
+                {ownModels.length === 0 ? (
+                  <p className="text-[10px] text-slate-400">No models configured.</p>
+                ) : (
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-0">
+                    {ownModels.map(m => (
+                      <label key={m.id} className="flex items-center gap-2 py-1.5 px-1 rounded hover:bg-white dark:hover:bg-white/5 cursor-pointer transition-colors min-w-0">
+                        <input type="checkbox" checked={sharedModels.includes(m.id)} onChange={() => toggleSharedModel(m.id)} className="accent-blue-500 w-3.5 h-3.5 shrink-0" />
+                        <span className="text-xs text-slate-700 dark:text-slate-300 truncate">{m.id}</span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+                {sharedModels.length === 0 && ownModels.length > 0 && (
+                  <p className="text-[9px] text-amber-500">No models shared yet.</p>
+                )}
+              </div>
+
+              {/* Consumer Permissions */}
+              <div className={sectionCls}>
+                <div className="flex items-center gap-1.5">
+                  <Shield size={12} className="text-slate-400" />
+                  <h4 className={labelCls}>Permissions</h4>
+                </div>
+
+                {/* Tool Presets */}
+                <div className="grid grid-cols-3 gap-1.5">
                   {(['chat', 'read', 'edit'] as const).map(preset => {
                     const active = activePreset === preset;
-                    const labels: Record<string, [string, string]> = {
-                      chat: ['Chat', 'Conversation only'],
-                      read: ['Read', 'Search & browse'],
-                      edit: ['Edit', 'Full coding tools'],
-                    };
-                    const [title, desc] = labels[preset];
+                    const labels: Record<string, string> = { chat: 'Chat', read: 'Read', edit: 'Edit' };
                     return (
                       <button
                         key={preset}
                         onClick={() => applyPreset(preset)}
-                        className={`relative px-3 py-3 rounded-lg text-center transition-all ${
+                        className={`px-2 py-1.5 rounded-lg text-center text-[10px] font-bold transition-all ${
                           active
-                            ? 'border-2 border-blue-500 bg-blue-500/5'
-                            : 'border border-slate-200 dark:border-white/10 hover:border-slate-300 dark:hover:border-white/20'
+                            ? 'border-2 border-blue-500 bg-blue-500/5 text-blue-400'
+                            : 'border border-slate-200 dark:border-white/10 text-slate-500 hover:border-slate-300'
                         }`}
                       >
-                        {active && (
-                          <div className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-blue-500 rounded-full flex items-center justify-center">
-                            <Check size={10} className="text-white" />
-                          </div>
-                        )}
-                        <div className={`text-xs font-bold ${active ? 'text-blue-400' : 'text-slate-700 dark:text-slate-300'}`}>{title}</div>
-                        <div className="text-[10px] text-slate-500 mt-0.5">{desc}</div>
+                        {labels[preset]}
                       </button>
                     );
                   })}
                 </div>
-              </div>
 
-              {/* Individual Tools */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <label className="text-[10px] font-bold text-slate-400">Allowed Tools</label>
-                  <span className="text-[10px] text-slate-500">{allowedTools.length} enabled</span>
-                </div>
-                <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 px-1">
+                {/* Individual Tools */}
+                <div className="grid grid-cols-2 gap-x-2 gap-y-0 px-0.5">
                   {ALL_TOOLS.map(tool => {
                     const checked = allowedTools.includes(tool);
                     return (
-                      <label key={tool} className="flex items-center gap-2 py-1.5 cursor-pointer">
-                        <input type="checkbox" checked={checked} onChange={() => toggleTool(tool)} className="accent-blue-500 w-3.5 h-3.5" />
-                        <span className={`text-xs ${checked ? 'text-slate-700 dark:text-slate-300' : 'text-slate-400 dark:text-slate-500'}`}>{tool}</span>
+                      <label key={tool} className="flex items-center gap-1.5 py-1 cursor-pointer">
+                        <input type="checkbox" checked={checked} onChange={() => toggleTool(tool)} className="accent-blue-500 w-3 h-3" />
+                        <span className={`text-[10px] ${checked ? 'text-slate-700 dark:text-slate-300' : 'text-slate-400'}`}>{tool}</span>
                       </label>
                     );
                   })}
                 </div>
-                {activePreset === null && (
-                  <p className="text-[10px] text-slate-500 px-1">Custom selection. Choosing a preset will reset.</p>
+              </div>
+
+              {/* Shared Skills */}
+              {allSkills.length > 0 && (
+                <div className={sectionCls}>
+                  <div className="flex items-center justify-between">
+                    <h4 className={labelCls}>Skills</h4>
+                    <span className="text-[10px] text-slate-500">{allowedSkills.length}/{allSkills.length}</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-0">
+                    {allSkills.map(skill => {
+                      const mode = skill.permission?.mode ?? null;
+                      const skillLevel = PERM_LEVEL[mode ?? 'chat'] ?? 0;
+                      const disabled = skillLevel > currentPermLevel || mode === 'admin';
+                      const checked = allowedSkills.includes(skill.name);
+                      return (
+                        <label
+                          key={skill.name}
+                          className={`flex items-center gap-2 px-1 py-1.5 rounded transition-colors min-w-0 ${
+                            disabled ? 'opacity-40 cursor-not-allowed' : 'hover:bg-white dark:hover:bg-white/5 cursor-pointer'
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked && !disabled}
+                            disabled={disabled}
+                            onChange={() => !disabled && toggleSkill(skill.name)}
+                            className="accent-blue-500 w-3.5 h-3.5 shrink-0"
+                          />
+                          <span className="text-xs text-slate-700 dark:text-slate-300 truncate">{skill.name}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Members */}
+              <div className={sectionCls}>
+                <h4 className={labelCls}>Members ({members.length}/{room.max_consumers})</h4>
+                {members.length === 0 ? (
+                  <p className="text-[10px] text-slate-400">No members yet.</p>
+                ) : (
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-0">
+                    {members.map(m => (
+                      <div key={m.user_id} className="flex items-center justify-between py-1.5 px-1 rounded hover:bg-white dark:hover:bg-white/5 transition-colors min-w-0">
+                        <div className="flex items-center gap-2 min-w-0">
+                          {m.avatar_url ? (
+                            <img src={m.avatar_url} alt="" className="w-5 h-5 rounded-full shrink-0 object-cover" referrerPolicy="no-referrer" />
+                          ) : (
+                            <div className="w-5 h-5 rounded-full bg-blue-500/10 text-blue-500 text-[9px] font-bold flex items-center justify-center shrink-0">
+                              {(m.display_name || '?')[0].toUpperCase()}
+                            </div>
+                          )}
+                          <span className="text-xs text-slate-700 dark:text-slate-300 truncate">{m.display_name}</span>
+                        </div>
+                        <button onClick={() => removeMember(m.user_id)} className="p-0.5 text-slate-300 hover:text-red-500 transition-colors shrink-0">
+                          <Trash2 size={10} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 )}
               </div>
-            </div>
 
-            {/* Shared Skills */}
-            <div className={sectionCls}>
-              <div className="flex items-center justify-between">
-                <h4 className={labelCls}>Shared Skills</h4>
-                <span className="text-[10px] text-slate-500">{allowedSkills.length} of {allSkills.length} shared</span>
+              {/* Footer */}
+              <div className="flex items-center justify-between px-1">
+                <a href="https://linggen.dev/app" target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-[10px] text-blue-500 hover:text-blue-600 font-medium">
+                  linggen.dev <ExternalLink size={10} />
+                </a>
+                <button onClick={deleteRoom} disabled={saving} className="text-[10px] text-red-500 hover:text-red-600 font-medium">
+                  Delete Room
+                </button>
               </div>
-              <p className="text-[10px] text-slate-400">Skills consumers can use. Requires matching permission level.</p>
-
-              {allSkills.length === 0 ? (
-                <p className="text-xs text-slate-400">No skills installed.</p>
-              ) : (
-                <div className="space-y-0.5">
-                  {allSkills.map(skill => {
-                    const mode = skill.permission?.mode ?? null;
-                    const skillLevel = PERM_LEVEL[mode ?? 'chat'] ?? 0;
-                    const disabled = skillLevel > currentPermLevel || mode === 'admin';
-                    const checked = allowedSkills.includes(skill.name);
-                    const reason = mode === 'admin' ? 'Not shareable' : disabled ? `Needs ${mode ?? 'higher'} preset` : null;
-
-                    return (
-                      <label
-                        key={skill.name}
-                        className={`flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors ${
-                          disabled ? 'opacity-40 cursor-not-allowed' : 'hover:bg-white dark:hover:bg-white/5 cursor-pointer'
-                        }`}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={checked && !disabled}
-                          disabled={disabled}
-                          onChange={() => !disabled && toggleSkill(skill.name)}
-                          className="accent-blue-500"
-                        />
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2">
-                            <span className="text-xs font-medium text-slate-700 dark:text-slate-300">{skill.name}</span>
-                            {mode && (
-                              <span className={`text-[10px] px-1.5 py-0.5 rounded ${permBadge[mode] ?? 'bg-slate-500/10 text-slate-400'}`}>
-                                {mode}
-                              </span>
-                            )}
-                            {!mode && (
-                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-500/10 text-slate-400">
-                                no perm
-                              </span>
-                            )}
-                            {skill.app && (
-                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-400">app</span>
-                            )}
-                          </div>
-                          <div className="text-[10px] text-slate-500 mt-0.5 truncate">{skill.description}</div>
-                        </div>
-                        {reason && (
-                          <span className={`text-[10px] shrink-0 ${mode === 'admin' ? 'text-red-400' : 'text-amber-400'}`}>{reason}</span>
-                        )}
-                      </label>
-                    );
-                  })}
-                </div>
-              )}
             </div>
-
-            {/* Members */}
-            <div className={sectionCls}>
-              <h4 className={labelCls}>Members ({members.length}/{room.max_consumers})</h4>
-              {members.length === 0 ? (
-                <p className="text-xs text-slate-400">No members yet. Share your invite link to get started.</p>
-              ) : (
-                <div className="space-y-1">
-                  {members.map(m => (
-                    <div key={m.user_id} className="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-white dark:hover:bg-white/5 transition-colors">
-                      <div className="flex items-center gap-2">
-                        {m.avatar_url ? (
-                          <img src={m.avatar_url} alt="" className="w-5 h-5 rounded-full" />
-                        ) : (
-                          <div className="w-5 h-5 rounded-full bg-blue-500/10 text-blue-500 text-[9px] font-bold flex items-center justify-center">
-                            {(m.display_name || '?')[0].toUpperCase()}
-                          </div>
-                        )}
-                        <span className="text-xs text-slate-700 dark:text-slate-300">{m.display_name}</span>
-                        <span className="text-[9px] text-slate-400 font-mono">{m.consumer_type}</span>
-                      </div>
-                      <button onClick={() => removeMember(m.user_id)} className="p-1 text-slate-300 hover:text-red-500 transition-colors">
-                        <Trash2 size={12} />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* Footer */}
-            <div className="flex items-center justify-between">
-              <a href="https://linggen.dev/app" target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-xs text-blue-500 hover:text-blue-600 font-medium">
-                Manage on linggen.dev <ExternalLink size={12} />
-              </a>
-              <button onClick={deleteRoom} disabled={saving} className={btnDanger}>
-                Delete Room
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* ================================================================= */}
-      {/* SECTION 2: JOINED ROOMS (Consumer — linggen server mode)          */}
-      {/* ================================================================= */}
-      <div>
-        <div className="mb-3">
-          <h2 className="text-sm font-bold text-slate-900 dark:text-white">Joined Rooms</h2>
-          <p className="text-[10px] text-slate-500 mt-0.5">Rooms you've joined as a linggen server consumer. Proxy models appear in your model selector.</p>
+          )}
         </div>
 
-        {joinedRooms.length === 0 ? (
-          <div className="p-4 border border-dashed border-slate-300 dark:border-white/10 rounded-xl text-center">
-            <p className="text-xs text-slate-500">No rooms joined. Browse available rooms below or use an invite link.</p>
+        {/* Vertical divider (desktop only) */}
+        <div className="hidden lg:block w-px self-stretch bg-slate-200 dark:bg-white/5" />
+
+        {/* ─────────────────────────────────────────────────────────── */}
+        {/* RIGHT PANEL: Rooms (Joined + Public + Invite)               */}
+        {/* ─────────────────────────────────────────────────────────── */}
+        <div className="flex-1 min-w-0 space-y-4">
+          <h3 className={labelCls}>Rooms</h3>
+
+          {/* Invite link input */}
+          <div className="flex items-center gap-2">
+            <div className="relative flex-1">
+              <Link size={11} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+              <input
+                placeholder="Paste invite link to join a private room..."
+                value={inviteInput}
+                onChange={e => setInviteInput(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') joinByInvite(); }}
+                className="w-full pl-7 pr-3 py-1.5 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded-lg text-[11px] outline-none focus:ring-1 focus:ring-blue-500/50"
+              />
+            </div>
+            <button onClick={joinByInvite} disabled={joining || !inviteInput.trim()} className={btnPrimary}>
+              {joining ? '...' : 'Join'}
+            </button>
           </div>
-        ) : (
-          <div className="space-y-2">
-            {joinedRooms.map(jr => {
-              const conn = proxyConnections.find(c => c.instance_id === jr.instance_id);
-              const isConnected = !!conn;
-              return (
-                <div key={jr.id} className={sectionCls}>
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <div className={onlineDot(jr.online)} />
-                      <span className="text-xs font-bold text-slate-900 dark:text-white">{jr.name}</span>
-                      <span className="text-[10px] text-slate-500">by {jr.owner_name}</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      {jr.online && !isConnected && (
+
+          {/* Joined rooms */}
+          {joinedRooms.length > 0 && (
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Joined</span>
+                <span className="text-[9px] text-slate-400">{joinedRooms.length}</span>
+              </div>
+              {joinedRooms.map(jr => {
+                const conn = proxyConnections.find(c => c.instance_id === jr.instance_id);
+                const isConnected = !!conn;
+                return (
+                  <div key={jr.id} className="px-3 py-2.5 rounded-xl border border-slate-200 dark:border-white/5 bg-white dark:bg-white/[0.02] space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <div className={onlineDot(jr.online)} />
+                        <span className="text-xs font-bold text-slate-900 dark:text-white truncate">{jr.name}</span>
+                        <span className="text-[10px] text-slate-500 shrink-0">by {jr.owner_name}</span>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {jr.online && !isConnected && (
+                          <button
+                            onClick={() => connectProxyRoom(jr.instance_id, jr.owner_name, jr.name)}
+                            className="flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-blue-500 bg-blue-500/10 hover:bg-blue-500/20 rounded transition-colors"
+                          >
+                            <Wifi size={10} /> Connect
+                          </button>
+                        )}
+                        {isConnected && (
+                          <button
+                            onClick={() => disconnectProxyRoom(jr.instance_id)}
+                            className="flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-slate-500 bg-slate-200/50 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 rounded transition-colors"
+                          >
+                            <WifiOff size={10} /> Disconnect
+                          </button>
+                        )}
                         <button
-                          onClick={() => connectProxyRoom(jr.instance_id, jr.owner_name, jr.name)}
-                          className="flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-blue-500 hover:text-blue-600 bg-blue-500/10 hover:bg-blue-500/20 rounded transition-colors"
+                          onClick={() => leaveRoom(jr.id, jr.instance_id)}
+                          className="p-1 text-slate-300 hover:text-red-500 transition-colors"
+                          title="Leave room"
                         >
-                          <Wifi size={10} /> Connect
+                          <LogOut size={12} />
                         </button>
-                      )}
-                      {isConnected && (
-                        <button
-                          onClick={() => disconnectProxyRoom(jr.instance_id)}
-                          className="flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-slate-500 hover:text-slate-700 bg-slate-200/50 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 rounded transition-colors"
-                        >
-                          <WifiOff size={10} /> Disconnect
-                        </button>
-                      )}
-                      <button
-                        onClick={() => leaveRoom(jr.id, jr.instance_id)}
-                        className="flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-red-500 hover:text-red-600 rounded transition-colors"
-                      >
-                        <LogOut size={10} /> Leave
-                      </button>
-                    </div>
-                  </div>
-                  {/* Connection status */}
-                  {isConnected && conn.models.length > 0 && (
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      <span className="text-[10px] text-green-500 font-medium">Connected</span>
-                      {conn.models.map(m => (
-                        <span key={m} className="text-[9px] px-1.5 py-0.5 rounded bg-green-500/10 text-green-600 dark:text-green-400 font-mono">
-                          {m.replace(/^proxy:/, '')}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                  {!isConnected && !jr.online && (
-                    <p className="text-[10px] text-slate-400">Owner is offline. Models unavailable.</p>
-                  )}
-                  {!isConnected && jr.online && (
-                    <p className="text-[10px] text-slate-400">Not connected. Click Connect to fetch proxy models.</p>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-
-      {/* ================================================================= */}
-      {/* SECTION 3: AVAILABLE ROOMS (Discovery)                            */}
-      {/* ================================================================= */}
-      <div>
-        <div className="mb-3">
-          <h2 className="text-sm font-bold text-slate-900 dark:text-white">Available Rooms</h2>
-          <p className="text-[10px] text-slate-500 mt-0.5">Public rooms you can join. Use an invite link for private rooms.</p>
-        </div>
-
-        {/* Invite link input */}
-        <div className="flex items-center gap-2 mb-3">
-          <div className="relative flex-1">
-            <Link size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
-            <input
-              placeholder="Paste invite link..."
-              value={inviteInput}
-              onChange={e => setInviteInput(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') joinByInvite(); }}
-              className="w-full pl-7 pr-3 py-2 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded-lg text-xs outline-none focus:ring-1 focus:ring-blue-500/50"
-            />
-          </div>
-          <button onClick={joinByInvite} disabled={joining || !inviteInput.trim()} className={btnPrimary}>
-            {joining ? 'Joining...' : 'Join'}
-          </button>
-        </div>
-
-        {/* Public room list */}
-        {publicRooms.length === 0 ? (
-          <div className="p-4 border border-dashed border-slate-300 dark:border-white/10 rounded-xl text-center">
-            <p className="text-xs text-slate-500">No public rooms available.</p>
-          </div>
-        ) : (
-          <div className="space-y-1.5">
-            {publicRooms.map(pr => {
-              const alreadyJoined = joinedRoomIds.has(pr.id);
-              const isOwnRoom = room?.id === pr.id;
-              const isFull = pr.member_count >= pr.max_consumers;
-              return (
-                <div key={pr.id} className="flex items-center justify-between px-3 py-2.5 rounded-lg border border-slate-200 dark:border-white/5 hover:bg-white/50 dark:hover:bg-white/[0.02] transition-colors">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <div className={onlineDot(pr.online)} />
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs font-medium text-slate-900 dark:text-white truncate">{pr.name}</span>
-                        <span className="text-[10px] text-slate-500">by {pr.owner_name}</span>
-                      </div>
-                      <div className="flex items-center gap-3 text-[10px] text-slate-400 mt-0.5">
-                        <span>{pr.member_count}/{pr.max_consumers} members</span>
-                        {pr.token_budget_daily != null && (
-                          <span>{Math.round(pr.token_budget_daily / 1000).toLocaleString()}K/day</span>
-                        )}
                       </div>
                     </div>
-                  </div>
-                  <div className="shrink-0 ml-3">
-                    {isOwnRoom ? (
-                      <span className="text-[10px] px-2 py-1 rounded bg-slate-200 dark:bg-white/10 text-slate-500">Your room</span>
-                    ) : alreadyJoined ? (
-                      <span className="text-[10px] px-2 py-1 rounded bg-green-500/10 text-green-500 font-medium">Joined</span>
-                    ) : (
-                      <button
-                        onClick={() => joinPublicRoom(pr.id)}
-                        disabled={joining || isFull || !pr.online}
-                        className={btnPrimary}
-                      >
-                        {isFull ? 'Full' : 'Join'}
-                      </button>
+                    {/* Connected models */}
+                    {isConnected && conn.models.length > 0 && (
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="text-[9px] text-green-500 font-medium">Connected</span>
+                        {conn.models.map(m => (
+                          <span key={m} className="text-[9px] px-1.5 py-0.5 rounded bg-green-500/10 text-green-600 dark:text-green-400 font-mono">
+                            {m.replace(/^proxy:/, '')}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {!isConnected && !jr.online && (
+                      <p className="text-[9px] text-slate-400">Owner offline</p>
+                    )}
+                    {!isConnected && jr.online && (
+                      <p className="text-[9px] text-slate-400">Click Connect to fetch models</p>
                     )}
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
+          )}
+
+          {/* Public rooms */}
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Public</span>
+              <span className="text-[9px] text-slate-400">{publicRooms.length}</span>
+            </div>
+            {publicRooms.length === 0 ? (
+              <p className="text-[10px] text-slate-500 px-1">No public rooms available.</p>
+            ) : (
+              <div className="space-y-1">
+                {publicRooms.map(pr => {
+                  const alreadyJoined = joinedRoomIds.has(pr.id);
+                  const isOwnRoom = room?.id === pr.id;
+                  const isFull = pr.member_count >= pr.max_consumers;
+                  return (
+                    <div key={pr.id} className="flex items-center justify-between px-3 py-2 rounded-lg border border-slate-200 dark:border-white/5 hover:bg-white/50 dark:hover:bg-white/[0.02] transition-colors">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <div className={onlineDot(pr.online)} />
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[11px] font-medium text-slate-900 dark:text-white truncate">{pr.name}</span>
+                            <span className="text-[9px] text-slate-500 shrink-0">by {pr.owner_name}</span>
+                          </div>
+                          <div className="flex items-center gap-2 text-[9px] text-slate-400 mt-0.5">
+                            <span>{pr.member_count}/{pr.max_consumers}</span>
+                            {pr.token_budget_daily != null && (
+                              <span>{Math.round(pr.token_budget_daily / 1000).toLocaleString()}K/d</span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="shrink-0 ml-2">
+                        {isOwnRoom ? (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded bg-slate-200 dark:bg-white/10 text-slate-500">Yours</span>
+                        ) : alreadyJoined ? (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded bg-green-500/10 text-green-500 font-medium">Joined</span>
+                        ) : (
+                          <button
+                            onClick={() => joinPublicRoom(pr.id)}
+                            disabled={joining || isFull || !pr.online}
+                            className="px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white text-[10px] font-bold rounded-md transition-colors disabled:opacity-40"
+                          >
+                            {isFull ? 'Full' : 'Join'}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
-        )}
+
+          {/* Empty state when no rooms at all */}
+          {joinedRooms.length === 0 && publicRooms.length === 0 && (
+            <div className="py-12 text-center">
+              <Users size={28} className="mx-auto text-slate-300 dark:text-slate-600 mb-3" />
+              <p className="text-sm text-slate-500">No rooms found</p>
+              <p className="text-xs text-slate-400 mt-1">Create your own room or paste an invite link above.</p>
+            </div>
+          )}
+        </div>
       </div>
 
     </div>

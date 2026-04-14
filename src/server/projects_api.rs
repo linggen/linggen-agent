@@ -1211,6 +1211,8 @@ pub(crate) async fn auth_callback(
         instance_name,
         instance_id,
         user_id,
+        user_name: None,
+        avatar_url: None,
     };
     let path = crate::paths::linggen_home().join("remote.toml");
     if let Some(parent) = path.parent() {
@@ -1250,6 +1252,8 @@ pub(crate) async fn get_room_config() -> impl IntoResponse {
         "shared_models": config.shared_models,
         "allowed_tools": config.allowed_tools,
         "allowed_skills": config.allowed_skills,
+        "room_enabled": config.room_enabled,
+        "auto_connect": config.auto_connect,
     }))
 }
 
@@ -1267,6 +1271,12 @@ pub(crate) async fn update_room_config(
     }
     if let Some(v) = body.get("allowed_skills") {
         config.allowed_skills = serde_json::from_value(v.clone()).unwrap_or_default();
+    }
+    if let Some(v) = body.get("room_enabled") {
+        config.room_enabled = v.as_bool().unwrap_or(true);
+    }
+    if let Some(v) = body.get("auto_connect") {
+        config.auto_connect = v.as_bool().unwrap_or(true);
     }
     match crate::server::rtc::room_config::save_room_config(&config) {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),

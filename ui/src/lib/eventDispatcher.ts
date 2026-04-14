@@ -749,10 +749,17 @@ function handlePageState(item: UiEvent): void {
   // Note: userType is set once by user_info at connection time, not by page_state.
   if (ps.permission) {
     const userStore = useUserStore.getState();
-    if (userStore.userPermission !== ps.permission || userStore.userRoomName !== (ps.room_name ?? null)) {
-      userStore.setUserInfo(ps.permission, ps.room_name, userStore.userTokenBudget);
+    // For owners, don't let page_state overwrite room_name — it's fetched via HTTP
+    // from linggen.dev and page_state doesn't have it (owner's UserContext.room_name is null).
+    const roomName = userStore.userType === 'owner' ? userStore.userRoomName : (ps.room_name ?? null);
+    if (userStore.userPermission !== ps.permission || userStore.userRoomName !== roomName) {
+      userStore.setUserInfo(ps.permission, roomName, userStore.userTokenBudget);
       useUiStore.getState().setCurrentPage(userStore.userType === 'consumer' ? 'consumer' : 'main');
     }
+  }
+  // Room enabled status (owner only — pushed from room_config.toml)
+  if (ps.room_enabled !== undefined && ps.room_enabled !== null) {
+    useUserStore.getState().setRoomEnabled(ps.room_enabled);
   }
 
   // -- Global fields --
@@ -851,6 +858,7 @@ function handleUserInfo(item: UiEvent): void {
 
   const userType = user.user_type || 'owner';
   if (user.user_id) userStore.setUserId(user.user_id);
+  userStore.setUserProfile(user.user_name || null, user.avatar_url || null);
   userStore.setUserType(userType as 'owner' | 'consumer');
 
   const perm = userType === 'consumer' ? (room?.permission || 'read') : 'admin';
@@ -873,6 +881,7 @@ function handleRoomChat(item: UiEvent): void {
   useRoomChatStore.getState().addMessage({
     senderId,
     senderName: data.sender_name || 'Unknown',
+    avatarUrl: data.avatar_url || null,
     text: data.text,
     timestamp: item.ts_ms || Date.now(),
     isMine: senderId !== '' && senderId === localUserId,

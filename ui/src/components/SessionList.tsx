@@ -189,7 +189,7 @@ export const SessionList: React.FC<{
   }, []);
 
   return (
-    <div className="flex flex-col h-full relative">
+    <div className="flex flex-col flex-1 min-h-0 relative">
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-slate-200 dark:border-white/5">
         <span className="text-[11px] font-bold uppercase tracking-widest text-slate-400">Sessions</span>

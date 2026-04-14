@@ -200,10 +200,8 @@ export const SettingsPage: React.FC<{
         )}
 
         {activeTab === 'room' && (
-          <div className="h-full overflow-y-auto p-3 md:p-6">
-            <div className="max-w-4xl mx-auto">
-              <RoomTab />
-            </div>
+          <div className="h-full overflow-y-auto p-3 md:p-5">
+            <RoomTab />
           </div>
         )}
       </div>

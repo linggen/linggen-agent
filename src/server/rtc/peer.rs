@@ -202,6 +202,8 @@ async fn run_peer(
                                     "user": {
                                         "user_id": user_ctx.user_id,
                                         "user_type": "consumer",
+                                        "user_name": user_ctx.user_name,
+                                        "avatar_url": user_ctx.avatar_url,
                                     },
                                     "room": {
                                         "permission": user_ctx.permission.as_str(),
@@ -216,6 +218,8 @@ async fn run_peer(
                                     "user": {
                                         "user_id": user_ctx.user_id,
                                         "user_type": "owner",
+                                        "user_name": user_ctx.user_name,
+                                        "avatar_url": user_ctx.avatar_url,
                                     },
                                 })
                             };
@@ -566,17 +570,20 @@ fn handle_control_message(
         }
 
         "room_chat" => {
-            let text = msg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            if text.is_empty() {
+            let text = msg.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if text.is_empty() || text.len() > 2000 {
                 return None;
             }
-            let sender_name = msg.get("sender_name")
-                .and_then(|v| v.as_str())
+            let text = text.to_string();
+            // Prefer server-side user_name (trusted), fall back to client-provided sender_name
+            let sender_name: String = user_ctx.user_name.as_deref()
+                .or_else(|| msg.get("sender_name").and_then(|v| v.as_str()))
                 .unwrap_or(&user_ctx.user_id)
-                .to_string();
+                .chars().take(64).collect();
             let _ = state.events_tx.send(crate::server::ServerEvent::RoomChat {
                 sender_id: user_ctx.user_id.clone(),
                 sender_name,
+                avatar_url: user_ctx.avatar_url.clone(),
                 text,
             });
             None
@@ -1088,8 +1095,11 @@ fn forward_event_to_channels(
     if !filter.is_admin {
         match ui_msg.session_id.as_deref() {
             Some("global") | None => {
-                // Global events — drop for non-admin (they get page_state instead)
-                return;
+                // Room chat must reach all peers regardless of permission level.
+                if ui_msg.kind != "room_chat" {
+                    // Global events — drop for non-admin (they get page_state instead)
+                    return;
+                }
             }
             Some(sid) => {
                 // For SessionCreated events, check if the new session belongs to us

@@ -65,6 +65,10 @@ impl UserPermission {
 pub struct UserContext {
     /// User ID on linggen.dev (or "__local__" for owner without remote login).
     pub user_id: String,
+    /// Display name (from linggen.dev profile or relay signaling).
+    pub user_name: Option<String>,
+    /// Avatar URL (from linggen.dev profile or relay signaling).
+    pub avatar_url: Option<String>,
     /// Whether this user is a proxy room consumer (vs owner).
     /// Set at connection time — not derived from permission level.
     pub is_consumer: bool,
@@ -81,8 +85,12 @@ pub struct UserContext {
 impl UserContext {
     /// Build for owner (local or remote).
     pub fn owner(user_id: Option<String>) -> Self {
+        let remote = crate::cli::login::load_remote_config();
         Self {
-            user_id: user_id.unwrap_or_else(|| "__local__".to_string()),
+            user_id: user_id.or_else(|| remote.as_ref().and_then(|r| r.user_id.clone()))
+                .unwrap_or_else(|| "__local__".to_string()),
+            user_name: remote.as_ref().and_then(|r| r.user_name.clone()),
+            avatar_url: remote.as_ref().and_then(|r| r.avatar_url.clone()),
             is_consumer: false,
             permission: UserPermission::Admin,
             token_budget_daily: None,
@@ -101,6 +109,8 @@ impl UserContext {
     ) -> Self {
         Self {
             user_id,
+            user_name: None,
+            avatar_url: None,
             is_consumer: true,
             permission,
             token_budget_daily,

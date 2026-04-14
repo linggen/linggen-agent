@@ -8,6 +8,7 @@ export interface RoomChatMessage {
   id: string;
   senderId: string;
   senderName: string;
+  avatarUrl: string | null;
   text: string;
   timestamp: number;
   isMine: boolean;
