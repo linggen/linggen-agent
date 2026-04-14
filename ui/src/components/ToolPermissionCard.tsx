@@ -11,7 +11,7 @@ export const ToolPermissionCard: React.FC<ToolPermissionCardProps> = ({ pending,
   const question = pending.questions[0];
   const [otherActive, setOtherActive] = useState(false);
   const [customText, setCustomText] = useState('');
-  const userPermission = useUserStore((s) => s.userPermission);
+  const userType = useUserStore((s) => s.userType);
 
   if (!question) return null;
 
@@ -77,7 +77,7 @@ export const ToolPermissionCard: React.FC<ToolPermissionCardProps> = ({ pending,
           {question.options
           .filter((opt) => {
             // Non-admin users can't escalate — hide mode switch and blanket allow
-            if (userPermission !== 'admin') {
+            if (userType === 'consumer') {
               if (isModeSwitch(opt.label) || isBlanketOption(opt.label)) return false;
             }
             return true;

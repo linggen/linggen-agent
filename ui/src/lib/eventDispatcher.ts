@@ -10,6 +10,7 @@ import { useChatStore } from '../stores/chatStore';
 import { useUiStore } from '../stores/uiStore';
 import { useUserStore } from '../stores/userStore';
 import { useInteractionStore } from '../stores/interactionStore';
+import { useRoomChatStore } from '../stores/roomChatStore';
 import type { AgentStatusValue } from '../stores/serverStore';
 import { agentTracker } from './agentTracker';
 import {
@@ -159,6 +160,7 @@ export function dispatchEvent(item: UiEvent, sessionIdOverride?: string): void {
     case 'widget_resolved': handleWidgetResolved(item); return;
     case 'page_state':   handlePageState(item); return;
     case 'user_info':    handleUserInfo(item); return;
+    case 'room_chat':    handleRoomChat(item); return;
   }
 }
 
@@ -283,9 +285,9 @@ function handleRun(item: UiEvent): void {
 }
 
 function handleQueue(item: UiEvent): void {
-  const { activeSessionId, selectedProjectRoot } = useSessionStore.getState();
+  const { activeSessionId } = useSessionStore.getState();
   const session = activeSessionId || 'default';
-  if (item.project_root === selectedProjectRoot && item.session_id === session) {
+  if (item.session_id === session) {
     const items = Array.isArray(item.data?.items) ? item.data.items : [];
     useInteractionStore.getState().setQueuedMessages(items);
   }
@@ -743,17 +745,29 @@ function handlePageState(item: UiEvent): void {
   const ps = item.data;
   if (!ps) return;
 
-  // -- Permission + room from unified page_state --
+  // -- Permission from page_state --
+  // Note: userType is set once by user_info at connection time, not by page_state.
   if (ps.permission) {
     const userStore = useUserStore.getState();
     if (userStore.userPermission !== ps.permission || userStore.userRoomName !== (ps.room_name ?? null)) {
       userStore.setUserInfo(ps.permission, ps.room_name, userStore.userTokenBudget);
-      useUiStore.getState().setCurrentPage(ps.permission !== 'admin' ? 'consumer' : 'main');
+      useUiStore.getState().setCurrentPage(userStore.userType === 'consumer' ? 'consumer' : 'main');
     }
   }
 
   // -- Global fields --
-  if (ps.all_sessions) useSessionStore.setState({ allSessions: ps.all_sessions });
+  if (ps.all_sessions) {
+    useSessionStore.setState({ allSessions: ps.all_sessions });
+    // Auto-select session if none is active (e.g. on init/restart):
+    // 1. Try to restore from localStorage (last used session)
+    // 2. Fall back to first session in the list
+    const store = useSessionStore.getState();
+    if (!store.activeSessionId && ps.all_sessions.length > 0) {
+      const saved = window.localStorage.getItem('linggen:active-session');
+      const match = saved && ps.all_sessions.find((s: any) => s.id === saved);
+      store.setActiveSessionId(match ? saved! : ps.all_sessions[0].id);
+    }
+  }
   if (ps.models) useServerStore.setState({ models: ps.models });
   if (ps.default_models) useServerStore.setState({ defaultModels: ps.default_models });
   if (ps.skills) useServerStore.setState({ skills: ps.skills });
@@ -828,7 +842,39 @@ function handlePageState(item: UiEvent): void {
 function handleUserInfo(item: UiEvent): void {
   const data = item.data;
   if (!data) return;
-  const perm = data.permission || 'admin';
-  useUserStore.getState().setUserInfo(perm, data.room_name, data.token_budget_daily);
-  useUiStore.getState().setCurrentPage(perm !== 'admin' ? 'consumer' : 'main');
+
+  const userStore = useUserStore.getState();
+
+  // Structured format: { user: { user_id, user_type, permission? }, room?: { room_name, ... } }
+  const user = data.user || data;
+  const room = data.room;
+
+  const userType = user.user_type || 'owner';
+  if (user.user_id) userStore.setUserId(user.user_id);
+  userStore.setUserType(userType as 'owner' | 'consumer');
+
+  const perm = userType === 'consumer' ? (room?.permission || 'read') : 'admin';
+  const roomName = room?.room_name ?? null;
+  const tokenBudget = room?.token_budget_daily ?? null;
+  userStore.setUserInfo(perm, roomName, tokenBudget);
+
+  useUiStore.getState().setCurrentPage(userType === 'consumer' ? 'consumer' : 'main');
+}
+
+// ---------------------------------------------------------------------------
+// Room chat — relayed between all peers in a proxy room
+// ---------------------------------------------------------------------------
+
+function handleRoomChat(item: UiEvent): void {
+  const data = item.data;
+  if (!data?.text) return;
+  const senderId = data.sender_id || '';
+  const localUserId = useUserStore.getState().userId || '';
+  useRoomChatStore.getState().addMessage({
+    senderId,
+    senderName: data.sender_name || 'Unknown',
+    text: data.text,
+    timestamp: item.ts_ms || Date.now(),
+    isMine: senderId !== '' && senderId === localUserId,
+  });
 }

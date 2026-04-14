@@ -180,6 +180,9 @@ pub struct Tools {
     progress_tx: Option<ToolProgressSender>,
     prompt_store: Option<Arc<crate::prompts::PromptStore>>,
     pub(crate) session_id: Option<String>,
+    /// Session policy propagated to subagents via delegation.
+    /// Set by the parent engine; applied to subagent engines after spawn.
+    pub(crate) session_policy: Option<super::session_policy::SessionPolicy>,
 }
 
 impl Tools {
@@ -198,6 +201,7 @@ impl Tools {
             progress_tx: None,
             prompt_store: None,
             session_id: None,
+            session_policy: None,
         })
     }
 

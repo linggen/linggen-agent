@@ -25,6 +25,10 @@ pub struct ViewContext {
 pub struct PageState {
     // -- User context (always included) --
 
+    /// User type: "owner" or "consumer". Set at connection time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_type: Option<String>,
+
     /// User's permission level: "admin", "edit", "read", "chat"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission: Option<String>,
@@ -97,6 +101,7 @@ pub async fn build_page_state(
     let user_id = &user.user_id;
 
     let mut ps = PageState {
+        user_type: Some(user.user_type().to_string()),
         permission: Some(user.permission.as_str().to_string()),
         room_name: user.room_name.clone(),
         all_sessions: None,
@@ -130,8 +135,8 @@ pub async fn build_page_state(
             std::collections::HashSet::new()
         };
 
-    // Load room config for non-admin filtering
-    let room_cfg = if !is_admin {
+    // Load room config for consumer filtering (room_config is the consumer ceiling)
+    let room_cfg = if user.is_consumer {
         Some(super::room_config::load_room_config())
     } else {
         None

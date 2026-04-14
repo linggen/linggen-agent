@@ -79,6 +79,7 @@ impl AgentEngine {
             depth: usize,
             max_depth: usize,
             session_id: Option<String>,
+            policy: Option<crate::engine::session_policy::SessionPolicy>,
         }
         let mut spawns: Vec<DelegationSpawn> = Vec::new();
 
@@ -95,6 +96,7 @@ impl AgentEngine {
                         depth: self.tools.builtins.delegation_depth(),
                         max_depth: self.tools.builtins.max_delegation_depth(),
                         session_id: self.tools.builtins.session_id.clone(),
+                        policy: self.tools.builtins.session_policy.clone(),
                     });
                 }
                 Err(e) => {
@@ -144,7 +146,7 @@ impl AgentEngine {
                     tools::run_delegation(
                         spawn.manager, ws, spawn.caller_id, spawn.target_agent_id,
                         spawn.task, spawn.parent_run_id, spawn.depth, spawn.max_depth,
-                        bridge, spawn.session_id,
+                        bridge, spawn.session_id, spawn.policy,
                     )
                     .await
                 });

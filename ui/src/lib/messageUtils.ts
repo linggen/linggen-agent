@@ -479,9 +479,17 @@ export const chatMessageKey = (msg: ChatMessage): string => {
   return `${from}|${to}|${ts}|${msg.text}`;
 };
 
+/** Strip run-ID prefix (e.g. "run-ling-1234" → "ling") so streaming messages
+ *  (which carry the run ID as `from`) can match persisted messages (which use
+ *  the bare agent name). */
+const normalizeFrom = (from: string): string => {
+  const m = from.match(/^run-(.+?)-\d+$/);
+  return m ? m[1] : from;
+};
+
 export const sameMessageContent = (a: ChatMessage, b: ChatMessage): boolean => {
-  const fromA = a.from || a.role;
-  const fromB = b.from || b.role;
+  const fromA = normalizeFrom(a.from || a.role);
+  const fromB = normalizeFrom(b.from || b.role);
   const toA = a.to || '';
   const toB = b.to || '';
   return (
@@ -626,7 +634,7 @@ export const mergeChatMessages = (persisted: ChatMessage[], live: ChatMessage[])
       (candidate, idx) =>
         !mergedLiveIndices.has(idx) &&
         !candidate.isGenerating &&
-        (msg.from || msg.role) === (candidate.from || candidate.role) &&
+        normalizeFrom(msg.from || msg.role) === normalizeFrom(candidate.from || candidate.role) &&
         Math.abs((msg.timestampMs ?? 0) - (candidate.timestampMs ?? 0)) <= 120_000 &&
         hasRichContent(candidate) &&
         isPlanMessage(candidate) === msgIsPlan
@@ -681,7 +689,7 @@ export const mergeChatMessages = (persisted: ChatMessage[], live: ChatMessage[])
   const deduped: typeof merged = [];
   const seenContent = new Set<string>();
   for (const msg of merged) {
-    const key = `${msg.from || msg.role}|${msg.to || ''}|${normalizeMessageTextForDedup(msg.text)}`;
+    const key = `${normalizeFrom(msg.from || msg.role)}|${msg.to || ''}|${normalizeMessageTextForDedup(msg.text)}`;
     if (seenContent.has(key) && !msg.isGenerating) continue;
     seenContent.add(key);
     deduped.push(msg);

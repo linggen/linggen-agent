@@ -33,12 +33,13 @@ impl UserPermission {
     /// Admin can access everything. Others are restricted to static assets + session creation.
     pub fn can_access_endpoint(&self, method: &str, url: &str) -> bool {
         if self.is_admin() { return true; }
-        // Static assets (tunnel loading)
-        if (url == "/index.html" || url.starts_with("/assets/")) && method == "GET" {
+        // Static assets (tunnel loading) and skill app files
+        if (url == "/index.html" || url.starts_with("/assets/") || url.starts_with("/apps/")) && method == "GET" {
             return true;
         }
-        // Session creation
+        // Session creation + deletion (consumers can manage their own sessions)
         if url == "/api/sessions" && method == "POST" { return true; }
+        if url == "/api/sessions/all" && method == "DELETE" { return true; }
         // Workspace state — chat history on page load / refresh
         if method == "GET" && (url.starts_with("/api/workspace/state") || url.starts_with("/api/skill-sessions/state")) {
             return true;
@@ -46,14 +47,6 @@ impl UserPermission {
         false
     }
 
-    /// Map to the chat_api mode string for tool permission loading.
-    pub fn chat_mode(&self) -> Option<&'static str> {
-        match self {
-            UserPermission::Admin => None,
-            UserPermission::Edit => Some("edit"),
-            UserPermission::Read | UserPermission::Chat => Some("consumer"),
-        }
-    }
 
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -72,14 +65,16 @@ impl UserPermission {
 pub struct UserContext {
     /// User ID on linggen.dev (or "__local__" for owner without remote login).
     pub user_id: String,
+    /// Whether this user is a proxy room consumer (vs owner).
+    /// Set at connection time — not derived from permission level.
+    pub is_consumer: bool,
     /// Permission ceiling — max session permission this user can use.
     pub permission: UserPermission,
     /// Optional daily token budget (None = unlimited).
     pub token_budget_daily: Option<i64>,
     /// Room name (only for room consumers).
     pub room_name: Option<String>,
-    /// Original consumer type for backward compat with inference endpoint.
-    /// "browser" or "linggen". None for owner.
+    /// Consumer transport type: "browser" or "linggen". None for owner.
     pub consumer_type: Option<String>,
 }
 
@@ -88,6 +83,7 @@ impl UserContext {
     pub fn owner(user_id: Option<String>) -> Self {
         Self {
             user_id: user_id.unwrap_or_else(|| "__local__".to_string()),
+            is_consumer: false,
             permission: UserPermission::Admin,
             token_budget_daily: None,
             room_name: None,
@@ -105,11 +101,17 @@ impl UserContext {
     ) -> Self {
         Self {
             user_id,
+            is_consumer: true,
             permission,
             token_budget_daily,
             room_name,
             consumer_type: Some(consumer_type),
         }
+    }
+
+    /// User type string for the chat API.
+    pub fn user_type(&self) -> &'static str {
+        if self.is_consumer { "consumer" } else { "owner" }
     }
 }
 

@@ -76,8 +76,12 @@ impl AgentEngine {
             .as_ref()
             .is_some_and(|s| s.app.is_some());
 
-        let body = if is_app_skill {
-            // Skip agent body; skill content becomes the primary prompt.
+        let body = if is_app_skill || self.prompt_profile.consumer_frame {
+            // App skills: skill content becomes the primary prompt.
+            // Consumer sessions: agent spec body describes owner capabilities
+            // (coding, delegation, file editing) that consumers don't have.
+            // Skip it — the consumer frame in build_stable_system_content
+            // provides appropriate instructions.
             String::new()
         } else {
             self.spec_system_prompt
@@ -146,8 +150,8 @@ impl AgentEngine {
 
         let mut stable = self.system_prompt();
 
-        // --- Environment block ---
-        {
+        // --- Environment block (owner only) ---
+        if self.prompt_profile.include_environment {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".into());
             let os_version = get_os_version();
             stable.push_str(&self.prompt_store.render_or_fallback(
@@ -162,8 +166,8 @@ impl AgentEngine {
             ));
         }
 
-        // --- Project context files (AGENTS.md, CLAUDE.md, .cursorrules) ---
-        {
+        // --- Project context files (owner only) ---
+        if self.prompt_profile.include_project_context {
             let context_filenames = ["AGENTS.md", "CLAUDE.md", ".cursorrules"];
             let mut seen: std::collections::HashSet<std::path::PathBuf> =
                 std::collections::HashSet::new();
@@ -212,8 +216,9 @@ impl AgentEngine {
             }
         }
 
-        // --- Auto Memory (project-scoped) ---
-        if let Some(memory_dir) = self.tools.memory_dir() {
+        // --- Auto Memory (owner only) ---
+        if self.prompt_profile.include_memory && self.tools.memory_dir().is_some() {
+            let memory_dir = self.tools.memory_dir().unwrap();
             let memory_path = memory_dir.join("MEMORY.md");
             let mem_dir_display = memory_dir.display().to_string();
             let mut memory_appended = false;
@@ -237,8 +242,8 @@ impl AgentEngine {
             }
         }
 
-        // --- Global Memory (shared across all projects) ---
-        {
+        // --- Global Memory (owner only) ---
+        if self.prompt_profile.include_memory {
             let global_mem_dir = crate::paths::global_memory_dir();
             let global_mem_path = global_mem_dir.join("MEMORY.md");
             let global_dir_display = global_mem_dir.display().to_string();
@@ -261,6 +266,14 @@ impl AgentEngine {
                     &[("global_mem_dir", &global_dir_display)],
                 ));
             }
+        }
+
+        // --- Consumer frame (consumer only) ---
+        if self.prompt_profile.consumer_frame {
+            stable.push_str(&self.prompt_store.render_or_fallback(
+                keys::SYSTEM_CONSUMER_FRAME,
+                &[],
+            ));
         }
 
         let mut hasher = DefaultHasher::new();
@@ -347,9 +360,8 @@ impl AgentEngine {
             }
         }
 
-        // Inject available agents for Task delegation — only when tools are available
-        // and the Task tool is in the allowed set.
-        if has_tools && !self.available_agents_metadata.is_empty() {
+        // Inject available agents for Task delegation (owner only).
+        if has_tools && self.prompt_profile.include_delegation && !self.available_agents_metadata.is_empty() {
             let task_available = allowed_tools
                 .as_ref()
                 .map_or(true, |s| s.contains("Task"));
@@ -399,21 +411,25 @@ impl AgentEngine {
         }
 
         // Provide workspace info + task (last user message).
-        // Tool schema and action format are already in the system prompt.
-        let ws_listing = workspace_listing(&self.cfg.ws_root);
-        let task_content = self.prompt_store.render(
-            crate::prompts::TASK_BOOTSTRAP,
-            &[
-                ("ws_root", &self.cfg.ws_root.display().to_string()),
-                ("platform", std::env::consts::OS),
-                ("role", &format!("{:?}", self.role)),
-                ("workspace_listing", &ws_listing),
-                ("task", task),
-            ],
-        ).unwrap_or_else(|| format!(
-            "Autonomous agent loop started.\n\nWorkspace root: {}\nPlatform: {}\nCurrent Role: {:?}\n\nWorkspace contents:\n{}\n\nTask: {}",
-            self.cfg.ws_root.display(), std::env::consts::OS, self.role, ws_listing, task,
-        ));
+        // Owner gets full workspace listing; consumer gets task only.
+        let task_content = if self.prompt_profile.include_workspace_listing {
+            let ws_listing = workspace_listing(&self.cfg.ws_root);
+            self.prompt_store.render(
+                crate::prompts::TASK_BOOTSTRAP,
+                &[
+                    ("ws_root", &self.cfg.ws_root.display().to_string()),
+                    ("platform", std::env::consts::OS),
+                    ("role", &format!("{:?}", self.role)),
+                    ("workspace_listing", &ws_listing),
+                    ("task", task),
+                ],
+            ).unwrap_or_else(|| format!(
+                "Autonomous agent loop started.\n\nWorkspace root: {}\nPlatform: {}\nCurrent Role: {:?}\n\nWorkspace contents:\n{}\n\nTask: {}",
+                self.cfg.ws_root.display(), std::env::consts::OS, self.role, ws_listing, task,
+            ))
+        } else {
+            task.to_string()
+        };
         let task_msg = ChatMessage::new("user", task_content);
         // Attach any pending images to the task message, then clear them.
         let images = std::mem::take(&mut self.pending_images);

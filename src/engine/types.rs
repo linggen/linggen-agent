@@ -205,6 +205,8 @@ pub struct AgentEngine {
     pub pending_images: Vec<String>,
     /// Session-scoped permissions (path modes, allows, denied sigs). See permission-spec.md.
     pub session_permissions: permission::SessionPermissions,
+    /// Prompt profile — which system prompt sections to include (owner vs consumer).
+    pub prompt_profile: super::prompt_profile::PromptProfile,
     /// Directory for the current session (for persisting permission.json).
     pub session_dir: Option<PathBuf>,
     /// Ordered list of default model IDs from routing config (for fallback chain).
@@ -390,6 +392,7 @@ impl AgentEngine {
             plan: None,
             pending_images: Vec::new(),
             session_permissions: permission::SessionPermissions::default(),
+            prompt_profile: super::prompt_profile::PromptProfile::default(),
             session_dir: None,
             default_models: Vec::new(),
             auto_fallback: true,

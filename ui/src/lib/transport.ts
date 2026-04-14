@@ -107,6 +107,9 @@ export interface Transport {
   /** Tell the server which session/project the frontend has active.
    *  The server uses this to scope its page_state push. */
   sendViewContext(ctx: { sessionId: string | null; projectRoot: string | null; isCompact: boolean }): void;
+
+  /** Send a room chat message (fire-and-forget). */
+  sendRoomChat?(text: string, senderName: string): void;
 }
 
 // ---------------------------------------------------------------------------

@@ -16,13 +16,18 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
+fn default_user_type() -> String { "owner".to_string() }
+
 #[derive(Deserialize)]
 pub(crate) struct ChatRequest {
     project_root: String,
     agent_id: String,
     message: String,
     session_id: Option<String>,
-    mode: Option<String>,
+    /// User type: "owner" (default) or "consumer" (proxy room).
+    /// Injected server-side by peer.rs. Missing = owner (local HTTP requests).
+    #[serde(default = "default_user_type")]
+    user_type: String,
     /// When set, this chat belongs to a mission session — persist messages
     /// under `~/.linggen/missions/{mission_id}/sessions/` instead of
     /// the project's session store.
@@ -306,6 +311,7 @@ struct ChatRunCtx {
     session_id: Option<String>,
     clean_msg: String,
     images: Vec<String>,
+    policy: crate::engine::session_policy::SessionPolicy,
 }
 
 /// Dispatch a skill (slash command) invocation.
@@ -335,20 +341,18 @@ async fn run_skill_dispatch(
                 .await;
                 return;
             }
-            // Check consumer skill allowlist
-            if let Some(ref allowed) = engine.cfg.consumer_allowed_skills {
-                if !allowed.contains(&skill.name) {
-                    let err_msg = format!(
-                        "Skill '{}' is not available in this room.",
-                        skill.name
-                    );
-                    persist_and_emit_message(
-                        &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
-                        &ctx.agent_id, "user", &err_msg, ctx.session_id.as_deref(), false,
-                    )
-                    .await;
-                    return;
-                }
+            // Check session policy skill allowlist
+            if !ctx.policy.is_skill_allowed(&skill.name) {
+                let err_msg = format!(
+                    "Skill '{}' is not available in this room.",
+                    skill.name
+                );
+                persist_and_emit_message(
+                    &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+                    &ctx.agent_id, "user", &err_msg, ctx.session_id.as_deref(), false,
+                )
+                .await;
+                return;
             }
             // App skill: launch app UI only when --web flag is present.
             // Without --web, fall through to run as a regular skill (model uses tools).
@@ -473,68 +477,71 @@ async fn run_skill_dispatch(
     wire_ask_user_bridge(&ctx.state, engine, ctx.session_id.clone());
 
     // Skill permission approval — prompt user if skill declares permission requirements.
-    if let Some(ref skill) = engine.active_skill {
-        if let Some(ref perm) = skill.permission {
-            use crate::engine::permission::PermissionMode;
-            let mode = match perm.mode.as_str() {
-                "edit" => PermissionMode::Edit,
-                "admin" => PermissionMode::Admin,
-                _ => PermissionMode::Read,
-            };
-            let paths_str = perm.paths.join(", ");
-            let mut question_text = format!(
-                "Skill \"{}\" requests {} mode on: {}",
-                skill.name, perm.mode, paths_str
-            );
-            if let Some(ref warning) = perm.warning {
-                question_text.push_str(&format!("\n⚠️ {}", warning));
-            }
-
-            let question = crate::engine::tools::AskUserQuestion {
-                question: question_text,
-                header: "Permission".to_string(),
-                options: vec![
-                    crate::engine::tools::AskUserOption {
-                        label: "Approve".to_string(),
-                        description: Some(format!("Grant {} mode on {}", perm.mode, paths_str)),
-                        preview: None,
-                    },
-                    crate::engine::tools::AskUserOption {
-                        label: "Run in current mode".to_string(),
-                        description: Some("Skill runs with existing permissions (may fail)".to_string()),
-                        preview: None,
-                    },
-                    crate::engine::tools::AskUserOption {
-                        label: "Cancel".to_string(),
-                        description: Some("Don't run this skill".to_string()),
-                        preview: None,
-                    },
-                ],
-                multi_select: false,
-            };
-
-            match engine.ask_permission_raw(&skill.name, question).await {
-                Some(crate::engine::permission::PermissionAction::AllowOnce) => {
-                    // "Approve" — grant the requested permissions.
-                    for path in &perm.paths {
-                        engine.session_permissions.set_path_mode(path, mode.clone());
-                    }
-                    if let Some(ref sdir) = engine.session_dir {
-                        engine.session_permissions.save(sdir);
-                    }
+    // Consumer sessions are locked — skills run with the permissions already set by SessionPolicy.
+    if !engine.session_permissions.locked {
+        if let Some(ref skill) = engine.active_skill {
+            if let Some(ref perm) = skill.permission {
+                use crate::engine::permission::PermissionMode;
+                let mode = match perm.mode.as_str() {
+                    "edit" => PermissionMode::Edit,
+                    "admin" => PermissionMode::Admin,
+                    _ => PermissionMode::Read,
+                };
+                let paths_str = perm.paths.join(", ");
+                let mut question_text = format!(
+                    "Skill \"{}\" requests {} mode on: {}",
+                    skill.name, perm.mode, paths_str
+                );
+                if let Some(ref warning) = perm.warning {
+                    question_text.push_str(&format!("\n⚠️ {}", warning));
                 }
-                Some(crate::engine::permission::PermissionAction::AllowSession) => {
-                    // "Run in current mode" — proceed without grants.
-                }
-                _ => {
-                    // "Cancel" or timeout — abort skill.
-                    let msg = format!("Skill '{}' cancelled — permission not granted.", skill.name);
-                    persist_and_emit_message(
-                        &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
-                        &ctx.agent_id, "user", &msg, ctx.session_id.as_deref(), false,
-                    ).await;
-                    unwire_interrupt_channel(ctx, engine, &interrupt_key).await;
-                    return;
+
+                let question = crate::engine::tools::AskUserQuestion {
+                    question: question_text,
+                    header: "Permission".to_string(),
+                    options: vec![
+                        crate::engine::tools::AskUserOption {
+                            label: "Approve".to_string(),
+                            description: Some(format!("Grant {} mode on {}", perm.mode, paths_str)),
+                            preview: None,
+                        },
+                        crate::engine::tools::AskUserOption {
+                            label: "Run in current mode".to_string(),
+                            description: Some("Skill runs with existing permissions (may fail)".to_string()),
+                            preview: None,
+                        },
+                        crate::engine::tools::AskUserOption {
+                            label: "Cancel".to_string(),
+                            description: Some("Don't run this skill".to_string()),
+                            preview: None,
+                        },
+                    ],
+                    multi_select: false,
+                };
+
+                match engine.ask_permission_raw(&skill.name, question).await {
+                    Some(crate::engine::permission::PermissionAction::AllowOnce) => {
+                        // "Approve" — grant the requested permissions.
+                        for path in &perm.paths {
+                            engine.session_permissions.set_path_mode(path, mode.clone());
+                        }
+                        if let Some(ref sdir) = engine.session_dir {
+                            engine.session_permissions.save(sdir);
+                        }
+                    }
+                    Some(crate::engine::permission::PermissionAction::AllowSession) => {
+                        // "Run in current mode" — proceed without grants.
+                    }
+                    _ => {
+                        // "Cancel" or timeout — abort skill.
+                        let msg = format!("Skill '{}' cancelled — permission not granted.", skill.name);
+                        persist_and_emit_message(
+                            &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+                            &ctx.agent_id, "user", &msg, ctx.session_id.as_deref(), false,
+                        ).await;
+                        unwire_interrupt_channel(ctx, engine, &interrupt_key).await;
+                        return;
+                    }
                 }
             }
         }
@@ -585,6 +592,19 @@ async fn run_trigger_dispatch(
             if !skill.user_invocable {
                 let err_msg = format!(
                     "Skill '{}' is not user-invocable and cannot be activated via trigger.",
+                    skill.name
+                );
+                persist_and_emit_message(
+                    &ctx.manager, &ctx.events_tx, &ctx.root, &ctx.agent_id,
+                    &ctx.agent_id, "user", &err_msg, ctx.session_id.as_deref(), false,
+                )
+                .await;
+                return;
+            }
+            // Check session policy skill allowlist
+            if !ctx.policy.is_skill_allowed(&skill.name) {
+                let err_msg = format!(
+                    "Skill '{}' is not available in this room.",
                     skill.name
                 );
                 persist_and_emit_message(
@@ -1111,22 +1131,10 @@ async fn run_structured_loop(
 
     if let Ok(outcome) = &outcome {
         emit_outcome_event(outcome, &ctx.events_tx, &ctx.agent_id, ctx.session_id.as_deref());
-        // For text-only responses (AgentOutcome::None with streamed content),
-        // the engine already persists the message to session files but doesn't
-        // emit a ServerEvent::Message.  Emit one now so the UI can finalize
-        // liveText → text.  (Don't persist again — the engine already did.)
-        if matches!(outcome, crate::engine::AgentOutcome::None) {
-            if let Some(text) = &engine.last_assistant_text {
-                if !text.is_empty() {
-                    let _ = ctx.events_tx.send(ServerEvent::Message {
-                        from: ctx.agent_id.clone(),
-                        to: "user".to_string(),
-                        content: text.clone(),
-                        session_id: ctx.session_id.clone(),
-                    });
-                }
-            }
-        }
+        // Note: persist_assistant_message() (in engine/context.rs) already emits
+        // an AgentEvent::Message which the bridge converts to ServerEvent::Message.
+        // No additional Message event needed here — emitting one would duplicate
+        // the assistant response for WebRTC consumers.
     } else if let Err(err) = outcome {
         let error_msg = format!("Error: {}", err);
         persist_and_emit_message(
@@ -1310,7 +1318,7 @@ pub(crate) async fn chat_handler(
             let queued_item_id = queued_item.as_ref().map(|q| q.id.clone());
             let session_id_for_queue = effective_session_id.clone();
             let project_root_for_queue = project_root_str.clone();
-            let req_mode = req.mode.clone();
+            let req_user_type = req.user_type;
             let req_model_id = req.model_id.clone();
             let req_images = req.images.clone();
             if was_busy {
@@ -1422,23 +1430,11 @@ pub(crate) async fn chat_handler(
                     }
                 }
 
-                // Apply session mode override for proxy room consumers.
-                match req_mode.as_deref() {
-                    Some("chat") => {
-                        // Chat mode: no tools at all.
-                        engine.cfg.permission_mode = crate::engine::permission::PermissionMode::Chat;
-                        engine.cached_system_prompt = None;
-                    }
-                    Some("consumer") => {
-                        // Consumer mode: load allowed tools/skills from room_config.toml
-                        // server-side. Never trust the request body for permissions.
-                        let room_cfg = crate::server::rtc::room_config::load_room_config();
-                        engine.cfg.consumer_allowed_tools = Some(room_cfg.allowed_tools.into_iter().collect());
-                        engine.cfg.consumer_allowed_skills = Some(room_cfg.allowed_skills.into_iter().collect());
-                        engine.cached_system_prompt = None;
-                    }
-                    _ => {}
-                }
+                // Apply session policy for proxy room consumers.
+                let policy = crate::engine::session_policy::SessionPolicy::from_user_type(
+                    &req_user_type,
+                );
+                policy.apply(&mut engine);
 
                 let model_label = &engine.model_id;
                 state_clone
@@ -1458,6 +1454,7 @@ pub(crate) async fn chat_handler(
                     session_id: session_id.clone(),
                     clean_msg: clean_msg_clone.clone(),
                     images: req_images,
+                    policy,
                 };
 
                 // Restore chat history from session store when the engine was
@@ -1502,9 +1499,13 @@ pub(crate) async fn chat_handler(
                             }
                         };
                         if let Some(ref skill_name) = bound_skill_name {
-                            if let Some(skill) = manager.skill_manager.get_skill(skill_name).await {
-                                tracing::info!("Session-bound skill activated: {}", skill.name);
-                                engine.active_skill = Some(skill);
+                            if ctx.policy.is_skill_allowed(skill_name) {
+                                if let Some(skill) = manager.skill_manager.get_skill(skill_name).await {
+                                    tracing::info!("Session-bound skill activated: {}", skill.name);
+                                    engine.active_skill = Some(skill);
+                                }
+                            } else {
+                                tracing::info!("Session-bound skill '{}' blocked by policy", skill_name);
                             }
                         }
                     }
@@ -1673,6 +1674,9 @@ pub(crate) async fn approve_plan_handler(
         }
 
         // Build a ChatRunCtx so we can reuse run_plan_execution.
+        // Plan execution only calls run_agent_loop (no skill dispatch), so
+        // ctx.policy is not consulted. Engine-level restrictions (consumer_allowed_tools,
+        // locked) are already set from the original chat request.
         let session_id_for_cleanup = session_id.clone();
         let ctx = ChatRunCtx {
             state: state_clone.clone(),
@@ -1683,6 +1687,7 @@ pub(crate) async fn approve_plan_handler(
             session_id,
             clean_msg: String::new(),
             images: Vec::new(),
+            policy: crate::engine::session_policy::SessionPolicy::default(),
         };
 
         run_plan_execution(&ctx, &mut engine).await;

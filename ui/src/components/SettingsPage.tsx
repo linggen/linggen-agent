@@ -8,7 +8,7 @@ import { ToolsTab } from './ToolsTab';
 import { GeneralTab } from './GeneralTab';
 import { MissionPage } from './MissionPage';
 import { StoragePage } from './StoragePage';
-import { SharingTab } from './SharingTab';
+import { RoomTab } from './RoomTab';
 
 const tabs: { key: ManagementTab; label: string }[] = [
   { key: 'models', label: 'Models' },
@@ -18,7 +18,7 @@ const tabs: { key: ManagementTab; label: string }[] = [
   { key: 'general', label: 'General' },
   { key: 'mission', label: 'Mission' },
   { key: 'storage', label: 'Storage' },
-  { key: 'sharing', label: 'Sharing' },
+  { key: 'room', label: 'Room' },
 ];
 
 export const SettingsPage: React.FC<{
@@ -199,10 +199,10 @@ export const SettingsPage: React.FC<{
           <StoragePage embedded onBack={onBack} />
         )}
 
-        {activeTab === 'sharing' && (
+        {activeTab === 'room' && (
           <div className="h-full overflow-y-auto p-3 md:p-6">
             <div className="max-w-4xl mx-auto">
-              <SharingTab />
+              <RoomTab />
             </div>
           </div>
         )}

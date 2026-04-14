@@ -1285,19 +1285,37 @@ pub(crate) async fn connect_proxy_room_api(
         None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "instance_id required" }))).into_response(),
     };
     let owner_name = body.get("owner_name").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let room_name = body.get("room_name").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    match crate::server::rtc::proxy_room::connect_proxy_room(state, &instance_id, owner_name).await {
+    match crate::server::rtc::proxy_room::connect_proxy_room(state, &instance_id, owner_name, room_name).await {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("{e}") }))).into_response(),
     }
 }
 
-/// POST /api/proxy/disconnect — disconnect from proxy room, remove proxy models.
+/// POST /api/proxy/disconnect — disconnect from proxy room(s).
+/// Body: { "instance_id": "..." } for per-room, or empty/omitted for all.
 pub(crate) async fn disconnect_proxy_room_api(
     State(state): State<Arc<ServerState>>,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    crate::server::rtc::proxy_room::disconnect_proxy_room(state).await;
+    let instance_id = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("instance_id").and_then(|id| id.as_str()).map(String::from));
+
+    match instance_id {
+        Some(id) => crate::server::rtc::proxy_room::disconnect_proxy_room_by_instance(state, &id).await,
+        None => crate::server::rtc::proxy_room::disconnect_all_proxy_rooms(state).await,
+    }
     Json(serde_json::json!({ "ok": true }))
+}
+
+/// GET /api/proxy/status — list active proxy room connections.
+pub(crate) async fn proxy_status_api(
+    State(state): State<Arc<ServerState>>,
+) -> impl IntoResponse {
+    let connections = state.proxy_connections.list().await;
+    Json(serde_json::json!({ "connections": connections }))
 }
 
 /// Proxy linggen.dev room APIs — forwards GET/POST/PATCH/DELETE to /api/rooms/*.

@@ -74,6 +74,7 @@ impl Tools {
         let session_id = self.session_id.clone();
 
         let ask_bridge = self.ask_user_bridge.clone();
+        let policy = self.session_policy.clone();
         block_on_async(run_delegation(
             manager,
             ws_root,
@@ -85,6 +86,7 @@ impl Tools {
             max_delegation_depth,
             ask_bridge,
             session_id,
+            policy,
         ))
     }
 
@@ -242,6 +244,7 @@ pub(crate) async fn run_delegation(
     max_delegation_depth: usize,
     ask_user_bridge: Option<Arc<AskUserBridge>>,
     session_id: Option<String>,
+    parent_policy: Option<crate::engine::session_policy::SessionPolicy>,
 ) -> Result<ToolResult> {
     let run_id = manager
         .begin_agent_run(
@@ -291,6 +294,11 @@ pub(crate) async fn run_delegation(
     engine.set_run_id(Some(run_id.clone()));
     engine.set_task(task);
     engine.tools.builtins.set_session_id(session_id.clone());
+
+    // Inherit consumer restrictions from parent — subagents can only tighten, never widen.
+    if let Some(ref policy) = parent_policy {
+        policy.apply(&mut engine);
+    }
 
     // Wire AskUser bridge so the subagent can prompt for permissions and user questions.
     if let Some(bridge) = ask_user_bridge {

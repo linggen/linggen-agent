@@ -301,9 +301,9 @@ Skills without a `permission` section run with whatever the session already has.
 | Local browser (owner) | Any | No | Yes |
 | Remote same-user (owner) | Any | No | Yes |
 | Remote different-user (guest) | Owner-set (default: read) | Yes | No |
-| Proxy consumer | chat | Yes | No |
+| Proxy consumer (browser) | Room config ceiling | Yes | No |
 
-Guest sessions are always locked — no prompts, actions within ceiling + allow rules proceed, everything else blocked.
+Guest and consumer sessions are always locked — no prompts, actions within ceiling + allow rules proceed, everything else blocked. For proxy consumers, the room config (`allowed_tools`, `allowed_skills`) is the hard ceiling — the consumer's permission level operates within it.
 
 
 ## Subagents

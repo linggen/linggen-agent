@@ -127,7 +127,25 @@ export const HeaderBar: React.FC<{
   const [spStatus, setSpStatus] = useState<'idle' | 'copied' | 'error'>('idle');
   const connectionStatus = useUserStore((s) => s.connectionStatus);
   const userRoomName = useUserStore((s) => s.userRoomName);
-  const userPermission = useUserStore((s) => s.userPermission);
+  const userType = useUserStore((s) => s.userType);
+
+  // Fetch room name for owner — the backend doesn't include it in page_state
+  useEffect(() => {
+    if (userType !== 'owner') return;
+    let cancelled = false;
+    fetch('/api/rooms/mine')
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (cancelled) return;
+        const name = data?.room?.name ?? null;
+        const store = useUserStore.getState();
+        if (store.userRoomName !== name) {
+          store.setUserInfo(store.userPermission, name, store.userTokenBudget);
+        }
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [userType]);
 
   return (
     <header className="flex items-center justify-between px-4 md:px-6 py-2.5 border-b border-slate-200 dark:border-white/5 bg-white/90 dark:bg-[#0f0f0f]/90 backdrop-blur-md z-50">
@@ -142,10 +160,10 @@ export const HeaderBar: React.FC<{
           <img src={logoUrl} alt="Linggen" className="w-6 h-6 md:w-7 md:h-7" />
           <h1 className="text-sm md:text-base font-bold tracking-tight text-slate-900 dark:text-white">Linggen</h1>
         </a>
-        {userPermission === 'admin' && userRoomName && (
+        {userType === 'owner' && userRoomName && (
           <button
             onClick={() => {
-              useUiStore.getState().openSettings('sharing');
+              useUiStore.getState().openSettings('room');
             }}
             className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-500 font-medium hover:bg-amber-500/20 transition-colors"
             title="Open Sharing settings"

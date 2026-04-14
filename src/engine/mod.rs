@@ -4,7 +4,9 @@ pub mod patch;
 pub mod permission;
 mod plan;
 mod prompt;
+pub mod prompt_profile;
 pub mod render;
+pub mod session_policy;
 pub mod skill_tool;
 mod streaming;
 pub mod tool_registry;
@@ -71,6 +73,14 @@ impl AgentEngine {
         if let Some(sid) = session_id {
             let sdir = crate::paths::global_sessions_dir().join(sid);
             self.session_permissions = permission::SessionPermissions::load(&sdir);
+
+            // Consumer/mission sessions must stay locked even after reload from disk.
+            // The locked flag is set by SessionPolicy::apply() before the loop starts,
+            // but SessionPermissions::load() clobbers it. Re-apply if consumer restrictions
+            // are active (consumer_allowed_tools is Some only for consumer/chat modes).
+            if self.cfg.consumer_allowed_tools.is_some() || self.cfg.mission_allowed_tools.is_some() {
+                self.session_permissions.locked = true;
+            }
 
             // Initialize default path_modes if empty (new session = read on cwd).
             if self.session_permissions.path_modes.is_empty() && !self.session_permissions.locked {

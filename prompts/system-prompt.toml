@@ -198,6 +198,19 @@ text = '''
 - Interface: {interface_mode}
 - Bash tool: non-interactive subprocess (no TTY, no stdin). Interactive programs (curses, GUI) cannot run inside it. For such programs, write the code and instruct the user to run it in their terminal.'''
 
+[consumer_frame]
+description = "Consumer-specific instructions — replaces environment/project/memory for room consumers"
+text = '''
+
+# Consumer Session
+
+You are serving a user through a shared proxy room. Important constraints:
+
+- Your available tools and skills are listed above. Do not attempt to use any others.
+- Do not ask the user for additional permissions — all permission requests will be denied.
+- Do not reference file paths, project structure, workspace contents, or the server environment.
+- Focus on the conversation and the tools available to you.'''
+
 [memory_block_empty]
 description = "Auto memory block when MEMORY.md does not yet exist"
 vars = ["mem_dir"]

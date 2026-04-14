@@ -45,7 +45,7 @@ use projects_api::{
     rename_session_api, resolve_session_api, upsert_agent_file_api, upsert_skill_file_api,
     get_user_me, auth_login, auth_callback, auth_logout,
     get_session_permission, update_session_permission,
-    proxy_rooms, connect_proxy_room_api, disconnect_proxy_room_api,
+    proxy_rooms, connect_proxy_room_api, disconnect_proxy_room_api, proxy_status_api,
     get_room_config, update_room_config,
 };
 use marketplace_api::{builtin_skills_install, builtin_skills_list, clawhub_scan, community_search, marketplace_install, marketplace_move_to_global, marketplace_uninstall};
@@ -88,6 +88,8 @@ pub struct ServerState {
     /// Per-session cwd for user `!` bash commands. Key = session_id.
     /// Mirrors the agent's cwd_by_session but for direct user shell commands.
     pub user_bash_cwd: Arc<Mutex<HashMap<String, std::path::PathBuf>>>,
+    /// Tracks active proxy room connections (per-room model tracking).
+    pub proxy_connections: Arc<rtc::proxy_room::ProxyRoomConnections>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -326,6 +328,12 @@ pub enum ServerEvent {
         cwd: String,
         project: Option<String>,
         project_name: Option<String>,
+    },
+    /// Room chat message — relayed between all peers in a proxy room.
+    RoomChat {
+        sender_id: String,
+        sender_name: String,
+        text: String,
     },
 }
 
@@ -1009,6 +1017,27 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
                 "project_name": project_name,
             })),
         }),
+        ServerEvent::RoomChat {
+            sender_id,
+            sender_name,
+            text,
+        } => Some(UiEvent {
+            id: format!("room-chat-{seq}"),
+            seq,
+            rev: seq,
+            ts_ms,
+            kind: "room_chat".to_string(),
+            phase: None,
+            text: Some(text.clone()),
+            agent_id: None,
+            session_id: Some("global".to_string()),
+            project_root: None,
+            data: Some(json!({
+                "sender_id": sender_id,
+                "sender_name": sender_name,
+                "text": text,
+            })),
+        }),
     }
 }
 
@@ -1144,6 +1173,7 @@ async fn prepare_server(
         session_tokens: Arc::new(Mutex::new(HashMap::new())),
         whip_token: uuid::Uuid::new_v4().to_string(),
         user_bash_cwd: Arc::new(Mutex::new(HashMap::new())),
+        proxy_connections: Arc::new(rtc::proxy_room::ProxyRoomConnections::new()),
     });
 
     // Bridge internal AgentManager events to the UI (broadcast channel → WebRTC).
@@ -1287,6 +1317,7 @@ async fn prepare_server(
         .route("/api/rooms/{*path}", axum::routing::any(proxy_rooms))
         .route("/api/proxy/connect", post(connect_proxy_room_api))
         .route("/api/proxy/disconnect", post(disconnect_proxy_room_api))
+        .route("/api/proxy/status", get(proxy_status_api))
         .route("/api/room-config", get(get_room_config).post(update_room_config))
         .route("/api/health", get(health_handler))
         .route("/api/utils/pick-folder", get(pick_folder))
@@ -1306,6 +1337,16 @@ async fn prepare_server(
 
     // Spawn remote relay tasks (heartbeat + offer polling) if remote.toml exists.
     rtc::relay::spawn_relay_tasks(state.clone());
+
+    // Auto-connect to joined proxy rooms (linggen server consumer mode).
+    {
+        let auto_state = state.clone();
+        tokio::spawn(async move {
+            // Small delay to let relay establish first.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            rtc::proxy_room::auto_connect_joined_rooms(auto_state).await;
+        });
+    }
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
     let actual_port = listener.local_addr()?.port();
@@ -1655,6 +1696,11 @@ mod tests {
                 context_tokens: Some(5000),
                 parent_id: None,
                 session_id: None,
+            },
+            ServerEvent::RoomChat {
+                sender_id: "user-1".into(),
+                sender_name: "Alice".into(),
+                text: "Hello room!".into(),
             },
         ];
 

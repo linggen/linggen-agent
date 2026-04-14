@@ -220,7 +220,7 @@ pub fn permission_target_summary(tool: &str, args: &serde_json::Value, cwd: &Pat
 // ===========================================================================
 
 /// Session permission mode — defines the ceiling of what the agent can do.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
     Chat,
@@ -860,6 +860,11 @@ pub fn check_permission(
         // Check if user already overrode this ask rule for the session.
         // Store the rule itself as the key so suppression covers all matching commands.
         if !session_perms.allows.contains(&rule) {
+            if session_perms.locked {
+                return PermissionCheckResult::Blocked(
+                    format!("Ask rule '{}' blocked (locked session)", rule),
+                );
+            }
             let summary = rule_arg.unwrap_or(tool).to_string();
             return PermissionCheckResult::NeedsPrompt(PromptKind::AskRuleOverride {
                 rule,
@@ -888,6 +893,13 @@ pub fn check_permission(
         return PermissionCheckResult::NeedsPrompt(PromptKind::SystemZoneWrite {
             tool_summary: format!("{} {}", tool, summary),
         });
+    }
+
+    // 5b. Locked sessions (consumer/mission): tools already passed the
+    // consumer_allowed_tools gate in pre_execute_tool. The room owner
+    // explicitly allowed these tools — skip path-based permission checks.
+    if session_perms.locked {
+        return PermissionCheckResult::Allowed;
     }
 
     // 6. Find effective mode for target path

@@ -98,6 +98,32 @@ Very similar to what we already have. Their additions:
 | Anti-distillation | N/A | Not needed yet |
 | Memory layers | MEMORY.md + topic files | Already aligned |
 
+## 8. Claw Code — Rust Rewrite of Claude Code
+
+`ultraworkers/claw-code` is an open-source Rust rewrite of Claude Code. 77K LOC Rust across 9 crates. Worth analyzing for architecture patterns.
+
+**Key highlights:**
+- **Multi-agent orchestration** — agent teams with lane events (Started → Green → PR → Merged), worker boot lifecycle, Discord-driven human interface
+- **Trait-based DI** — `ApiClient` and `ToolExecutor` traits for swappable providers/tools
+- **Permission model** — 3-tier (ReadOnly → WorkspaceWrite → DangerFullAccess), 1004-LOC bash validation
+- **Mock parity harness** — deterministic Anthropic-compatible mock for reproducible testing (10 validated scenarios)
+- **MCP integration** — full lifecycle management with partial startup / degraded mode
+- **Plugin system** — hook points at pre/post tool use, session lifecycle
+- **Multi-provider** — Anthropic, OpenAI-compatible, xAI, DashScope
+- **JSONL sessions** — append-only, resumable, compactable
+- **`unsafe_code = "forbid"`** — no unsafe blocks anywhere
+
+**Local copy:** `/Users/lianghuang/workspace/playground/claw-code`
+
+**TODO:**
+- [ ] Analyze their multi-agent lane event system vs our delegation model
+- [ ] Compare their bash validation (1004 LOC) with our `check.rs`
+- [ ] Study their mock parity harness for testing ideas
+- [ ] Review their MCP lifecycle management vs ours
+- [ ] Compare their plugin hook system with our skill system
+
+---
+
 ## Sources
 
 - [VentureBeat](https://venturebeat.com/technology/claude-codes-source-code-appears-to-have-leaked-heres-what-we-know)
@@ -105,3 +131,4 @@ Very similar to what we already have. Their additions:
 - [Alex Kim — Fake tools, frustration regexes, undercover mode](https://alex000kim.com/posts/2026-03-31-claude-code-source-leak/)
 - [WaveSpeedAI — BUDDY, KAIROS & Hidden Features](https://wavespeed.ai/blog/posts/claude-code-leaked-source-hidden-features/)
 - [Kingy AI — KAIROS Deep Dive](https://kingy.ai/ai/kairos-everything-we-know-about-anthropics-secret-always-on-ai-daemon/)
+- [Claw Code](https://github.com/ultraworkers/claw-code) — Rust rewrite of Claude Code (open source)

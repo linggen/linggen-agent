@@ -89,6 +89,7 @@ export const SessionModeSelector: React.FC = () => {
   const setSessionMode = useUiStore((s) => s.setSessionMode);
   const sessionZone = useUiStore((s) => s.sessionZone);
   const userPermission = useUserStore((s) => s.userPermission);
+  const userType = useUserStore((s) => s.userType);
   const sessionId = useSessionStore((s) => s.activeSessionId);
 
   const modes = [
@@ -99,8 +100,8 @@ export const SessionModeSelector: React.FC = () => {
 
   const isSystemZone = sessionZone === 'system';
 
-  // Non-admin users: show permission as read-only badge
-  if (userPermission !== 'admin') {
+  // Consumers: show permission as read-only badge (room settings control permissions)
+  if (userType === 'consumer') {
     const current = modes.find((m) => m.value === (sessionMode || userPermission));
     return (
       <span

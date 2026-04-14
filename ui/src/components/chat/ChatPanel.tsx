@@ -231,6 +231,14 @@ export const ChatPanel: React.FC<{
   const thinkingStartRef = useRef<number | null>(null);
   const [thinkingElapsed, setThinkingElapsed] = useState(0);
 
+  // Focus chat input when session changes (e.g. new session created)
+  useEffect(() => {
+    if (sessionId) {
+      // Small delay to let the DOM settle after session switch
+      setTimeout(() => inputRef.current?.focus(), 50);
+    }
+  }, [sessionId]);
+
   useEffect(() => {
     if (pendingAskUser) {
       chatEndRef?.current?.scrollIntoView({ behavior: 'auto', block: 'nearest' });
@@ -434,7 +442,7 @@ export const ChatPanel: React.FC<{
                   <>
                     <span className="font-semibold uppercase tracking-wider text-slate-500">Session</span>
                     <span className="font-mono truncate max-w-[160px]">{sessionId}</span>
-                    {useUserStore.getState().userPermission === 'admin' && (sessionMeta?.project_name || sessionMeta?.cwd) && (() => {
+                    {useUserStore.getState().userType === 'owner' && (sessionMeta?.project_name || sessionMeta?.cwd) && (() => {
                       const fullPath = sessionMeta?.cwd || sessionMeta?.project || '';
                       const displayName = sessionMeta?.project_name || fullPath.split('/').filter(Boolean).pop() || fullPath;
                       return (

@@ -30,6 +30,7 @@ pub mod keys {
     pub const SYSTEM_MEMORY_BLOCK_EMPTY: &str = "system-prompt.memory_block_empty";
     pub const GLOBAL_MEMORY_BLOCK: &str = "system-prompt.global_memory_block";
     pub const GLOBAL_MEMORY_BLOCK_EMPTY: &str = "system-prompt.global_memory_block_empty";
+    pub const SYSTEM_CONSUMER_FRAME: &str = "system-prompt.consumer_frame";
 
     // -- system-reminder.* ------------------------------------------------
     pub const NUDGE_INVALID_JSON: &str = "system-reminder.nudge_invalid_json";

@@ -288,19 +288,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   })),
 
   finalizeMessage: (agentId, content, to, tsMs, elapsed, ctxTokens, isError) => set(mutate((state) => {
-    // Look for a generating message first; if turn_complete already finalized
-    // it, fall back to the last message from this agent (within 30s) so we
-    // update in place instead of creating a duplicate.
-    let generatingIdx = findLastGeneratingMessageIndex(state, agentId);
-    if (generatingIdx < 0) {
-      for (let i = state.length - 1; i >= 0; i--) {
-        const m = state[i];
-        if (m.from !== agentId || m.role === 'user') continue;
-        if (m.timestampMs && tsMs - m.timestampMs > 30_000) break;
-        generatingIdx = i;
-        break;
-      }
-    }
+    const generatingIdx = findLastGeneratingMessageIndex(state, agentId);
     if (generatingIdx >= 0) {
       const next = [...state];
       const existingMsg = next[generatingIdx];
@@ -585,12 +573,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (!activeSessionId) return;
     if (isMissionSession && !activeMissionId) return;
     if (isSkillSession && !activeSkillName) return;
-    // When no project is selected, fall back to the active session's cwd/project
-    // so messages still load after page refresh in project-less workspaces.
+    // When no project is selected, fall back to the active session's cwd/project.
     if (!isMissionSession && !isSkillSession && !selectedProjectRoot) {
       const sess = projectState.allSessions.find((s) => s.id === activeSessionId);
       selectedProjectRoot = sess?.project || sess?.cwd || '';
-      if (!selectedProjectRoot) return;
     }
     try {
       let url: URL;

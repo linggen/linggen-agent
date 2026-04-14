@@ -9,7 +9,7 @@
  */
 import { useEffect, useRef, useCallback, useState } from 'react';
 
-export function useAutoScroll(messages: { length: number }, lastMsg: { isGenerating?: boolean; content?: any[] } | undefined) {
+export function useAutoScroll(messages: { length: number }, lastMsg: { isGenerating?: boolean; content?: any[]; text?: string; liveText?: string; segments?: any[] } | undefined) {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const lastChatCountRef = useRef(0);
   const lastContentLenRef = useRef(0);
@@ -98,15 +98,17 @@ export function useAutoScroll(messages: { length: number }, lastMsg: { isGenerat
   }, [updateScrollButton]);
 
   const lastContentLen = lastMsg?.isGenerating ? (lastMsg.content?.length || 0) : 0;
+  // Track text growth (liveText during streaming, text after finalize) and segments
+  // so multi-line output triggers auto-scroll, not just new messages or content blocks.
+  const lastTextLen = (lastMsg?.liveText?.length || 0) + (lastMsg?.text?.length || 0);
+  const lastSegmentsLen = lastMsg?.segments?.length || 0;
   useEffect(() => {
-    const newMessages = messages.length > lastChatCountRef.current;
-    const newContentBlocks = lastContentLen > lastContentLenRef.current;
-    if ((newMessages || newContentBlocks) && isNearBottomRef.current) {
+    if (isNearBottomRef.current) {
       doScrollToBottom();
     }
     lastChatCountRef.current = messages.length;
     lastContentLenRef.current = lastContentLen;
-  }, [messages.length, lastContentLen, doScrollToBottom]);
+  }, [messages.length, lastContentLen, lastTextLen, lastSegmentsLen, doScrollToBottom]);
 
   const scrollToBottom = useCallback(() => {
     isNearBottomRef.current = true;

@@ -157,6 +157,16 @@ export class RtcTransport implements Transport {
     }
   }
 
+  /** Send a room chat message (fire-and-forget, no request_id). */
+  sendRoomChat(text: string, senderName: string): void {
+    if (!this.controlChannel || this.controlChannel.readyState !== 'open') return;
+    this.controlChannel.send(JSON.stringify({
+      type: 'room_chat',
+      text,
+      sender_name: senderName,
+    }));
+  }
+
   /** Flush queued view context when control channel opens. */
   private flushPendingViewContext(): void {
     if (this.pendingViewContext) {

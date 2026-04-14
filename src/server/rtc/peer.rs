@@ -195,24 +195,39 @@ async fn run_peer(
                         tracing::info!("Data channel opened: {label} (id: {id:?})");
                         if label == "control" {
                             control_channel_id = Some(id);
-                            // Send user info to all peers on control channel open
-                            let room_cfg = super::room_config::load_room_config();
+                            // Send connection metadata: user info + room info.
+                            let data = if user_ctx.is_consumer {
+                                let room_cfg = super::room_config::load_room_config();
+                                serde_json::json!({
+                                    "user": {
+                                        "user_id": user_ctx.user_id,
+                                        "user_type": "consumer",
+                                    },
+                                    "room": {
+                                        "permission": user_ctx.permission.as_str(),
+                                        "room_name": user_ctx.room_name,
+                                        "token_budget_daily": user_ctx.token_budget_daily,
+                                        "allowed_tools": room_cfg.allowed_tools,
+                                        "allowed_skills": room_cfg.allowed_skills,
+                                    },
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "user": {
+                                        "user_id": user_ctx.user_id,
+                                        "user_type": "owner",
+                                    },
+                                })
+                            };
                             let info_msg = serde_json::json!({
                                 "kind": "user_info",
-                                "data": {
-                                    "user_id": user_ctx.user_id,
-                                    "permission": user_ctx.permission.as_str(),
-                                    "token_budget_daily": user_ctx.token_budget_daily,
-                                    "room_name": user_ctx.room_name,
-                                    "allowed_tools": room_cfg.allowed_tools,
-                                    "allowed_skills": room_cfg.allowed_skills,
-                                }
+                                "data": data,
                             });
                             if pending_dc_writes.len() < MAX_DC_WRITE_QUEUE {
                                 pending_dc_writes.push_back((id, info_msg.to_string()));
                             }
-                            // Privacy warning for non-admin users
-                            if !user_ctx.permission.is_admin() {
+                            // Privacy warning for consumers
+                            if user_ctx.is_consumer {
                                 let warning = serde_json::json!({
                                     "kind": "notification",
                                     "data": {
@@ -271,6 +286,7 @@ async fn run_peer(
                                 &mut channel_sessions,
                                 &mut view_ctx,
                                 &mut force_page_state,
+                                &user_ctx,
                             ) {
                                 // Enforce consumer permissions: browser consumers can only chat
                                 // and load static assets. All dynamic data (sessions, models,
@@ -500,11 +516,12 @@ fn handle_control_message(
     rtc: &mut Rtc,
     channel_id: str0m::channel::ChannelId,
     text: &str,
-    _state: &Arc<ServerState>,
+    state: &Arc<ServerState>,
     _session_channels: &mut HashMap<String, str0m::channel::ChannelId>,
     _channel_sessions: &mut HashMap<str0m::channel::ChannelId, String>,
     view_ctx: &mut super::page_state::ViewContext,
     force_page_state: &mut bool,
+    user_ctx: &super::UserContext,
 ) -> Option<ControlRequest> {
     let msg: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -548,6 +565,23 @@ fn handle_control_message(
             None
         }
 
+        "room_chat" => {
+            let text = msg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if text.is_empty() {
+                return None;
+            }
+            let sender_name = msg.get("sender_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&user_ctx.user_id)
+                .to_string();
+            let _ = state.events_tx.send(crate::server::ServerEvent::RoomChat {
+                sender_id: user_ctx.user_id.clone(),
+                sender_name,
+                text,
+            });
+            None
+        }
+
         _ => {
             tracing::debug!("Unknown control message type: {msg_type}");
             if let Some(rid) = request_id {
@@ -578,7 +612,7 @@ async fn process_control_request_async(
 
     // Check token budget before chat calls
     if let Some(budget) = user_ctx.token_budget_daily {
-        if tokens_used.load(std::sync::atomic::Ordering::Relaxed) >= budget && matches!(req.msg_type.as_str(), "chat") {
+        if tokens_used.load(std::sync::atomic::Ordering::Relaxed) >= budget && matches!(req.msg_type.as_str(), "chat" | "plan_approve" | "plan_reject" | "plan_edit") {
             return serde_json::json!({
                 "error": "Token budget exhausted for today. Please try again tomorrow or ask the proxy owner to increase the budget."
             });
@@ -640,8 +674,9 @@ async fn process_control_request_async(
                 "ask_user_response" => "/api/ask-user-response",
                 _ => unreachable!(),
             };
-            // Inject user_id into the request body for session ownership tracking
+            // Inject user_type and user_id into the request body
             let mut body = req.body.clone();
+            body["user_type"] = serde_json::Value::String(user_ctx.user_type().to_string());
             body["user_id"] = serde_json::Value::String(user_ctx.user_id.clone());
             let url = format!("http://127.0.0.1:{port}{endpoint}");
             match client.post(&url).json(&body).send().await {
@@ -690,8 +725,9 @@ async fn process_inference_request(
             let models = state.manager.models.read().await;
             let model_list: Vec<serde_json::Value> = models.list_models().iter()
                 .filter(|m| {
-                    // Only expose models the owner has explicitly shared
-                    room_cfg.shared_models.contains(&m.id)
+                    // Only expose local models the owner has explicitly shared.
+                    // Proxy models (from rooms this owner joined) are never re-shared.
+                    m.provider != "proxy" && room_cfg.shared_models.contains(&m.id)
                 })
                 .map(|m| {
                     serde_json::json!({
@@ -851,10 +887,10 @@ async fn handle_session_message(
         "chat" => {
             let mut body = msg.clone();
             body["session_id"] = serde_json::Value::String(session_id.to_string());
-            // Inject permission mode and user_id
-            if let Some(mode) = user_ctx.permission.chat_mode() {
-                body["mode"] = serde_json::Value::String(mode.to_string());
-            }
+            // Inject user type and user_id
+            body["user_type"] = serde_json::Value::String(
+                user_ctx.user_type().to_string(),
+            );
             body["user_id"] = serde_json::Value::String(user_ctx.user_id.clone());
             ("/api/chat", body)
         }
@@ -1085,7 +1121,7 @@ fn forward_event_to_channels(
     // updates when a skill or mission creates a new session).
     let is_broadcast = matches!(ui_msg.kind.as_str(),
         "agent_status" | "activity" | "run" | "notification"
-        | "ask_user" | "widget_resolved"
+        | "ask_user" | "widget_resolved" | "room_chat"
     );
     match ui_msg.session_id.as_deref() {
         Some("global") | None => {

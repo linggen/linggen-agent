@@ -12,6 +12,7 @@ import { ToastContainer } from './components/ToastContainer';
 import { AppPanel } from './components/AppPanel';
 import { InfoPanel } from './components/InfoPanel';
 import { ConsumerChatPage } from './components/ConsumerChatPage';
+import { RoomChatPanel } from './components/RoomChatPanel';
 import { recordSkillUsage } from './components/SkillsCard';
 import {
   buildAgentWorkInfo,
@@ -511,6 +512,7 @@ const App: React.FC = () => {
             onDeleteSession={(id) => projectStore.removeSession(id)}
             onOpenSettings={(tab) => uiStore.openSettings(tab as any)}
           />
+          <RoomChatPanel />
         </div>
         )}
 

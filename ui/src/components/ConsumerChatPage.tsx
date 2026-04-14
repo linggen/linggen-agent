@@ -6,15 +6,19 @@
  * Layout mirrors the owner's main page: header + left sidebar (sessions) + center (chat)
  * + right sidebar (allowed skills). No settings button, no file browser.
  */
-import React, { useState } from 'react';
-import { ShieldAlert, Plus, Menu, X, LogOut } from 'lucide-react';
+import React, { useCallback, useRef, useState } from 'react';
+import { ShieldAlert, Copy, Eraser, Menu, LogOut } from 'lucide-react';
+import { cn } from '../lib/cn';
 import { ChatWidget } from './chat/ChatWidget';
 import { SessionList } from './SessionList';
 import { SkillsCard } from './SkillsCard';
 import { CollapsibleCard } from './CollapsibleCard';
+import { RoomChatPanel } from './RoomChatPanel';
+import { useChatActions } from '../hooks/useChatActions';
 import { useSessionStore } from '../stores/sessionStore';
 import { useServerStore } from '../stores/serverStore';
 import { useUserStore } from '../stores/userStore';
+import { useUiStore } from '../stores/uiStore';
 export const ConsumerChatPage: React.FC = () => {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const selectedProjectRoot = useSessionStore((s) => s.selectedProjectRoot);
@@ -22,10 +26,33 @@ export const ConsumerChatPage: React.FC = () => {
   const skills = useServerStore((s) => s.skills);
   const userRoomName = useUserStore((s) => s.userRoomName);
   const userTokenBudget = useUserStore((s) => s.userTokenBudget);
+  const copyChatStatus = useUiStore((s) => s.copyChatStatus);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const scrollToBottomRef = useRef<() => void>(() => {});
+  const { copyChat, clearChat } = useChatActions(
+    () => scrollToBottomRef.current?.(),
+    {},
+  );
 
   // Skills are already filtered by the server in page_state
   const filteredSkills = skills;
+
+  const handleClickSkill = useCallback((skill: any) => {
+    if (skill.app) {
+      if (skill.app.launcher === 'web') {
+        const appUrl = `/apps/${skill.name}/${skill.app.entry}`;
+        const instanceId = document.querySelector('meta[name="linggen-instance"]')?.getAttribute('content') || '';
+        const relayOrigin = document.querySelector('meta[name="linggen-relay-origin"]')?.getAttribute('content') || '';
+        if (instanceId && relayOrigin) {
+          window.open(`${relayOrigin}/app/connect/${instanceId}?app=${encodeURIComponent(appUrl)}`, '_blank');
+        } else {
+          window.open(appUrl, '_blank');
+        }
+      } else if (skill.app.launcher === 'url') {
+        window.open(skill.app.entry, '_blank');
+      }
+    }
+  }, []);
 
   const handleSelectSession = (session: any) => {
     projectStore.setActiveSessionId(session.id);
@@ -33,6 +60,10 @@ export const ConsumerChatPage: React.FC = () => {
     const isSkill = session.creator === 'skill' || (!session.project && session.skill);
     projectStore.setIsSkillSession(!!isSkill);
     projectStore.setActiveSkillName(isSkill && session.skill ? session.skill : null);
+    const sessionRoot = session.project || session.cwd || session.repo_path || '~';
+    if (sessionRoot !== selectedProjectRoot) {
+      projectStore.setSelectedProjectRoot(sessionRoot);
+    }
     window.localStorage.setItem('linggen:active-session', session.id);
     setMobileMenuOpen(false);
   };
@@ -56,6 +87,28 @@ export const ConsumerChatPage: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-2">
+          {/* Chat actions */}
+          <button
+            onClick={copyChat}
+            className={cn(
+              'p-1.5 rounded-md transition-colors text-slate-400 shrink-0',
+              copyChatStatus === 'copied'
+                ? 'bg-green-500/10 text-green-600'
+                : copyChatStatus === 'error'
+                  ? 'bg-red-500/10 text-red-500'
+                  : 'hover:bg-slate-100 dark:hover:bg-white/5'
+            )}
+            title={copyChatStatus === 'copied' ? 'Copied' : copyChatStatus === 'error' ? 'Copy failed' : 'Copy Chat'}
+          >
+            <Copy size={14} />
+          </button>
+          <button
+            onClick={clearChat}
+            className="p-1.5 hover:bg-red-500/10 hover:text-red-500 rounded-md text-slate-400 transition-colors shrink-0"
+            title="Clear Chat"
+          >
+            <Eraser size={14} />
+          </button>
           {/* Privacy indicator */}
           <div className="flex items-center gap-1.5">
             <ShieldAlert size={12} className="text-amber-500" />
@@ -105,6 +158,7 @@ export const ConsumerChatPage: React.FC = () => {
             onCreateSession={() => projectStore.createSession()}
             onDeleteSession={(id) => projectStore.removeSession(id)}
                       />
+          <RoomChatPanel />
         </div>
 
         {/* Center: Chat */}
@@ -128,7 +182,7 @@ export const ConsumerChatPage: React.FC = () => {
               badge={`${filteredSkills.length}`}
               defaultOpen
             >
-              <SkillsCard skills={filteredSkills} onClickSkill={() => {}} />
+              <SkillsCard skills={filteredSkills} onClickSkill={handleClickSkill} />
             </CollapsibleCard>
           </aside>
         )}

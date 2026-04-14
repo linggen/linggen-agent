@@ -477,14 +477,14 @@ impl ModelManager {
     }
 
     /// Register proxy models from a remote room owner.
-    /// Each model is backed by the ProxyModelClient and routes inference
-    /// through a WebRTC data channel.
+    /// Returns the list of registered proxy model IDs for connection tracking.
     pub fn register_proxy_models(
         &mut self,
         proxy_client: Arc<super::proxy_provider::ProxyModelClient>,
         remote_models: Vec<serde_json::Value>,
         owner_name: Option<String>,
-    ) {
+    ) -> Vec<String> {
+        let mut registered = Vec::new();
         for model_info in remote_models {
             let id = model_info.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let model_name = model_info.get("model").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
@@ -509,14 +509,16 @@ impl ModelManager {
                 provided_by: owner_name.clone(),
             };
 
-            self.models.insert(proxy_id, ModelInstance {
+            self.models.insert(proxy_id.clone(), ModelInstance {
                 config,
                 client: ProviderClient::Proxy(proxy_client.clone()),
                 semaphore: Arc::new(Semaphore::new(1)),
                 context_window: OnceCell::new(),
                 has_vision: OnceCell::new(),
             });
+            registered.push(proxy_id);
         }
+        registered
     }
 
     /// Return all registered model IDs (for fallback iteration).

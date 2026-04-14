@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { ExternalLink, Copy, Check, Trash2, RefreshCw, Users, Shield } from 'lucide-react';
+import { ExternalLink, Copy, Check, Trash2, RefreshCw, Users, Shield, Link, Wifi, WifiOff, LogOut } from 'lucide-react';
 import type { SkillInfoFull } from '../types';
+import { useUserStore } from '../stores/userStore';
 
 
 // ---------------------------------------------------------------------------
@@ -28,6 +29,35 @@ interface Member {
   added_at: string;
 }
 
+interface JoinedRoom {
+  id: string;
+  name: string;
+  instance_id: string;
+  consumer_type: string;
+  owner_name: string;
+  online: boolean;
+  token_budget_daily: number | null;
+}
+
+interface ProxyConnectionInfo {
+  instance_id: string;
+  room_name: string;
+  owner_name: string;
+  models: string[];
+}
+
+interface PublicRoom {
+  id: string;
+  name: string;
+  owner_name: string;
+  owner_avatar: string | null;
+  online: boolean;
+  max_consumers: number;
+  member_count: number;
+  token_budget_daily: number | null;
+  tokens_used_today: number;
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -53,7 +83,6 @@ function presetForTools(tools: string[]): string | null {
 function permLevelForTools(tools: string[]): number {
   const preset = presetForTools(tools);
   if (preset) return PERM_LEVEL[preset] ?? 0;
-  // Custom selection: derive from highest tool present
   if (tools.some(t => ['Write', 'Edit', 'Bash'].includes(t))) return PERM_LEVEL.edit;
   if (tools.some(t => ['WebSearch', 'WebFetch', 'Read', 'Glob', 'Grep'].includes(t))) return PERM_LEVEL.read;
   return PERM_LEVEL.chat;
@@ -109,12 +138,14 @@ const BudgetInput: React.FC<{
 };
 
 // ---------------------------------------------------------------------------
-// Styles (match project conventions)
+// Styles
 // ---------------------------------------------------------------------------
 
 const sectionCls = 'bg-white dark:bg-white/[0.02] border border-slate-200 dark:border-white/5 rounded-xl p-4 space-y-3';
 const labelCls = 'text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400';
 const inputCls = 'w-full bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:ring-1 focus:ring-blue-500/50';
+const btnPrimary = 'px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg transition-colors disabled:opacity-50';
+const btnDanger = 'px-3 py-1.5 text-xs text-red-500 hover:text-red-600 font-medium';
 
 const permBadge: Record<string, string> = {
   read: 'bg-blue-500/10 text-blue-500 dark:text-blue-400',
@@ -122,11 +153,15 @@ const permBadge: Record<string, string> = {
   admin: 'bg-red-500/10 text-red-500 dark:text-red-400',
 };
 
+const onlineDot = (online: boolean) =>
+  `w-1.5 h-1.5 rounded-full ${online ? 'bg-green-500' : 'bg-slate-400'}`;
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
-export const SharingTab: React.FC = () => {
+export const RoomTab: React.FC = () => {
+  // --- Owner state (existing) ---
   const [room, setRoom] = useState<RoomData | null>(null);
   const [members, setMembers] = useState<Member[]>([]);
   const [loading, setLoading] = useState(true);
@@ -135,8 +170,8 @@ export const SharingTab: React.FC = () => {
   const [copied, setCopied] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  // Models
-  const [allModels, setAllModels] = useState<{ id: string; model: string }[]>([]);
+  // Models (filter proxy models for sharing)
+  const [allModels, setAllModels] = useState<{ id: string; model: string; provider?: string }[]>([]);
   const [sharedModels, setSharedModels] = useState<string[]>([]);
 
   // Tools & skills from room config
@@ -151,6 +186,15 @@ export const SharingTab: React.FC = () => {
   const [formMaxConsumers, setFormMaxConsumers] = useState(4);
   const [formBudget, setFormBudget] = useState<number | null>(500000);
 
+  // --- Consumer state (new) ---
+  const [joinedRooms, setJoinedRooms] = useState<JoinedRoom[]>([]);
+  const [proxyConnections, setProxyConnections] = useState<ProxyConnectionInfo[]>([]);
+
+  // --- Discovery state (new) ---
+  const [publicRooms, setPublicRooms] = useState<PublicRoom[]>([]);
+  const [inviteInput, setInviteInput] = useState('');
+  const [joining, setJoining] = useState(false);
+
   // -----------------------------------------------------------------------
   // Data fetching
   // -----------------------------------------------------------------------
@@ -164,15 +208,45 @@ export const SharingTab: React.FC = () => {
       if (data.room) {
         setRoom(data.room);
         setMembers(data.members || []);
-        // Room name is now pushed via page_state from server
       } else {
         setRoom(null);
         setMembers([]);
-        // Room name cleared via page_state
+      }
+      const name = data.room?.name ?? null;
+      const store = useUserStore.getState();
+      if (store.userRoomName !== name) {
+        store.setUserInfo(store.userPermission, name, store.userTokenBudget);
       }
     } catch { /* ignore */ } finally {
       setLoading(false);
     }
+  }, []);
+
+  const fetchJoinedRooms = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/rooms/joined');
+      if (!resp.ok) return;
+      const data = await resp.json();
+      setJoinedRooms((data.rooms || []).filter((r: JoinedRoom) => r.consumer_type === 'linggen'));
+    } catch { /* ignore */ }
+  }, []);
+
+  const fetchProxyStatus = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/proxy/status');
+      if (!resp.ok) return;
+      const data = await resp.json();
+      setProxyConnections(data.connections || []);
+    } catch { /* ignore */ }
+  }, []);
+
+  const fetchPublicRooms = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/rooms/public');
+      if (!resp.ok) return;
+      const data = await resp.json();
+      setPublicRooms(data.rooms || []);
+    } catch { /* ignore */ }
   }, []);
 
   useEffect(() => { fetchRoom(); }, [fetchRoom]);
@@ -201,10 +275,13 @@ export const SharingTab: React.FC = () => {
         }
       } catch { /* ignore */ }
     })();
-  }, []);
+    fetchJoinedRooms();
+    fetchProxyStatus();
+    fetchPublicRooms();
+  }, [fetchJoinedRooms, fetchProxyStatus, fetchPublicRooms]);
 
   // -----------------------------------------------------------------------
-  // Save helpers
+  // Save helpers (owner)
   // -----------------------------------------------------------------------
 
   const saveRoomConfig = async (updates: Partial<{ shared_models: string[]; allowed_tools: string[]; allowed_skills: string[] }>) => {
@@ -228,7 +305,6 @@ export const SharingTab: React.FC = () => {
   const applyPreset = (preset: string) => {
     const tools = TOOL_PRESETS[preset] ?? [];
     setAllowedTools(tools);
-    // Remove skills that exceed new permission level
     const level = PERM_LEVEL[preset] ?? 0;
     const filtered = allowedSkills.filter(name => {
       const skill = allSkills.find(s => s.name === name);
@@ -244,7 +320,6 @@ export const SharingTab: React.FC = () => {
       ? allowedTools.filter(t => t !== tool)
       : [...allowedTools, tool];
     setAllowedTools(next);
-    // Remove skills that exceed new permission level
     const level = permLevelForTools(next);
     const filtered = allowedSkills.filter(name => {
       const skill = allSkills.find(s => s.name === name);
@@ -264,7 +339,7 @@ export const SharingTab: React.FC = () => {
   };
 
   // -----------------------------------------------------------------------
-  // Room CRUD
+  // Room CRUD (owner)
   // -----------------------------------------------------------------------
 
   const createRoom = async () => {
@@ -340,11 +415,122 @@ export const SharingTab: React.FC = () => {
   };
 
   // -----------------------------------------------------------------------
+  // Consumer actions (new)
+  // -----------------------------------------------------------------------
+
+  const connectProxyRoom = async (instanceId: string, ownerName: string, roomName: string) => {
+    setError(null);
+    try {
+      const resp = await fetch('/api/proxy/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instance_id: instanceId, owner_name: ownerName, room_name: roomName }),
+      });
+      if (!resp.ok) {
+        const data = await resp.json();
+        setError(data.error || 'Failed to connect');
+        return;
+      }
+      fetchProxyStatus();
+    } catch (e: any) { setError(e.message); }
+  };
+
+  const disconnectProxyRoom = async (instanceId: string) => {
+    try {
+      await fetch('/api/proxy/disconnect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instance_id: instanceId }),
+      });
+      fetchProxyStatus();
+    } catch { /* ignore */ }
+  };
+
+  const leaveRoom = async (roomId: string, instanceId: string) => {
+    if (!confirm('Leave this room?')) return;
+    try {
+      // Leave room first — if this fails, don't disconnect proxy
+      const resp = await fetch(`/api/rooms/${roomId}/leave`, { method: 'DELETE' });
+      if (!resp.ok) {
+        setError('Failed to leave room');
+        return;
+      }
+      // Then disconnect proxy models if connected
+      const conn = proxyConnections.find(c => c.instance_id === instanceId);
+      if (conn) {
+        await fetch('/api/proxy/disconnect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ instance_id: instanceId }),
+        });
+      }
+    } catch { /* ignore */ } finally {
+      fetchJoinedRooms();
+      fetchProxyStatus();
+      fetchPublicRooms();
+    }
+  };
+
+  const joinPublicRoom = async (roomId: string) => {
+    setJoining(true); setError(null);
+    try {
+      const resp = await fetch('/api/rooms/join-public', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ room_id: roomId, consumer_type: 'linggen' }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        setError(data.error || 'Failed to join');
+        return;
+      }
+      // Auto-connect after joining (join response includes instance_id + owner_name)
+      if (data.instance_id) {
+        await connectProxyRoom(data.instance_id, data.owner_name || '', data.room_name || '');
+      }
+      fetchJoinedRooms();
+      fetchPublicRooms();
+    } catch (e: any) { setError(e.message); } finally { setJoining(false); }
+  };
+
+  const joinByInvite = async () => {
+    const input = inviteInput.trim();
+    if (!input) return;
+    // Extract token from URL or use as-is
+    const match = input.match(/\/join\/([a-z0-9_]+)/i);
+    const token = match ? match[1] : input;
+
+    setJoining(true); setError(null);
+    try {
+      const resp = await fetch('/api/rooms/join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ invite_token: token, consumer_type: 'linggen' }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        setError(data.error || 'Failed to join');
+        return;
+      }
+      setInviteInput('');
+      // Auto-connect
+      if (data.instance_id) {
+        await connectProxyRoom(data.instance_id, data.owner_name || '', data.room_name || '');
+      }
+      fetchJoinedRooms();
+      fetchPublicRooms();
+    } catch (e: any) { setError(e.message); } finally { setJoining(false); }
+  };
+
+  // -----------------------------------------------------------------------
   // Derived state
   // -----------------------------------------------------------------------
 
   const activePreset = presetForTools(allowedTools);
   const currentPermLevel = permLevelForTools(allowedTools);
+  // Only show local models for sharing (no proxy models)
+  const ownModels = allModels.filter(m => !m.id.startsWith('proxy:'));
+  const joinedRoomIds = new Set(joinedRooms.map(r => r.id));
 
   // -----------------------------------------------------------------------
   // Render
@@ -357,18 +543,14 @@ export const SharingTab: React.FC = () => {
   if (!loggedIn) {
     return (
       <div className="text-center py-12 space-y-3">
-        <p className="text-slate-500">Sign in to linggen.dev to manage your proxy room.</p>
+        <p className="text-slate-500">Sign in to linggen.dev to manage rooms.</p>
         <p className="text-xs text-slate-400">Click the avatar in the top bar to sign in.</p>
       </div>
     );
   }
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h2 className="text-lg font-bold text-slate-900 dark:text-white">Proxy Room</h2>
-        <p className="text-xs text-slate-500 mt-1">Share your AI models with others through a proxy room.</p>
-      </div>
+    <div className="space-y-8">
 
       {error && (
         <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg">
@@ -376,328 +558,489 @@ export const SharingTab: React.FC = () => {
         </div>
       )}
 
-      {/* No room — show create */}
-      {!room && !creating && (
-        <div className="p-6 border border-dashed border-slate-300 dark:border-white/10 rounded-xl text-center space-y-3">
-          <Users size={24} className="mx-auto text-slate-400" />
-          <p className="text-sm text-slate-500">No proxy room yet.</p>
-          <button
-            onClick={() => setCreating(true)}
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg transition-colors"
-          >
-            Create Room
-          </button>
-        </div>
-      )}
-
-      {/* Create form */}
-      {creating && !room && (
-        <div className={sectionCls}>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className={labelCls}>Room Name</label>
-              <input value={formName} onChange={e => setFormName(e.target.value)} className={inputCls + ' mt-1'} />
-            </div>
-            <div>
-              <label className={labelCls}>Type</label>
-              <select value={formType} onChange={e => setFormType(e.target.value)} className={inputCls + ' mt-1'}>
-                <option value="private">Private (invite only)</option>
-                <option value="public">Public (anyone can join)</option>
-              </select>
-            </div>
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className={labelCls}>Max Consumers</label>
-              <select value={formMaxConsumers} onChange={e => setFormMaxConsumers(parseInt(e.target.value))} className={inputCls + ' mt-1'}>
-                {[1, 2, 3, 4].map(n => <option key={n} value={n}>{n}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className={labelCls}>Daily Token Budget</label>
-              <div className="mt-1">
-                <BudgetInput value={formBudget} onChange={setFormBudget} />
-              </div>
-            </div>
-          </div>
-          <div className="flex gap-2 pt-1">
-            <button onClick={createRoom} disabled={saving} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg disabled:opacity-50">
-              {saving ? 'Creating...' : 'Create'}
-            </button>
-            <button onClick={() => { setCreating(false); setError(null); }} className="px-4 py-2 text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300">
-              Cancel
-            </button>
+      {/* ================================================================= */}
+      {/* SECTION 1: MY ROOM (Owner)                                        */}
+      {/* ================================================================= */}
+      <div>
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h2 className="text-sm font-bold text-slate-900 dark:text-white">My Room</h2>
+            <p className="text-[10px] text-slate-500 mt-0.5">Share your AI models with others.</p>
           </div>
         </div>
-      )}
 
-      {/* Room exists — full settings */}
-      {room && (
-        <div className="space-y-5">
+        {/* No room — show create */}
+        {!room && !creating && (
+          <div className="p-5 border border-dashed border-slate-300 dark:border-white/10 rounded-xl text-center space-y-3">
+            <Users size={20} className="mx-auto text-slate-400" />
+            <p className="text-xs text-slate-500">No room yet.</p>
+            <button onClick={() => setCreating(true)} className={btnPrimary}>
+              Create Room
+            </button>
+          </div>
+        )}
 
-          {/* ─── Room Info ─── */}
+        {/* Create form */}
+        {creating && !room && (
           <div className={sectionCls}>
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <h3 className="font-bold text-slate-900 dark:text-white">{room.name}</h3>
-                <span className={`px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider rounded ${
-                  room.room_type === 'public' ? 'bg-blue-500/10 text-blue-500' : 'bg-slate-200 dark:bg-white/10 text-slate-500'
-                }`}>{room.room_type}</span>
-              </div>
-              <div className={`flex items-center gap-1.5 text-[11px] font-medium ${room.online ? 'text-green-500' : 'text-slate-400'}`}>
-                <div className={`w-1.5 h-1.5 rounded-full ${room.online ? 'bg-green-500' : 'bg-slate-400'}`} />
-                {room.online ? 'Online' : 'Offline'}
-              </div>
-            </div>
-
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-[10px] font-bold text-slate-400 mb-1">Type</label>
-                <select value={room.room_type} onChange={e => updateRoom({ room_type: e.target.value })} className="w-full px-2 py-1.5 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded text-xs">
-                  <option value="private">Private</option>
-                  <option value="public">Public</option>
+                <label className={labelCls}>Room Name</label>
+                <input value={formName} onChange={e => setFormName(e.target.value)} className={inputCls + ' mt-1'} />
+              </div>
+              <div>
+                <label className={labelCls}>Type</label>
+                <select value={formType} onChange={e => setFormType(e.target.value)} className={inputCls + ' mt-1'}>
+                  <option value="private">Private (invite only)</option>
+                  <option value="public">Public (anyone can join)</option>
                 </select>
               </div>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-[10px] font-bold text-slate-400 mb-1">Max Consumers</label>
-                <select value={room.max_consumers} onChange={e => updateRoom({ max_consumers: parseInt(e.target.value) })} className="w-full px-2 py-1.5 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded text-xs">
+                <label className={labelCls}>Max Consumers</label>
+                <select value={formMaxConsumers} onChange={e => setFormMaxConsumers(parseInt(e.target.value))} className={inputCls + ' mt-1'}>
                   {[1, 2, 3, 4].map(n => <option key={n} value={n}>{n}</option>)}
                 </select>
               </div>
               <div>
-                <label className="block text-[10px] font-bold text-slate-400 mb-1">Daily Budget</label>
-                <BudgetInput
-                  value={room.token_budget_daily}
-                  onChange={val => { if (val !== room.token_budget_daily) updateRoom({ token_budget_daily: val }); }}
-                />
+                <label className={labelCls}>Daily Token Budget</label>
+                <div className="mt-1">
+                  <BudgetInput value={formBudget} onChange={setFormBudget} />
+                </div>
               </div>
             </div>
-
-            {/* Invite link */}
-            {room.room_type === 'private' && room.invite_token && (
-              <div>
-                <label className="block text-[10px] font-bold text-slate-400 mb-1">Invite Link</label>
-                <div className="flex items-center gap-2">
-                  <input readOnly value={`https://linggen.dev/join/${room.invite_token}`} className="flex-1 px-2 py-1.5 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded text-[11px] font-mono text-slate-500" />
-                  <button onClick={copyInvite} className="p-1.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded transition-colors">
-                    {copied ? <Check size={14} className="text-green-500" /> : <Copy size={14} className="text-slate-400" />}
-                  </button>
-                  <button onClick={regenerateInvite} disabled={saving} className="p-1.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded transition-colors">
-                    <RefreshCw size={14} className="text-slate-400" />
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* Token usage */}
-            {room.token_budget_daily != null && (
-              <div>
-                <div className="flex items-center justify-between text-[10px] mb-1">
-                  <span className="text-slate-400">Token usage today</span>
-                  <span className="font-mono text-slate-500">
-                    {(room.tokens_used_today || 0).toLocaleString()} / {room.token_budget_daily.toLocaleString()}
-                  </span>
-                </div>
-                <div className="w-full h-1 bg-slate-200 dark:bg-white/10 rounded-full overflow-hidden">
-                  <div className="h-full bg-blue-500 rounded-full" style={{ width: `${Math.min(100, ((room.tokens_used_today || 0) / room.token_budget_daily) * 100)}%` }} />
-                </div>
-              </div>
-            )}
+            <div className="flex gap-2 pt-1">
+              <button onClick={createRoom} disabled={saving} className={btnPrimary}>
+                {saving ? 'Creating...' : 'Create'}
+              </button>
+              <button onClick={() => { setCreating(false); setError(null); }} className="px-4 py-2 text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300">
+                Cancel
+              </button>
+            </div>
           </div>
+        )}
 
-          {/* ─── Shared Models ─── */}
-          <div className={sectionCls}>
-            <div className="flex items-center justify-between">
-              <h4 className={labelCls}>Shared Models</h4>
-              <span className="text-[10px] text-slate-500">{sharedModels.length} of {allModels.length} shared</span>
-            </div>
-            <p className="text-[10px] text-slate-400">Which models consumers can use.</p>
-            {allModels.length === 0 ? (
-              <p className="text-xs text-slate-400">No models configured.</p>
-            ) : (
-              <div className="space-y-1">
-                {allModels.map(m => (
-                  <label key={m.id} className="flex items-center gap-2 py-1.5 px-2 rounded-lg hover:bg-white dark:hover:bg-white/5 cursor-pointer transition-colors">
-                    <input type="checkbox" checked={sharedModels.includes(m.id)} onChange={() => toggleSharedModel(m.id)} className="accent-blue-500" />
-                    <span className="text-xs text-slate-700 dark:text-slate-300">{m.id}</span>
-                    <span className="text-[9px] text-slate-400 font-mono">{m.model}</span>
-                  </label>
-                ))}
-              </div>
-            )}
-            {sharedModels.length === 0 && allModels.length > 0 && (
-              <p className="text-[10px] text-amber-500">No models shared. Consumers won't be able to use inference.</p>
-            )}
-          </div>
+        {/* Room exists — full settings */}
+        {room && (
+          <div className="space-y-4">
 
-          {/* ─── Consumer Permissions ─── */}
-          <div className={sectionCls}>
-            <div className="flex items-center gap-2">
-              <Shield size={14} className="text-slate-400" />
-              <h4 className={labelCls}>Consumer Permissions</h4>
-            </div>
-            <p className="text-[10px] text-slate-400">What consumers can do in your room.</p>
-
-            {/* Tool Presets */}
-            <div className="space-y-2">
-              <label className="text-[10px] font-bold text-slate-400">Tool Preset</label>
-              <div className="grid grid-cols-3 gap-2">
-                {(['chat', 'read', 'edit'] as const).map(preset => {
-                  const active = activePreset === preset;
-                  const labels: Record<string, [string, string]> = {
-                    chat: ['Chat', 'Conversation only'],
-                    read: ['Read', 'Search & browse'],
-                    edit: ['Edit', 'Full coding tools'],
-                  };
-                  const [title, desc] = labels[preset];
-                  return (
-                    <button
-                      key={preset}
-                      onClick={() => applyPreset(preset)}
-                      className={`relative px-3 py-3 rounded-lg text-center transition-all ${
-                        active
-                          ? 'border-2 border-blue-500 bg-blue-500/5'
-                          : 'border border-slate-200 dark:border-white/10 hover:border-slate-300 dark:hover:border-white/20'
-                      }`}
-                    >
-                      {active && (
-                        <div className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-blue-500 rounded-full flex items-center justify-center">
-                          <Check size={10} className="text-white" />
-                        </div>
-                      )}
-                      <div className={`text-xs font-bold ${active ? 'text-blue-400' : 'text-slate-700 dark:text-slate-300'}`}>{title}</div>
-                      <div className="text-[10px] text-slate-500 mt-0.5">{desc}</div>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Individual Tools */}
-            <div className="space-y-2">
+            {/* Room Info */}
+            <div className={sectionCls}>
               <div className="flex items-center justify-between">
-                <label className="text-[10px] font-bold text-slate-400">Allowed Tools</label>
-                <span className="text-[10px] text-slate-500">{allowedTools.length} enabled</span>
+                <div className="flex items-center gap-2">
+                  <h3 className="font-bold text-sm text-slate-900 dark:text-white">{room.name}</h3>
+                  <span className={`px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider rounded ${
+                    room.room_type === 'public' ? 'bg-blue-500/10 text-blue-500' : 'bg-slate-200 dark:bg-white/10 text-slate-500'
+                  }`}>{room.room_type}</span>
+                </div>
+                <div className={`flex items-center gap-1.5 text-[11px] font-medium ${room.online ? 'text-green-500' : 'text-slate-400'}`}>
+                  <div className={onlineDot(room.online)} />
+                  {room.online ? 'Online' : 'Offline'}
+                </div>
               </div>
-              <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 px-1">
-                {ALL_TOOLS.map(tool => {
-                  const checked = allowedTools.includes(tool);
-                  return (
-                    <label key={tool} className="flex items-center gap-2 py-1.5 cursor-pointer">
-                      <input type="checkbox" checked={checked} onChange={() => toggleTool(tool)} className="accent-blue-500 w-3.5 h-3.5" />
-                      <span className={`text-xs ${checked ? 'text-slate-700 dark:text-slate-300' : 'text-slate-400 dark:text-slate-500'}`}>{tool}</span>
-                    </label>
-                  );
-                })}
+
+              <div className="grid grid-cols-3 gap-3">
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-400 mb-1">Type</label>
+                  <select value={room.room_type} onChange={e => updateRoom({ room_type: e.target.value })} className="w-full px-2 py-1.5 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded text-xs">
+                    <option value="private">Private</option>
+                    <option value="public">Public</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-400 mb-1">Max Consumers</label>
+                  <select value={room.max_consumers} onChange={e => updateRoom({ max_consumers: parseInt(e.target.value) })} className="w-full px-2 py-1.5 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded text-xs">
+                    {[1, 2, 3, 4].map(n => <option key={n} value={n}>{n}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-400 mb-1">Daily Budget</label>
+                  <BudgetInput
+                    value={room.token_budget_daily}
+                    onChange={val => { if (val !== room.token_budget_daily) updateRoom({ token_budget_daily: val }); }}
+                  />
+                </div>
               </div>
-              {activePreset === null && (
-                <p className="text-[10px] text-slate-500 px-1">Custom selection. Choosing a preset will reset.</p>
-              )}
-            </div>
-          </div>
 
-          {/* ─── Shared Skills ─── */}
-          <div className={sectionCls}>
-            <div className="flex items-center justify-between">
-              <h4 className={labelCls}>Shared Skills</h4>
-              <span className="text-[10px] text-slate-500">{allowedSkills.length} of {allSkills.length} shared</span>
-            </div>
-            <p className="text-[10px] text-slate-400">Skills consumers can use. Requires matching permission level.</p>
-
-            {allSkills.length === 0 ? (
-              <p className="text-xs text-slate-400">No skills installed.</p>
-            ) : (
-              <div className="space-y-0.5">
-                {allSkills.map(skill => {
-                  const mode = skill.permission?.mode ?? null;
-                  const skillLevel = PERM_LEVEL[mode ?? 'chat'] ?? 0;
-                  const disabled = skillLevel > currentPermLevel || mode === 'admin';
-                  const checked = allowedSkills.includes(skill.name);
-                  const reason = mode === 'admin' ? 'Not shareable' : disabled ? `Needs ${mode ?? 'higher'} preset` : null;
-
-                  return (
-                    <label
-                      key={skill.name}
-                      className={`flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors ${
-                        disabled ? 'opacity-40 cursor-not-allowed' : 'hover:bg-white dark:hover:bg-white/5 cursor-pointer'
-                      }`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={checked && !disabled}
-                        disabled={disabled}
-                        onChange={() => !disabled && toggleSkill(skill.name)}
-                        className="accent-blue-500"
-                      />
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs font-medium text-slate-700 dark:text-slate-300">{skill.name}</span>
-                          {mode && (
-                            <span className={`text-[10px] px-1.5 py-0.5 rounded ${permBadge[mode] ?? 'bg-slate-500/10 text-slate-400'}`}>
-                              {mode}
-                            </span>
-                          )}
-                          {!mode && (
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-500/10 text-slate-400">
-                              no perm
-                            </span>
-                          )}
-                          {skill.app && (
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-400">app</span>
-                          )}
-                        </div>
-                        <div className="text-[10px] text-slate-500 mt-0.5 truncate">{skill.description}</div>
-                      </div>
-                      {reason && (
-                        <span className={`text-[10px] shrink-0 ${mode === 'admin' ? 'text-red-400' : 'text-amber-400'}`}>{reason}</span>
-                      )}
-                    </label>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-
-          {/* ─── Members ─── */}
-          <div className={sectionCls}>
-            <h4 className={labelCls}>Members ({members.length}/{room.max_consumers})</h4>
-            {members.length === 0 ? (
-              <p className="text-xs text-slate-400">No members yet. Share your invite link to get started.</p>
-            ) : (
-              <div className="space-y-1">
-                {members.map(m => (
-                  <div key={m.user_id} className="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-white dark:hover:bg-white/5 transition-colors">
-                    <div className="flex items-center gap-2">
-                      {m.avatar_url ? (
-                        <img src={m.avatar_url} alt="" className="w-5 h-5 rounded-full" />
-                      ) : (
-                        <div className="w-5 h-5 rounded-full bg-blue-500/10 text-blue-500 text-[9px] font-bold flex items-center justify-center">
-                          {(m.display_name || '?')[0].toUpperCase()}
-                        </div>
-                      )}
-                      <span className="text-xs text-slate-700 dark:text-slate-300">{m.display_name}</span>
-                      <span className="text-[9px] text-slate-400 font-mono">{m.consumer_type}</span>
-                    </div>
-                    <button onClick={() => removeMember(m.user_id)} className="p-1 text-slate-300 hover:text-red-500 transition-colors">
-                      <Trash2 size={12} />
+              {/* Invite link */}
+              {room.room_type === 'private' && room.invite_token && (
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-400 mb-1">Invite Link</label>
+                  <div className="flex items-center gap-2">
+                    <input readOnly value={`https://linggen.dev/join/${room.invite_token}`} className="flex-1 px-2 py-1.5 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded text-[11px] font-mono text-slate-500" />
+                    <button onClick={copyInvite} className="p-1.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded transition-colors">
+                      {copied ? <Check size={14} className="text-green-500" /> : <Copy size={14} className="text-slate-400" />}
+                    </button>
+                    <button onClick={regenerateInvite} disabled={saving} className="p-1.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded transition-colors">
+                      <RefreshCw size={14} className="text-slate-400" />
                     </button>
                   </div>
-                ))}
-              </div>
-            )}
-          </div>
+                </div>
+              )}
 
-          {/* ─── Footer ─── */}
-          <div className="flex items-center justify-between">
-            <a href="https://linggen.dev/app" target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-xs text-blue-500 hover:text-blue-600 font-medium">
-              Manage on linggen.dev <ExternalLink size={12} />
-            </a>
-            <button onClick={deleteRoom} disabled={saving} className="text-xs text-red-500 hover:text-red-600 font-medium">
-              Delete Room
-            </button>
+              {/* Token usage */}
+              {room.token_budget_daily != null && (
+                <div>
+                  <div className="flex items-center justify-between text-[10px] mb-1">
+                    <span className="text-slate-400">Token usage today</span>
+                    <span className="font-mono text-slate-500">
+                      {(room.tokens_used_today || 0).toLocaleString()} / {room.token_budget_daily.toLocaleString()}
+                    </span>
+                  </div>
+                  <div className="w-full h-1 bg-slate-200 dark:bg-white/10 rounded-full overflow-hidden">
+                    <div className="h-full bg-blue-500 rounded-full" style={{ width: `${Math.min(100, ((room.tokens_used_today || 0) / room.token_budget_daily) * 100)}%` }} />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Shared Models */}
+            <div className={sectionCls}>
+              <div className="flex items-center justify-between">
+                <h4 className={labelCls}>Shared Models</h4>
+                <span className="text-[10px] text-slate-500">{sharedModels.length} of {ownModels.length} shared</span>
+              </div>
+              <p className="text-[10px] text-slate-400">Which models consumers can use.</p>
+              {ownModels.length === 0 ? (
+                <p className="text-xs text-slate-400">No models configured.</p>
+              ) : (
+                <div className="space-y-1">
+                  {ownModels.map(m => (
+                    <label key={m.id} className="flex items-center gap-2 py-1.5 px-2 rounded-lg hover:bg-white dark:hover:bg-white/5 cursor-pointer transition-colors">
+                      <input type="checkbox" checked={sharedModels.includes(m.id)} onChange={() => toggleSharedModel(m.id)} className="accent-blue-500" />
+                      <span className="text-xs text-slate-700 dark:text-slate-300">{m.id}</span>
+                      <span className="text-[9px] text-slate-400 font-mono">{m.model}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+              {sharedModels.length === 0 && ownModels.length > 0 && (
+                <p className="text-[10px] text-amber-500">No models shared. Consumers won't be able to use inference.</p>
+              )}
+            </div>
+
+            {/* Consumer Permissions */}
+            <div className={sectionCls}>
+              <div className="flex items-center gap-2">
+                <Shield size={14} className="text-slate-400" />
+                <h4 className={labelCls}>Consumer Permissions</h4>
+              </div>
+              <p className="text-[10px] text-slate-400">What consumers can do in your room.</p>
+
+              {/* Tool Presets */}
+              <div className="space-y-2">
+                <label className="text-[10px] font-bold text-slate-400">Tool Preset</label>
+                <div className="grid grid-cols-3 gap-2">
+                  {(['chat', 'read', 'edit'] as const).map(preset => {
+                    const active = activePreset === preset;
+                    const labels: Record<string, [string, string]> = {
+                      chat: ['Chat', 'Conversation only'],
+                      read: ['Read', 'Search & browse'],
+                      edit: ['Edit', 'Full coding tools'],
+                    };
+                    const [title, desc] = labels[preset];
+                    return (
+                      <button
+                        key={preset}
+                        onClick={() => applyPreset(preset)}
+                        className={`relative px-3 py-3 rounded-lg text-center transition-all ${
+                          active
+                            ? 'border-2 border-blue-500 bg-blue-500/5'
+                            : 'border border-slate-200 dark:border-white/10 hover:border-slate-300 dark:hover:border-white/20'
+                        }`}
+                      >
+                        {active && (
+                          <div className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-blue-500 rounded-full flex items-center justify-center">
+                            <Check size={10} className="text-white" />
+                          </div>
+                        )}
+                        <div className={`text-xs font-bold ${active ? 'text-blue-400' : 'text-slate-700 dark:text-slate-300'}`}>{title}</div>
+                        <div className="text-[10px] text-slate-500 mt-0.5">{desc}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Individual Tools */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-[10px] font-bold text-slate-400">Allowed Tools</label>
+                  <span className="text-[10px] text-slate-500">{allowedTools.length} enabled</span>
+                </div>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 px-1">
+                  {ALL_TOOLS.map(tool => {
+                    const checked = allowedTools.includes(tool);
+                    return (
+                      <label key={tool} className="flex items-center gap-2 py-1.5 cursor-pointer">
+                        <input type="checkbox" checked={checked} onChange={() => toggleTool(tool)} className="accent-blue-500 w-3.5 h-3.5" />
+                        <span className={`text-xs ${checked ? 'text-slate-700 dark:text-slate-300' : 'text-slate-400 dark:text-slate-500'}`}>{tool}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+                {activePreset === null && (
+                  <p className="text-[10px] text-slate-500 px-1">Custom selection. Choosing a preset will reset.</p>
+                )}
+              </div>
+            </div>
+
+            {/* Shared Skills */}
+            <div className={sectionCls}>
+              <div className="flex items-center justify-between">
+                <h4 className={labelCls}>Shared Skills</h4>
+                <span className="text-[10px] text-slate-500">{allowedSkills.length} of {allSkills.length} shared</span>
+              </div>
+              <p className="text-[10px] text-slate-400">Skills consumers can use. Requires matching permission level.</p>
+
+              {allSkills.length === 0 ? (
+                <p className="text-xs text-slate-400">No skills installed.</p>
+              ) : (
+                <div className="space-y-0.5">
+                  {allSkills.map(skill => {
+                    const mode = skill.permission?.mode ?? null;
+                    const skillLevel = PERM_LEVEL[mode ?? 'chat'] ?? 0;
+                    const disabled = skillLevel > currentPermLevel || mode === 'admin';
+                    const checked = allowedSkills.includes(skill.name);
+                    const reason = mode === 'admin' ? 'Not shareable' : disabled ? `Needs ${mode ?? 'higher'} preset` : null;
+
+                    return (
+                      <label
+                        key={skill.name}
+                        className={`flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors ${
+                          disabled ? 'opacity-40 cursor-not-allowed' : 'hover:bg-white dark:hover:bg-white/5 cursor-pointer'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked && !disabled}
+                          disabled={disabled}
+                          onChange={() => !disabled && toggleSkill(skill.name)}
+                          className="accent-blue-500"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-medium text-slate-700 dark:text-slate-300">{skill.name}</span>
+                            {mode && (
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded ${permBadge[mode] ?? 'bg-slate-500/10 text-slate-400'}`}>
+                                {mode}
+                              </span>
+                            )}
+                            {!mode && (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-500/10 text-slate-400">
+                                no perm
+                              </span>
+                            )}
+                            {skill.app && (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-400">app</span>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-slate-500 mt-0.5 truncate">{skill.description}</div>
+                        </div>
+                        {reason && (
+                          <span className={`text-[10px] shrink-0 ${mode === 'admin' ? 'text-red-400' : 'text-amber-400'}`}>{reason}</span>
+                        )}
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Members */}
+            <div className={sectionCls}>
+              <h4 className={labelCls}>Members ({members.length}/{room.max_consumers})</h4>
+              {members.length === 0 ? (
+                <p className="text-xs text-slate-400">No members yet. Share your invite link to get started.</p>
+              ) : (
+                <div className="space-y-1">
+                  {members.map(m => (
+                    <div key={m.user_id} className="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-white dark:hover:bg-white/5 transition-colors">
+                      <div className="flex items-center gap-2">
+                        {m.avatar_url ? (
+                          <img src={m.avatar_url} alt="" className="w-5 h-5 rounded-full" />
+                        ) : (
+                          <div className="w-5 h-5 rounded-full bg-blue-500/10 text-blue-500 text-[9px] font-bold flex items-center justify-center">
+                            {(m.display_name || '?')[0].toUpperCase()}
+                          </div>
+                        )}
+                        <span className="text-xs text-slate-700 dark:text-slate-300">{m.display_name}</span>
+                        <span className="text-[9px] text-slate-400 font-mono">{m.consumer_type}</span>
+                      </div>
+                      <button onClick={() => removeMember(m.user_id)} className="p-1 text-slate-300 hover:text-red-500 transition-colors">
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="flex items-center justify-between">
+              <a href="https://linggen.dev/app" target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-xs text-blue-500 hover:text-blue-600 font-medium">
+                Manage on linggen.dev <ExternalLink size={12} />
+              </a>
+              <button onClick={deleteRoom} disabled={saving} className={btnDanger}>
+                Delete Room
+              </button>
+            </div>
           </div>
+        )}
+      </div>
+
+      {/* ================================================================= */}
+      {/* SECTION 2: JOINED ROOMS (Consumer — linggen server mode)          */}
+      {/* ================================================================= */}
+      <div>
+        <div className="mb-3">
+          <h2 className="text-sm font-bold text-slate-900 dark:text-white">Joined Rooms</h2>
+          <p className="text-[10px] text-slate-500 mt-0.5">Rooms you've joined as a linggen server consumer. Proxy models appear in your model selector.</p>
         </div>
-      )}
+
+        {joinedRooms.length === 0 ? (
+          <div className="p-4 border border-dashed border-slate-300 dark:border-white/10 rounded-xl text-center">
+            <p className="text-xs text-slate-500">No rooms joined. Browse available rooms below or use an invite link.</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {joinedRooms.map(jr => {
+              const conn = proxyConnections.find(c => c.instance_id === jr.instance_id);
+              const isConnected = !!conn;
+              return (
+                <div key={jr.id} className={sectionCls}>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <div className={onlineDot(jr.online)} />
+                      <span className="text-xs font-bold text-slate-900 dark:text-white">{jr.name}</span>
+                      <span className="text-[10px] text-slate-500">by {jr.owner_name}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {jr.online && !isConnected && (
+                        <button
+                          onClick={() => connectProxyRoom(jr.instance_id, jr.owner_name, jr.name)}
+                          className="flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-blue-500 hover:text-blue-600 bg-blue-500/10 hover:bg-blue-500/20 rounded transition-colors"
+                        >
+                          <Wifi size={10} /> Connect
+                        </button>
+                      )}
+                      {isConnected && (
+                        <button
+                          onClick={() => disconnectProxyRoom(jr.instance_id)}
+                          className="flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-slate-500 hover:text-slate-700 bg-slate-200/50 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 rounded transition-colors"
+                        >
+                          <WifiOff size={10} /> Disconnect
+                        </button>
+                      )}
+                      <button
+                        onClick={() => leaveRoom(jr.id, jr.instance_id)}
+                        className="flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-red-500 hover:text-red-600 rounded transition-colors"
+                      >
+                        <LogOut size={10} /> Leave
+                      </button>
+                    </div>
+                  </div>
+                  {/* Connection status */}
+                  {isConnected && conn.models.length > 0 && (
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="text-[10px] text-green-500 font-medium">Connected</span>
+                      {conn.models.map(m => (
+                        <span key={m} className="text-[9px] px-1.5 py-0.5 rounded bg-green-500/10 text-green-600 dark:text-green-400 font-mono">
+                          {m.replace(/^proxy:/, '')}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {!isConnected && !jr.online && (
+                    <p className="text-[10px] text-slate-400">Owner is offline. Models unavailable.</p>
+                  )}
+                  {!isConnected && jr.online && (
+                    <p className="text-[10px] text-slate-400">Not connected. Click Connect to fetch proxy models.</p>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* ================================================================= */}
+      {/* SECTION 3: AVAILABLE ROOMS (Discovery)                            */}
+      {/* ================================================================= */}
+      <div>
+        <div className="mb-3">
+          <h2 className="text-sm font-bold text-slate-900 dark:text-white">Available Rooms</h2>
+          <p className="text-[10px] text-slate-500 mt-0.5">Public rooms you can join. Use an invite link for private rooms.</p>
+        </div>
+
+        {/* Invite link input */}
+        <div className="flex items-center gap-2 mb-3">
+          <div className="relative flex-1">
+            <Link size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input
+              placeholder="Paste invite link..."
+              value={inviteInput}
+              onChange={e => setInviteInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') joinByInvite(); }}
+              className="w-full pl-7 pr-3 py-2 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded-lg text-xs outline-none focus:ring-1 focus:ring-blue-500/50"
+            />
+          </div>
+          <button onClick={joinByInvite} disabled={joining || !inviteInput.trim()} className={btnPrimary}>
+            {joining ? 'Joining...' : 'Join'}
+          </button>
+        </div>
+
+        {/* Public room list */}
+        {publicRooms.length === 0 ? (
+          <div className="p-4 border border-dashed border-slate-300 dark:border-white/10 rounded-xl text-center">
+            <p className="text-xs text-slate-500">No public rooms available.</p>
+          </div>
+        ) : (
+          <div className="space-y-1.5">
+            {publicRooms.map(pr => {
+              const alreadyJoined = joinedRoomIds.has(pr.id);
+              const isOwnRoom = room?.id === pr.id;
+              const isFull = pr.member_count >= pr.max_consumers;
+              return (
+                <div key={pr.id} className="flex items-center justify-between px-3 py-2.5 rounded-lg border border-slate-200 dark:border-white/5 hover:bg-white/50 dark:hover:bg-white/[0.02] transition-colors">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className={onlineDot(pr.online)} />
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-medium text-slate-900 dark:text-white truncate">{pr.name}</span>
+                        <span className="text-[10px] text-slate-500">by {pr.owner_name}</span>
+                      </div>
+                      <div className="flex items-center gap-3 text-[10px] text-slate-400 mt-0.5">
+                        <span>{pr.member_count}/{pr.max_consumers} members</span>
+                        {pr.token_budget_daily != null && (
+                          <span>{Math.round(pr.token_budget_daily / 1000).toLocaleString()}K/day</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="shrink-0 ml-3">
+                    {isOwnRoom ? (
+                      <span className="text-[10px] px-2 py-1 rounded bg-slate-200 dark:bg-white/10 text-slate-500">Your room</span>
+                    ) : alreadyJoined ? (
+                      <span className="text-[10px] px-2 py-1 rounded bg-green-500/10 text-green-500 font-medium">Joined</span>
+                    ) : (
+                      <button
+                        onClick={() => joinPublicRoom(pr.id)}
+                        disabled={joining || isFull || !pr.online}
+                        className={btnPrimary}
+                      >
+                        {isFull ? 'Full' : 'Join'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
     </div>
   );
 };
