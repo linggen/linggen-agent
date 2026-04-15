@@ -9,6 +9,7 @@
 import React, { useCallback, useRef, useState } from 'react';
 import { ShieldAlert, Copy, Eraser, Menu, LogOut } from 'lucide-react';
 import { cn } from '../lib/cn';
+import { getTransport } from '../lib/transport';
 import { ChatWidget } from './chat/ChatWidget';
 import { SessionList } from './SessionList';
 import { SkillsCard } from './SkillsCard';
@@ -122,7 +123,10 @@ export const ConsumerChatPage: React.FC = () => {
             </span>
           )}
           <button
-            onClick={() => { window.location.href = 'https://linggen.dev/app'; }}
+            onClick={() => {
+              try { getTransport().disconnect(); } catch { /* already gone */ }
+              window.close();
+            }}
             className="flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium text-red-500 hover:bg-red-500/10 transition-colors"
             title="Leave this room"
           >
