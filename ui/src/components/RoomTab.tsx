@@ -201,6 +201,7 @@ export const RoomTab: React.FC = () => {
   const [publicRooms, setPublicRooms] = useState<PublicRoom[]>([]);
   const [inviteInput, setInviteInput] = useState('');
   const [joining, setJoining] = useState(false);
+  const [localTokenUsage, setLocalTokenUsage] = useState<{ room_total: number; room_budget: number | null } | null>(null);
 
   // -----------------------------------------------------------------------
   // Data fetching
@@ -224,6 +225,10 @@ export const RoomTab: React.FC = () => {
       if (store.userRoomName !== name) {
         store.setUserInfo(store.userPermission, name, store.userTokenBudget);
       }
+      // Also fetch local token usage
+      fetch('/api/token-usage').then(r => r.ok ? r.json() : null).then(data => {
+        if (data) setLocalTokenUsage(data);
+      }).catch(() => {});
     } catch { /* ignore */ } finally {
       setLoading(false);
     }
@@ -505,6 +510,7 @@ export const RoomTab: React.FC = () => {
   };
 
   const joinPublicRoom = async (roomId: string) => {
+    if (!confirm('Privacy Notice: The room owner can see your messages. Don\'t share sensitive information.\n\nJoin this room?')) return;
     setJoining(true); setError(null);
     try {
       const resp = await fetch('/api/rooms/join-public', {
@@ -703,17 +709,17 @@ export const RoomTab: React.FC = () => {
                   </div>
                 </div>
 
-                {/* Token usage bar */}
-                {room.token_budget_daily != null && (
+                {/* Token usage bar — from local persistent store */}
+                {localTokenUsage?.room_budget != null && (
                   <div>
                     <div className="flex items-center justify-between text-[10px] mb-0.5">
-                      <span className="text-slate-400">Usage</span>
+                      <span className="text-slate-400">Usage (today)</span>
                       <span className="font-mono text-slate-500">
-                        {Math.round((room.tokens_used_today || 0) / 1000).toLocaleString()}K / {Math.round(room.token_budget_daily / 1000).toLocaleString()}K
+                        {Math.round((localTokenUsage.room_total || 0) / 1000).toLocaleString()}K / {Math.round(localTokenUsage.room_budget / 1000).toLocaleString()}K
                       </span>
                     </div>
                     <div className="w-full h-1 bg-slate-200 dark:bg-white/10 rounded-full overflow-hidden">
-                      <div className="h-full bg-blue-500 rounded-full" style={{ width: `${Math.min(100, ((room.tokens_used_today || 0) / room.token_budget_daily) * 100)}%` }} />
+                      <div className="h-full bg-blue-500 rounded-full" style={{ width: `${Math.min(100, ((localTokenUsage.room_total || 0) / localTokenUsage.room_budget) * 100)}%` }} />
                     </div>
                   </div>
                 )}

@@ -45,7 +45,7 @@ use projects_api::{
     rename_session_api, resolve_session_api, upsert_agent_file_api, upsert_skill_file_api,
     get_user_me, auth_login, auth_callback, auth_logout,
     get_session_permission, update_session_permission,
-    proxy_rooms, connect_proxy_room_api, disconnect_proxy_room_api, proxy_status_api,
+    proxy_rooms, connect_proxy_room_api, disconnect_proxy_room_api, proxy_status_api, token_usage_api,
     get_room_config, update_room_config,
 };
 use marketplace_api::{builtin_skills_install, builtin_skills_list, clawhub_scan, community_search, marketplace_install, marketplace_move_to_global, marketplace_uninstall};
@@ -1339,6 +1339,7 @@ async fn prepare_server(
         .route("/api/proxy/connect", post(connect_proxy_room_api))
         .route("/api/proxy/disconnect", post(disconnect_proxy_room_api))
         .route("/api/proxy/status", get(proxy_status_api))
+        .route("/api/token-usage", get(token_usage_api))
         .route("/api/room-config", get(get_room_config).post(update_room_config))
         .route("/api/health", get(health_handler))
         .route("/api/utils/pick-folder", get(pick_folder))

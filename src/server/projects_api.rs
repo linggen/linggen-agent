@@ -1139,7 +1139,21 @@ pub(crate) async fn get_user_me() -> impl IntoResponse {
     match resp {
         Ok(r) if r.status().is_success() => {
             match r.json::<serde_json::Value>().await {
-                Ok(body) => Json(body).into_response(),
+                Ok(body) => {
+                    // Update remote.toml with fresh user info so UserContext stays current
+                    let new_name = body.get("display_name").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let new_avatar = body.get("avatar_url").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    if new_name != config.user_name || new_avatar != config.avatar_url {
+                        let mut updated = config;
+                        updated.user_name = new_name;
+                        updated.avatar_url = new_avatar;
+                        if let Ok(toml_str) = toml::to_string_pretty(&updated) {
+                            let path = crate::paths::linggen_home().join("remote.toml");
+                            let _ = std::fs::write(&path, &toml_str);
+                        }
+                    }
+                    Json(body).into_response()
+                }
                 Err(_) => (StatusCode::BAD_GATEWAY, "Invalid response").into_response(),
             }
         }
@@ -1354,6 +1368,19 @@ pub(crate) async fn proxy_status_api(
 ) -> impl IntoResponse {
     let connections = state.proxy_connections.list().await;
     Json(serde_json::json!({ "connections": connections }))
+}
+
+/// GET /api/token-usage — get current token usage from persistent store.
+pub(crate) async fn token_usage_api(
+    State(state): State<Arc<ServerState>>,
+) -> impl IntoResponse {
+    let store = state.token_usage.lock().await;
+    let room_cfg = crate::server::rtc::room_config::load_room_config();
+    Json(serde_json::json!({
+        "room_total": store.get_usage("").1,
+        "room_budget": room_cfg.token_budget_room_daily,
+        "consumer_budget": room_cfg.token_budget_consumer_daily,
+    }))
 }
 
 /// Proxy linggen.dev room APIs — forwards GET/POST/PATCH/DELETE to /api/rooms/*.
