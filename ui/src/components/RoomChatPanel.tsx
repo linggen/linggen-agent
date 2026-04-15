@@ -8,9 +8,10 @@
  * Only visible when user is in a room (owner with active room, or consumer).
  */
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { MessageCircle, Send, ChevronDown, ChevronRight } from 'lucide-react';
+import { MessageCircle, Send, ChevronDown, ChevronRight, Settings } from 'lucide-react';
 import { useRoomChatStore } from '../stores/roomChatStore';
 import { useUserStore } from '../stores/userStore';
+import { useUiStore } from '../stores/uiStore';
 import { getTransport } from '../lib/transport';
 
 // ---------------------------------------------------------------------------
@@ -117,11 +118,17 @@ export const RoomChatPanel: React.FC = () => {
           <div className="flex items-center gap-1">
             <ChevronRight size={10} className="text-slate-400" />
             <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Room Chat</span>
-            {unreadCount > 0 && (
-              <span className="ml-auto text-[9px] font-bold bg-blue-500 text-white rounded-full px-1.5 min-w-[16px] text-center">
-                {unreadCount > 99 ? '99+' : unreadCount}
-              </span>
-            )}
+            <div className="ml-auto flex items-center gap-1">
+              <button onClick={(e) => { e.stopPropagation(); useUiStore.getState().openSettings('room'); }}
+                className="p-0.5 rounded hover:bg-slate-200 dark:hover:bg-white/10 text-slate-400 hover:text-blue-500 transition-colors" title="Room settings">
+                <Settings size={11} />
+              </button>
+              {unreadCount > 0 && (
+                <span className="text-[9px] font-bold bg-blue-500 text-white rounded-full px-1.5 min-w-[16px] text-center">
+                  {unreadCount > 99 ? '99+' : unreadCount}
+                </span>
+              )}
+            </div>
           </div>
           {lastMsg && (
             <p className="text-[11px] text-slate-500 dark:text-slate-500 truncate mt-0.5">
@@ -143,7 +150,13 @@ export const RoomChatPanel: React.FC = () => {
       >
         <ChevronDown size={10} className="text-slate-400" />
         <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Room Chat</span>
-        <span className="text-[10px] text-slate-400 ml-auto">{messages.length}</span>
+        <div className="ml-auto flex items-center gap-1.5">
+          <button onClick={(e) => { e.stopPropagation(); useUiStore.getState().openSettings('room'); }}
+            className="p-0.5 rounded hover:bg-slate-200 dark:hover:bg-white/10 text-slate-400 hover:text-blue-500 transition-colors" title="Room settings">
+            <Settings size={11} />
+          </button>
+          <span className="text-[10px] text-slate-400">{messages.length}</span>
+        </div>
       </div>
 
       {/* Messages */}
