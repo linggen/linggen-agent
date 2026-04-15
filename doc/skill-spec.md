@@ -83,6 +83,7 @@ These fields are Linggen-specific extensions.
 | `trigger` | Custom trigger prefix (e.g. `"!!"`, `"%%"`) |
 | `app` | App config — makes the skill a directly-runnable app (see below) |
 | `permission` | Permission request — user is prompted to approve before skill runs (see below) |
+| `mission` | Default mission config — auto-creates a cron mission on install (see below) |
 
 ## Skill permissions
 
@@ -172,6 +173,47 @@ Skills are discovered at startup and on file change (live reload).
 | 3 | `.linggen/skills/<name>/SKILL.md` | Project (highest priority) |
 
 All skill metadata (name + description + full body) is loaded at startup. Descriptions are included in agent context so the model knows what's available.
+
+## Skill missions
+
+A skill can declare a default **mission** in its frontmatter. When the skill is installed, the mission is automatically created.
+
+### `mission` frontmatter field
+
+```yaml
+mission:
+  schedule: '0 23 * * *'
+```
+
+| Field | Required | Description |
+|:------|:---------|:------------|
+| `schedule` | yes | Cron expression (5-field standard) |
+| `model` | no | Model override for this mission |
+
+The mission prompt is automatically set to `/skill-name` (e.g., `/memory`). No need to specify it.
+
+### Auto-creation on install
+
+During `ling init` or `ling skills install`, after downloading/copying skills:
+
+1. Scan each installed skill's frontmatter for the `mission` field.
+2. If found, check if `~/.linggen/missions/{skill-name}/` already exists.
+3. If not, create the mission using the existing `MissionStore::create_mission()` logic.
+4. If the mission already exists, **skip** — the user may have customized the schedule.
+
+This is idempotent: re-running `ling init` won't duplicate or overwrite existing missions. Users can edit, disable, or delete auto-created missions like any other mission.
+
+### Example
+
+The `memory` skill declares a nightly mission in its frontmatter:
+
+```yaml
+name: memory
+mission:
+  schedule: '0 23 * * *'
+```
+
+On install → creates `~/.linggen/missions/memory/mission.md` with prompt `/memory` → scheduler picks it up → runs nightly.
 
 ## Invocation
 

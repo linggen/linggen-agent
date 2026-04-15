@@ -28,7 +28,10 @@ pub async fn run(_global: bool, _root: Option<PathBuf>) -> Result<()> {
     // 4. Download default skills (best-effort)
     install_default_skills().await;
 
-    // 5. Summary
+    // 5. Create missions for skills that declare one
+    create_skill_missions();
+
+    // 6. Summary
     println!();
     println!("{}Done!{} Linggen is ready.", GREEN, RESET);
     println!("  Run `ling` to start the server and open the web UI.");
@@ -103,6 +106,22 @@ fn ensure_default_config() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Create missions for any installed skills that declare a `mission` field in frontmatter.
+fn create_skill_missions() {
+    let mission_store = crate::project_store::missions::MissionStore::new();
+    let created = crate::skills::create_missions_for_all_skills(&mission_store);
+    if created.is_empty() {
+        return;
+    }
+    println!(
+        "  {}[OK]{} Created {} skill missions: {}",
+        GREEN,
+        RESET,
+        created.len(),
+        created.join(", ")
+    );
 }
 
 /// Download skills from the linggen/skills GitHub repo (best-effort).

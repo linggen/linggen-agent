@@ -404,25 +404,26 @@ Layer 3: ENGINE (per-request)
 - linggen.dev frontend: dashboard room sections, join page, public rooms browser.
 - linggen local UI: Settings > Sharing tab (room management, shared models, member list).
 - Browser consumer mode: tunnel owner's UI via WebRTC, consumer_mode message on control channel, server-side permission loading.
+- Consumer permission enforcement: SessionPolicy loads room_config for consumer sessions (allowed_tools, allowed_skills, locked=true). System prompt filters skills. Execution gate blocks disallowed tool/skill calls. Locked sessions skip path-based prompts.
 
-### Phase 6b: Linggen server proxy mode
+### Phase 6b: Linggen server proxy mode — DONE
 
-Core WebRTC plumbing done: proxy_client.rs, inference endpoint on peer.rs, proxy_provider.rs, connect_proxy_room.
+- proxy_client.rs: outbound WebRTC connection, SDP exchange via relay, data channel lifecycle.
+- proxy_provider.rs: ProviderClient::Proxy variant, streams inference over WebRTC, request demuxing.
+- peer.rs: list_models and inference data channel handlers. Filters by shared_models, rejects proxy:* models, enforces token budget.
+- One-room-per-owner: rooms.owner_id UNIQUE in DB.
+- Multiple consumer rooms: room_members UNIQUE(room_id, user_id), user can join multiple rooms. Cannot join own room (UI shows "Yours" badge).
+- No re-sharing: list_models handler filters out provider="proxy" models. Sharing tab hides proxy models. Prevents proxy loops.
+- Auto-connect on startup: linggen server calls GET /api/rooms/joined, auto-connects to rooms where consumer_type=linggen and owner is online.
+- Room page in local UI: My Room (owner CRUD + config), Joined Rooms (consumer list with connect/disconnect/leave), Available Rooms (public rooms + invite link input).
+- Model selector: proxy models show "gpt-4 (By Tom)" via provided_by field.
+- Note: server mode consumers run their own engine locally — permission enforcement is not needed. They only use the owner for inference (list_models + inference endpoints).
 
-Remaining:
-- One-room-per-owner constraint: rooms.owner_id already UNIQUE. API rejects if user already owns a room.
-- Multiple consumer rooms: room_members UNIQUE(room_id, user_id), no limit on how many rooms a user joins. Cannot join own room.
-- No re-sharing: list_models handler filters out proxy:* models. Sharing tab hides proxy models.
-- Auto-connect on startup: linggen server calls GET /api/rooms/joined, auto-connects to all rooms where consumer_type=linggen and owner is online.
-- Room page in local UI: My Room (owner CRUD + config), Joined Rooms (consumer list + leave), Available Rooms (public rooms + invite input). Browser mode not shown here — that's on linggen.dev dashboard.
-- Model selector: proxy models show "gpt-5.4 (By Tom)" in the UI.
+### Phase 6c: UI polish — DONE
 
-### Phase 6c: UI polish + integration testing
-
-- Consumer UI mode: detect consumer_mode on control channel, hide settings/tools/project panels, show privacy banner.
-- Sharing tab: tool permission presets (chat/read/edit) with individual checkboxes.
-- End-to-end testing: create room → join → connect → chat with tools → token budget → permission enforcement.
-- Deploy DB migration + CF Worker + linggensite.
+- Consumer UI mode: consumer_mode on control channel, restricted UI for browser consumers.
+- Sharing tab: tool permission presets (chat/read/edit) with individual tool checkboxes.
+- Deployed: DB migration + CF Worker + linggensite.
 
 ### Phase 6d: Credits + auto-dispatch
 

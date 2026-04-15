@@ -122,6 +122,82 @@ async fn fetch_builtin_skills_inner() -> Result<Vec<BuiltInSkillInfo>> {
     Ok(skills)
 }
 
+/// Check a single skill directory for a `mission` frontmatter field.
+/// If found and no mission with that name exists yet, create it.
+/// Returns the skill name if a mission was created.
+pub fn create_mission_for_skill(
+    skill_dir: &Path,
+    mission_store: &crate::project_store::missions::MissionStore,
+) -> Option<String> {
+    let skill_md = skill_dir.join("SKILL.md");
+    let text = std::fs::read_to_string(&skill_md).ok()?;
+
+    // Quick frontmatter parse for name + mission fields only
+    if !text.starts_with("---") {
+        return None;
+    }
+    let parts: Vec<&str> = text.splitn(3, "---").collect();
+    if parts.len() < 3 {
+        return None;
+    }
+
+    #[derive(Deserialize)]
+    struct MissionMeta {
+        name: String,
+        #[serde(default)]
+        mission: Option<SkillMission>,
+    }
+
+    let meta: MissionMeta = serde_yml::from_str(parts[1]).ok()?;
+    let mission_cfg = meta.mission?;
+
+    // Check if mission already exists
+    let missions_dir = crate::paths::global_missions_dir();
+    let mission_dir = missions_dir.join(&meta.name);
+    if mission_dir.exists() {
+        return None;
+    }
+
+    // Create the mission with prompt = /skill-name
+    let prompt = format!("/{}", meta.name);
+    match mission_store.create_mission(
+        Some(meta.name.clone()),
+        &mission_cfg.schedule,
+        &prompt,
+        mission_cfg.model,
+        None,  // no project
+        None,  // default permission tier
+    ) {
+        Ok(_) => Some(meta.name),
+        Err(e) => {
+            tracing::warn!(skill = %meta.name, err = %e, "Failed to create mission for skill");
+            None
+        }
+    }
+}
+
+/// Scan all installed skills and create missions for any that declare one.
+/// Returns the number of missions created.
+pub fn create_missions_for_all_skills(
+    mission_store: &crate::project_store::missions::MissionStore,
+) -> Vec<String> {
+    let skills_dir = crate::paths::global_skills_dir();
+    let mut created = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name) = create_mission_for_skill(&path, mission_store) {
+                    created.push(name);
+                }
+            }
+        }
+    }
+
+    created
+}
+
 /// Extract `name` and `description` from YAML frontmatter in a SKILL.md file.
 fn parse_frontmatter_meta(text: &str) -> Option<(String, String)> {
     if !text.starts_with("---") {
@@ -154,6 +230,16 @@ pub struct AppConfig {
     /// Suggested panel height in pixels.
     #[serde(default)]
     pub height: Option<u32>,
+}
+
+/// Mission config declared by a skill. See skill-spec.md → Skill missions.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SkillMission {
+    /// Cron expression (5-field standard).
+    pub schedule: String,
+    /// Model override for this mission.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Permission request declared by a skill. See permission-spec.md → Skill invocation.
@@ -198,6 +284,9 @@ pub struct Skill {
     /// Permission request — if set, user is prompted to approve before skill runs.
     #[serde(default)]
     pub permission: Option<SkillPermission>,
+    /// Mission config — if set, a cron mission is auto-created on install.
+    #[serde(default)]
+    pub mission: Option<SkillMission>,
     /// Filesystem path to the skill directory (set at load time, not serialized to clients).
     #[serde(skip)]
     pub skill_dir: Option<std::path::PathBuf>,
@@ -260,6 +349,8 @@ struct SkillFrontmatter {
     app: Option<AppConfig>,
     #[serde(default)]
     permission: Option<SkillPermission>,
+    #[serde(default)]
+    mission: Option<SkillMission>,
 }
 
 pub struct SkillManager {
@@ -398,6 +489,7 @@ impl SkillManager {
             trigger: frontmatter.trigger,
             app: frontmatter.app,
             permission: frontmatter.permission,
+            mission: frontmatter.mission,
             skill_dir: None,
         })
     }
