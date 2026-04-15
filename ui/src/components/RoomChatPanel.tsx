@@ -51,6 +51,7 @@ export const RoomChatPanel: React.FC = () => {
   const setOpen = useRoomChatStore((s) => s.setOpen);
   const ownerRoomName = useUserStore((s) => s.userRoomName);
   const proxyRoomName = useUserStore((s) => s.proxyRoomName);
+  const roomEnabled = useUserStore((s) => s.roomEnabled);
   const roomName = ownerRoomName || proxyRoomName;
 
   const [input, setInput] = useState('');
@@ -103,7 +104,8 @@ export const RoomChatPanel: React.FC = () => {
     inputRef.current?.focus();
   }, [input]);
 
-  if (!roomName) return null;
+  // Show panel if owner has room enabled or if consumer has a room name
+  if (!roomName && !roomEnabled) return null;
 
   const lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
 
