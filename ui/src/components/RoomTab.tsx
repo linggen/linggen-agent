@@ -243,7 +243,11 @@ export const RoomTab: React.FC = () => {
       const resp = await fetch('/api/proxy/status');
       if (!resp.ok) return;
       const data = await resp.json();
-      setProxyConnections(data.connections || []);
+      const conns = data.connections || [];
+      setProxyConnections(conns);
+      // Update global store so header and chat card can show proxy room info
+      const name = conns.length > 0 ? conns[0].room_name : null;
+      useUserStore.getState().setProxyRoom(name);
     } catch { /* ignore */ }
   }, []);
 

@@ -703,6 +703,7 @@ pub fn effective_mode_for_path(path_modes: &[PathMode], target: &Path) -> Option
         // Check if target starts with the grant path (grant covers children)
         if target_str.starts_with(&grant_path)
             && (target_str.len() == grant_path.len()
+                || grant_path == "/"
                 || target_str.as_bytes().get(grant_path.len()) == Some(&b'/'))
         {
             let specificity = grant_path.len();

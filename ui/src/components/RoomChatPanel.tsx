@@ -49,7 +49,9 @@ export const RoomChatPanel: React.FC = () => {
   const isOpen = useRoomChatStore((s) => s.isOpen);
   const unreadCount = useRoomChatStore((s) => s.unreadCount);
   const setOpen = useRoomChatStore((s) => s.setOpen);
-  const roomName = useUserStore((s) => s.userRoomName);
+  const ownerRoomName = useUserStore((s) => s.userRoomName);
+  const proxyRoomName = useUserStore((s) => s.proxyRoomName);
+  const roomName = ownerRoomName || proxyRoomName;
 
   const [input, setInput] = useState('');
   const listRef = useRef<HTMLDivElement>(null);

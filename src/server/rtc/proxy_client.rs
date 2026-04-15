@@ -127,12 +127,20 @@ pub async fn connect_to_room(
     // Create channels for communicating with the peer loop
     let (request_tx, mut request_rx) = mpsc::channel::<String>(32);
     let (response_tx, response_rx) = mpsc::channel::<String>(256);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
 
     // Spawn the peer connection event loop
     tokio::spawn(async move {
-        run_proxy_client_loop(&mut rtc, &socket, &mut request_rx, &response_tx).await;
+        run_proxy_client_loop(&mut rtc, &socket, &mut request_rx, &response_tx, Some(ready_tx)).await;
         info!("Proxy client peer connection closed");
     });
+
+    // Wait for the inference data channel to open before returning,
+    // so callers can immediately send requests without a race.
+    tokio::time::timeout(Duration::from_secs(10), ready_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out waiting for inference channel to open"))?
+        .map_err(|_| anyhow::anyhow!("Proxy client loop exited before channel opened"))?;
 
     Ok(ProxyConnection {
         request_tx,
@@ -146,9 +154,11 @@ async fn run_proxy_client_loop(
     socket: &UdpSocket,
     request_rx: &mut mpsc::Receiver<String>,
     response_tx: &mpsc::Sender<String>,
+    ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) {
     let mut buf = vec![0u8; 65536];
     let mut inference_channel: Option<str0m::channel::ChannelId> = None;
+    let mut ready_tx = ready_tx;
 
     loop {
         // Drain str0m outputs (STUN, DTLS, SCTP packets)
@@ -168,6 +178,9 @@ async fn run_proxy_client_loop(
                         info!("Proxy client: data channel opened: {label}");
                         if label == "inference" {
                             inference_channel = Some(id);
+                            if let Some(tx) = ready_tx.take() {
+                                let _ = tx.send(());
+                            }
                         }
                     }
                     Event::ChannelData(data) => {
@@ -204,10 +217,13 @@ async fn run_proxy_client_loop(
             Some(msg) = request_rx.recv() => {
                 if let Some(cid) = inference_channel {
                     if let Some(mut ch) = rtc.channel(cid) {
-                        let _ = ch.write(false, msg.as_bytes());
+                        let written = ch.write(false, msg.as_bytes());
+                        info!("Inference channel write: {:?} ({}bytes)", written, msg.len());
+                    } else {
+                        tracing::warn!("Inference channel {:?} not found in rtc", cid);
                     }
                 } else {
-                    debug!("Inference channel not open yet, dropping request");
+                    tracing::warn!("Inference channel not open yet, dropping request");
                 }
             }
 

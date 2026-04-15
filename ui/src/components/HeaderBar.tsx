@@ -129,9 +129,12 @@ export const HeaderBar: React.FC<{
   const userRoomName = useUserStore((s) => s.userRoomName);
   const userType = useUserStore((s) => s.userType);
   const roomEnabled = useUserStore((s) => s.roomEnabled);
+  const roomRole = useUserStore((s) => s.roomRole);
+  const proxyRoomName = useUserStore((s) => s.proxyRoomName);
 
   // Fetch room name for owner — room_enabled comes from page_state, but
   // room_name requires an HTTP call since it's stored on linggen.dev.
+  // Also fetch proxy status for consumer role.
   useEffect(() => {
     if (userType !== 'owner') return;
     let cancelled = false;
@@ -158,7 +161,19 @@ export const HeaderBar: React.FC<{
           }
         });
     };
+    const fetchProxyRoom = () => {
+      fetch('/api/proxy/status')
+        .then(r => r.ok ? r.json() : null)
+        .then(data => {
+          if (cancelled) return;
+          const conns = data?.connections || [];
+          const name = conns.length > 0 ? conns[0].room_name : null;
+          useUserStore.getState().setProxyRoom(name);
+        })
+        .catch(() => {});
+    };
     fetchRoomName();
+    fetchProxyRoom();
     return () => { cancelled = true; };
   }, [userType, connectionStatus]);
 
@@ -175,7 +190,7 @@ export const HeaderBar: React.FC<{
           <img src={logoUrl} alt="Linggen" className="w-6 h-6 md:w-7 md:h-7" />
           <h1 className="text-sm md:text-base font-bold tracking-tight text-slate-900 dark:text-white">Linggen</h1>
         </a>
-        {userType === 'owner' && userRoomName && (
+        {userRoomName && (
           <button
             onClick={() => {
               useUiStore.getState().openSettings('room');
@@ -189,6 +204,20 @@ export const HeaderBar: React.FC<{
           >
             <span className={`w-1.5 h-1.5 rounded-full ${roomEnabled ? 'bg-green-500' : 'bg-slate-400'}`} />
             {userRoomName}
+            <span className="text-[8px] opacity-60">owner</span>
+          </button>
+        )}
+        {!userRoomName && proxyRoomName && (
+          <button
+            onClick={() => {
+              useUiStore.getState().openSettings('room');
+            }}
+            className="flex items-center gap-1.5 text-[10px] px-1.5 py-0.5 rounded font-medium transition-colors bg-blue-500/10 text-blue-600 hover:bg-blue-500/20"
+            title="Proxy room"
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
+            {proxyRoomName}
+            <span className="text-[8px] opacity-60">consumer</span>
           </button>
         )}
       </div>

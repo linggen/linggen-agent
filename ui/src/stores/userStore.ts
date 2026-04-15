@@ -19,6 +19,10 @@ interface UserState {
   /** Whether owner's room is enabled (accepting consumers). */
   roomEnabled: boolean;
   connectionStatus: 'connected' | 'reconnecting' | 'disconnected';
+  /** Role in a room: 'owner' if sharing, 'consumer' if joined via proxy. */
+  roomRole: 'owner' | 'consumer' | null;
+  /** Name of the proxy room the user joined (consumer role). */
+  proxyRoomName: string | null;
 
   setUserType: (userType: 'owner' | 'consumer') => void;
   setUserId: (userId: string) => void;
@@ -26,6 +30,7 @@ interface UserState {
   setUserInfo: (permission: string, roomName?: string | null, tokenBudget?: number | null) => void;
   setRoomEnabled: (enabled: boolean) => void;
   setConnectionStatus: (status: 'connected' | 'reconnecting' | 'disconnected') => void;
+  setProxyRoom: (roomName: string | null) => void;
 }
 
 const isRemote = typeof document !== 'undefined' && !!document.querySelector('meta[name="linggen-instance"]');
@@ -40,6 +45,8 @@ export const useUserStore = create<UserState>((set) => ({
   userTokenBudget: null,
   roomEnabled: true,
   connectionStatus: isRemote ? 'disconnected' : 'connected',
+  roomRole: null,
+  proxyRoomName: null,
 
   setUserType: (userType) => set({ userType }),
   setUserId: (userId) => set({ userId }),
@@ -51,4 +58,5 @@ export const useUserStore = create<UserState>((set) => ({
   }),
   setRoomEnabled: (enabled) => set({ roomEnabled: enabled }),
   setConnectionStatus: (status) => set({ connectionStatus: status }),
+  setProxyRoom: (roomName) => set({ proxyRoomName: roomName, roomRole: roomName ? 'consumer' : null }),
 }));
