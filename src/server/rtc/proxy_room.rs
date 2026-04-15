@@ -179,6 +179,7 @@ pub async fn connect_proxy_room(
     info!("WebRTC connection established to proxy room");
 
     // Create the proxy model client with request demuxing
+    let disconnect_rx = conn.disconnect_rx;
     let proxy_client = Arc::new(
         crate::agent_manager::proxy_provider::ProxyModelClient::new(
             conn.request_tx,
@@ -237,6 +238,16 @@ pub async fn connect_proxy_room(
     ).await;
 
     info!("Proxy room models registered successfully");
+
+    // Watch for disconnect — auto-cleanup when proxy connection drops
+    let iid = instance_id.to_string();
+    let st = state.clone();
+    tokio::spawn(async move {
+        let _ = disconnect_rx.await;
+        tracing::info!("Proxy connection lost (instance: {iid}), cleaning up");
+        disconnect_proxy_room_by_instance(st, &iid).await;
+    });
+
     Ok(())
 }
 

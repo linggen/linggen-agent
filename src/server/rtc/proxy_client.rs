@@ -24,6 +24,8 @@ pub struct ProxyConnection {
     pub request_tx: mpsc::Sender<String>,
     /// Receive inference responses (JSON) from the owner's linggen.
     pub response_rx: mpsc::Receiver<String>,
+    /// Fires when the proxy client loop exits (connection lost).
+    pub disconnect_rx: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// Establish a WebRTC connection to a room owner's linggen via the relay.
@@ -129,6 +131,7 @@ pub async fn connect_to_room(
     let (request_tx, mut request_rx) = mpsc::channel::<String>(32);
     let (response_tx, response_rx) = mpsc::channel::<String>(256);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (disconnect_tx, disconnect_rx) = tokio::sync::oneshot::channel::<()>();
     let mut events_rx = events_tx.as_ref().map(|tx| tx.subscribe());
     let events_broadcast_tx = events_tx.clone();
 
@@ -136,6 +139,7 @@ pub async fn connect_to_room(
     tokio::spawn(async move {
         run_proxy_client_loop(&mut rtc, &socket, &mut request_rx, &response_tx, Some(ready_tx), &mut events_rx, events_broadcast_tx).await;
         info!("Proxy client peer connection closed");
+        let _ = disconnect_tx.send(());
     });
 
     // Wait for the inference data channel to open before returning,
@@ -148,6 +152,7 @@ pub async fn connect_to_room(
     Ok(ProxyConnection {
         request_tx,
         response_rx,
+        disconnect_rx,
     })
 }
 
@@ -268,7 +273,7 @@ async fn run_proxy_client_loop(
                     None => std::future::pending().await,
                 }
             } => {
-                if let Ok(crate::server::ServerEvent::RoomChat { sender_id, sender_name, text, .. }) = result {
+                if let Ok(crate::server::ServerEvent::RoomChat { sender_id, sender_name, avatar_url, text }) = result {
                     // Only forward messages from the local user to the owner.
                     // Skip: owner's messages (echoed back), other remote senders.
                     if sender_id != local_user_id {
@@ -280,6 +285,7 @@ async fn run_proxy_client_loop(
                             "text": text,
                             "sender_name": sender_name,
                             "sender_id": sender_id,
+                            "avatar_url": avatar_url,
                         });
                         if let Some(mut ch) = rtc.channel(cid) {
                             let _ = ch.write(false, msg.to_string().as_bytes());
