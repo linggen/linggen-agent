@@ -110,6 +110,7 @@ async fn run_peer(
 ) -> Result<()> {
     let mut buf = vec![0u8; 65536];
     let mut control_channel_id = None;
+    let mut inference_channel_id: Option<str0m::channel::ChannelId> = None;
     // Track token usage for proxy room consumers with budgets (shared with spawned tasks)
     let tokens_used = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let mut session_channels: HashMap<String, str0m::channel::ChannelId> = HashMap::new();
@@ -244,6 +245,8 @@ async fn run_peer(
                                     pending_dc_writes.push_back((id, warning.to_string()));
                                 }
                             }
+                        } else if label == "inference" {
+                            inference_channel_id = Some(id);
                         } else if let Some(session_id) = label.strip_prefix("sess-") {
                             // Verify session ownership for non-admin users.
                             // Check user_session_ids first (fast), then fall back to session store
@@ -333,6 +336,30 @@ async fn run_peer(
                                     });
                                 }
                             }
+                        } else if Some(data.id) == inference_channel_id {
+                            // Inference channel: proxy client sends list_models / inference requests
+                            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
+                                let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let request_id = msg.get("request_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                if msg_type == "inference" || msg_type == "list_models" {
+                                    let req = ControlRequest {
+                                        request_id,
+                                        channel_id: data.id,
+                                        msg_type,
+                                        body: msg,
+                                    };
+                                    let tx = ctrl_resp_tx.clone();
+                                    let st = state.clone();
+                                    let ctx_clone = user_ctx.clone();
+                                    let tok = tokens_used.clone();
+                                    let cid = data.id;
+                                    tokio::spawn(async move {
+                                        process_inference_request(&req, &st, &ctx_clone, &tok, &tx, cid).await;
+                                    });
+                                } else {
+                                    tracing::warn!("Unknown inference channel message type: {msg_type}");
+                                }
+                            }
                         } else if let Some(session_id) = channel_sessions.get(&data.id).cloned() {
                             // Check token budget before session messages
                             if let Some(budget) = user_ctx.token_budget_daily {
@@ -355,6 +382,10 @@ async fn run_peer(
                         if let Some(session_id) = channel_sessions.remove(&id) {
                             session_channels.remove(&session_id);
                             tracing::info!("Session channel closed: {session_id}");
+                        }
+                        if Some(id) == inference_channel_id {
+                            inference_channel_id = None;
+                            tracing::info!("Inference channel closed");
                         }
                         if Some(id) == control_channel_id {
                             control_channel_id = None;

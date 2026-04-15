@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { ExternalLink, Copy, Check, Trash2, RefreshCw, Users, Shield, Link, Wifi, WifiOff, LogOut } from 'lucide-react';
+import { ExternalLink, Copy, Check, Trash2, RefreshCw, Users, Shield, Link, Wifi, WifiOff, LogOut, Loader2 } from 'lucide-react';
 import type { SkillInfoFull } from '../types';
 import { useUserStore } from '../stores/userStore';
 
@@ -191,6 +191,7 @@ export const RoomTab: React.FC = () => {
   // Room connect state
   const [roomEnabled, setRoomEnabled] = useState(true);
   const [autoConnect, setAutoConnect] = useState(true);
+  const [connectingInstance, setConnectingInstance] = useState<string | null>(null);
 
   // --- Consumer state (new) ---
   const [joinedRooms, setJoinedRooms] = useState<JoinedRoom[]>([]);
@@ -445,7 +446,9 @@ export const RoomTab: React.FC = () => {
   // -----------------------------------------------------------------------
 
   const connectProxyRoom = async (instanceId: string, ownerName: string, roomName: string) => {
+    if (connectingInstance) return; // prevent double-click
     setError(null);
+    setConnectingInstance(instanceId);
     try {
       const resp = await fetch('/api/proxy/connect', {
         method: 'POST',
@@ -458,7 +461,7 @@ export const RoomTab: React.FC = () => {
         return;
       }
       fetchProxyStatus();
-    } catch (e: any) { setError(e.message); }
+    } catch (e: any) { setError(e.message); } finally { setConnectingInstance(null); }
   };
 
   const disconnectProxyRoom = async (instanceId: string) => {
@@ -917,9 +920,12 @@ export const RoomTab: React.FC = () => {
                         {jr.status !== 'disabled' && jr.online && !isConnected && (
                           <button
                             onClick={() => connectProxyRoom(jr.instance_id, jr.owner_name, jr.name)}
-                            className="flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-blue-500 bg-blue-500/10 hover:bg-blue-500/20 rounded transition-colors"
+                            disabled={connectingInstance === jr.instance_id}
+                            className="flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-blue-500 bg-blue-500/10 hover:bg-blue-500/20 rounded transition-colors disabled:opacity-50"
                           >
-                            <Wifi size={10} /> Connect
+                            {connectingInstance === jr.instance_id
+                              ? <><Loader2 size={10} className="animate-spin" /> Connecting...</>
+                              : <><Wifi size={10} /> Connect</>}
                           </button>
                         )}
                         {isConnected && (
