@@ -835,7 +835,7 @@ function handlePageState(item: UiEvent): void {
     const uiStore = useUiStore.getState();
     // Only update mode if user hasn't made a local change recently
     // (prevents page_state from overwriting optimistic UI updates)
-    if (perm.effective_mode && (Date.now() >= _permissionSuppressedUntil)) {
+    if (perm.effective_mode) {
       uiStore.setSessionMode(perm.effective_mode);
     }
     if (perm.zone) uiStore.setSessionZone(perm.zone);
