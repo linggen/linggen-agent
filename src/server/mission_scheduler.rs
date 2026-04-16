@@ -90,10 +90,12 @@ pub async fn mission_scheduler_loop(state: Arc<ServerState>) {
                 continue;
             }
 
-            // Missions require the "mission" skill.
-            if state.skill_manager.get_skill("mission").await.is_none() {
-                warn!("Mission scheduler: \"mission\" skill not installed, skipping '{}'. Run `ling init` to install.", mission.id);
-                continue;
+            // Agent mode missions require the "mission" skill.
+            if mission.mode != "app" && mission.mode != "script" {
+                if state.skill_manager.get_skill("mission").await.is_none() {
+                    warn!("Mission scheduler: \"mission\" skill not installed, skipping '{}'. Run `ling init` to install.", mission.id);
+                    continue;
+                }
             }
 
             // Determine project root for this mission
@@ -122,12 +124,59 @@ pub async fn mission_scheduler_loop(state: Arc<ServerState>) {
             // Fire!
             ms.last_fire_minute = Some(current_minute);
             ms.daily_count += 1;
-            ms.running.store(true, std::sync::atomic::Ordering::Relaxed);
 
             info!(
-                "Mission scheduler: triggering mission '{}' (project: {:?})",
-                mission.id, mission.project
+                "Mission scheduler: triggering mission '{}' (mode: {}, project: {:?})",
+                mission.id, mission.mode, mission.project
             );
+
+            // App mode: open URL in browser, no session or agent loop.
+            if mission.mode == "app" {
+                if let Some(ref url) = mission.entry {
+                    info!("Mission scheduler: opening app URL: {}", url);
+                    let _ = crate::server::chat_api::open_in_browser(url);
+                } else {
+                    warn!("Mission scheduler: app mode mission '{}' has no entry URL", mission.id);
+                }
+                record_mission_run(&state, mission, "", None, "completed", false);
+                continue;
+            }
+
+            // Script mode: run entry as shell command, no session or agent loop.
+            if mission.mode == "script" {
+                if let Some(ref cmd) = mission.entry {
+                    info!("Mission scheduler: running script: {}", cmd);
+                    let cmd_owned = cmd.clone();
+                    let state_clone = state.clone();
+                    let mission_owned = mission.clone();
+                    tokio::spawn(async move {
+                        let output = tokio::process::Command::new("bash")
+                            .arg("-c")
+                            .arg(&cmd_owned)
+                            .output()
+                            .await;
+                        let status = match output {
+                            Ok(o) if o.status.success() => "completed",
+                            Ok(o) => {
+                                let stderr = String::from_utf8_lossy(&o.stderr);
+                                warn!("Mission script failed: {}", stderr.trim());
+                                "failed"
+                            }
+                            Err(e) => {
+                                warn!("Mission script error: {}", e);
+                                "failed"
+                            }
+                        };
+                        record_mission_run(&state_clone, &mission_owned, "", None, status, false);
+                    });
+                } else {
+                    warn!("Mission scheduler: script mode mission '{}' has no entry command", mission.id);
+                }
+                continue;
+            }
+
+            // Agent mode (default): create session and run agent loop.
+            ms.running.store(true, std::sync::atomic::Ordering::Relaxed);
 
             state
                 .manager

@@ -1889,7 +1889,7 @@ mod tests {
 }
 
 /// Open a URL in the system's default browser.
-fn open_in_browser(url: &str) -> std::io::Result<()> {
+pub fn open_in_browser(url: &str) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open").arg(url).spawn()?;

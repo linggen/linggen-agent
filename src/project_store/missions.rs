@@ -14,6 +14,15 @@ struct MissionFrontmatter {
     schedule: String,
     #[serde(default)]
     enabled: bool,
+    /// Mission mode: "agent" (default), "app", or "script".
+    /// Agent: scheduler creates session and runs agent loop.
+    /// App: scheduler opens `entry` URL in browser. No session created.
+    /// Script: scheduler runs `entry` as a shell command. No session created.
+    #[serde(default = "default_mode", skip_serializing_if = "is_default_mode")]
+    mode: String,
+    /// Entry point for app/script mode. URL (app) or command (script). Ignored in agent mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entry: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -23,6 +32,14 @@ struct MissionFrontmatter {
     permission_tier: String,
     #[serde(default)]
     created_at: u64,
+}
+
+fn default_mode() -> String {
+    "agent".to_string()
+}
+
+fn is_default_mode(s: &str) -> bool {
+    s == "agent"
 }
 
 fn default_permission_tier() -> String {
@@ -42,6 +59,12 @@ pub struct Mission {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub schedule: String,
+    /// Mission mode: "agent" (default), "app", or "script".
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    /// Entry point for app/script mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
     /// Always "mission".
     #[serde(default = "default_mission_agent")]
     pub agent_id: String,
@@ -155,6 +178,8 @@ fn parse_mission_md(id: &str, content: &str) -> Result<Mission> {
                 MissionFrontmatter {
                     schedule: String::new(),
                     enabled: false,
+                    mode: default_mode(),
+                    entry: None,
                     model: None,
                     project: None,
                     permission_tier: default_permission_tier(),
@@ -169,6 +194,8 @@ fn parse_mission_md(id: &str, content: &str) -> Result<Mission> {
             MissionFrontmatter {
                 schedule: String::new(),
                 enabled: false,
+                mode: default_mode(),
+                entry: None,
                 model: None,
                 project: None,
                 permission_tier: default_permission_tier(),
@@ -182,6 +209,8 @@ fn parse_mission_md(id: &str, content: &str) -> Result<Mission> {
         name: Some(id_to_display_name(&id)),
         id,
         schedule: fm.schedule,
+        mode: fm.mode,
+        entry: fm.entry,
         agent_id: MISSION_AGENT_ID.to_string(),
         prompt: body,
         model: fm.model,
@@ -197,6 +226,8 @@ fn mission_to_md(mission: &Mission) -> String {
     let fm = MissionFrontmatter {
         schedule: mission.schedule.clone(),
         enabled: mission.enabled,
+        mode: mission.mode.clone(),
+        entry: mission.entry.clone(),
         model: mission.model.clone(),
         project: mission.project.clone(),
         permission_tier: mission.permission_tier.clone(),
@@ -339,6 +370,8 @@ impl MissionStore {
             id: id.clone(),
             name: Some(display_name),
             schedule: schedule.to_string(),
+            mode: default_mode(),
+            entry: None,
             agent_id: MISSION_AGENT_ID.to_string(),
             prompt: prompt.to_string(),
             model,
