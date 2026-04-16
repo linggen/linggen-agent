@@ -118,14 +118,6 @@ impl ToolRegistry {
         self.builtins.get_manager()
     }
 
-    pub fn set_memory_dir(&mut self, dir: PathBuf) {
-        self.builtins.set_memory_dir(dir);
-    }
-
-    pub fn memory_dir(&self) -> Option<&PathBuf> {
-        self.builtins.memory_dir()
-    }
-
     pub fn set_ask_user_bridge(&mut self, bridge: std::sync::Arc<tools::AskUserBridge>) {
         self.builtins.set_ask_user_bridge(bridge);
     }

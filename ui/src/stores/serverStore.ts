@@ -172,6 +172,7 @@ export const useServerStore = create<ServerState>((set, get) => ({
 
   reloadSkills: async () => {
     set({ reloadingSkills: true });
+    const minSpin = new Promise((r) => setTimeout(r, 1000));
     try {
       const { selectedProjectRoot } = useSessionStore.getState();
       await fetch('/api/skills/reload', {
@@ -183,6 +184,7 @@ export const useServerStore = create<ServerState>((set, get) => ({
     } catch (e) {
       console.error('Failed to reload skills:', e);
     } finally {
+      await minSpin;
       set({ reloadingSkills: false });
     }
   },

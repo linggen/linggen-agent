@@ -253,12 +253,11 @@ impl AgentEngine {
         let tools_ref = &self.tools;
         let cached_hash = self.cached_system_prompt.as_ref().map(|c| c.input_hash);
         let staleness_ws_root = &self.cfg.ws_root;
-        let staleness_memory_dir = self.tools.memory_dir().map(|p| p.as_path());
         let (results, prompt_stale): (Vec<(usize, ReadyExec, anyhow::Result<tools::ToolResult>)>, bool) =
             tokio::task::block_in_place(|| {
                 std::thread::scope(|scope| {
                     let staleness_handle = scope.spawn(|| {
-                        check_context_staleness(cached_hash, staleness_ws_root, staleness_memory_dir)
+                        check_context_staleness(cached_hash, staleness_ws_root)
                     });
                     let handles: Vec<_> = ready
                         .into_iter()

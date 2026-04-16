@@ -465,10 +465,6 @@ impl AgentEngine {
         self.tools.set_run_id(run_id);
     }
 
-    pub fn set_memory_dir(&mut self, dir: PathBuf) {
-        self.tools.set_memory_dir(dir);
-    }
-
     pub fn get_task(&self) -> Option<String> {
         self.task.clone()
     }

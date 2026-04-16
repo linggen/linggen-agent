@@ -175,7 +175,6 @@ pub struct Tools {
     delegation_depth: usize,
     max_delegation_depth: usize,
     run_id: Option<String>,
-    memory_dir: Option<PathBuf>,
     ask_user_bridge: Option<Arc<AskUserBridge>>,
     progress_tx: Option<ToolProgressSender>,
     prompt_store: Option<Arc<crate::prompts::PromptStore>>,
@@ -196,7 +195,6 @@ impl Tools {
             delegation_depth: 0,
             max_delegation_depth: 2,
             run_id: None,
-            memory_dir: None,
             ask_user_bridge: None,
             progress_tx: None,
             prompt_store: None,
@@ -234,13 +232,7 @@ impl Tools {
         self.run_id = run_id;
     }
 
-    pub fn set_memory_dir(&mut self, dir: PathBuf) {
-        self.memory_dir = Some(dir);
-    }
 
-    pub fn memory_dir(&self) -> Option<&PathBuf> {
-        self.memory_dir.as_ref()
-    }
 
     pub fn set_ask_user_bridge(&mut self, bridge: Arc<AskUserBridge>) {
         self.ask_user_bridge = Some(bridge);

@@ -454,6 +454,9 @@ async fn run_peer(
                 tokio::spawn(async move {
                     let ps = super::page_state::build_page_state(&st, &ctx, flags, &user_ctx_clone).await;
                     if let Ok(data) = serde_json::to_value(&ps) {
+                        let size = data.to_string().len();
+                        tracing::info!("Pushing page_state (forced): {}bytes, models={}", size,
+                            data.get("models").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0));
                         let msg = serde_json::json!({ "kind": "page_state", "data": data });
                         let _ = tx.send((None, cid, msg)).await;
                     }

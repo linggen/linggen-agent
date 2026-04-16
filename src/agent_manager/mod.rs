@@ -546,10 +546,6 @@ impl AgentManager {
                 .collect();
         }
 
-        // Set up auto memory directory
-        let repo_path_str = project_root.to_string_lossy().to_string();
-        engine.set_memory_dir(self.store.memory_dir(&repo_path_str));
-
         let agent = Arc::new(Mutex::new(engine));
         agents.insert(normalized_id, agent.clone());
         Ok(agent)
@@ -633,9 +629,6 @@ impl AgentManager {
                 .map(|s| (s.spec.name.clone(), s.spec.description.clone()))
                 .collect();
         }
-
-        let repo_path_str = project_root.to_string_lossy().to_string();
-        engine.set_memory_dir(self.store.memory_dir(&repo_path_str));
 
         let agent = Arc::new(Mutex::new(engine));
         // Re-check under lock to handle concurrent creation race.
@@ -728,10 +721,6 @@ impl AgentManager {
                 .map(|s| (s.spec.name.clone(), s.spec.description.clone()))
                 .collect();
         }
-
-        // Set up auto memory directory
-        let repo_path_str = project_root.to_string_lossy().to_string();
-        engine.set_memory_dir(self.store.memory_dir(&repo_path_str));
 
         Ok(engine)
     }

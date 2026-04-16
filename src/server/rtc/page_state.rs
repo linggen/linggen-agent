@@ -182,7 +182,17 @@ pub async fn build_page_state(
         } else {
             all_models
         };
-        ps.models = Some(models.into_iter().filter_map(|m| serde_json::to_value(m).ok()).collect());
+        ps.models = Some(models.into_iter().map(|m| {
+            // Only send metadata — strip sensitive fields (api_key, url)
+            serde_json::json!({
+                "id": m.id,
+                "provider": m.provider,
+                "model": m.model,
+                "tags": m.tags,
+                "supports_tools": m.supports_tools,
+                "provided_by": m.provided_by,
+            })
+        }).collect());
 
         // Default models — admin only
         if is_admin {
@@ -199,7 +209,15 @@ pub async fn build_page_state(
         } else {
             skills
         };
-        ps.skills = Some(skills.into_iter().filter_map(|s| serde_json::to_value(s).ok()).collect());
+        ps.skills = Some(skills.into_iter().filter_map(|s| {
+            let mut v = serde_json::to_value(s).ok()?;
+            // Strip large fields — UI only needs metadata for sidebar cards
+            v.as_object_mut().map(|m| {
+                m.remove("content");
+                m.remove("context");
+            });
+            Some(v)
+        }).collect());
 
         // Pending ask-user — filtered to user's sessions
         let pending = state.pending_ask_user.lock().await;

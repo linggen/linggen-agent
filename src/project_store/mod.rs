@@ -92,9 +92,6 @@ impl ProjectStore {
         Ok(())
     }
 
-    pub fn memory_dir(&self, project_path: &str) -> PathBuf {
-        self.project_dir(project_path).join("memory")
-    }
 }
 
 #[cfg(test)]
