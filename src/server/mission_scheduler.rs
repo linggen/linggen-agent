@@ -131,10 +131,17 @@ pub async fn mission_scheduler_loop(state: Arc<ServerState>) {
             );
 
             // App mode: open URL in browser, no session or agent loop.
+            // Relative entries (starting with "/") are resolved against the
+            // current server port so missions survive port reconfiguration.
             if mission.mode == "app" {
-                if let Some(ref url) = mission.entry {
-                    info!("Mission scheduler: opening app URL: {}", url);
-                    let _ = crate::server::chat_api::open_in_browser(url);
+                if let Some(ref entry) = mission.entry {
+                    let full_url = if entry.starts_with("http://") || entry.starts_with("https://") {
+                        entry.clone()
+                    } else {
+                        format!("http://localhost:{}{}", state.port, entry)
+                    };
+                    info!("Mission scheduler: opening app URL: {}", full_url);
+                    let _ = crate::server::chat_api::open_in_browser(&full_url);
                 } else {
                     warn!("Mission scheduler: app mode mission '{}' has no entry URL", mission.id);
                 }
@@ -409,18 +416,56 @@ async fn dispatch_mission_prompt(
     // Force Auto permission mode (legacy — kept for backward compat with old check flow).
     engine.cfg.tool_permission_mode = crate::config::ToolPermissionMode::Auto;
 
-    // New permission model: lock session + set mode from tier.
-    // Locked = no prompts; actions within mode ceiling pass, everything else blocked.
+    // New permission model: apply session policy + path-mode grants.
+    //
+    // - Policy ("autonomy") decides what happens when the agent tries
+    //   something outside its grants:
+    //     strict  → silently deny (safe default for unattended runs)
+    //     trusted → silently allow (legacy locked-mission behavior)
+    //     interactive → prompt (rare for missions — nothing to click)
+    // - Path-mode grants come from (a) the mission's permission_tier on
+    //   the mission cwd, and (b) if a skill is bound to the session,
+    //   the skill's declared permission.paths.
     {
-        use crate::engine::permission::PermissionMode;
-        let mode = match mission.permission_tier.as_str() {
+        use crate::engine::permission::{PermissionMode, PermissionPolicy};
+        let tier_mode = match mission.permission_tier.as_str() {
             "readonly" => PermissionMode::Read,
             "standard" => PermissionMode::Edit,
             _ => PermissionMode::Admin, // "full" or unknown
         };
+        let policy = match mission.policy.as_str() {
+            "strict" => PermissionPolicy::strict(),
+            "interactive" => PermissionPolicy::interactive(),
+            _ => PermissionPolicy::trusted(),
+        };
         let cwd = mission.project.clone().unwrap_or_else(|| "~/".to_string());
-        engine.session_permissions.locked = true;
-        engine.session_permissions.set_path_mode(&cwd, mode);
+        engine.session_permissions.set_policy(policy);
+        engine.session_permissions.set_path_mode(&cwd, tier_mode);
+
+        // If the session binds a skill, apply its declared permission grants.
+        // These are narrower than the tier grant (e.g. admin on ~/.linggen)
+        // and win via longest-path-match in effective_mode_for_path.
+        if let Some(ref sid) = session_id {
+            if let Ok(Some(meta)) = state.manager.global_sessions.get_session_meta(sid) {
+                if let Some(ref skill_name) = meta.skill {
+                    if let Some(skill) = state.skill_manager.get_skill(skill_name).await {
+                        if let Some(ref perm) = skill.permission {
+                            let skill_mode = match perm.mode.as_str() {
+                                "edit" => PermissionMode::Edit,
+                                "admin" => PermissionMode::Admin,
+                                _ => PermissionMode::Read,
+                            };
+                            for path in &perm.paths {
+                                engine
+                                    .session_permissions
+                                    .set_path_mode(path, skill_mode);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Persist so the UI shows the correct mode if user opens the mission session.
         if let Some(ref sid) = session_id {
             let sdir = crate::paths::global_sessions_dir().join(sid);

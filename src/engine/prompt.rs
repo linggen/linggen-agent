@@ -186,6 +186,18 @@ impl AgentEngine {
                     ("content", &resolved_content),
                 ],
             ));
+
+            // App-skills receive the built-in PageUpdate tool. Remind the
+            // model to call it whenever state the user should see has changed.
+            if skill.app.is_some() {
+                prompt.push_str(
+                    "\n\n## Dashboard updates\n\nThis skill has a dashboard UI. \
+                     Call `PageUpdate({ page: {...} })` whenever your work produces \
+                     state the user should see — task complete, new results, progress \
+                     changed. The page JSON schema is defined in your skill \
+                     instructions above. Do not emit page JSON as text; use the tool.\n",
+                );
+            }
         }
 
         prompt

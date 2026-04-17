@@ -15,7 +15,9 @@ use std::sync::Arc;
 pub struct ViewContext {
     pub session_id: Option<String>,
     pub project_root: Option<String>,
-    pub is_compact: bool,
+    /// Which UI entry is connected: "main" | "embed" | "consumer".
+    /// None means the client hasn't reported yet — treat as "main".
+    pub view: Option<String>,
 }
 
 /// Aggregated page state pushed to the frontend.
@@ -146,8 +148,10 @@ pub async fn build_page_state(
     // Wrap room config for consumer filtering
     let room_cfg = if user.is_consumer { Some(room_cfg) } else { None };
 
-    // -- Global data (skip in compact/skill mode) --
-    if include_global && !ctx.is_compact {
+    // -- Global data (skip for embed peers — they're pinned to one session
+    // and don't render the sidebar/mission list that these fields feed) --
+    let is_embed_view = ctx.view.as_deref() == Some("embed");
+    if include_global && !is_embed_view {
         // All sessions — filtered by user_id
         if let Ok(sessions) = state.manager.global_sessions.list_sessions() {
             ps.all_sessions = Some(
@@ -219,12 +223,25 @@ pub async fn build_page_state(
             Some(v)
         }).collect());
 
-        // Pending ask-user — filtered to user's sessions
+        // Embed peers are pinned to one session — narrow user_session_ids to
+        // just that session so pending_ask_user and busy_sessions can't leak
+        // across sessions owned by the same user.
+        let is_embed = ctx.view.as_deref() == Some("embed");
+        let pinned = if is_embed { ctx.session_id.as_deref() } else { None };
+        let scope_check = |sid: &str| -> bool {
+            if let Some(pin) = pinned {
+                sid == pin
+            } else {
+                is_admin || user_session_ids.contains(sid)
+            }
+        };
+
+        // Pending ask-user — filtered to user's sessions (+ pinned for embed)
         let pending = state.pending_ask_user.lock().await;
         let items: Vec<serde_json::Value> = pending.iter()
             .filter(|(_, entry)| {
                 entry.session_id.as_deref()
-                    .map_or(is_admin, |sid| user_session_ids.contains(sid))
+                    .map_or(is_admin && pinned.is_none(), |sid| scope_check(sid))
             })
             .map(|(qid, entry)| {
                 serde_json::json!({
@@ -237,12 +254,12 @@ pub async fn build_page_state(
             .collect();
         ps.pending_ask_user = Some(items);
 
-        // Busy sessions — filtered to user's sessions
+        // Busy sessions — filtered to user's sessions (+ pinned for embed)
         let active = state.active_statuses.lock().await;
         let mut busy: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for (key, record) in active.iter() {
             if let Some(sid) = key.split('|').next() {
-                if !sid.is_empty() && (is_admin || user_session_ids.contains(sid)) {
+                if !sid.is_empty() && scope_check(sid) {
                     busy.entry(sid.to_string())
                         .or_insert_with(|| record.status.as_str().to_string());
                 }
@@ -281,8 +298,28 @@ pub async fn build_page_state(
             let perms = crate::engine::permission::SessionPermissions::load(&session_dir);
             let mut perm_val = serde_json::to_value(&perms).unwrap_or_default();
 
-            if let Some(ref root) = ctx.project_root {
-                if let Some(mode) = crate::engine::permission::effective_mode_for_path(&perms.path_modes, std::path::Path::new(root)) {
+            // Prefer the session's own cwd (from SessionMeta) over the UI's
+            // ctx.project_root. Skill-embed sessions send empty project_root;
+            // without falling back to session.cwd, effective_mode and zone
+            // would always be computed against an empty path.
+            let effective_root: Option<String> = state
+                .manager
+                .global_sessions
+                .get_session_meta(session_id)
+                .ok()
+                .flatten()
+                .and_then(|m| m.cwd)
+                .filter(|s| !s.is_empty())
+                .or_else(|| ctx.project_root.clone().filter(|s| !s.is_empty()));
+
+            if let Some(ref root) = effective_root {
+                // Mode at session root. Falls back to the highest granted mode
+                // across any path_mode when the root has no direct grant — so
+                // skills that grant admin on subpaths (e.g. ~/.linggen) still
+                // show "admin" in the session header.
+                let mode = crate::engine::permission::effective_mode_for_path(&perms.path_modes, std::path::Path::new(root))
+                    .or_else(|| perms.path_modes.iter().map(|pm| pm.mode.clone()).max());
+                if let Some(mode) = mode {
                     perm_val.as_object_mut().map(|m| m.insert("effective_mode".to_string(), serde_json::Value::String(mode.to_string())));
                 }
                 let zone = crate::engine::permission::path_zone(std::path::Path::new(root));

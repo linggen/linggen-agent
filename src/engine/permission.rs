@@ -272,19 +272,99 @@ pub enum BashClass {
     Admin,
 }
 
+/// How the agent should react to a permission decision point.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Decision {
+    /// Prompt the user.
+    Ask,
+    /// Silently allow — no prompt.
+    Allow,
+    /// Silently block — no prompt.
+    Deny,
+}
+
+impl Default for Decision {
+    fn default() -> Self { Decision::Ask }
+}
+
+/// Session-level policy — how the agent handles actions outside the
+/// granted path-mode ceiling, and actions matching `ask:` rules.
+///
+/// Orthogonal to `path_modes` (which sets the per-path capability
+/// ceiling). The policy decides what happens WHEN the ceiling isn't
+/// enough — ask the user, silently allow, or silently deny. Hard
+/// `deny:` rules (sudo, rm -rf) are the safety floor and always
+/// deny regardless of policy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PermissionPolicy {
+    /// What to do when action exceeds the effective path-mode grant.
+    #[serde(default)]
+    pub on_exceed: Decision,
+    /// What to do when action matches an `ask:` rule.
+    #[serde(default)]
+    pub on_ask_rule: Decision,
+}
+
+impl Default for PermissionPolicy {
+    fn default() -> Self { Self::interactive() }
+}
+
+impl PermissionPolicy {
+    /// Default for user-facing sessions — prompt for anything beyond grant.
+    pub const fn interactive() -> Self {
+        Self { on_exceed: Decision::Ask, on_ask_rule: Decision::Ask }
+    }
+    /// Safe autonomous — silently deny anything out of scope. No prompts.
+    pub const fn strict() -> Self {
+        Self { on_exceed: Decision::Deny, on_ask_rule: Decision::Deny }
+    }
+    /// Trusted autonomous — silently allow out of scope, but still deny
+    /// ask-rules (e.g. `git push`). Matches legacy `locked=true` behavior
+    /// for consumer/mission sessions.
+    pub const fn trusted() -> Self {
+        Self { on_exceed: Decision::Allow, on_ask_rule: Decision::Deny }
+    }
+    /// Sandbox (e.g. Docker) — allow everything that isn't a hard deny rule.
+    pub const fn sandbox() -> Self {
+        Self { on_exceed: Decision::Allow, on_ask_rule: Decision::Allow }
+    }
+
+    /// True when the policy never prompts the user. Back-compat replacement
+    /// for the old `locked: bool` field.
+    pub fn is_locked(&self) -> bool {
+        self.on_exceed != Decision::Ask && self.on_ask_rule != Decision::Ask
+    }
+}
+
 /// Per-session permission state, persisted to permission.json.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct SessionPermissions {
     #[serde(default)]
     pub path_modes: Vec<PathMode>,
+    /// Legacy flag — kept for on-disk compatibility. If true and `policy`
+    /// is absent, `load()` migrates to `PermissionPolicy::trusted()` (the
+    /// historical meaning of "locked"). New code should set `policy` and
+    /// treat this field as a derived mirror of `policy.is_locked()`.
     #[serde(default)]
     pub locked: bool,
+    /// Session-level policy governing how out-of-scope actions are handled.
+    #[serde(default)]
+    pub policy: PermissionPolicy,
     /// Ask-rule overrides approved by the user this session.
     #[serde(default)]
     pub allows: HashSet<String>,
     /// Tool call signatures the user denied (auto-blocked on retry).
     #[serde(default)]
     pub denied_sigs: HashSet<String>,
+}
+
+impl SessionPermissions {
+    /// Update the policy and keep the legacy `locked` mirror in sync.
+    pub fn set_policy(&mut self, policy: PermissionPolicy) {
+        self.policy = policy;
+        self.locked = policy.is_locked();
+    }
 }
 
 impl SessionPermissions {
@@ -295,9 +375,18 @@ impl SessionPermissions {
             return Self::default();
         }
         match fs::read_to_string(&file) {
-            Ok(content) => match serde_json::from_str(&content) {
-                Ok(p) => {
+            Ok(content) => match serde_json::from_str::<Self>(&content) {
+                Ok(mut p) => {
                     tracing::trace!("Loaded session permissions from {}", file.display());
+                    // Back-compat: old files have `locked: true` and no
+                    // `policy` — map to the historical meaning (Trusted).
+                    // Old files with `locked: false` stay Interactive (default).
+                    let has_default_policy = p.policy == PermissionPolicy::default();
+                    if p.locked && has_default_policy {
+                        p.policy = PermissionPolicy::trusted();
+                    }
+                    // Keep the mirror in sync going forward.
+                    p.locked = p.policy.is_locked();
                     p
                 }
                 Err(e) => {
@@ -861,16 +950,21 @@ pub fn check_permission(
         // Check if user already overrode this ask rule for the session.
         // Store the rule itself as the key so suppression covers all matching commands.
         if !session_perms.allows.contains(&rule) {
-            if session_perms.locked {
-                return PermissionCheckResult::Blocked(
-                    format!("Ask rule '{}' blocked (locked session)", rule),
-                );
+            match session_perms.policy.on_ask_rule {
+                Decision::Allow => { /* policy skips the rule */ }
+                Decision::Deny => {
+                    return PermissionCheckResult::Blocked(
+                        format!("Ask rule '{}' denied by session policy", rule),
+                    );
+                }
+                Decision::Ask => {
+                    let summary = rule_arg.unwrap_or(tool).to_string();
+                    return PermissionCheckResult::NeedsPrompt(PromptKind::AskRuleOverride {
+                        rule,
+                        tool_summary: format!("{} {}", tool, summary),
+                    });
+                }
             }
-            let summary = rule_arg.unwrap_or(tool).to_string();
-            return PermissionCheckResult::NeedsPrompt(PromptKind::AskRuleOverride {
-                rule,
-                tool_summary: format!("{} {}", tool, summary),
-            });
         }
     }
 
@@ -883,24 +977,70 @@ pub fn check_permission(
         .unwrap_or_else(|| session_cwd.to_path_buf());
     let zone = path_zone(&target_path);
 
-    // 5. System zone + write/edit/admin → per-action only
-    if zone == PathZone::System && action_tier > PermissionMode::Read {
-        if session_perms.locked {
-            return PermissionCheckResult::Blocked(
-                "System zone write blocked (locked session)".to_string(),
-            );
+    // 4b. Explicit grants take precedence over zone-based defaults. If the
+    // session already has a grant covering the target path that satisfies
+    // the required tier (e.g. a skill's `permission: admin on ~/.linggen`),
+    // allow without prompting — the user already approved this grant when
+    // activating the skill.
+    if let Some(mode) = effective_mode_for_path(&session_perms.path_modes, &target_path) {
+        if action_tier <= mode {
+            return PermissionCheckResult::Allowed;
         }
-        let summary = rule_arg.unwrap_or(tool).to_string();
-        return PermissionCheckResult::NeedsPrompt(PromptKind::SystemZoneWrite {
-            tool_summary: format!("{} {}", tool, summary),
-        });
     }
 
-    // 5b. Locked sessions (consumer/mission): tools already passed the
-    // consumer_allowed_tools gate in pre_execute_tool. The room owner
-    // explicitly allowed these tools — skip path-based permission checks.
-    if session_perms.locked {
-        return PermissionCheckResult::Allowed;
+    // 4c. Bash has no meaningful single target path (its file_path is
+    // synthesized from session cwd by the caller, not derived from the
+    // command). If the command string references a granted path
+    // (e.g. `bash ~/.linggen/skills/.../run.sh`), treat that grant as the
+    // effective ceiling. This lets skill-bound sessions run bash against
+    // their approved paths without per-call prompts, while commands that
+    // don't touch granted paths still fall through to the normal
+    // zone/ceiling checks.
+    if tool == "Bash" {
+        if let Some(cmd) = bash_command {
+            let mut best: Option<PermissionMode> = None;
+            for pm in &session_perms.path_modes {
+                let grant_path = if let Some(stripped) = pm.path.strip_prefix("~/") {
+                    dirs::home_dir()
+                        .map(|h| h.join(stripped).to_string_lossy().to_string())
+                        .unwrap_or_else(|| pm.path.clone())
+                } else if pm.path == "~" {
+                    dirs::home_dir()
+                        .map(|h| h.to_string_lossy().to_string())
+                        .unwrap_or_else(|| pm.path.clone())
+                } else {
+                    pm.path.clone()
+                };
+                if cmd.contains(&grant_path) || cmd.contains(&pm.path) {
+                    if best.as_ref().map_or(true, |b| pm.mode > *b) {
+                        best = Some(pm.mode.clone());
+                    }
+                }
+            }
+            if let Some(mode) = best {
+                if action_tier <= mode {
+                    return PermissionCheckResult::Allowed;
+                }
+            }
+        }
+    }
+
+    // 5. System zone + write/edit/admin → per-action only
+    if zone == PathZone::System && action_tier > PermissionMode::Read {
+        match session_perms.policy.on_exceed {
+            Decision::Allow => return PermissionCheckResult::Allowed,
+            Decision::Deny => {
+                return PermissionCheckResult::Blocked(
+                    "System zone write denied by session policy".to_string(),
+                );
+            }
+            Decision::Ask => {
+                let summary = rule_arg.unwrap_or(tool).to_string();
+                return PermissionCheckResult::NeedsPrompt(PromptKind::SystemZoneWrite {
+                    tool_summary: format!("{} {}", tool, summary),
+                });
+            }
+        }
     }
 
     // 6. Find effective mode for target path
@@ -912,21 +1052,33 @@ pub fn check_permission(
             PermissionCheckResult::Allowed
         }
         Some(_) | None => {
-            // Exceeds ceiling or no grant
-            if session_perms.locked {
+            // Exceeds ceiling or no grant — policy decides.
+            if session_perms.policy.on_exceed == Decision::Allow {
+                return PermissionCheckResult::Allowed;
+            }
+            if session_perms.policy.on_exceed == Decision::Deny {
                 return PermissionCheckResult::Blocked(format!(
-                    "Action requires {} mode but session is locked",
+                    "Action requires {} mode but session policy denies out-of-scope actions",
                     action_tier,
                 ));
             }
+            // on_exceed == Ask — fall through to the prompt paths below.
 
-            // For reads outside any granted path, offer path grant
+            // For reads outside any granted path, offer path grant.
+            // Dir-targeting tools (Grep, Glob, Task) already pass a directory
+            // as target_path — granting on its parent would be too broad
+            // (e.g. Grep /Users/lianghuang → granting /Users). Use the target
+            // itself as the grant. File-targeting tools (Read) keep parent()
+            // so granting covers siblings the agent will likely read next.
             if action_tier == PermissionMode::Read && effective_mode.is_none() {
-                let dir = target_path
-                    .parent()
-                    .unwrap_or(&target_path)
-                    .to_string_lossy()
-                    .to_string();
+                let target_is_dir = matches!(tool, "Grep" | "Glob" | "Task")
+                    || target_path.is_dir();
+                let dir_path = if target_is_dir {
+                    target_path.as_path()
+                } else {
+                    target_path.parent().unwrap_or(&target_path)
+                };
+                let dir = dir_path.to_string_lossy().to_string();
                 let summary = rule_arg.unwrap_or(tool).to_string();
                 return PermissionCheckResult::NeedsPrompt(PromptKind::ReadOutsidePath {
                     dir,

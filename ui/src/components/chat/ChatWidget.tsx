@@ -1,10 +1,10 @@
 /**
- * Self-contained chat widget — owns transport, actions, run info, auto-scroll.
- * Renders <ChatPanel> with all props derived from stores + hooks.
+ * Presenter-only chat widget. The enclosing App (MainApp / EmbedApp /
+ * ConsumerApp) owns the WebRTC transport lifecycle; this component only
+ * reads from stores and renders.
  */
 import React, { useCallback, useMemo } from 'react';
 import { ChatPanel } from './ChatPanel';
-import { useTransport } from '../../hooks/useTransport';
 import { useChatActions } from '../../hooks/useChatActions';
 import { useRunInfo } from '../../hooks/useRunInfo';
 import { useAutoScroll } from '../../hooks/useAutoScroll';
@@ -71,15 +71,7 @@ export const ChatWidget: React.FC<ChatWidgetProps> = ({
     editPlan,
   } = useChatActions(scrollToBottom, runningMainRunIds, effectiveRoot);
 
-  // --- Transport (WebRTC) ---
   const effectiveSessionId = sessionId || null;
-  useTransport({
-    sessionId: effectiveSessionId,
-    onParseError: () => {
-      useChatStore.getState().fetchSessionState();
-      useServerStore.getState().fetchAgentRuns();
-    },
-  });
 
   const mainAgentIds = useMemo(() => agents.map((a) => a.name.toLowerCase()), [agents]);
   const agentTree = useMemo(

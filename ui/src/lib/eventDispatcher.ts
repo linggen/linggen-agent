@@ -1,889 +1,106 @@
 /**
- * Per-kind event handler functions — dispatches UiEvent events to stores.
- * Transport-agnostic: works with the WebRTC transport layer.
- * Reads/writes state directly via Zustand stores — no deps object needed.
+ * Event dispatcher — routes `UiEvent`s received over the WebRTC transport
+ * to per-kind handlers that update Zustand stores.
+ *
+ * Layering:
+ *   rtcTransport  →  dispatchEvent  →  eventHandlers/<kind>.ts  →  stores
+ *
+ * This file handles cross-cutting concerns only:
+ *   - session-scope filtering (drop events from non-active sessions)
+ *   - skill-iframe bridge (relay key events to the parent page)
+ * The handler map in `./eventHandlers` does the actual work.
  */
-import type { UiEvent, ContentBlock, SubagentTreeEntry, SubagentToolStep, Plan } from '../types';
+import type { UiEvent } from '../types';
 import { useSessionStore } from '../stores/sessionStore';
-import { useServerStore } from '../stores/serverStore';
 import { useChatStore } from '../stores/chatStore';
-import { useUiStore } from '../stores/uiStore';
-import { useUserStore } from '../stores/userStore';
-import { useInteractionStore } from '../stores/interactionStore';
-import { useRoomChatStore } from '../stores/roomChatStore';
-import type { AgentStatusValue } from '../stores/serverStore';
-import { agentTracker } from './agentTracker';
-import {
-  stripEmbeddedStructuredJson,
-  isStatusLineText,
-  normalizeAgentStatus,
-  shouldHideInternalChatMessage,
-} from './messageUtils';
+import { asEventKind } from './eventKinds';
+import { eventHandlers } from './eventHandlers';
 
-// ---------------------------------------------------------------------------
-// Permission suppress — prevents page_state from overwriting optimistic mode changes
-// ---------------------------------------------------------------------------
-
-let _permissionSuppressedUntil = 0;
-
-/** Call after a user-initiated permission mode change to suppress page_state
- *  overwrites for a short window (3s, enough for the PATCH to propagate). */
-export function suppressPermissionSync(): void {
-  _permissionSuppressedUntil = Date.now() + 3000;
-}
-
-// ---------------------------------------------------------------------------
-// Tool activity text parser
-// ---------------------------------------------------------------------------
-
-const toolPrefixMap: [string, string][] = [
-  ['Reading file: ', 'Read'],
-  ['Read file: ', 'Read'],
-  ['Read failed: ', 'Read'],
-  ['Writing file: ', 'Write'],
-  ['Wrote file: ', 'Write'],
-  ['Write failed: ', 'Write'],
-  ['Editing file: ', 'Edit'],
-  ['Edited file: ', 'Edit'],
-  ['Edit failed: ', 'Edit'],
-  ['Running command: ', 'Bash'],
-  ['Ran command: ', 'Bash'],
-  ['Command failed: ', 'Bash'],
-  ['Searching: ', 'Grep'],
-  ['Searched: ', 'Grep'],
-  ['Search failed: ', 'Grep'],
-  ['Listing files: ', 'Glob'],
-  ['Listed files: ', 'Glob'],
-  ['List files failed: ', 'Glob'],
-  ['Delegating to subagent: ', 'Task'],
-  ['Delegated to subagent: ', 'Task'],
-  ['Delegation failed: ', 'Task'],
-  ['Fetching URL: ', 'WebFetch'],
-  ['Fetched URL: ', 'WebFetch'],
-  ['Fetch failed: ', 'WebFetch'],
-  ['Searching web: ', 'WebSearch'],
-  ['Searched web: ', 'WebSearch'],
-  ['Web search failed: ', 'WebSearch'],
-  ['Calling tool: ', 'Tool'],
-  ['Used tool: ', 'Tool'],
-  ['Tool failed: ', 'Tool'],
-];
-
-/** Build a user-facing status line for a tool start event. */
-function formatToolStartLine(toolName: string, argsStr: string): string {
-  try {
-    const args = JSON.parse(argsStr);
-    switch (toolName) {
-      case 'Read': return `Reading file: ${args.file_path || args.path || argsStr}`;
-      case 'Write': return `Writing file: ${args.file_path || args.path || argsStr}`;
-      case 'Edit': return `Editing file: ${args.file_path || args.path || argsStr}`;
-      case 'Bash': {
-        const cmd = args.command || args.cmd || '';
-        return `Running command: ${cmd.length > 80 ? cmd.slice(0, 77) + '...' : cmd}`;
-      }
-      case 'Grep': return `Searching: ${args.pattern || argsStr}`;
-      case 'Glob': return `Listing files: ${args.pattern || argsStr}`;
-      case 'Task':
-      case 'delegate_to_agent':
-        return `Delegating to subagent: ${args.agent_id || args.agent || argsStr}`;
-      case 'WebFetch': return `Fetching URL: ${args.url || argsStr}`;
-      case 'WebSearch': return `Searching web: ${args.query || argsStr}`;
-      default: return `Calling tool: ${toolName}`;
-    }
-  } catch {
-    return `Calling tool: ${toolName}`;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Resolve a session ID for keying status maps. Prefer the event's session_id,
- *  fall back to the currently active session. */
-function getSessionId(item: UiEvent): string {
-  return item.session_id || useSessionStore.getState().activeSessionId || '';
-}
-
-// ---------------------------------------------------------------------------
-// Main dispatcher
-// ---------------------------------------------------------------------------
+export { suppressPermissionSync } from './eventHandlers/_shared';
+export { handleAskUser } from './eventHandlers';
 
 export function dispatchEvent(item: UiEvent, sessionIdOverride?: string): void {
+  if (!passesSessionFilter(item, sessionIdOverride)) return;
+  relayToSkillIframe(item);
+
+  const kind = asEventKind(item.kind);
+  if (!kind) {
+    // Unknown kind — server is emitting a wire type this build doesn't know.
+    // Log once (not per-event) so version skew is visible without spamming.
+    warnUnknownKind(item.kind);
+    return;
+  }
+  eventHandlers[kind](item);
+}
+
+// ---------------------------------------------------------------------------
+// Session-scope filtering
+// ---------------------------------------------------------------------------
+
+/** Events with `session_id === 'global'` are broadcast. Other session-scoped
+ *  events are dropped unless they match the caller's active session.
+ *
+ *  `notification` is always allowed through regardless of session (toasts are
+ *  global). Everything else is gated on session ownership. */
+function passesSessionFilter(item: UiEvent, sessionIdOverride?: string): boolean {
+  if (item.kind === 'notification') return true;
+  if (!item.session_id || item.session_id === 'global') return true;
   const effectiveSessionId = sessionIdOverride ?? useSessionStore.getState().activeSessionId;
-  // Allow notifications and agent_status through regardless — they are global events.
-  // agent_status must pass through so the session list can show spinners for busy sessions.
-  // ask_user and widget_resolved are session-scoped — they should only show in their own session.
-  if (item.kind !== 'notification' && item.kind !== 'agent_status' && item.session_id && item.session_id !== 'global') {
-    // Drop events from other sessions when we have an active session.
-    if (effectiveSessionId && item.session_id !== effectiveSessionId) return;
-    // Drop session-scoped events when no session is active — they belong to
-    // skill apps or other scoped sessions, not the main view.
-    if (!effectiveSessionId) return;
+  if (effectiveSessionId) return item.session_id === effectiveSessionId;
+  // Session-scoped event, no active session — belongs to a skill app / scoped session.
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Skill-iframe bridge — forward key events to parent page when embedded
+// ---------------------------------------------------------------------------
+
+function relayToSkillIframe(item: UiEvent): void {
+  if (window.parent === window) return;
+
+  if (item.kind === 'token' && item.text) {
+    window.parent.postMessage({
+      type: 'linggen-skill-event',
+      event: 'stream_token',
+      payload: { text: item.text, done: item.phase === 'done' },
+    }, '*');
+    return;
   }
 
-  // Skill app bridge: forward key events to parent when embedded as iframe
-  if (window.parent !== window) {
-    if (item.kind === 'token' && item.text) {
-      window.parent.postMessage({ type: 'linggen-skill-event', event: 'stream_token', payload: { text: item.text, done: item.phase === 'done' } }, '*');
-    } else if (item.kind === 'turn_complete') {
-      const msgs = useChatStore.getState().messages;
-      const lastMsg = [...msgs].reverse().find(m => m.role === 'assistant' || (m as any).role === 'agent');
-      window.parent.postMessage({ type: 'linggen-skill-event', event: 'stream_end', payload: { text: lastMsg?.text || '' } }, '*');
-    } else if (item.kind === 'content_block') {
-      // Forward tool activity so skill apps can show real-time progress.
-      window.parent.postMessage({ type: 'linggen-skill-event', event: 'content_block', payload: {
-        phase: item.phase,           // 'start' | 'update' | 'done' | 'error'
-        tool: item.data?.tool,       // e.g. 'Bash', 'Read', 'Glob'
-        args: item.data?.args,       // tool arguments (may contain command text)
+  if (item.kind === 'turn_complete') {
+    const msgs = useChatStore.getState().messages;
+    const lastMsg = [...msgs].reverse().find((m) => m.role === 'assistant' || (m as any).role === 'agent');
+    window.parent.postMessage({
+      type: 'linggen-skill-event',
+      event: 'stream_end',
+      payload: { text: lastMsg?.text || '' },
+    }, '*');
+    return;
+  }
+
+  if (item.kind === 'content_block') {
+    window.parent.postMessage({
+      type: 'linggen-skill-event',
+      event: 'content_block',
+      payload: {
+        phase: item.phase,
+        tool: item.data?.tool,
+        args: item.data?.args,
         blockId: item.data?.block_id,
-        output: item.data?.output,   // tool output (on 'done'/'update')
-      } }, '*');
-    }
-  }
-
-  switch (item.kind) {
-    case 'run':          handleRun(item); return;
-    case 'queue':        handleQueue(item); return;
-    case 'ask_user':     handleAskUser(item); return;
-    case 'text_segment': handleTextSegment(item); return;
-    case 'activity':     handleActivity(item); return;
-    case 'token':        handleToken(item); return;
-    case 'message':      handleMessage(item); return;
-    case 'model_fallback': handleModelFallback(item); return;
-    case 'content_block':  handleContentBlock(item); return;
-    case 'turn_complete':   handleTurnComplete(item); return;
-    case 'tool_progress': handleToolProgress(item); return;
-    case 'app_launched':   handleAppLaunched(item); return;
-    case 'notification':   handleNotification(item); return;
-    case 'working_folder': handleWorkingFolder(item); return;
-    case 'widget_resolved': handleWidgetResolved(item); return;
-    case 'page_state':   handlePageState(item); return;
-    case 'user_info':    handleUserInfo(item); return;
-    case 'room_chat':    handleRoomChat(item); return;
+        output: item.data?.output,
+      },
+    }, '*');
   }
 }
 
 // ---------------------------------------------------------------------------
-// Per-kind handlers
+// Unknown-kind logging — logged once per distinct kind to surface version skew.
 // ---------------------------------------------------------------------------
 
-function handleRun(item: UiEvent): void {
-  const agentStore = useServerStore.getState();
-  const chatStore = useChatStore.getState();
-
-  // sync/resync phases are now handled by server-pushed page_state — no HTTP fetches needed.
-  // outcome still needs workspace state fetch (persisted chat messages changed).
-  if (item.phase === 'sync' || item.phase === 'resync') {
-    return;
-  }
-  if (item.phase === 'outcome') {
-    // Skip session state fetch for consumer mode — messages arrive via streaming
-    // events, and the HTTP fetch goes through the WebRTC tunnel which blocks
-    // /api/workspace/state for browser consumers.
-    chatStore.fetchSessionState();
-    useServerStore.setState({ tokensPerSec: 0 });
-    return;
-  }
-
-  if (item.phase === 'context_usage' && item.data) {
-    const agentIdKey =
-      typeof item.data.agent_id === 'string'
-        ? item.data.agent_id.toLowerCase()
-        : (item.agent_id || '').toLowerCase();
-    if (!agentIdKey) return;
-    const sid = getSessionId(item);
-
-    const estTokens = Number(item.data.estimated_tokens || 0);
-    if (sid) agentTracker.latestContextTokens[sid] = estTokens;
-
-    // Accumulate session token usage from actual_prompt/completion_tokens
-    const promptDelta = Number(item.data.actual_prompt_tokens || 0);
-    const completionDelta = Number(item.data.actual_completion_tokens || 0);
-    if (promptDelta > 0 || completionDelta > 0) {
-      const prev = useServerStore.getState().sessionTokens;
-      useServerStore.setState({
-        sessionTokens: {
-          prompt: prev.prompt + promptDelta,
-          completion: prev.completion + completionDelta,
-        },
-      });
-    }
-
-    const parentId = agentTracker.getParent(agentIdKey);
-    if (parentId) {
-      agentTracker.setSubagentContextTokens(agentIdKey, estTokens);
-      chatStore.updateSubagentTree(parentId, agentIdKey,
-        (entry) => ({ ...entry, contextTokens: estTokens }));
-    } else if (sid) {
-      agentStore.setAgentContext((prev) => ({
-        ...prev,
-        [sid]: {
-          tokens: estTokens,
-          messages: Number(item.data.message_count || 0),
-          tokenLimit:
-            typeof item.data.token_limit === 'number'
-              ? Number(item.data.token_limit)
-              : prev[sid]?.tokenLimit,
-        },
-      }));
-    }
-    return;
-  }
-
-  if (item.phase === 'plan_update' && item.data?.plan) {
-    const plan = item.data.plan as Plan;
-    const rawId = String(item.agent_id || '');
-    const match = rawId.match(/^run-(.+?)-\d+/);
-    const agentId = match ? match[1] : rawId;
-    const interaction = useInteractionStore.getState();
-    interaction.setActivePlan(plan);
-    if (plan.status === 'planned') {
-      interaction.setPendingPlan(plan);
-      interaction.setPendingPlanAgentId(agentId);
-    } else {
-      // approved, executing, completed, rejected — no longer waiting for user decision
-      interaction.setPendingPlan(null);
-      interaction.setPendingPlanAgentId(null);
-    }
-    const planText = JSON.stringify({ type: 'plan', plan });
-    chatStore.upsertPlan(agentId, planText);
-    return;
-  }
-
-  if (item.phase === 'subagent_spawned' && item.data) {
-    const parentId = String(item.agent_id || '').toLowerCase();
-    const subagentId = String(item.data.subagent_id || '');
-    const task = String(item.data.task || '');
-    if (subagentId && parentId) {
-      agentTracker.registerSubagent(subagentId, parentId);
-      const newEntry: SubagentTreeEntry = {
-        subagentId,
-        agentName: subagentId,
-        task,
-        status: 'running',
-        toolCount: 0,
-        contextTokens: 0,
-        currentActivity: null,
-        toolSteps: [],
-      };
-      chatStore.addSubagentToTree(parentId, newEntry);
-    }
-    return;
-  }
-
-  if (item.phase === 'subagent_result' && item.data) {
-    const parentId = String(item.agent_id || '').toLowerCase();
-    const subagentId = String(item.data.subagent_id || '');
-    if (subagentId && parentId) {
-      chatStore.updateSubagentTree(parentId, subagentId,
-        (entry) => ({ ...entry, status: 'done', currentActivity: null }));
-      agentTracker.unregisterSubagent(subagentId);
-    }
-    return;
-  }
-}
-
-function handleQueue(item: UiEvent): void {
-  const { activeSessionId } = useSessionStore.getState();
-  const session = activeSessionId || 'default';
-  if (item.session_id === session) {
-    const items = Array.isArray(item.data?.items) ? item.data.items : [];
-    useInteractionStore.getState().setQueuedMessages(items);
-  }
-}
-
-function handleAskUser(item: UiEvent): void {
-  const { question_id, questions } = item.data || {};
-  if (question_id && questions) {
-    useInteractionStore.getState().setPendingAskUser({
-      questionId: question_id,
-      agentId: String(item.agent_id || ''),
-      questions,
-    });
-  }
-}
-
-// Re-export for use by SDK and other consumers
-export { handleAskUser };
-
-function handleTextSegment(item: UiEvent): void {
-  const agentId = String(item.agent_id || '');
-  if (!agentId) return;
-  if (agentTracker.getParent(agentId)) return;
-  const segText = String(item.text || '').trim();
-  if (!segText) return;
-  useChatStore.getState().addTextSegment(agentId, segText);
-}
-
-function handleActivity(item: UiEvent): void {
-  const agentId = String(item.agent_id || '');
-  if (!agentId) return;
-  const statusRaw = String(item.data?.status || '').trim();
-  const nextStatus = normalizeAgentStatus(statusRaw) as AgentStatusValue;
-  const statusText = String(item.text || '').trim();
-
-  const agentStore = useServerStore.getState();
-  const chatStore = useChatStore.getState();
-
-  // Route subagent activity to parent tree
-  const parentIdFromData = item.data?.parent_id ? String(item.data.parent_id) : null;
-  const parentIdForSubagent =
-    agentTracker.getParent(agentId) ||
-    (parentIdFromData ? parentIdFromData.toLowerCase() : null);
-
-  if (parentIdForSubagent && statusRaw !== 'mission_triggered') {
-    if (nextStatus === 'calling_tool') {
-      if (item.phase !== 'done') {
-        const toolCount = agentTracker.incrementToolCount(agentId);
-        const newStep: SubagentToolStep | null = statusText
-          ? (() => {
-              for (const [prefix, toolName] of toolPrefixMap) {
-                if (statusText.startsWith(prefix)) {
-                  return { toolName, args: statusText.slice(prefix.length), status: 'running' as const };
-                }
-              }
-              return null;
-            })()
-          : null;
-        chatStore.updateSubagentTree(parentIdForSubagent, agentId,
-          (entry) => ({
-            ...entry,
-            toolCount: toolCount || entry.toolCount + 1,
-            currentActivity: statusText || entry.currentActivity,
-            toolSteps: newStep ? [...(entry.toolSteps || []), newStep] : (entry.toolSteps || []),
-          }));
-      } else {
-        const isFailed = statusText.toLowerCase().includes('failed');
-        chatStore.updateSubagentTree(parentIdForSubagent, agentId,
-          (entry) => {
-            const steps = [...(entry.toolSteps || [])];
-            if (steps.length > 0) {
-              steps[steps.length - 1] = { ...steps[steps.length - 1], status: isFailed ? 'failed' : 'done' };
-            }
-            return { ...entry, toolSteps: steps };
-          });
-      }
-    } else if (nextStatus === 'thinking' || nextStatus === 'model_loading') {
-      chatStore.updateSubagentTree(parentIdForSubagent, agentId,
-        (entry) => ({
-          ...entry,
-          currentActivity: statusText || (nextStatus === 'thinking' ? 'Thinking...' : 'Model loading...'),
-        }));
-    } else if (nextStatus === 'idle') {
-      chatStore.updateSubagentTree(parentIdForSubagent, agentId,
-        (entry) => ({ ...entry, currentActivity: null }));
-    }
-    return;
-  }
-
-  const sid = getSessionId(item);
-  if (statusRaw && sid) {
-    if (item.phase !== 'done' || nextStatus === 'idle') {
-      agentStore.setAgentStatus((prev) => ({ ...prev, [sid]: nextStatus }));
-      agentStore.setAgentStatusText((prev) => ({
-        ...prev,
-        [sid]:
-          nextStatus === 'idle'
-            ? 'Idle'
-            : statusText.length > 0
-              ? statusText
-              : nextStatus === 'calling_tool'
-                ? 'Calling Tool'
-                : nextStatus === 'model_loading'
-                  ? 'Model Loading'
-                  : nextStatus === 'thinking'
-                    ? 'Thinking'
-                    : nextStatus === 'working'
-                      ? 'Working'
-                      : 'Idle',
-      }));
-    }
-  }
-
-  if (sid) agentTracker.ensureRunStarted(sid);
-
-  if (statusText.length > 0 && item.phase !== 'done') {
-    if (nextStatus === 'model_loading' || nextStatus === 'thinking') {
-      chatStore.setPlaceholder(agentId, statusText);
-    } else {
-      chatStore.appendActivityWithSegments(agentId, statusText);
-    }
-  } else if ((nextStatus === 'model_loading' || nextStatus === 'thinking') && item.phase !== 'done') {
-    const placeholder = nextStatus === 'model_loading' ? 'Model loading...' : 'Thinking...';
-    chatStore.setPlaceholder(agentId, placeholder);
-  }
-
-  if (nextStatus === 'idle' || item.phase === 'failed') {
-    const { elapsed, contextTokens: ctxTokens } = sid ? agentTracker.clearRun(sid) : {};
-    chatStore.finalizeOnIdle(agentId, elapsed, ctxTokens);
-    useInteractionStore.getState().setActivePlan(null);
-  }
-}
-
-// Token batching: accumulate tokens and flush to React state on rAF
-// to avoid "Maximum update depth exceeded" when tokens arrive very fast.
-const _tokenBuffer: Map<string, { text: string; isThinking: boolean }> = new Map();
-let _tokenFlushScheduled = false;
-
-function flushTokenBuffer() {
-  _tokenFlushScheduled = false;
-  if (_tokenBuffer.size === 0) return;
-  const chatStore = useChatStore.getState();
-  for (const [agentId, { text, isThinking }] of _tokenBuffer) {
-    if (text) chatStore.appendToken(agentId, text, isThinking);
-  }
-  _tokenBuffer.clear();
-  useServerStore.getState().recomputeTokenRate();
-}
-
-function handleToken(item: UiEvent): void {
-  const agentId = String(item.agent_id || '');
-  const isThinking = item.data?.thinking === true;
-  if (!agentId) return;
-
-  if (agentTracker.getParent(agentId)) return;
-
-  if (item.phase === 'done') {
-    // Flush any pending tokens before marking thinking done
-    if (_tokenBuffer.size > 0) flushTokenBuffer();
-    if (isThinking) {
-      useChatStore.getState().setThinkingFlag(agentId);
-    }
-    return;
-  }
-
-  const tokenText = String(item.text || '');
-  if (!isThinking && tokenText) {
-    useServerStore.getState().recordTokenEvent();
-  }
-  const existing = _tokenBuffer.get(agentId);
-  if (existing && existing.isThinking === isThinking) {
-    existing.text += tokenText;
-  } else {
-    // Flush if thinking state changed for this agent
-    if (existing) flushTokenBuffer();
-    _tokenBuffer.set(agentId, { text: tokenText, isThinking });
-  }
-
-  if (!_tokenFlushScheduled) {
-    _tokenFlushScheduled = true;
-    requestAnimationFrame(flushTokenBuffer);
-  }
-}
-
-function handleMessage(item: UiEvent): void {
-  const from = String(item.data?.from || item.agent_id || 'assistant');
-  const to = String(item.data?.to || '');
-  let content = String(item.text || '');
-  if (!content) return;
-  if (shouldHideInternalChatMessage(from, content)) return;
-
-  if (agentTracker.getParent(from)) return;
-
-  try {
-    const parsed = JSON.parse(content);
-    if (parsed?.type === 'plan' && parsed?.plan) return;
-  } catch (_e) { /* not JSON */ }
-
-  if (from !== 'user') {
-    content = stripEmbeddedStructuredJson(content);
-    if (!content) return;
-  }
-
-  const chatStore = useChatStore.getState();
-  if (from !== 'user' && isStatusLineText(content)) {
-    chatStore.appendActivity(from, content);
-    return;
-  }
-
-  const tsMs = Number(item.ts_ms || Date.now());
-  const sid = getSessionId(item);
-  const { elapsed: msgElapsed, contextTokens: msgCtxTokens } = sid ? agentTracker.clearRun(sid) : {};
-
-  const isError = from !== 'user' && content.startsWith('Error:');
-
-  chatStore.finalizeMessage(from, content, to, tsMs, msgElapsed, msgCtxTokens, isError || undefined);
-}
-
-function handleContentBlock(item: UiEvent): void {
-  const agentId = String(item.agent_id || '');
-  if (!agentId) return;
-  const data = item.data || {};
-
-  const chatStore = useChatStore.getState();
-
-  // Route subagent content blocks to parent tree
-  const parentId = agentTracker.getParent(agentId);
-  if (parentId) {
-    if (item.phase === 'start' && data.block_type === 'tool_use') {
-      const toolCount = agentTracker.incrementToolCount(agentId);
-      const newStep: SubagentToolStep = {
-        toolName: data.tool || 'Tool',
-        args: data.args || '',
-        status: 'running',
-      };
-      chatStore.updateSubagentTree(parentId, agentId,
-        (entry) => ({
-          ...entry,
-          toolCount: toolCount || entry.toolCount + 1,
-          currentActivity: `${data.tool || 'Tool'}: ${data.args || ''}`,
-          toolSteps: [...(entry.toolSteps || []), newStep],
-        }));
-    } else if (item.phase === 'update') {
-      const isFailed = data.status === 'failed';
-      chatStore.updateSubagentTree(parentId, agentId,
-        (entry) => {
-          const steps = [...(entry.toolSteps || [])];
-          if (steps.length > 0) {
-            steps[steps.length - 1] = { ...steps[steps.length - 1], status: isFailed ? 'failed' : 'done' };
-          }
-          return { ...entry, toolSteps: steps, currentActivity: data.summary || entry.currentActivity };
-        });
-    }
-    return;
-  }
-
-  if (item.phase === 'start') {
-    const blockType = String(data.block_type || 'text');
-    const block: ContentBlock = {
-      type: blockType as ContentBlock['type'],
-      id: String(data.block_id || ''),
-      tool: data.tool || undefined,
-      args: data.args || undefined,
-      status: blockType === 'tool_use' ? 'running' : undefined,
-      text: blockType === 'text' ? (data.args || '') : undefined,
-    };
-    chatStore.contentBlockStart(agentId, block);
-
-    if (blockType === 'tool_use') {
-      const toolName = data.tool || 'Tool';
-      const toolArgs = data.args || '';
-      const activityLine = formatToolStartLine(toolName, toolArgs);
-      chatStore.appendActivity(agentId, activityLine);
-
-      const sid = getSessionId(item);
-      if (sid) {
-        const agentStore = useServerStore.getState();
-        agentStore.setAgentStatus((prev) => ({ ...prev, [sid]: 'calling_tool' as AgentStatusValue }));
-        agentStore.setAgentStatusText((prev) => ({ ...prev, [sid]: activityLine }));
-        agentTracker.ensureRunStarted(sid);
-      }
-    }
-  } else if (item.phase === 'update') {
-    const diffData = data.diff_type
-      ? {
-          diff_type: data.diff_type as 'edit' | 'write',
-          path: data.path || '',
-          old_string: data.old_string,
-          new_string: data.new_string,
-          new_content: data.new_content,
-          start_line: typeof data.start_line === 'number' ? data.start_line : undefined,
-          lines_written: typeof data.lines_written === 'number' ? data.lines_written : undefined,
-        }
-      : undefined;
-    chatStore.contentBlockUpdate(
-      agentId,
-      String(data.block_id || ''),
-      (data.status as 'running' | 'done' | 'failed' | undefined) || undefined,
-      data.summary || undefined,
-      data.is_error ?? undefined,
-      diffData,
-      Array.isArray(data.bash_output) ? data.bash_output as string[] : undefined,
-    );
-
-    if (data.summary) {
-      chatStore.appendActivity(agentId, data.summary);
-    }
-  }
-}
-
-function handleTurnComplete(item: UiEvent): void {
-  const agentId = String(item.agent_id || '');
-  if (!agentId) return;
-
-  if (agentTracker.getParent(agentId)) return;
-
-  const data = item.data || {};
-  const durationMs = typeof data.duration_ms === 'number' ? data.duration_ms : undefined;
-  const contextTokens = typeof data.context_tokens === 'number' ? data.context_tokens : undefined;
-
-  const sid = getSessionId(item);
-  const cleared = sid ? agentTracker.clearRun(sid) : {};
-  const elapsed = durationMs || cleared.elapsed;
-  const ctxTokens = contextTokens || cleared.contextTokens;
-
-  useChatStore.getState().turnComplete(agentId, elapsed, ctxTokens);
-  useInteractionStore.getState().setPendingAskUser(null);
-
-  // Ensure status transitions to idle — the subsequent AgentStatus(idle)
-  // event may arrive late or be missed, leaving the spinner stuck on "Thinking…".
-  if (sid) {
-    const agentStore = useServerStore.getState();
-    agentStore.setAgentStatus((prev) => ({ ...prev, [sid]: 'idle' }));
-    agentStore.setAgentStatusText((prev) => ({ ...prev, [sid]: 'Idle' }));
-  }
-}
-
-function handleToolProgress(item: UiEvent): void {
-  const agentId = String(item.agent_id || '');
-  if (!agentId) return;
-  if (agentTracker.getParent(agentId)) return;
-  const data = item.data || {};
-  const line = String(data.line || item.text || '');
-  if (!line) return;
-  useChatStore.getState().toolProgress(agentId, line);
-}
-
-function handleAppLaunched(item: UiEvent): void {
-  const data = item.data || {};
-  const url = data.url || '';
-  if (!url) return;
-  const isRemote = !!document.querySelector('meta[name="linggen-instance"]');
-  if (isRemote) {
-    const instanceId = document.querySelector('meta[name="linggen-instance"]')?.getAttribute('content') || '';
-    const relayOrigin = document.querySelector('meta[name="linggen-relay-origin"]')?.getAttribute('content') || '';
-    window.open(`${relayOrigin}/app/connect/${instanceId}?app=${encodeURIComponent(url)}`, '_blank');
-  } else {
-    window.open(url, '_blank');
-  }
-}
-
-function handleModelFallback(item: UiEvent): void {
-  const agentId = String(item.agent_id || '');
-  const text = String(item.text || 'Model switched');
-  useChatStore.getState().addMessage({
-    role: 'agent' as const,
-    from: 'system',
-    to: '',
-    text: `\u26A0\uFE0F ${text}`,
-    timestamp: new Date().toLocaleTimeString(),
-    timestampMs: Date.now(),
-    isGenerating: false,
-  });
-  const sid = getSessionId(item);
-  if (sid) {
-    useServerStore.getState().setAgentStatusText((prev) => ({
-      ...prev,
-      [sid]: `Fallback: ${item.data?.actual_model || 'alternate model'}`,
-    }));
-  }
-}
-
-function handleNotification(item: UiEvent): void {
-  const data = item.data;
-  if (!data) return;
-
-  switch (data.kind as string) {
-    case 'mission_completed': {
-      const name = String(data.mission_name || data.mission_id || 'Mission');
-      const status = String(data.status || 'completed');
-      const variant = status === 'completed' ? 'success' as const : 'error' as const;
-      const label = status === 'completed' ? 'completed' : 'failed';
-      useUiStore.getState().addToast({ message: `Mission "${name}" ${label}`, variant });
-      useUiStore.getState().bumpMissionRefreshKey();
-      return;
-    }
-    case 'session_created': {
-      // page_state push will deliver the updated session list within 2s.
-      // No HTTP fetch needed.
-      return;
-    }
-    default:
-      return;
-  }
-}
-
-function handleWorkingFolder(item: UiEvent): void {
-  const data = item.data;
-  if (!data || !item.session_id) return;
-  // Update the session's metadata in the store
-  const store = useSessionStore.getState();
-  const sessions = store.allSessions.map((s) => {
-    if (s.id === item.session_id) {
-      return {
-        ...s,
-        cwd: data.cwd as string,
-        project: data.project as string | undefined,
-        project_name: data.project_name as string | undefined,
-      };
-    }
-    return s;
-  });
-  useSessionStore.setState({ allSessions: sessions });
-
-  // If this is the active session, update the global project root so
-  // API calls, file tree, and sidebar reflect the new working folder.
-  if (item.session_id === store.activeSessionId) {
-    const newRoot = (data.project as string) || (data.cwd as string);
-    if (newRoot && newRoot !== store.selectedProjectRoot) {
-      store.setSelectedProjectRoot(newRoot);
-    }
-  }
-}
-
-function handleWidgetResolved(item: UiEvent): void {
-  const widgetId = item.data?.widget_id as string | undefined;
-  if (!widgetId) return;
-  const interaction = useInteractionStore.getState();
-  // Dismiss AskUser permission widget
-  if (interaction.pendingAskUser?.questionId === widgetId) {
-    interaction.setPendingAskUser(null);
-  }
-  // Dismiss plan widget (defensive — plan normally syncs via PlanUpdate)
-  if (interaction.pendingPlanAgentId === widgetId) {
-    interaction.setPendingPlan(null);
-    interaction.setPendingPlanAgentId(null);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Server-pushed page state — replaces individual HTTP polling
-// ---------------------------------------------------------------------------
-
-function handlePageState(item: UiEvent): void {
-  const ps = item.data;
-  if (!ps) return;
-
-  // -- Permission from page_state --
-  // Note: userType is set once by user_info at connection time, not by page_state.
-  if (ps.permission) {
-    const userStore = useUserStore.getState();
-    // For owners, don't let page_state overwrite room_name — it's fetched via HTTP
-    // from linggen.dev and page_state doesn't have it (owner's UserContext.room_name is null).
-    const roomName = userStore.userType === 'owner' ? userStore.userRoomName : (ps.room_name ?? null);
-    if (userStore.userPermission !== ps.permission || userStore.userRoomName !== roomName) {
-      userStore.setUserInfo(ps.permission, roomName, userStore.userTokenBudget);
-      useUiStore.getState().setCurrentPage(userStore.userType === 'consumer' ? 'consumer' : 'main');
-    }
-  }
-  // Room enabled status (owner only — pushed from room_config.toml)
-  if (ps.room_enabled !== undefined && ps.room_enabled !== null) {
-    useUserStore.getState().setRoomEnabled(ps.room_enabled);
-  }
-
-  // -- Global fields --
-  if (ps.all_sessions) {
-    useSessionStore.setState({ allSessions: ps.all_sessions });
-    // Auto-select session if none is active (e.g. on init/restart):
-    // 1. Try to restore from localStorage (last used session)
-    // 2. Fall back to first session in the list
-    const store = useSessionStore.getState();
-    if (!store.activeSessionId && ps.all_sessions.length > 0) {
-      const saved = window.localStorage.getItem('linggen:active-session');
-      const match = saved && ps.all_sessions.find((s: any) => s.id === saved);
-      store.setActiveSessionId(match ? saved! : ps.all_sessions[0].id);
-    }
-  }
-  if (ps.models) useServerStore.setState({ models: ps.models });
-  if (ps.default_models) useServerStore.setState({ defaultModels: ps.default_models });
-  if (ps.skills) useServerStore.setState({ skills: ps.skills });
-  if (ps.missions) useUiStore.getState().bumpMissionRefreshKey();
-  if (ps.pending_ask_user !== undefined) {
-    // Restore pending ask-user from server state — only for the active session.
-    // Without session filtering, prompts from other sessions leak into skill iframes.
-    const activeSessionId = useSessionStore.getState().activeSessionId;
-    const items = (Array.isArray(ps.pending_ask_user) ? ps.pending_ask_user : [])
-      .filter((item: any) => !item.session_id || item.session_id === activeSessionId);
-    const interaction = useInteractionStore.getState();
-    if (items.length > 0 && !interaction.pendingAskUser) {
-      const first = items[0];
-      interaction.setPendingAskUser({
-        questionId: first.question_id,
-        agentId: first.agent_id || '',
-        questions: first.questions || [],
-      });
-    }
-  }
-
-  // Busy sessions — merge into agentStatus so session list shows spinners.
-  // Only set status for sessions not already tracked (real-time activity events
-  // are authoritative for the active session).
-  if (ps.busy_sessions) {
-    const agentStore = useServerStore.getState();
-    agentStore.setAgentStatus((prev) => {
-      const next = { ...prev };
-      // Clear sessions that are no longer busy
-      for (const sid of Object.keys(next)) {
-        if (!(sid in ps.busy_sessions) && next[sid] !== 'idle') {
-          next[sid] = 'idle';
-        }
-      }
-      // Add/update busy sessions
-      for (const [sid, status] of Object.entries(ps.busy_sessions)) {
-        if (!next[sid] || next[sid] === 'idle') {
-          next[sid] = status as any;
-        }
-      }
-      return next;
-    });
-  }
-
-  // -- Scoped fields --
-  if (ps.agents) useServerStore.setState({ agents: ps.agents });
-  if (ps.agent_runs) {
-    // Skip update if runs haven't changed (prevents re-render loops)
-    const prev = useServerStore.getState().agentRuns;
-    const data = Array.isArray(ps.agent_runs) ? ps.agent_runs : [];
-    if (data.length !== prev.length || !data.every((r: any, i: number) => r.run_id === prev[i]?.run_id && r.status === prev[i]?.status)) {
-      useServerStore.setState({ agentRuns: data });
-    }
-  }
-  if (ps.sessions) useSessionStore.setState({ sessions: ps.sessions });
-  if (ps.session_permission) {
-    const perm = ps.session_permission;
-    const uiStore = useUiStore.getState();
-    // Only update mode if user hasn't made a local change recently
-    // (prevents page_state from overwriting optimistic UI updates)
-    if (perm.effective_mode) {
-      uiStore.setSessionMode(perm.effective_mode);
-    }
-    if (perm.zone) uiStore.setSessionZone(perm.zone);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// User info — sent on control channel open for ALL peers
-// ---------------------------------------------------------------------------
-
-function handleUserInfo(item: UiEvent): void {
-  const data = item.data;
-  if (!data) return;
-
-  const userStore = useUserStore.getState();
-
-  // Structured format: { user: { user_id, user_type, permission? }, room?: { room_name, ... } }
-  const user = data.user || data;
-  const room = data.room;
-
-  const userType = user.user_type || 'owner';
-  if (user.user_id) userStore.setUserId(user.user_id);
-  userStore.setUserProfile(user.user_name || null, user.avatar_url || null);
-  userStore.setUserType(userType as 'owner' | 'consumer');
-
-  const perm = userType === 'consumer' ? (room?.permission || 'read') : 'admin';
-  const roomName = room?.room_name ?? null;
-  const tokenBudget = room?.token_budget_daily ?? null;
-  userStore.setUserInfo(perm, roomName, tokenBudget);
-
-  useUiStore.getState().setCurrentPage(userType === 'consumer' ? 'consumer' : 'main');
-}
-
-// ---------------------------------------------------------------------------
-// Room chat — relayed between all peers in a proxy room
-// ---------------------------------------------------------------------------
-
-function handleRoomChat(item: UiEvent): void {
-  const data = item.data;
-  if (!data?.text) return;
-  const senderId = data.sender_id || '';
-  const localUserId = useUserStore.getState().userId || '';
-  useRoomChatStore.getState().addMessage({
-    senderId,
-    senderName: data.sender_name || 'Unknown',
-    avatarUrl: data.avatar_url || null,
-    text: data.text,
-    timestamp: item.ts_ms || Date.now(),
-    isMine: senderId !== '' && senderId === localUserId,
-  });
+const _warnedUnknownKinds = new Set<string>();
+function warnUnknownKind(kind: unknown): void {
+  const key = String(kind);
+  if (_warnedUnknownKinds.has(key)) return;
+  _warnedUnknownKinds.add(key);
+  console.warn(`[eventDispatcher] Unknown event kind "${key}" — check EVENT_KINDS in eventKinds.ts`);
 }

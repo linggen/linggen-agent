@@ -30,7 +30,8 @@ pub(crate) struct CreateMissionRequest {
     #[serde(default)]
     name: Option<String>,
     schedule: String,
-    prompt: String,
+    #[serde(default)]
+    prompt: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -38,6 +39,15 @@ pub(crate) struct CreateMissionRequest {
     /// Permission tier: "readonly", "standard", "full".
     #[serde(default)]
     permission_tier: Option<String>,
+    /// Mission mode: "agent" (default), "app", or "script".
+    #[serde(default)]
+    mode: Option<String>,
+    /// Entry URL (app) or command (script). Required when mode != "agent".
+    #[serde(default)]
+    entry: Option<String>,
+    /// Autonomy policy: "trusted" (default), "strict", or "interactive".
+    #[serde(default)]
+    policy: Option<String>,
 }
 
 /// POST /api/missions
@@ -57,15 +67,27 @@ pub(crate) async fn create_mission(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
+    let mode = req.mode.as_deref().unwrap_or("agent");
+    let prompt = req.prompt.unwrap_or_default();
+    if mode == "agent" && prompt.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "Agent-mode missions require a prompt".to_string()).into_response();
+    }
+    if mode != "agent" && req.entry.as_deref().unwrap_or("").trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, format!("{mode}-mode missions require an entry URL")).into_response();
+    }
+
     let project = req.project;
 
     match state.manager.missions.create_mission(
         req.name,
         &req.schedule,
-        &req.prompt,
+        &prompt,
         req.model,
         project,
         req.permission_tier,
+        Some(mode.to_string()),
+        req.entry,
+        req.policy,
     ) {
         Ok(mission) => {
             let _ = state.events_tx.send(ServerEvent::StateUpdated);
@@ -96,6 +118,15 @@ pub(crate) struct UpdateMissionRequest {
     /// Permission tier: "readonly", "standard", "full".
     #[serde(default)]
     permission_tier: Option<String>,
+    /// Mission mode: "agent", "app", or "script".
+    #[serde(default)]
+    mode: Option<String>,
+    /// Entry URL (app) or command (script).
+    #[serde(default)]
+    entry: Option<Option<String>>,
+    /// Autonomy policy: "trusted", "strict", or "interactive".
+    #[serde(default)]
+    policy: Option<String>,
 }
 
 /// PUT /api/missions/:id
@@ -119,6 +150,9 @@ pub(crate) async fn update_mission(
         req.project,
         req.enabled,
         req.permission_tier,
+        req.mode,
+        req.entry,
+        req.policy,
     ) {
         Ok(mission) => {
             let _ = state.events_tx.send(ServerEvent::StateUpdated);

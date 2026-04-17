@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { ArrowLeft, Target, Plus, Play, Trash2, Clock, Edit3, Check, X, Eye, ChevronDown, ChevronRight, Pause } from 'lucide-react';
+import { ArrowLeft, Target, Plus, Play, Trash2, Clock, Check, X, Eye, ChevronDown, ChevronRight, Pause } from 'lucide-react';
 import { cn } from '../lib/cn';
 import type { AgentInfo, CronMission, MissionRunEntry } from '../types';
 import { ChatWidget } from './chat/ChatWidget';
@@ -66,11 +66,33 @@ async function fetchMissions(): Promise<CronMission[]> {
   return Array.isArray(data.missions) ? data.missions : [];
 }
 
-async function createMission(name: string | undefined, schedule: string, prompt: string, model?: string, project?: string, permission_tier?: string): Promise<CronMission | null> {
+interface CreateMissionArgs {
+  name?: string;
+  schedule: string;
+  prompt?: string;
+  model?: string;
+  project?: string;
+  permission_tier?: string;
+  mode?: string;
+  entry?: string;
+  policy?: string;
+}
+
+async function createMission(args: CreateMissionArgs): Promise<CronMission | null> {
   const resp = await fetch('/api/missions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: name || null, schedule, prompt, model: model || null, project: project || null, permission_tier: permission_tier || 'full' }),
+    body: JSON.stringify({
+      name: args.name || null,
+      schedule: args.schedule,
+      prompt: args.prompt || null,
+      model: args.model || null,
+      project: args.project || null,
+      permission_tier: args.permission_tier || 'full',
+      mode: args.mode || 'agent',
+      entry: args.entry || null,
+      policy: args.policy || 'trusted',
+    }),
   });
   if (!resp.ok) { throw new Error(await resp.text()); }
   return resp.json();
@@ -109,10 +131,10 @@ async function triggerMission(id: string, project?: string): Promise<void> {
 
 // ---- Left Sidebar: Mission Nav with expandable runs -------------------------
 
-/** Selected item in the sidebar: either a run's session or the mission editor. */
+/** Selected item in the sidebar: a run, the inline editor (existing or new), or nothing. */
 type SidebarSelection =
   | { type: 'run'; missionId: string; run: MissionRunEntry }
-  | { type: 'editor'; missionId: string }
+  | { type: 'editor'; missionId: string | null }
   | { type: 'agent-viewer' }
   | null;
 
@@ -122,13 +144,13 @@ const MissionNav: React.FC<{
   expandedMissions: Set<string>;
   selection: SidebarSelection;
   onToggleExpand: (id: string) => void;
+  onSelectMission: (m: CronMission) => void;
   onSelectRun: (mission: CronMission, run: MissionRunEntry) => void;
   onToggleEnabled: (id: string, enabled: boolean) => void;
-  onEdit: (m: CronMission) => void;
   onDelete: (id: string) => void;
   onTrigger: (m: CronMission) => void;
   onCreate: () => void;
-}> = ({ missions, runsMap, expandedMissions, selection, onToggleExpand, onSelectRun, onToggleEnabled: _onToggleEnabled, onEdit, onDelete, onTrigger, onCreate }) => {
+}> = ({ missions, runsMap, expandedMissions, selection, onToggleExpand, onSelectMission, onSelectRun, onToggleEnabled: _onToggleEnabled, onDelete, onTrigger, onCreate }) => {
   const enabledCount = missions.filter(m => m.enabled).length;
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
@@ -166,40 +188,49 @@ const MissionNav: React.FC<{
           return (
             <div key={mission.id} className="rounded-lg">
               {/* Mission header */}
-              <div className="relative group">
-                <button
-                  onClick={() => onToggleExpand(mission.id)}
-                  className={cn(
-                    'w-full text-left px-2.5 py-2 rounded-lg transition-colors',
-                    (selection?.type === 'run' && selection.missionId === mission.id) ||
-                    (selection?.type === 'editor' && selection.missionId === mission.id)
-                      ? 'bg-blue-50 dark:bg-blue-500/10'
-                      : 'hover:bg-slate-50 dark:hover:bg-white/5',
-                  )}
-                >
-                  <div className="flex items-center gap-1.5">
+              <div className={cn(
+                'relative group rounded-lg transition-colors',
+                selection?.type === 'editor' && selection.missionId === mission.id
+                  ? 'bg-blue-50 dark:bg-blue-500/10'
+                  : selection?.type === 'run' && selection.missionId === mission.id
+                  ? 'bg-blue-50/50 dark:bg-blue-500/5'
+                  : 'hover:bg-slate-50 dark:hover:bg-white/5',
+              )}>
+                <div className="flex items-stretch">
+                  <button
+                    onClick={(e) => { e.stopPropagation(); onToggleExpand(mission.id); }}
+                    className="pl-2 pr-0.5 py-2 text-slate-400 hover:text-slate-600 shrink-0"
+                    title={isExpanded ? 'Collapse runs' : 'Expand runs'}
+                  >
                     {isExpanded
-                      ? <ChevronDown size={13} className="text-slate-400 shrink-0" />
-                      : <ChevronRight size={13} className="text-slate-400 shrink-0" />
+                      ? <ChevronDown size={13} />
+                      : <ChevronRight size={13} />
                     }
-                    <span className={cn(
-                      'w-2 h-2 rounded-full shrink-0',
-                      mission.enabled ? 'bg-green-500' : 'bg-slate-300 dark:bg-slate-600',
-                    )} />
-                    <span className="text-[12px] font-bold text-slate-800 dark:text-slate-200 truncate">
-                      {mission.name || 'Untitled Mission'}
-                    </span>
-                  </div>
-                  <div className="ml-5 text-[11px] text-slate-400 truncate mt-0.5">
-                    {describeCron(mission.schedule)}
-                    {projLabel && <> &middot; {projLabel}</>}
-                  </div>
-                  {!isExpanded && runs.length > 0 && (
-                    <div className="ml-5 text-[11px] text-slate-400 mt-0.5">
-                      {runs.length} run{runs.length !== 1 ? 's' : ''}
+                  </button>
+                  <button
+                    onClick={() => onSelectMission(mission)}
+                    className="flex-1 text-left pr-2.5 py-2 min-w-0"
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <span className={cn(
+                        'w-2 h-2 rounded-full shrink-0',
+                        mission.enabled ? 'bg-green-500' : 'bg-slate-300 dark:bg-slate-600',
+                      )} />
+                      <span className="text-[12px] font-bold text-slate-800 dark:text-slate-200 truncate">
+                        {mission.name || 'Untitled Mission'}
+                      </span>
                     </div>
-                  )}
-                </button>
+                    <div className="text-[11px] text-slate-400 truncate mt-0.5">
+                      {describeCron(mission.schedule)}
+                      {projLabel && <> &middot; {projLabel}</>}
+                    </div>
+                    {!isExpanded && runs.length > 0 && (
+                      <div className="text-[11px] text-slate-400 mt-0.5">
+                        {runs.length} run{runs.length !== 1 ? 's' : ''}
+                      </div>
+                    )}
+                  </button>
+                </div>
 
                 {/* Action buttons on hover */}
                 <div className="absolute right-1.5 top-1.5 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-all">
@@ -209,13 +240,6 @@ const MissionNav: React.FC<{
                     title="Run now"
                   >
                     <Play size={11} />
-                  </button>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); onEdit(mission); }}
-                    className="p-1 rounded hover:bg-slate-100 dark:hover:bg-white/5 text-slate-400 hover:text-slate-600"
-                    title="Edit"
-                  >
-                    <Edit3 size={11} />
                   </button>
                   {confirmDeleteId === mission.id ? (
                     <>
@@ -317,6 +341,11 @@ export const MissionEditor: React.FC<{
   const [model, setModel] = useState(editing?.model || '');
   const [selectedProject, setSelectedProject] = useState(editing?.project || '');
   const [permissionTier, setPermissionTier] = useState(editing?.permission_tier || 'full');
+  const [mode, setMode] = useState<'agent' | 'app'>((editing?.mode as 'agent' | 'app') || 'agent');
+  const [entry, setEntry] = useState(editing?.entry || '');
+  const [policy, setPolicy] = useState<'trusted' | 'strict' | 'interactive'>(
+    (editing?.policy as 'trusted' | 'strict' | 'interactive') || 'trusted',
+  );
   const [models, setModels] = useState<{ id: string; model: string; provider: string }[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -331,13 +360,38 @@ export const MissionEditor: React.FC<{
     : null;
 
   const handleSave = async () => {
-    if (!schedule.trim() || !prompt.trim()) { setError('Schedule and prompt are required'); return; }
-    if (tierError) { setError(tierError); return; }
+    if (!schedule.trim()) { setError('Schedule is required'); return; }
+    if (mode === 'agent') {
+      if (!prompt.trim()) { setError('Prompt is required for agent missions'); return; }
+      if (tierError) { setError(tierError); return; }
+    } else if (mode === 'app') {
+      if (!entry.trim()) { setError('Entry URL is required for app missions'); return; }
+    }
     setSaving(true); setError(null);
     try {
       const result = editing
-        ? await updateMission(editing.id, { name: name || null, schedule, prompt, model: model || null, project: selectedProject || null, permission_tier: permissionTier })
-        : await createMission(name || undefined, schedule, prompt, model || undefined, selectedProject || undefined, permissionTier);
+        ? await updateMission(editing.id, {
+            name: name || null,
+            schedule,
+            prompt: mode === 'agent' ? prompt : '',
+            model: mode === 'agent' ? (model || null) : null,
+            project: mode === 'agent' ? (selectedProject || null) : null,
+            permission_tier: permissionTier,
+            mode,
+            entry: mode === 'app' ? entry : null,
+            policy: mode === 'agent' ? policy : null,
+          })
+        : await createMission({
+            name: name || undefined,
+            schedule,
+            prompt: mode === 'agent' ? prompt : undefined,
+            model: mode === 'agent' ? (model || undefined) : undefined,
+            project: mode === 'agent' ? (selectedProject || undefined) : undefined,
+            permission_tier: permissionTier,
+            mode,
+            entry: mode === 'app' ? entry : undefined,
+            policy: mode === 'agent' ? policy : undefined,
+          });
       if (result) onSave(result);
     } catch (e: any) { setError(e.message || 'Failed to save mission'); }
     setSaving(false);
@@ -351,6 +405,34 @@ export const MissionEditor: React.FC<{
         </h2>
 
         {error && <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-3 text-xs text-red-600 dark:text-red-400">{error}</div>}
+
+        <div>
+          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">Mode</label>
+          <div className="grid grid-cols-2 gap-2">
+            {([
+              { value: 'agent', label: 'Agent', desc: 'Run a prompt with the mission agent on each trigger' },
+              { value: 'app', label: 'App', desc: 'Open a URL in the browser. No agent session.' },
+            ] as const).map(m => {
+              const selected = mode === m.value;
+              return (
+                <button
+                  key={m.value}
+                  type="button"
+                  onClick={() => setMode(m.value)}
+                  className={cn(
+                    'flex flex-col items-start gap-0.5 px-3 py-2 rounded-lg border text-left transition-colors',
+                    selected
+                      ? 'border-blue-500/40 bg-blue-500/10'
+                      : 'border-slate-200 dark:border-white/10 hover:bg-slate-50 dark:hover:bg-white/5',
+                  )}
+                >
+                  <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">{m.label}</div>
+                  <div className="text-[11px] text-slate-500 dark:text-slate-400">{m.desc}</div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
 
         <div>
           <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">Name</label>
@@ -373,6 +455,23 @@ export const MissionEditor: React.FC<{
           <div className="text-[11px] text-slate-400 mt-1.5">{describeCron(schedule)}</div>
         </div>
 
+        {mode === 'app' && (
+          <div>
+            <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">Entry URL</label>
+            <input
+              type="text"
+              value={entry}
+              onChange={e => setEntry(e.target.value)}
+              placeholder="/apps/memory/  or  https://example.com"
+              className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+            />
+            <div className="text-[11px] text-slate-400 mt-1.5">
+              Relative paths (starting with <code>/</code>) are opened against the Linggen server. Absolute <code>http(s)://</code> URLs are opened as-is.
+            </div>
+          </div>
+        )}
+
+        {mode === 'agent' && (
         <div>
           <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">Agent</label>
           <div className="flex items-center gap-2">
@@ -383,6 +482,51 @@ export const MissionEditor: React.FC<{
             <button onClick={onViewAgent} className="flex items-center gap-1 px-2.5 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5 transition-colors shrink-0" title="View mission.md">
               <Eye size={13} /> View
             </button>
+          </div>
+        </div>
+        )}
+
+        {mode === 'agent' && (<>
+        <div>
+          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
+            Autonomy
+            <span className="text-slate-400 font-normal ml-1">(how to handle actions outside the grant)</span>
+          </label>
+          <div className="space-y-2">
+            {([
+              { value: 'trusted', label: 'Trusted', desc: 'Silently allow out-of-scope. Ask-rules (git push, etc.) still deny. Matches legacy mission behavior.', color: 'blue' },
+              { value: 'strict', label: 'Strict', desc: 'Silently deny anything outside the grant. Safest — the agent must stay within what it\'s told.', color: 'green' },
+              { value: 'interactive', label: 'Interactive', desc: 'Prompt for out-of-scope. Rare — no one is there to click, so prompts queue.', color: 'amber' },
+            ] as const).map(opt => {
+              const selected = policy === opt.value;
+              const colorMap = {
+                blue: selected ? 'border-blue-500/40 bg-blue-500/10' : '',
+                green: selected ? 'border-green-500/40 bg-green-500/10' : '',
+                amber: selected ? 'border-amber-500/40 bg-amber-500/10' : '',
+              };
+              const dotMap = {
+                blue: 'bg-blue-500',
+                green: 'bg-green-500',
+                amber: 'bg-amber-500',
+              };
+              return (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() => setPolicy(opt.value)}
+                  className={cn(
+                    'w-full flex items-start gap-3 px-3 py-2.5 rounded-lg border text-left transition-colors',
+                    selected ? colorMap[opt.color] : 'border-slate-200 dark:border-white/10 hover:bg-slate-50 dark:hover:bg-white/5',
+                  )}
+                >
+                  <div className={cn('w-3 h-3 rounded-full mt-0.5 shrink-0 border-2', selected ? dotMap[opt.color] + ' border-transparent' : 'border-slate-300 dark:border-white/20')} />
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">{opt.label}</div>
+                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">{opt.desc}</div>
+                  </div>
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -464,9 +608,10 @@ export const MissionEditor: React.FC<{
           <textarea value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="The instruction to send to the agent on each trigger..." rows={6}
             className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 resize-y focus:outline-none focus:ring-2 focus:ring-blue-500/30" />
         </div>
+        </>)}
 
         <div className="flex items-center gap-3 pt-2">
-          <button onClick={handleSave} disabled={saving || !prompt.trim() || !!tierError}
+          <button onClick={handleSave} disabled={saving || (mode === 'agent' && (!prompt.trim() || !!tierError)) || (mode === 'app' && !entry.trim())}
             className="px-4 py-2 text-sm font-semibold rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
             {saving ? 'Saving...' : editing ? 'Update Mission' : 'Create Mission'}
           </button>
@@ -648,7 +793,7 @@ export const MissionPage: React.FC<{
     try { await deleteMission(id); await loadMissions(); if (selection && 'missionId' in selection && selection.missionId === id) setSelection(null); } catch (e) { console.error('Failed to delete mission:', e); }
   };
 
-  const handleEdit = (m: CronMission) => {
+  const handleSelectMission = (m: CronMission) => {
     setEditingMission(m);
     setSelection({ type: 'editor', missionId: m.id });
     setRightView('editor');
@@ -664,19 +809,20 @@ export const MissionPage: React.FC<{
 
   const handleCreate = () => {
     setEditingMission(null);
-    setSelection(null);
+    setSelection({ type: 'editor', missionId: null });
     setRightView('editor');
   };
 
-  const handleSave = async (_mission: CronMission) => {
-    setEditingMission(null);
-    setRightView('session');
-    setSelection(null);
+  const handleSave = async (mission: CronMission) => {
     await loadMissions();
+    setEditingMission(mission);
+    setSelection({ type: 'editor', missionId: mission.id });
+    setRightView('editor');
   };
 
   const handleCancel = () => {
     setEditingMission(null);
+    setSelection(null);
     setRightView('session');
   };
 
@@ -687,29 +833,24 @@ export const MissionPage: React.FC<{
 
   const enabledCount = missions.filter(m => m.enabled).length;
 
-  // Full-page views (editor, agent viewer) hide the sidebar
-  const isFullPageView = rightView === 'editor' || rightView === 'agent-viewer';
-
   const mainContent = (
     <div className="flex-1 flex overflow-hidden">
-      {/* Left sidebar — mission nav (hidden during editor/agent-viewer) */}
-      {!isFullPageView && (
-        <div className="w-72 border-r border-slate-200 dark:border-white/5 flex flex-col bg-white dark:bg-[#0f0f0f] h-full">
-          <MissionNav
-            missions={missions}
-            runsMap={runsMap}
-            expandedMissions={expandedMissions}
-            selection={selection}
-            onToggleExpand={handleToggleExpand}
-            onSelectRun={handleSelectRun}
-            onToggleEnabled={handleToggle}
-            onEdit={handleEdit}
-            onDelete={handleDelete}
-            onTrigger={handleTrigger}
-            onCreate={handleCreate}
-          />
-        </div>
-      )}
+      {/* Left sidebar — mission nav */}
+      <div className="w-72 border-r border-slate-200 dark:border-white/5 flex flex-col bg-white dark:bg-[#0f0f0f] h-full">
+        <MissionNav
+          missions={missions}
+          runsMap={runsMap}
+          expandedMissions={expandedMissions}
+          selection={selection}
+          onToggleExpand={handleToggleExpand}
+          onSelectMission={handleSelectMission}
+          onSelectRun={handleSelectRun}
+          onToggleEnabled={handleToggle}
+          onDelete={handleDelete}
+          onTrigger={handleTrigger}
+          onCreate={handleCreate}
+        />
+      </div>
 
       {/* Right panel — session content or full-page editor */}
       <main className="flex-1 flex flex-col overflow-hidden bg-slate-100/40 dark:bg-[#0a0a0a] min-h-0">

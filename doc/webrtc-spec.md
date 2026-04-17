@@ -196,6 +196,28 @@ Each session's events flow on a dedicated data channel. No filtering needed — 
 
 When the user switches sessions in the UI, the frontend simply reads from a different data channel. Old session channels stay open (messages are cached). No clear/refetch cycle.
 
+### UI entries and view signal
+
+Linggen ships three UI entries, each a separate HTML + JS bundle:
+
+| Entry | HTML | Surface | What it renders |
+|:------|:-----|:--------|:----------------|
+| `main` | `/` (index.html) | Owner's full UI | Sidebar, chat, info panel, settings, missions |
+| `embed` | `/embed` | Skill-iframe chat widget (memory, game-table, sys-doctor) and VS Code extension | Just `<ChatWidget>`, pinned to one session |
+| `consumer` | `/consumer` | Remote consumer joining a proxy room | Consumer chat with shared-skills panel |
+
+On connect, the client sends a `set_view_context` control message including a `view` field (`"main" | "embed" | "consumer"`). The server uses this to scope pushes so an embed peer never observes cross-session state.
+
+### Embed isolation
+
+Embed peers are pinned to a single session. The server enforces:
+
+- **Broadcasts**: activity, agent_status, run, ask_user, widget_resolved, session_created events from sessions other than the pinned one are dropped on the embed peer's control channel.
+- **page_state snapshots**: `pending_ask_user` and `busy_sessions` are filtered to only the pinned session (not the user's full session set).
+- **Global fields skipped**: `all_sessions` and `missions` are not sent to embed peers (they don't render the sidebar/mission list).
+
+A skill iframe therefore only receives events for its own session plus truly global notifications (room_chat, global notifications) — the user's other sessions running in the main page cannot leak into the iframe.
+
 ### Remote asset loading
 
 In remote mode, all assets (main UI and skill pages) are fetched from the linggen server through the data channel's HTTP proxy. This covers `/index.html`, `/assets/*` (JS/CSS chunks), and `/apps/*` (skill files). Skill iframes are loaded via blob URLs and communicate with the main UI via `postMessage`. No files need to be hosted on `linggen.dev`.

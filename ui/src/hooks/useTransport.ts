@@ -14,6 +14,7 @@ import { dispatchEvent } from '../lib/eventDispatcher';
 import { useUserStore } from '../stores/userStore';
 import { useChatStore } from '../stores/chatStore';
 import { useSessionStore } from '../stores/sessionStore';
+import { useServerStore } from '../stores/serverStore';
 
 /** Send the frontend's active view context to the server.
  *  The server uses this to scope its page_state push. */
@@ -21,11 +22,13 @@ export function sendViewContext() {
   try {
     const transport = getTransport();
     const { activeSessionId, selectedProjectRoot } = useSessionStore.getState();
-    const isCompact = new URLSearchParams(window.location.search).get('mode') === 'compact';
+    // View is baked in by the entry file (main.tsx / embed.tsx / consumer.tsx)
+    // via window.__LINGGEN_VIEW__. Defaults to 'main' for safety.
+    const view = ((window as any).__LINGGEN_VIEW__ || 'main') as 'main' | 'embed' | 'consumer';
     transport.sendViewContext({
       sessionId: activeSessionId,
       projectRoot: selectedProjectRoot,
-      isCompact,
+      view,
     });
   } catch { /* transport not ready */ }
 }
@@ -93,6 +96,11 @@ export function useTransport({ sessionId, onReconnect, onParseError }: UseTransp
         }
       },
       onParseError: () => {
+        // Generic recovery: transport failed to parse a message — refetch the
+        // chat state and agent runs to re-sync. Any app-specific handler
+        // registered via useTransport runs after.
+        useChatStore.getState().fetchSessionState();
+        useServerStore.getState().fetchAgentRuns();
         onParseErrorRef.current?.();
       },
     };

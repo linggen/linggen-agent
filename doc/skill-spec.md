@@ -297,6 +297,20 @@ Data tools enable **real-time structured updates** from agent to app UI without 
 
 **Implementation**: `engine/skill_tool.rs`, `engine/tool_registry.rs`
 
+### Built-in `PageUpdate` (app skills)
+
+Every skill with an `app` section automatically receives a built-in data tool called `PageUpdate`. Skills do **not** need to declare it in their `tools:` list.
+
+```
+PageUpdate({ "page": { <skill-specific layout> } })
+```
+
+- Emitted as a `content_block` event; the app iframe receives it via `onContentBlock` and re-renders.
+- The `page` argument is opaque to the engine — each skill defines its own layout schema in SKILL.md (e.g. `top_bar`, `body`, `footer` for dashboard-style skills).
+- When the active skill has an `app`, the system prompt includes a standing instruction to call `PageUpdate` whenever state the user should see changes. Skills should **not** emit page JSON as text — always use the tool.
+
+This replaces the older `<!--page-->` text-tag convention, which required per-skill parsing and nag loops. Apps can still parse text tags for backward compatibility, but new skills should use `PageUpdate`.
+
 ## Cross-tool compatibility
 
 Linggen follows the [Agent Skills](https://agentskills.io) open standard. Skills written for Linggen work in Claude Code and Codex — same directory structure, same frontmatter. Claude Code extension fields (`argument-hint`, `disable-model-invocation`, `context`, etc.) are also supported. Linggen-specific fields (`trigger`, `app`) are ignored by other tools.

@@ -21,10 +21,6 @@ fn default_creator() -> String {
     "user".to_string()
 }
 
-fn is_default_creator(s: &str) -> bool {
-    s == "user"
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub id: String,
@@ -34,7 +30,7 @@ pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<String>,
     /// Who created this session: "user", "skill", "mission", "agent"
-    #[serde(default = "default_creator", skip_serializing_if = "is_default_creator")]
+    #[serde(default = "default_creator")]
     pub creator: String,
     /// Session-level model override. Persisted so it survives reload/session switch.
     #[serde(default, skip_serializing_if = "Option::is_none")]

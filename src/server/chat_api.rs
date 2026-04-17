@@ -478,7 +478,7 @@ async fn run_skill_dispatch(
 
     // Skill permission approval — prompt user if skill declares permission requirements.
     // Consumer sessions are locked — skills run with the permissions already set by SessionPolicy.
-    if !engine.session_permissions.locked {
+    if !engine.session_permissions.policy.is_locked() {
         if let Some(ref skill) = engine.active_skill {
             if let Some(ref perm) = skill.permission {
                 use crate::engine::permission::PermissionMode;
@@ -1502,6 +1502,63 @@ pub(crate) async fn chat_handler(
                             if ctx.policy.is_skill_allowed(skill_name) {
                                 if let Some(skill) = manager.skill_manager.get_skill(skill_name).await {
                                     tracing::info!("Session-bound skill activated: {}", skill.name);
+                                    // Ensure session_dir is populated so skill-permission
+                                    // saves persist. Otherwise run_agent_loop later loads
+                                    // permission.json from disk and clobbers in-memory
+                                    // grants we're about to apply.
+                                    if engine.session_dir.is_none() {
+                                        if let Some(ref sid) = ctx.session_id {
+                                            engine.session_dir =
+                                                Some(crate::paths::global_sessions_dir().join(sid));
+                                        }
+                                    }
+                                    // Apply skill's declared permission. Launching a skill's app
+                                    // is implicit approval of its declared permissions — without
+                                    // this, the skill runs at the session's default mode and its
+                                    // SKILL.md permission block has no effect.
+                                    if !engine.session_permissions.policy.is_locked() {
+                                        if let Some(ref perm) = skill.permission {
+                                            use crate::engine::permission::PermissionMode;
+                                            let mode = match perm.mode.as_str() {
+                                                "edit" => PermissionMode::Edit,
+                                                "admin" => PermissionMode::Admin,
+                                                _ => PermissionMode::Read,
+                                            };
+                                            let mut changed = false;
+                                            for path in &perm.paths {
+                                                let current = crate::engine::permission::effective_mode_for_path(
+                                                    &engine.session_permissions.path_modes,
+                                                    std::path::Path::new(path),
+                                                );
+                                                if current.as_ref() != Some(&mode) {
+                                                    engine.session_permissions.set_path_mode(path, mode.clone());
+                                                    changed = true;
+                                                }
+                                            }
+                                            if changed {
+                                                if let Some(ref sdir) = engine.session_dir {
+                                                    engine.session_permissions.save(sdir);
+                                                }
+                                            }
+
+                                            // Seed session cwd to the first granted path so Bash
+                                            // (which has no file_path arg) resolves permission
+                                            // checks against the granted path, not the workspace
+                                            // root. Only set if not already chosen by the user.
+                                            if let Some(first) = perm.paths.first() {
+                                                let expanded = if let Some(stripped) = first.strip_prefix("~/") {
+                                                    dirs::home_dir().map(|h| h.join(stripped))
+                                                } else if first == "~" {
+                                                    dirs::home_dir()
+                                                } else {
+                                                    Some(std::path::PathBuf::from(first))
+                                                };
+                                                if let Some(abs) = expanded {
+                                                    engine.tools.builtins.seed_session_cwd_if_unset(abs);
+                                                }
+                                            }
+                                        }
+                                    }
                                     engine.active_skill = Some(skill);
                                 }
                             } else {

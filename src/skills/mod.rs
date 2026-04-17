@@ -1,6 +1,6 @@
 pub mod marketplace;
 
-use crate::engine::skill_tool::SkillToolDef;
+use crate::engine::skill_tool::{SkillParamDef, SkillToolDef};
 use anyhow::Result;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
@@ -8,6 +8,38 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+/// Built-in data tool auto-registered for every skill with `app`.
+/// The agent calls it to refresh the skill's dashboard UI; the engine emits
+/// a `ContentBlockUpdate` carrying the `page` payload, which the skill's
+/// iframe picks up via `onContentBlock`. No shell command — `cmd` empty
+/// makes this a data tool (see SkillToolDef::execute).
+fn page_update_tool_def() -> SkillToolDef {
+    let mut args = HashMap::new();
+    args.insert(
+        "page".to_string(),
+        SkillParamDef {
+            param_type: "object".to_string(),
+            required: true,
+            default: None,
+            description:
+                "The page layout JSON (top_bar, body, footer, etc. — schema defined by the skill)."
+                    .to_string(),
+            items: None,
+        },
+    );
+    SkillToolDef {
+        name: "PageUpdate".to_string(),
+        description:
+            "Refresh the skill's dashboard UI with a new page layout. Call this when state changes the user should see."
+                .to_string(),
+        cmd: String::new(),
+        args,
+        returns: Some("ok".to_string()),
+        timeout_ms: 1000,
+        skill_dir: None,
+    }
+}
 
 /// Built-in skills available for one-click install from the linggen/skills repo.
 #[derive(Debug, Clone, Serialize)]
@@ -447,12 +479,20 @@ impl SkillManager {
         let frontmatter: SkillFrontmatter = serde_yml::from_str(parts[1])?;
         let content = parts[2].trim().to_string();
 
+        // Skills with an `app` automatically receive the built-in PageUpdate
+        // data tool — the agent calls it to refresh the dashboard UI. Skills
+        // without an app don't get it (no UI to update).
+        let mut tool_defs = frontmatter.tools;
+        if frontmatter.app.is_some() {
+            tool_defs.push(page_update_tool_def());
+        }
+
         Ok(Skill {
             name: frontmatter.name,
             description: frontmatter.description,
             content,
             source,
-            tool_defs: frontmatter.tools,
+            tool_defs,
             argument_hint: frontmatter.argument_hint,
             disable_model_invocation: frontmatter.disable_model_invocation,
             user_invocable: frontmatter.user_invocable,

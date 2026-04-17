@@ -1,0 +1,139 @@
+import type { UiEvent, SubagentTreeEntry, Plan } from '../../types';
+import { useChatStore } from '../../stores/chatStore';
+import { useServerStore } from '../../stores/serverStore';
+import { useInteractionStore } from '../../stores/interactionStore';
+import { agentTracker } from '../agentTracker';
+import { getSessionId } from './_shared';
+
+export function handleRun(item: UiEvent): void {
+  switch (item.phase) {
+    case 'sync':
+    case 'resync':
+      // sync/resync are now handled by server-pushed page_state — no HTTP fetches needed.
+      return;
+    case 'outcome':
+      handleRunOutcome();
+      return;
+    case 'context_usage':
+      handleContextUsage(item);
+      return;
+    case 'plan_update':
+      handlePlanUpdate(item);
+      return;
+    case 'subagent_spawned':
+      handleSubagentSpawned(item);
+      return;
+    case 'subagent_result':
+      handleSubagentResult(item);
+      return;
+  }
+}
+
+function handleRunOutcome(): void {
+  // Skip session state fetch for consumer mode — messages arrive via streaming
+  // events, and the HTTP fetch goes through the WebRTC tunnel which blocks
+  // /api/workspace/state for browser consumers.
+  useChatStore.getState().fetchSessionState();
+  useServerStore.setState({ tokensPerSec: 0 });
+}
+
+function handleContextUsage(item: UiEvent): void {
+  if (!item.data) return;
+  const agentIdKey =
+    typeof item.data.agent_id === 'string'
+      ? item.data.agent_id.toLowerCase()
+      : (item.agent_id || '').toLowerCase();
+  if (!agentIdKey) return;
+
+  const sid = getSessionId(item);
+  const estTokens = Number(item.data.estimated_tokens || 0);
+  if (sid) agentTracker.latestContextTokens[sid] = estTokens;
+
+  // Accumulate session token usage from actual_prompt/completion_tokens
+  const promptDelta = Number(item.data.actual_prompt_tokens || 0);
+  const completionDelta = Number(item.data.actual_completion_tokens || 0);
+  if (promptDelta > 0 || completionDelta > 0) {
+    const prev = useServerStore.getState().sessionTokens;
+    useServerStore.setState({
+      sessionTokens: {
+        prompt: prev.prompt + promptDelta,
+        completion: prev.completion + completionDelta,
+      },
+    });
+  }
+
+  const parentId = agentTracker.getParent(agentIdKey);
+  if (parentId) {
+    agentTracker.setSubagentContextTokens(agentIdKey, estTokens);
+    useChatStore.getState().updateSubagentTree(parentId, agentIdKey,
+      (entry) => ({ ...entry, contextTokens: estTokens }));
+    return;
+  }
+
+  if (sid) {
+    useServerStore.getState().setAgentContext((prev) => ({
+      ...prev,
+      [sid]: {
+        tokens: estTokens,
+        messages: Number(item.data.message_count || 0),
+        tokenLimit:
+          typeof item.data.token_limit === 'number'
+            ? Number(item.data.token_limit)
+            : prev[sid]?.tokenLimit,
+      },
+    }));
+  }
+}
+
+function handlePlanUpdate(item: UiEvent): void {
+  if (!item.data?.plan) return;
+  const plan = item.data.plan as Plan;
+  const rawId = String(item.agent_id || '');
+  const match = rawId.match(/^run-(.+?)-\d+/);
+  const agentId = match ? match[1] : rawId;
+
+  const interaction = useInteractionStore.getState();
+  interaction.setActivePlan(plan);
+  if (plan.status === 'planned') {
+    interaction.setPendingPlan(plan);
+    interaction.setPendingPlanAgentId(agentId);
+  } else {
+    // approved, executing, completed, rejected — no longer waiting for user decision
+    interaction.setPendingPlan(null);
+    interaction.setPendingPlanAgentId(null);
+  }
+  const planText = JSON.stringify({ type: 'plan', plan });
+  useChatStore.getState().upsertPlan(agentId, planText);
+}
+
+function handleSubagentSpawned(item: UiEvent): void {
+  if (!item.data) return;
+  const parentId = String(item.agent_id || '').toLowerCase();
+  const subagentId = String(item.data.subagent_id || '');
+  const task = String(item.data.task || '');
+  if (!subagentId || !parentId) return;
+
+  agentTracker.registerSubagent(subagentId, parentId);
+  const newEntry: SubagentTreeEntry = {
+    subagentId,
+    agentName: subagentId,
+    task,
+    status: 'running',
+    toolCount: 0,
+    contextTokens: 0,
+    currentActivity: null,
+    toolSteps: [],
+  };
+  useChatStore.getState().addSubagentToTree(parentId, newEntry);
+}
+
+function handleSubagentResult(item: UiEvent): void {
+  if (!item.data) return;
+  const parentId = String(item.agent_id || '').toLowerCase();
+  const subagentId = String(item.data.subagent_id || '');
+  if (!subagentId || !parentId) return;
+
+  useChatStore.getState().updateSubagentTree(parentId, subagentId,
+    (entry) => ({ ...entry, status: 'done', currentActivity: null }));
+  agentTracker.unregisterSubagent(subagentId);
+}

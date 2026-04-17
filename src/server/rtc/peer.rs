@@ -503,6 +503,12 @@ async fn run_peer(
                             session_ids: &mut user_session_ids,
                             user_id: &user_ctx.user_id,
                             is_admin: user_ctx.permission.is_admin(),
+                            view: view_ctx.view.as_deref(),
+                            pinned_session_id: if view_ctx.view.as_deref() == Some("embed") {
+                                view_ctx.session_id.as_deref()
+                            } else {
+                                None
+                            },
                         };
                         forward_event_to_channels(
                             &event, &session_channels, control_channel_id,
@@ -625,9 +631,12 @@ fn handle_control_message(
         "set_view_context" => {
             view_ctx.session_id = msg.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
             view_ctx.project_root = msg.get("project_root").and_then(|v| v.as_str()).map(|s| s.to_string());
-            view_ctx.is_compact = msg.get("is_compact").and_then(|v| v.as_bool()).unwrap_or(false);
+            view_ctx.view = msg.get("view").and_then(|v| v.as_str()).map(|s| s.to_string());
             *force_page_state = true;
-            tracing::debug!("View context updated: session={:?} project={:?} compact={}", view_ctx.session_id, view_ctx.project_root, view_ctx.is_compact);
+            tracing::debug!(
+                "View context updated: view={:?} session={:?} project={:?}",
+                view_ctx.view, view_ctx.session_id, view_ctx.project_root
+            );
             None
         }
 
@@ -1127,10 +1136,16 @@ const MAX_PENDING_EVENTS: usize = 2000;
 
 /// Event filter context — passed to forward_event_to_channels for all peers.
 /// Admin peers skip session filtering; non-admin peers only see their own sessions.
+/// The `view` and `pinned_session_id` fields further scope broadcasts for embed
+/// peers so a skill iframe can't observe activity from the user's other sessions.
 struct EventFilter<'a> {
     session_ids: &'a mut std::collections::HashSet<String>,
     user_id: &'a str,
     is_admin: bool,
+    /// Which UI entry is connected: "main" | "embed" | "consumer" | None (pre-PR2).
+    view: Option<&'a str>,
+    /// For embed: the pinned session id. Broadcasts from other sessions are dropped.
+    pinned_session_id: Option<&'a str>,
 }
 
 fn forward_event_to_channels(
@@ -1183,6 +1198,21 @@ fn forward_event_to_channels(
                 if !filter.session_ids.contains(sid) {
                     return;
                 }
+            }
+        }
+    }
+
+    // Embed peers are pinned to a single session. They receive that session's
+    // events via its sess-{id} channel and never need activity from other
+    // sessions — suppress cross-session events entirely (skill iframe must not
+    // observe activity, ask_user, or session_created from unrelated sessions).
+    // Room chat is user-level and still reaches the peer.
+    if let (Some("embed"), Some(pinned)) = (filter.view, filter.pinned_session_id) {
+        if let Some(sid) = ui_msg.session_id.as_deref() {
+            let is_user_level = matches!(ui_msg.kind.as_str(), "room_chat")
+                || sid == "global";
+            if !is_user_level && sid != pinned {
+                return;
             }
         }
     }

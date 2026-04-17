@@ -159,11 +159,41 @@ Not a mode — a flag. When locked, prompts are skipped; actions that would need
 ┌─────────────────────────────────────┐
 │  1. Config (linggen.toml)           │  Deny/ask rules, default mode
 ├─────────────────────────────────────┤
-│  2. Session (permission.json)       │  Path modes, session allows, denied sigs
+│  2. Session (permission.json)       │  Path modes, policy, session allows, denied sigs
 └─────────────────────────────────────┘
 ```
 
 Config sets guardrails. Session holds runtime state. That's it.
+
+## Session policy
+
+Mode sets the *capability ceiling* on each path. **Policy** decides what happens when an action exceeds the ceiling or hits an ask-rule. The two concepts are orthogonal and compose: mode = what the agent is allowed to do, policy = behavior when it wants more.
+
+Two independent levers:
+
+| Lever | When it applies | Choices |
+|:------|:----------------|:--------|
+| **on_exceed** | Action exceeds effective path-mode grant | `ask` / `allow` / `deny` |
+| **on_ask_rule** | Action matches an `ask:` rule | `ask` / `allow` / `deny` |
+
+Deny rules always deny — policy cannot override the safety floor.
+
+Named presets:
+
+| Preset | `on_exceed` | `on_ask_rule` | When to use |
+|:-------|:-----------:|:-------------:|:------------|
+| **interactive** | ask | ask | Default for user-facing sessions |
+| **strict** | deny | deny | Autonomous runs where safety matters more than coverage |
+| **trusted** | allow | deny | Autonomous runs you trust — legacy locked-session behavior |
+| **sandbox** | allow | allow | Containerized/Docker runs where the OS is the guardrail |
+
+Policy applies to the *whole session*. It's set by:
+
+- Interactive user sessions → `interactive` (default)
+- Consumer (proxy-room) sessions → `trusted` (no prompts, still denies `ask:` rules like `git push`)
+- Mission sessions → declared in the mission's `policy:` field, defaults to `trusted` for backward-compat. Strict is opt-in for safer runs.
+
+A policy where either lever is not `ask` is *locked* — the agent never prompts the user in that session.
 
 ## Permission rules (deny / ask)
 
@@ -189,13 +219,24 @@ No config `allow` rules — within-ceiling actions are already allowed by the mo
 ```
  1. Tool in agent's effective set? NO → blocked
  2. Classify action tier (read / edit / admin)
- 3. Check deny rules → blocked
- 4. Check ask rules (config + not in session allows) → force prompt (step 8)
+ 3. Check deny rules → blocked (hard floor, not overridable)
+ 4. Check ask rules (config + not in session allows):
+      policy.on_ask_rule = ask   → prompt
+      policy.on_ask_rule = allow → skip the rule
+      policy.on_ask_rule = deny  → blocked
  5. Resolve target path + zone
- 6. System zone + write? → per-action prompt only (step 8)
- 7. Find effective mode for path → action within ceiling → allowed
-    No grant or exceeds ceiling → prompt (step 8)
- 8. Prompt user (or block if locked)
+ 6. If an explicit path grant covers the target and satisfies the tier → allowed
+    (skill-declared grants short-circuit zone and ceiling checks)
+ 7. System zone + write/admin?
+      policy.on_exceed = ask   → per-action prompt
+      policy.on_exceed = allow → allowed
+      policy.on_exceed = deny  → blocked
+ 8. Find effective mode for path:
+      Within ceiling            → allowed
+      Exceeds / no grant, and
+        policy.on_exceed = ask   → prompt
+        policy.on_exceed = allow → allowed
+        policy.on_exceed = deny  → blocked
 ```
 
 ## Prompt options

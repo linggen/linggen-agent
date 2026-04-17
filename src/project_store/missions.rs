@@ -30,6 +30,11 @@ struct MissionFrontmatter {
     /// Permission tier: "readonly", "standard", "full". Default: "full".
     #[serde(default = "default_permission_tier", skip_serializing_if = "is_default_permission_tier")]
     permission_tier: String,
+    /// Autonomy policy: "trusted" (default, allow out-of-scope),
+    /// "strict" (deny out-of-scope), or "interactive" (prompt — rare).
+    /// Only consulted for agent-mode missions. See permission-spec.md.
+    #[serde(default = "default_policy", skip_serializing_if = "is_default_policy")]
+    policy: String,
     #[serde(default)]
     created_at: u64,
 }
@@ -48,6 +53,16 @@ fn default_permission_tier() -> String {
 
 fn is_default_permission_tier(s: &str) -> bool {
     s == "full"
+}
+
+fn default_policy() -> String {
+    // "trusted" matches pre-policy behavior of locked mission sessions:
+    // silently allow out-of-scope, but still deny ask-rules (git push etc).
+    "trusted".to_string()
+}
+
+fn is_default_policy(s: &str) -> bool {
+    s == "trusted"
 }
 
 /// A cron-scheduled mission stored as `~/.linggen/missions/<id>/mission.md`.
@@ -77,6 +92,10 @@ pub struct Mission {
     /// Permission tier: "readonly", "standard", "full". Default: "full".
     #[serde(default = "default_permission_tier")]
     pub permission_tier: String,
+    /// Autonomy policy: "trusted" (default), "strict", or "interactive".
+    /// Only consulted for agent-mode missions.
+    #[serde(default = "default_policy")]
+    pub policy: String,
     pub enabled: bool,
     pub created_at: u64,
 }
@@ -183,6 +202,7 @@ fn parse_mission_md(id: &str, content: &str) -> Result<Mission> {
                     model: None,
                     project: None,
                     permission_tier: default_permission_tier(),
+                    policy: default_policy(),
                     created_at: 0,
                 },
                 content.to_string(),
@@ -199,6 +219,7 @@ fn parse_mission_md(id: &str, content: &str) -> Result<Mission> {
                 model: None,
                 project: None,
                 permission_tier: default_permission_tier(),
+                policy: default_policy(),
                 created_at: 0,
             },
             content.to_string(),
@@ -216,6 +237,7 @@ fn parse_mission_md(id: &str, content: &str) -> Result<Mission> {
         model: fm.model,
         project: fm.project,
         permission_tier: fm.permission_tier,
+        policy: fm.policy,
         enabled: fm.enabled,
         created_at: fm.created_at,
     })
@@ -231,6 +253,7 @@ fn mission_to_md(mission: &Mission) -> String {
         model: mission.model.clone(),
         project: mission.project.clone(),
         permission_tier: mission.permission_tier.clone(),
+        policy: mission.policy.clone(),
         created_at: mission.created_at,
     };
     let yaml = serde_yml::to_string(&fm).unwrap_or_default();
@@ -342,6 +365,9 @@ impl MissionStore {
         model: Option<String>,
         project: Option<String>,
         permission_tier: Option<String>,
+        mode: Option<String>,
+        entry: Option<String>,
+        policy: Option<String>,
     ) -> Result<Mission> {
         validate_cron(schedule)?;
         self.ensure_dir()?;
@@ -370,13 +396,14 @@ impl MissionStore {
             id: id.clone(),
             name: Some(display_name),
             schedule: schedule.to_string(),
-            mode: default_mode(),
-            entry: None,
+            mode: mode.unwrap_or_else(default_mode),
+            entry,
             agent_id: MISSION_AGENT_ID.to_string(),
             prompt: prompt.to_string(),
             model,
             project,
             permission_tier: tier,
+            policy: policy.unwrap_or_else(default_policy),
             enabled: true,
             created_at: crate::util::now_ts_secs(),
         };
@@ -409,6 +436,9 @@ impl MissionStore {
         project: Option<Option<String>>,
         enabled: Option<bool>,
         permission_tier: Option<String>,
+        mode: Option<String>,
+        entry: Option<Option<String>>,
+        policy: Option<String>,
     ) -> Result<Mission> {
         let Some(mut mission) = self.get_mission(mission_id)? else {
             bail!("Mission '{}' not found", mission_id);
@@ -435,6 +465,15 @@ impl MissionStore {
         }
         if let Some(t) = permission_tier {
             mission.permission_tier = t;
+        }
+        if let Some(m) = mode {
+            mission.mode = m;
+        }
+        if let Some(e) = entry {
+            mission.entry = e;
+        }
+        if let Some(p) = policy {
+            mission.policy = p;
         }
 
         let content = mission_to_md(&mission);
@@ -616,14 +655,14 @@ mod tests {
         let (store, _dir) = temp_store();
 
         let m1 = store
-            .create_mission(Some("Check Status".into()), "*/30 * * * *", "Check status", None, None, None)
+            .create_mission(Some("Check Status".into()), "*/30 * * * *", "Check status", None, None, None, None, None, None)
             .unwrap();
         assert_eq!(m1.id, "check-status");
         assert!(m1.enabled);
         assert_eq!(m1.agent_id, MISSION_AGENT_ID);
 
         let m2 = store
-            .create_mission(Some("Review Code".into()), "0 9 * * 1-5", "Review code", Some("gpt-4".into()), Some("/tmp/proj".into()), None)
+            .create_mission(Some("Review Code".into()), "0 9 * * 1-5", "Review code", Some("gpt-4".into()), Some("/tmp/proj".into()), None, None, None, None)
             .unwrap();
         assert_eq!(m2.id, "review-code");
         assert_eq!(m2.project, Some("/tmp/proj".to_string()));
@@ -637,7 +676,7 @@ mod tests {
         let (store, _dir) = temp_store();
 
         let created = store
-            .create_mission(Some("Daily Cleanup".into()), "0 9 * * *", "Clean up old files\n\nRemove build artifacts.", Some("gpt-4".into()), Some("/tmp/proj".into()), None)
+            .create_mission(Some("Daily Cleanup".into()), "0 9 * * *", "Clean up old files\n\nRemove build artifacts.", Some("gpt-4".into()), Some("/tmp/proj".into()), None, None, None, None)
             .unwrap();
 
         let loaded = store.get_mission("daily-cleanup").unwrap().unwrap();
@@ -654,11 +693,11 @@ mod tests {
         let (store, _dir) = temp_store();
 
         let m = store
-            .create_mission(Some("Test".into()), "0 * * * *", "Hello", None, None, None)
+            .create_mission(Some("Test".into()), "0 * * * *", "Hello", None, None, None, None, None, None)
             .unwrap();
 
         let updated = store
-            .update_mission(&m.id, None, Some("*/15 * * * *"), Some("Updated prompt"), None, None, Some(false), None)
+            .update_mission(&m.id, None, Some("*/15 * * * *"), Some("Updated prompt"), None, None, Some(false), None, None, None, None)
             .unwrap();
         assert_eq!(updated.schedule, "*/15 * * * *");
         assert_eq!(updated.prompt, "Updated prompt");
@@ -675,7 +714,7 @@ mod tests {
         let (store, _dir) = temp_store();
 
         let m = store
-            .create_mission(Some("Test".into()), "0 * * * *", "Test", None, None, None)
+            .create_mission(Some("Test".into()), "0 * * * *", "Test", None, None, None, None, None, None)
             .unwrap();
 
         let entry1 = MissionRunEntry {
@@ -716,10 +755,10 @@ mod tests {
     fn test_duplicate_name_gets_suffix() {
         let (store, _dir) = temp_store();
 
-        let m1 = store.create_mission(Some("Test".into()), "0 * * * *", "First", None, None, None).unwrap();
+        let m1 = store.create_mission(Some("Test".into()), "0 * * * *", "First", None, None, None, None, None, None).unwrap();
         assert_eq!(m1.id, "test");
 
-        let m2 = store.create_mission(Some("Test".into()), "0 * * * *", "Second", None, None, None).unwrap();
+        let m2 = store.create_mission(Some("Test".into()), "0 * * * *", "Second", None, None, None, None, None, None).unwrap();
         assert_eq!(m2.id, "test-2");
     }
 
@@ -728,10 +767,10 @@ mod tests {
         let (store, _dir) = temp_store();
 
         let m = store
-            .create_mission(Some("Test".into()), "0 * * * *", "Test", None, None, None)
+            .create_mission(Some("Test".into()), "0 * * * *", "Test", None, None, None, None, None, None)
             .unwrap();
 
-        let result = store.update_mission(&m.id, None, Some("bad cron"), None, None, None, None, None);
+        let result = store.update_mission(&m.id, None, Some("bad cron"), None, None, None, None, None, None, None, None);
         assert!(result.is_err());
     }
 
@@ -741,7 +780,7 @@ mod tests {
         let root = dir.path().to_path_buf();
 
         let m = store
-            .create_mission(Some("Test Dir".into()), "0 * * * *", "Hello", None, None, None)
+            .create_mission(Some("Test Dir".into()), "0 * * * *", "Hello", None, None, None, None, None, None)
             .unwrap();
 
         // Verify directory-based layout

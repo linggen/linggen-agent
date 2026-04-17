@@ -1489,12 +1489,13 @@ async fn static_handler(State(state): State<Arc<ServerState>>, uri: Uri) -> Resp
         );
     }
 
+    // All surface routes (/, /embed, /consumer) share a single index.html.
+    // The JS entry inspects window.location to pick MainApp/EmbedApp/ConsumerApp.
+    // This keeps the bundle as a single chunk — required for blob-URL loading
+    // through the linggen.dev tunnel (shared chunks with relative imports fail).
     let path = if path.is_empty() { "index.html" } else { path };
 
-    // Allow embedding in iframes (e.g. VS Code webview compact mode).
-    // Disable frame restrictions entirely via X-Frame-Options and use a
-    // permissive frame-ancestors that explicitly lists non-network schemes
-    // used by VS Code webviews.
+    // Allow embedding in iframes (e.g. VS Code webview, skill app iframes).
     let xfo = "X-Frame-Options";
     let xfo_val = "ALLOWALL";
 

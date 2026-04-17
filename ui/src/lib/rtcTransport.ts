@@ -139,14 +139,14 @@ export class RtcTransport implements Transport {
     return this.controlRequest({ type: 'http_request', method, url, body });
   }
 
-  private pendingViewContext: { sessionId: string | null; projectRoot: string | null; isCompact: boolean } | null = null;
+  private pendingViewContext: { sessionId: string | null; projectRoot: string | null; view: 'main' | 'embed' | 'consumer' } | null = null;
 
-  sendViewContext(ctx: { sessionId: string | null; projectRoot: string | null; isCompact: boolean }): void {
+  sendViewContext(ctx: { sessionId: string | null; projectRoot: string | null; view: 'main' | 'embed' | 'consumer' }): void {
     const msg = JSON.stringify({
       type: 'set_view_context',
       session_id: ctx.sessionId,
       project_root: ctx.projectRoot,
-      is_compact: ctx.isCompact,
+      view: ctx.view,
     });
     if (this.controlChannel?.readyState === 'open') {
       this.controlChannel.send(msg);

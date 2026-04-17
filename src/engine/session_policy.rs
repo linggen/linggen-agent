@@ -73,9 +73,17 @@ impl SessionPolicy {
     /// Always applies, even for owner — clears any stale consumer restrictions.
     /// Also stores the policy on tools so subagents inherit it via delegation.
     pub fn apply(&self, engine: &mut super::AgentEngine) {
+        use crate::engine::permission::PermissionPolicy;
         engine.cfg.consumer_allowed_tools = self.allowed_tools.clone();
         engine.cfg.consumer_allowed_skills = self.allowed_skills.clone();
-        engine.session_permissions.locked = self.locked;
+        // Consumer sessions map to the Trusted policy — no prompts, but
+        // still deny ask-rules (e.g. `git push`). Owner stays Interactive.
+        let perm_policy = if self.locked {
+            PermissionPolicy::trusted()
+        } else {
+            PermissionPolicy::interactive()
+        };
+        engine.session_permissions.set_policy(perm_policy);
         engine.prompt_profile = self.prompt_profile.clone();
         // Store on tools for subagent propagation.
         engine.tools.builtins.session_policy = Some(self.clone());

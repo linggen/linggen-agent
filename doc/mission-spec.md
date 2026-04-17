@@ -26,7 +26,8 @@ A **mission** is a cron job:
 | `schedule` | yes | Cron expression (5-field standard) |
 | `prompt` | yes | The instruction sent to the agent |
 | `model` | no | Model override for this mission |
-| `permission_tier` | no | `"readonly"`, `"standard"`, or `"full"` (default: `"full"`) |
+| `permission_tier` | no | `"readonly"`, `"standard"`, or `"full"` (default: `"full"`) — sets the path-mode ceiling on the mission cwd |
+| `policy` | no | `"trusted"` (default), `"strict"`, or `"interactive"` — autonomy policy for out-of-scope actions. See `permission-spec.md` → Session policy. |
 | `enabled` | yes | Whether this mission is active |
 | `created_at` | yes | Timestamp |
 
@@ -109,15 +110,20 @@ Skipped triggers (agent busy) are also logged with `"skipped": true` and no `ses
 
 ## Autonomous permissions
 
-Missions run without a human in the loop. Mission sessions are always **locked** — no interactive prompts. See `permission-spec.md` for the full permission model.
+Missions run without a human in the loop. Mission sessions never prompt the user. Two orthogonal levers govern what the agent can do and how out-of-scope actions are handled:
+
+- **`permission_tier`** — sets the capability ceiling (path-mode) on the mission cwd.
+- **`policy`** — decides what happens when an action exceeds the ceiling.
+
+See `permission-spec.md` for the full permission model.
 
 - **No AskUser tool**: the mission agent cannot ask questions.
 - **No interactive commands**: the agent prompt forbids commands requiring stdin (`git rebase -i`, `vim`, etc.).
-- **Config deny rules still apply**: `linggen.toml` deny rules are hard-blocks that missions cannot bypass.
+- **Config deny rules always apply**: `linggen.toml` deny rules are hard-blocks that no policy can bypass.
 
 ### Permission tiers
 
-Each mission has a `permission_tier` that maps to a session permission mode:
+Each mission has a `permission_tier` that maps to a session permission mode on the mission cwd:
 
 | Tier | Mode | Bash | Use case |
 |:-----|:-----|:-----|:---------|
@@ -125,7 +131,21 @@ Each mission has a `permission_tier` that maps to a session permission mode:
 | **Standard** | edit | write-class + curated prefixes | Build, test, maintenance |
 | **Full access** | admin | Unrestricted | Trusted automation |
 
-All tiers are locked — actions within the mode ceiling proceed, everything else is blocked.
+### Autonomy policy
+
+The `policy:` field controls how the agent handles actions outside the tier's grants:
+
+| Policy | `on_exceed` | `on_ask_rule` | Semantics |
+|:-------|:-----------:|:-------------:|:----------|
+| **trusted** (default) | allow | deny | Legacy locked-mission behavior. Out-of-scope passes; `ask:` rules (e.g. `git push`) are denied. |
+| **strict** | deny | deny | Safer for unattended runs. Out-of-scope fails silently — model course-corrects within the grant. |
+| **interactive** | ask | ask | Rare. Opens prompts that nobody is there to click — they queue. Use only for debugging. |
+
+`trusted` is the default to preserve behavior of existing missions. Choose `strict` when the mission should be bounded tightly (e.g. nightly memory extraction limited to `~/.linggen/memory` and `~/.claude`).
+
+### Skill-bound missions
+
+A mission may bind a skill via the session's `skill:` field. When it does, the skill's declared `permission.paths` are applied as path-mode grants at mission start, in addition to the tier grant on cwd. This is how skills like `memory` get narrow admin access (e.g. `~/.linggen`, `~/.claude`) without widening the entire mission cwd.
 
 ### Safety
 

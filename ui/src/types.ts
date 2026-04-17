@@ -1,3 +1,5 @@
+import type { EventKind } from './lib/eventKinds';
+
 export interface SubagentToolStep {
   toolName: string;
   args: string;
@@ -74,7 +76,7 @@ export interface UiEvent {
   seq: number;
   rev: number;
   ts_ms: number;
-  kind: 'message' | 'activity' | 'queue' | 'run' | 'token' | 'text_segment' | 'ask_user' | 'model_fallback' | 'content_block' | 'turn_complete' | 'app_launched' | 'tool_progress' | 'notification' | 'working_folder';
+  kind: EventKind;
   phase?: string;
   text?: string;
   agent_id?: string;
@@ -316,6 +318,12 @@ export interface CronMission {
   project?: string | null;
   /** Permission tier: "readonly", "standard", "full". Default: "full". */
   permission_tier?: string;
+  /** Mission mode: "agent" (default), "app", or "script". */
+  mode?: string;
+  /** Entry URL (app) or command (script). */
+  entry?: string | null;
+  /** Autonomy policy: "trusted" (default), "strict", or "interactive". */
+  policy?: string;
   enabled: boolean;
   created_at: number;
 }

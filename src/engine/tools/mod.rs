@@ -285,6 +285,17 @@ impl Tools {
         }
     }
 
+    /// Seed the per-session cwd if not already set. Used when a session-bound
+    /// skill activates — the skill's permission grant usually targets a
+    /// specific path (e.g. ~/.linggen), and aligning session_cwd with that
+    /// path lets Bash permission checks resolve to the granted mode.
+    /// Callers should pass an absolute, expanded path.
+    pub fn seed_session_cwd_if_unset(&self, path: PathBuf) {
+        let Some(sid) = &self.session_id else { return };
+        let mut map = self.cwd_by_session.lock().unwrap();
+        map.entry(sid.clone()).or_insert(path);
+    }
+
     // ── Execute dispatcher ──────────────────────────────────────────────
 
     pub fn execute(&self, call: ToolCall) -> Result<ToolResult> {

@@ -131,12 +131,17 @@ export const SessionModeSelector: React.FC = () => {
   const current = modes.find((m) => m.value === (sessionMode || 'read'));
 
   if (isSystemZone) {
+    // In a system zone, mode is not user-switchable. If a skill (or other
+    // mechanism) has elevated the effective mode above "read", reflect that
+    // so the user sees the real permission instead of a misleading "read".
+    const effective = sessionMode && sessionMode !== 'read' ? sessionMode : 'read';
+    const effectiveColor = modes.find((m) => m.value === effective)?.color || 'text-slate-400';
     return (
       <span
-        className="text-[11px] border border-slate-200 dark:border-white/10 rounded px-1.5 py-0.5 font-semibold bg-slate-50 dark:bg-black/30 text-slate-400 dark:text-slate-500"
-        title="System path — read only, no mode switch"
+        className={`text-[11px] border border-slate-200 dark:border-white/10 rounded px-1.5 py-0.5 font-semibold bg-slate-50 dark:bg-black/30 ${effectiveColor}`}
+        title="System path — mode granted by skill or setup, not user-switchable"
       >
-        read (system)
+        {effective} (system)
       </span>
     );
   }

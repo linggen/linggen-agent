@@ -74,16 +74,20 @@ impl AgentEngine {
             let sdir = crate::paths::global_sessions_dir().join(sid);
             self.session_permissions = permission::SessionPermissions::load(&sdir);
 
-            // Consumer/mission sessions must stay locked even after reload from disk.
-            // The locked flag is set by SessionPolicy::apply() before the loop starts,
-            // but SessionPermissions::load() clobbers it. Re-apply if consumer restrictions
-            // are active (consumer_allowed_tools is Some only for consumer/chat modes).
+            // Consumer/mission sessions must keep their non-interactive policy
+            // even after reload from disk. SessionPolicy::apply() set the
+            // policy before the loop starts, but SessionPermissions::load()
+            // just overwrote it. Re-apply Trusted (no prompts, ask-rules
+            // denied) if consumer/mission restrictions are active.
             if self.cfg.consumer_allowed_tools.is_some() || self.cfg.mission_allowed_tools.is_some() {
-                self.session_permissions.locked = true;
+                self.session_permissions
+                    .set_policy(permission::PermissionPolicy::trusted());
             }
 
             // Initialize default path_modes if empty (new session = read on cwd).
-            if self.session_permissions.path_modes.is_empty() && !self.session_permissions.locked {
+            if self.session_permissions.path_modes.is_empty()
+                && !self.session_permissions.policy.is_locked()
+            {
                 let actual_cwd = self.tools.builtins.cwd();
                 let cwd_str = if let Some(home) = dirs::home_dir() {
                     let ws = actual_cwd.to_string_lossy();
