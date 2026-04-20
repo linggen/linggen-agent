@@ -1,3 +1,4 @@
+use crate::anthropic::AnthropicClient;
 use crate::codex_auth;
 use crate::config::ModelConfig;
 use crate::credentials::{self, Credentials};
@@ -145,6 +146,7 @@ fn is_rate_limit_error_str(msg: &str) -> bool {
 enum ProviderClient {
     Ollama(OllamaClient),
     OpenAi(OpenAiClient),
+    Anthropic(AnthropicClient),
     Proxy(Arc<super::proxy_provider::ProxyModelClient>),
 }
 
@@ -185,8 +187,11 @@ impl ModelManager {
             // Check if this model uses ChatGPT OAuth
             let is_chatgpt_oauth = cfg.auth_mode.as_deref() == Some("chatgpt_oauth")
                 || cfg.provider == "chatgpt";
+            // Anthropic with Claude Code OAuth (CC Max subscription).
+            let is_claude_oauth = cfg.provider == "anthropic"
+                && cfg.auth_mode.as_deref() == Some("claude_oauth");
 
-            if !is_chatgpt_oauth {
+            if !is_chatgpt_oauth && !is_claude_oauth {
                 // Standard: resolve API key from TOML > credentials.json > env var
                 let effective_key =
                     credentials::resolve_api_key(&cfg.id, cfg.api_key.as_deref(), creds);
@@ -196,6 +201,15 @@ impl ModelManager {
             let client = match cfg.provider.as_str() {
                 "ollama" => {
                     ProviderClient::Ollama(OllamaClient::new(cfg.url.clone(), cfg.api_key.clone()))
+                }
+                "anthropic" if is_claude_oauth => {
+                    ProviderClient::Anthropic(AnthropicClient::new_claude_oauth(cfg.url.clone()))
+                }
+                "anthropic" => {
+                    ProviderClient::Anthropic(AnthropicClient::new(
+                        cfg.url.clone(),
+                        cfg.api_key.clone(),
+                    ))
                 }
                 _ if is_chatgpt_oauth => {
                     // ChatGPT OAuth: use subscription tokens
@@ -358,6 +372,22 @@ impl ModelManager {
                     },
                 )))
             }
+            ProviderClient::Anthropic(client) => {
+                let stream = client
+                    .chat_text_stream(&instance.config.model, messages)
+                    .await?;
+                let boxed_stream: Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>> =
+                    Box::pin(stream);
+                Ok(Box::pin(futures_util::stream::unfold(
+                    (boxed_stream, _permit),
+                    |(mut stream, permit)| async move {
+                        match stream.next().await {
+                            Some(item) => Some((item, (stream, permit))),
+                            None => None,
+                        }
+                    },
+                )))
+            }
             ProviderClient::Proxy(client) => {
                 let stream = client.inference_stream(&instance.config.model, messages, None).await?;
                 Ok(Box::pin(futures_util::stream::unfold(
@@ -444,6 +474,22 @@ impl ModelManager {
             ProviderClient::OpenAi(client) => {
                 let stream = client
                     .chat_tool_stream(&instance.config.model, messages, tools, instance.config.reasoning_effort.as_deref())
+                    .await?;
+                let boxed_stream: Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>> =
+                    Box::pin(stream);
+                Ok(Box::pin(futures_util::stream::unfold(
+                    (boxed_stream, _permit),
+                    |(mut stream, permit)| async move {
+                        match stream.next().await {
+                            Some(item) => Some((item, (stream, permit))),
+                            None => None,
+                        }
+                    },
+                )))
+            }
+            ProviderClient::Anthropic(client) => {
+                let stream = client
+                    .chat_tool_stream(&instance.config.model, messages, tools)
                     .await?;
                 let boxed_stream: Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>> =
                     Box::pin(stream);
@@ -573,6 +619,19 @@ impl ModelManager {
                     .await;
                 Ok(*value?)
             }
+            ProviderClient::Anthropic(_) => {
+                // Anthropic doesn't expose per-model context window over the API;
+                // use the name-based guess (claude* → 200K).
+                let model_name = instance.config.model.clone();
+                let value = instance
+                    .context_window
+                    .get_or_try_init(|| async move {
+                        let guess = Self::guess_context_window(&model_name);
+                        Ok::<_, anyhow::Error>(Some(guess))
+                    })
+                    .await;
+                Ok(*value?)
+            }
             ProviderClient::Proxy(_) => {
                 // Proxy models: use config context_window or a conservative default
                 Ok(instance.config.context_window.or(Some(128000)))
@@ -646,6 +705,15 @@ impl ModelManager {
                     Ok(true)
                 } else {
                     Ok(instance.config.tags.iter().any(|t| t.eq_ignore_ascii_case("vision")))
+                }
+            }
+            ProviderClient::Anthropic(_) => {
+                // All Claude 3.5+ / 4.x models support vision. Respect an
+                // explicit opt-out via `tags = ["no-vision"]` if configured.
+                if instance.config.tags.iter().any(|t| t.eq_ignore_ascii_case("no-vision")) {
+                    Ok(false)
+                } else {
+                    Ok(true)
                 }
             }
             ProviderClient::Proxy(_) => Ok(false),

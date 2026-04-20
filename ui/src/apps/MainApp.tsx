@@ -63,7 +63,7 @@ export const MainApp: React.FC = () => {
   const [mobileInfoOpen, setMobileInfoOpen] = useState(false);
 
   // Shortcuts
-  const { selectedProjectRoot, sessions, activeSessionId, isMissionSession } = projectStore;
+  const { selectedProjectRoot, sessions, allSessions, activeSessionId, isMissionSession } = projectStore;
   const { agents, models, skills, selectedAgent, agentStatus, agentStatusText, defaultModels, ollamaStatus, reloadingSkills, agentTreesByProject } = agentStore;
   const { messages: chatMessages } = chatStore;
   const { currentPage, editingMission, showAgentSpecEditor, openApp, selectedFileContent, selectedFilePath } = uiStore;
@@ -150,10 +150,19 @@ export const MainApp: React.FC = () => {
   }, [activeSessionId, selectedProjectRoot, isMissionSession, projectStore.isSkillSession]);
 
   // --- Restore persisted session-level model override ---
+  // Look up the active session in `allSessions` (unified cross-project list),
+  // not `sessions` (project-scoped). For sessions that don't belong to the
+  // currently-selected project — skill sessions, mission sessions, sessions
+  // from other projects — `sessions` doesn't contain them, so `find` returns
+  // undefined and `setSessionModel(null)` runs on every page_state push,
+  // silently reverting any model override the user just picked. `allSessions`
+  // contains every session the user can see, so the lookup succeeds
+  // regardless of which project the active session lives in.
   useEffect(() => {
-    const sess = sessions.find((s) => s.id === activeSessionId);
+    const sess = allSessions.find((s) => s.id === activeSessionId)
+      ?? sessions.find((s) => s.id === activeSessionId);
     useUiStore.getState().setSessionModel(sess?.model_id ?? null);
-  }, [activeSessionId, sessions]);
+  }, [activeSessionId, allSessions, sessions]);
 
   // --- Poll workspace state for mission sessions (backup; events also trigger reloads) ---
   useEffect(() => {

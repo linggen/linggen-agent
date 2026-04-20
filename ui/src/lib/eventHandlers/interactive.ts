@@ -12,6 +12,15 @@ import { getSessionId } from './_shared';
 export function handleAskUser(item: UiEvent): void {
   const { question_id, questions } = item.data || {};
   if (!question_id || !questions) return;
+
+  // Only show the prompt when it belongs to the UI's currently-displayed
+  // session. Without this filter, a permission prompt raised by the memory
+  // skill's session leaks into unrelated user-chat windows that happen to be
+  // open in another tab, because `pendingAskUser` is a single global slot.
+  const evtSid = item.session_id ? String(item.session_id) : null;
+  const activeSid = useSessionStore.getState().activeSessionId;
+  if (evtSid && activeSid && evtSid !== activeSid) return;
+
   useInteractionStore.getState().setPendingAskUser({
     questionId: question_id,
     agentId: String(item.agent_id || ''),

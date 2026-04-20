@@ -1,5 +1,6 @@
 mod agent_api;
 mod chat_api;
+mod memory_api;
 pub(crate) mod chat_helpers;
 mod config_api;
 pub(crate) mod mission_scheduler;
@@ -34,7 +35,7 @@ use agent_api::{
     run_agent, set_task,
 };
 use chat_api::{approve_plan_handler, ask_user_response_handler, chat_handler, clear_chat_history_api, compact_chat_api, edit_plan_handler, get_system_prompt_api, pending_ask_user_handler, reject_plan_handler};
-use config_api::{get_config_api, get_credentials_api, get_models_health, update_config_api, update_credentials_api, get_codex_auth_status, start_codex_auth_login, codex_auth_logout};
+use config_api::{get_config_api, get_credentials_api, get_models_health, update_config_api, update_credentials_api, get_codex_auth_status, start_codex_auth_login, codex_auth_logout, get_claude_auth_status};
 use projects_api::{
     create_session, delete_agent_file_api, delete_skill_file_api,
     get_agent_file_api, get_skill_file_api,
@@ -1377,6 +1378,7 @@ async fn prepare_server(
         .route("/api/auth/codex/status", get(get_codex_auth_status))
         .route("/api/auth/codex/login", post(start_codex_auth_login))
         .route("/api/auth/codex/logout", post(codex_auth_logout))
+        .route("/api/auth/claude/status", get(get_claude_auth_status))
         .route("/api/skills/reload", post(reload_skills))
         .route("/api/agents/reload", post(reload_agents))
         .route("/api/community-skills/search", get(community_search))
@@ -1411,6 +1413,8 @@ async fn prepare_server(
         .route("/api/chat/clear", post(clear_chat_history_api))
         .route("/api/chat/compact", post(compact_chat_api))
         .route("/api/chat/system-prompt", get(get_system_prompt_api))
+        // Memory file direct edits (bypass the agent for trivial line edits).
+        .route("/api/memory/fact", axum::routing::delete(memory_api::delete_fact_api).patch(memory_api::edit_fact_api))
         .route("/api/plan/approve", post(approve_plan_handler))
         .route("/api/plan/edit", post(edit_plan_handler))
         .route("/api/plan/reject", post(reject_plan_handler))

@@ -127,6 +127,12 @@ pub struct AgentConfig {
     pub prompt_loop_breaker: Option<String>,
     #[serde(default = "default_max_delegation_depth")]
     pub max_delegation_depth: usize,
+    /// Default session policy preset for user-initiated chats:
+    /// "interactive" | "strict" | "trusted" | "sandbox".
+    /// Defaults to "interactive" (per-action prompts on out-of-scope).
+    /// See `permission-spec.md` → Session policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_policy: Option<String>,
 }
 
 impl AgentConfig {
@@ -317,7 +323,7 @@ impl Config {
                 );
             }
             // Validate provider is known.
-            let known_providers = ["ollama", "openai", "chatgpt", "gemini", "groq", "deepseek", "openrouter", "github"];
+            let known_providers = ["ollama", "openai", "chatgpt", "anthropic", "gemini", "groq", "deepseek", "openrouter", "github"];
             if !known_providers.contains(&model.provider.as_str()) {
                 anyhow::bail!(
                     "Model '{}' has unknown provider '{}'. Known providers: {}",
@@ -383,6 +389,7 @@ impl Default for Config {
                 default_permission_mode: None,
                 prompt_loop_breaker: None,
                 max_delegation_depth: default_max_delegation_depth(),
+                default_policy: None,
             },
             logging: LoggingConfig {
                 level: None,
@@ -440,7 +447,7 @@ mod tests {
     #[test]
     fn test_validate_unknown_provider() {
         let mut cfg = valid_config();
-        cfg.models[0].provider = "anthropic".to_string();
+        cfg.models[0].provider = "some_random_provider_xyz".to_string();
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("unknown provider"));
     }

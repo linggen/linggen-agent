@@ -330,6 +330,17 @@ impl PermissionPolicy {
         Self { on_exceed: Decision::Allow, on_ask_rule: Decision::Allow }
     }
 
+    /// Parse a preset name from config / SKILL.md frontmatter / mission spec.
+    /// Unknown names fall back to the default (`interactive`).
+    pub fn from_preset(name: &str) -> Self {
+        match name.to_ascii_lowercase().as_str() {
+            "strict" => Self::strict(),
+            "trusted" => Self::trusted(),
+            "sandbox" => Self::sandbox(),
+            _ => Self::interactive(),
+        }
+    }
+
     /// True when the policy never prompts the user. Back-compat replacement
     /// for the old `locked: bool` field.
     pub fn is_locked(&self) -> bool {
@@ -937,6 +948,37 @@ pub fn check_permission(
         tool_action_tier(tool)
     };
 
+    // 1b. Auto-allow reads of Linggen's own memory files (~/.linggen/memory/*).
+    // The system prompt explicitly tells every agent that this directory holds
+    // their persistent memory and to read files here when needed. Prompting on
+    // each read defeats the feature without adding security — the user already
+    // authorized Linggen to manage this directory by installing the app. Writes
+    // still go through the normal check (memory files are edited via the
+    // memory skill's grants, not every session's).
+    if action_tier == PermissionMode::Read {
+        if let Some(fp) = file_path {
+            let expanded = if fp == "~" {
+                dirs::home_dir()
+            } else if let Some(rest) = fp.strip_prefix("~/") {
+                dirs::home_dir().map(|h| h.join(rest))
+            } else {
+                Some(PathBuf::from(fp))
+            };
+            if let (Some(p), Some(home)) = (expanded, dirs::home_dir()) {
+                // Reject paths with `..` components — `PathBuf::starts_with` is
+                // purely lexical, so `~/.linggen/memory/../../.ssh/id_rsa` would
+                // match the memory prefix and escape the sandbox. Only allow
+                // paths whose components are all normal.
+                let has_parent_dir =
+                    p.components().any(|c| c == std::path::Component::ParentDir);
+                let mem_root = home.join(".linggen").join("memory");
+                if !has_parent_dir && p.starts_with(&mem_root) {
+                    return PermissionCheckResult::Allowed;
+                }
+            }
+        }
+    }
+
     // Determine the argument for rule matching
     let rule_arg = bash_command.or(file_path);
 
@@ -968,11 +1010,23 @@ pub fn check_permission(
         }
     }
 
-    // 4. Resolve target path + zone (ensure absolute for grant matching)
+    // 4. Resolve target path + zone (ensure absolute for grant matching).
+    // Expand `~` / `~/foo` to the home dir so tilde paths passed by tools
+    // (e.g. Read("~/.linggen/memory/...")) match grants like "~/.linggen"
+    // instead of being joined to session_cwd and producing garbage like
+    // "/Users/<name>/~/.linggen/...".
     let target_path = file_path
         .map(|fp| {
-            let p = PathBuf::from(fp);
-            if p.is_absolute() { p } else { session_cwd.join(p) }
+            if fp == "~" {
+                dirs::home_dir().unwrap_or_else(|| PathBuf::from(fp))
+            } else if let Some(rest) = fp.strip_prefix("~/") {
+                dirs::home_dir()
+                    .map(|h| h.join(rest))
+                    .unwrap_or_else(|| PathBuf::from(fp))
+            } else {
+                let p = PathBuf::from(fp);
+                if p.is_absolute() { p } else { session_cwd.join(p) }
+            }
         })
         .unwrap_or_else(|| session_cwd.to_path_buf());
     let zone = path_zone(&target_path);

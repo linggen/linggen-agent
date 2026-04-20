@@ -550,6 +550,7 @@ impl AgentManager {
                 mission_allowed_tools: None,
                 consumer_allowed_tools: None,
                 consumer_allowed_skills: None,
+                default_policy: None,
             },
             models,
             model_id,
@@ -634,6 +635,7 @@ impl AgentManager {
                 mission_allowed_tools: None,
                 consumer_allowed_tools: None,
                 consumer_allowed_skills: None,
+                default_policy: config.agent.default_policy.clone(),
             },
             models,
             model_id,
@@ -727,6 +729,7 @@ impl AgentManager {
                 mission_allowed_tools: None,
                 consumer_allowed_tools: None,
                 consumer_allowed_skills: None,
+                default_policy: None,
             },
             models,
             model_id,
@@ -1017,7 +1020,13 @@ impl AgentManager {
             crate::logging::set_log_level(level);
         }
 
-        // Invalidate all cached agents so they pick up new config on next use
+        // Invalidate all cached agents so they pick up new config on next use.
+        // Two caches to clear:
+        //   1. Project-level cached agents (ctx.agents) — rarely used on the chat path.
+        //   2. Per-session engines (session_engines) — THIS is where live chat engines
+        //      live. Without clearing this, existing sessions keep using whatever
+        //      model/routing they were built with and config changes have no effect
+        //      on running chats.
         let keys: Vec<String> = {
             let projects = self.projects.lock().await;
             projects.keys().cloned().collect()
@@ -1025,6 +1034,10 @@ impl AgentManager {
         for key in keys {
             let root = PathBuf::from(&key);
             let _ = self.invalidate_agent_cache(&root, None).await;
+        }
+        {
+            let mut engines = self.session_engines.lock().await;
+            engines.clear();
         }
 
         let _ = self.events.send((AgentEvent::StateUpdated, None));

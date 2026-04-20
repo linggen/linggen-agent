@@ -29,6 +29,17 @@ export const SubagentTreeView: React.FC<{
             : 'text-emerald-500';
         const taskPreview = entry.task.length > 60 ? entry.task.slice(0, 57) + '…' : entry.task;
 
+        const statusSuffix = isRunning
+          ? ' — running…'
+          : entry.status === 'failed'
+            ? ' — failed'
+            : ` — done (${entry.toolCount} tool use${entry.toolCount === 1 ? '' : 's'}${entry.contextTokens > 0 ? ` · ${formatCompactTokens(entry.contextTokens)} tokens` : ''})`;
+        const statusColor = isRunning
+          ? 'text-amber-600 dark:text-amber-400'
+          : entry.status === 'failed'
+            ? 'text-red-600 dark:text-red-400'
+            : 'text-emerald-600 dark:text-emerald-400';
+
         return (
           <div key={`${entry.subagentId}-${entryIdx}`} className="mb-0.5">
             <div className="flex items-start gap-0">
@@ -36,6 +47,7 @@ export const SubagentTreeView: React.FC<{
               <span className={cn('text-[11px] mr-0.5', bulletColor, isRunning && 'animate-pulse')}>⏺</span>
               <span className="text-cyan-600 dark:text-cyan-400 font-semibold">{entry.subagentId || entry.agentName || 'Task'}</span>
               <span className="text-slate-700 dark:text-slate-200">({taskPreview})</span>
+              <span className={cn('text-[11px] ml-1', statusColor)}>{statusSuffix}</span>
             </div>
 
             {isRunning ? (
@@ -80,16 +92,6 @@ export const SubagentTreeView: React.FC<{
                   </div>
                 );
               })
-            ) : !isRunning ? (
-              <div className="flex items-start gap-0 text-[11px] pl-4">
-                <span className="text-slate-400 dark:text-slate-600 select-none shrink-0">⎿&nbsp;&nbsp;</span>
-                <span className="text-slate-400 dark:text-slate-500 italic">
-                  Done ({[
-                    `${entry.toolCount} tool use${entry.toolCount === 1 ? '' : 's'}`,
-                    ...(entry.contextTokens > 0 ? [`${formatCompactTokens(entry.contextTokens)} tokens`] : []),
-                  ].join(' \u00b7 ')})
-                </span>
-              </div>
             ) : null}
           </div>
         );

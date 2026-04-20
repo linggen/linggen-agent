@@ -994,6 +994,11 @@ impl AgentEngine {
         {
             PreExecOutcome::Blocked(ctrl) => ctrl,
             PreExecOutcome::Ready(call, exec) => {
+                // Sync the current path-mode grants into tools so any Task
+                // delegation spawned inside this call inherits them. Grants can
+                // change during a run (user approves mid-turn), so re-sync here
+                // rather than at engine construction time.
+                self.tools.builtins.parent_path_modes = self.session_permissions.path_modes.clone();
                 let tools_clone = self.tools.clone();
                 let mut handle = tokio::task::spawn_blocking(move || tools_clone.execute(call));
                 let result = loop {

@@ -105,6 +105,10 @@ pub struct EngineConfig {
     pub consumer_allowed_tools: Option<std::collections::HashSet<String>>,
     /// When set, restricts available skills for proxy room consumers.
     pub consumer_allowed_skills: Option<std::collections::HashSet<String>>,
+    /// Default session policy preset for user sessions (`interactive` /
+    /// `strict` / `trusted` / `sandbox`). Set from `[agent] default_policy`
+    /// in linggen.toml. When unset, sessions default to `interactive`.
+    pub default_policy: Option<String>,
 }
 
 impl EngineConfig {

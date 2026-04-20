@@ -286,6 +286,13 @@ pub struct SkillPermission {
     /// Paths to grant the mode on. E.g. ["/", "~/workspace"].
     #[serde(default)]
     pub paths: Vec<String>,
+    /// Session policy preset when the skill is active: "interactive" | "strict"
+    /// | "trusted" | "sandbox". Defaults to "strict" (silently deny out-of-scope
+    /// actions — the skill declared its scope, enforce it without user prompts).
+    /// Skills that legitimately need to reach beyond their declared paths can
+    /// set this to "interactive" to fall back to per-action user prompts.
+    #[serde(default)]
+    pub policy: Option<String>,
     /// Warning message shown to user before approval.
     #[serde(default)]
     pub warning: Option<String>,

@@ -182,6 +182,12 @@ pub struct Tools {
     /// Session policy propagated to subagents via delegation.
     /// Set by the parent engine; applied to subagent engines after spawn.
     pub(crate) session_policy: Option<super::session_policy::SessionPolicy>,
+    /// Parent engine's path-mode grants, propagated to subagents via delegation.
+    /// Mirrors `engine.session_permissions.path_modes` and is re-synced by the
+    /// caller before each tool dispatch. Subagents inherit these so skill-
+    /// granted paths (e.g. `~/.linggen`) don't require re-prompting inside a
+    /// delegated run.
+    pub(crate) parent_path_modes: Vec<super::permission::PathMode>,
 }
 
 impl Tools {
@@ -200,6 +206,7 @@ impl Tools {
             prompt_store: None,
             session_id: None,
             session_policy: None,
+            parent_path_modes: Vec::new(),
         })
     }
 

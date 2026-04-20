@@ -75,6 +75,7 @@ impl Tools {
 
         let ask_bridge = self.ask_user_bridge.clone();
         let policy = self.session_policy.clone();
+        let parent_path_modes = self.parent_path_modes.clone();
         block_on_async(run_delegation(
             manager,
             ws_root,
@@ -87,6 +88,7 @@ impl Tools {
             ask_bridge,
             session_id,
             policy,
+            parent_path_modes,
         ))
     }
 
@@ -251,6 +253,7 @@ pub(crate) async fn run_delegation(
     ask_user_bridge: Option<Arc<AskUserBridge>>,
     session_id: Option<String>,
     parent_policy: Option<crate::engine::session_policy::SessionPolicy>,
+    parent_path_modes: Vec<crate::engine::permission::PathMode>,
 ) -> Result<ToolResult> {
     let run_id = manager
         .begin_agent_run(
@@ -308,6 +311,15 @@ pub(crate) async fn run_delegation(
     if let Some(ref policy) = parent_policy {
         policy.apply(&mut engine);
     }
+
+    // Inherit parent's path-mode grants so skill-approved paths (e.g. `~/.linggen`,
+    // `~/.claude` for the memory skill) don't re-prompt inside delegated runs. The
+    // parent is the authority: subagents cannot see anything the parent couldn't.
+    for pm in &parent_path_modes {
+        engine.session_permissions.set_path_mode(&pm.path, pm.mode.clone());
+    }
+    // Also propagate so that *further* nested delegations keep the grants.
+    engine.tools.builtins.parent_path_modes = parent_path_modes;
 
     // Wire AskUser bridge so the subagent can prompt for permissions and user questions.
     if let Some(bridge) = ask_user_bridge {

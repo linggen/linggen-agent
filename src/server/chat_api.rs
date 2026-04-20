@@ -557,10 +557,25 @@ async fn run_skill_dispatch(
 
                 match engine.ask_permission_raw(&skill.name, question).await {
                     Some(crate::engine::permission::PermissionAction::AllowOnce) => {
-                        // "Approve" — grant the requested permissions.
+                        // "Approve" — grant the requested permissions and lock
+                        // the session to `strict` policy. The skill declared
+                        // the paths it needs; anything outside that scope
+                        // should be silently denied (so the model sees an
+                        // error and adapts) rather than prompting the user on
+                        // every speculative Glob/Grep. Spec: permission-spec.md
+                        // → "A policy where either lever is not `ask` is
+                        // locked — the agent never prompts the user".
                         for path in &perm.paths {
                             engine.session_permissions.set_path_mode(path, mode.clone());
                         }
+                        // Skill may declare a policy (SKILL.md frontmatter
+                        // `permission.policy`); default to `strict` so the
+                        // skill's scope is enforced without user prompts.
+                        engine.session_permissions.policy = perm
+                            .policy
+                            .as_deref()
+                            .map(crate::engine::permission::PermissionPolicy::from_preset)
+                            .unwrap_or_else(crate::engine::permission::PermissionPolicy::strict);
                         if let Some(ref sdir) = engine.session_dir {
                             engine.session_permissions.save(sdir);
                         }
@@ -1431,6 +1446,27 @@ pub(crate) async fn chat_handler(
                                 }
                             }
                         }
+                    } else {
+                        // The UI asked for a model that's no longer in config
+                        // (renamed / removed / not yet reloaded). Fall back to
+                        // the default instead of silently running on stale
+                        // `engine.model_id`, and clear the stale pinning so the
+                        // session stops requesting the dead id.
+                        tracing::warn!(
+                            "Session '{}' requested model '{}' which is not configured — falling back to default '{}'",
+                            session_id.as_deref().unwrap_or("?"),
+                            mid,
+                            engine.default_model_id
+                        );
+                        engine.model_id = engine.default_model_id.clone();
+                        if let Some(ref sid) = session_id {
+                            if let Ok(Some(mut meta)) = state.manager.global_sessions.get_session_meta(sid) {
+                                if meta.model_id.is_some() {
+                                    meta.model_id = None;
+                                    let _ = state.manager.global_sessions.update_session_meta(&meta);
+                                }
+                            }
+                        }
                     }
                 } else {
                     engine.model_id = engine.default_model_id.clone();
@@ -1570,6 +1606,19 @@ pub(crate) async fn chat_handler(
                                                     engine.session_permissions.set_path_mode(path, mode.clone());
                                                     changed = true;
                                                 }
+                                            }
+                                            // Apply the skill's declared policy (or `strict` by
+                                            // default) so out-of-scope actions deny silently
+                                            // instead of prompting. See permission-spec.md §
+                                            // Session policy.
+                                            let want = perm
+                                                .policy
+                                                .as_deref()
+                                                .map(crate::engine::permission::PermissionPolicy::from_preset)
+                                                .unwrap_or_else(crate::engine::permission::PermissionPolicy::strict);
+                                            if engine.session_permissions.policy != want {
+                                                engine.session_permissions.policy = want;
+                                                changed = true;
                                             }
                                             if changed {
                                                 if let Some(ref sdir) = engine.session_dir {

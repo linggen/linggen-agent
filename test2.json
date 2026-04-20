@@ -1,0 +1,215 @@
+Linggen Agent Chat Export
+Project: /Users/lianghuang
+Session: sess-1776694746-93f681ec
+Agent: ling
+ExportedAt: 2026-04-20T14:25:20.786Z
+[11:19:10 AM] ling → user
+Hi — I’m your Memory agent. I am scanning sessions from the last 24 hours.
+
+[11:20:39 AM] ling → ling
+## New facts for user_info.md
+- None
+
+## New rules for user_feedback.md
+- None
+
+## Agent actions for agent_done_week.md (2026-04-20)
+### Built / Fixed / Decided / Tried / Learned
+- Explained a corrupt JSONL warning from `src/state_fs/sessions.rs:257` as a malformed concatenated JSONL line in session history loading.
+- Updated session filter UI behavior in `linggen/ui/src/components/SessionList.tsx`: reordered tabs to `User / Mission / Skill / All`, added per-tab counts, and made `User` the default selection.
+- Redesigned debug chat actions placement by moving `Copy Chat`, `Copy System Prompt`, and `Clear Chat` out of `HeaderBar` and into the shared chat widget area so all chat surfaces can access them.
+- Removed the main-message filter input from `ChatPanel.tsx` and repurposed that area for debug actions, then further hid those actions behind the expandable session bar/details area because they are mainly for debugging.
+- Removed related action props and inline button groups from `HeaderBar.tsx`, `MainApp.tsx`, and `ConsumerChatPage.tsx`.
+- Built both UI and Rust app successfully after the chat action relocation changes.
+- Diagnosed that exported system prompts from the main page were incomplete because the frontend `Copy System Prompt` flow was not sending `session_id`, causing backend prompt export to fall back to `default` and omit active skill prompt content.
+- Fixed system prompt export by including `session_id` in the request so main page and skill page exports for the same session can match.
+- Diagnosed a second export bug on skill/embed pages where empty `selectedProjectRoot` caused the client to silently fail prompt export; fixed by deriving `project_root` from session metadata and relaxing the client check when root is empty.
+- Confirmed successful builds after both system prompt export fixes.
+- Explained that the global `# Memory` block in the system prompt is separate from the memory skill’s `SKILL.md` body and appears in all sessions, while the skill prompt appears only when `active_skill=memory`.
+- Investigated a reported ordering issue on the memory skill page where main-agent tool calls appeared above or around the final assistant text.
+- Added a temporary `window.__chatStore` debug hook in the frontend to inspect live message ordering inside the embed/skill chat store.
+- Guided console-based inspection of message arrays, activity entries, and content blocks from the memory skill embed page.
+- Verified from runtime dumps that message array order and `content[]` order were already chronological; no concrete evidence of a true ordering bug was found in stored data.
+- Determined the observed “tools in the middle” effect was likely a rendering/layout perception inside a single generating message bubble, not proven data corruption or sort failure.
+- Added optional `timestampMs` fields to `ContentBlock`, `SubagentTreeEntry`, and `SubagentToolStep`.
+- Stamped new timestamps at insertion sites in `eventHandlers/chat.ts` and `eventHandlers/run.ts` using `Date.now()` for newly-created content blocks, subagent entries, and tool steps.
+- Intentionally left reconstructed historical/restored blocks without timestamps because their original per-tool timing cannot be recovered reliably.
+- Removed the temporary `window.__chatStore` debug hook after debugging.
+- Built both UI and Rust app successfully after timestamp additions and debug-hook cleanup.
+- Advised against sorting rendered tool/content blocks by client-side timestamps for now because reconstructed blocks lack timestamps and reload-time `Date.now()` values are not durable enough to be a trustworthy ordering source.
+
+## SUGGEST for CLAUDE.md (project-specific — do NOT promote to global)
+- /Users/lianghuang/workspace/linggen: For prompt-export debugging, always verify the frontend passes the real `session_id`; otherwise backend prompt export falls back to `default` and silently omits active skill prompt content.
+- /Users/lianghuang/workspace/linggen: On embed/skill chat surfaces, `selectedProjectRoot` may intentionally be empty; debug/export features should derive `project_root` from session metadata instead of treating empty root as a hard error.
+- /Users/lianghuang/workspace/linggen: Do not assume visible ordering issues in chat bubbles are data-order bugs; inspect `messages[]`, `content[]`, and activity arrays before changing sort logic.
+- /Users/lianghuang/workspace/linggen: Client-side timestamps on tool/content blocks are useful for diagnostics, but should not yet replace insertion order as render truth because restored historical blocks have no reliable per-block timestamps.
+
+## Duplicates skipped
+- Existing persistent memory feature already records that memory files live under `/Users/lianghuang/.linggen/memory`; not a new fact.
+- Existing workflow guidance already includes using builds to verify UI/Rust changes; repeated successful builds were treated as session actions, not new standing rules.
+- The discussion about replacing negative path restrictions in the memory skill with positive explicit-path rules was proposed but not implemented in this session, so it was not recorded as a completed action.
+
+Done: extracted cross-project facts from the flattened conversation, dedup-checked against current memory files (which were absent at the queried paths), and returned a structured no-write report only.
+
+[11:20:46 AM] ling → ling
+## New facts for user_info.md
+- None.
+
+## New rules for user_feedback.md
+- None.
+
+## Agent actions for agent_done_week.md (2026-04-20)
+### Learned
+- The extracted session `/Users/lianghuang/.claude/projects/-Users-lianghuang-workspace-linggen/952bd85d-010b-4d0f-921f-c71ce007ffc9.jsonl` contained only local `/exit` command metadata and `Bye!`, with no user/assistant conversation content to preserve.
+- The extracted memory-skill session contained only local-command caveat text and `Bye!`, confirming that some collected sessions add no reusable cross-project memory and should be treated as no-op extracts.
+
+## SUGGEST for CLAUDE.md (project-specific — do NOT promote to global)
+- None.
+
+## Duplicates skipped
+- Session-only no-op extract findings above are already recorded in `/Users/lianghuang/.linggen/memory/agent_done_week.md` under `2026-04-20 -> Learned`.
+- Existing memory already records the user preference to use the extraction script first, inspect existing memory for dedup, and return only a structured report without writing memory directly.
+
+Done: ran the extraction script, inspected the source session JSONL and existing memory files for dedup, and confirmed there are no new cross-project facts or rules to add from this session.
+
+[11:21:10 AM] ling → ling
+## New facts for user_info.md
+- Preferences: Prefers exported/copyable system prompt output to include the native tool schemas too, so the full model-facing surface is visible during debugging, not just the text prompt (2026-04-20)
+
+## New rules for user_feedback.md
+- Do: When debugging system-prompt export, include native tool schemas in the exported/copied output when tools are passed via API-level native function calling, so the user can inspect the full model-facing context including skill tools like `PageUpdate` (2026-04-20)
+- Do: Keep system-prompt sections in the TOML prompt store instead of hardcoding prompt text in Rust, including app-skill dashboard hints (2026-04-20)
+
+## Agent actions for agent_done_week.md (2026-04-20)
+### Fixed
+- Fixed duplicate subagent rows in the memory skill by stopping session-scoped broadcast events from being sent over both the session channel and the control channel when the session channel is already open; the duplicate UI entries came from client-side double handling, not from duplicated run-id generation.
+- Fixed Copy System Prompt timing out during active turns by changing prompt export to build from a throwaway engine instead of waiting on the live session engine lock, so WebRTC control-channel fetches no longer hit the 30-second timeout while an agent is busy.
+- Fixed duplicate app-skill dashboard-hint injection by suppressing the generic `PageUpdate` reminder when the active skill body already documents `PageUpdate` itself.
+- Fixed app-skill `PageUpdate` permission prompts by bypassing filesystem permission gating for skill data tools with empty commands, since they do not actually touch files and should not synthesize a HOME-path target.
+
+### Decided
+- Confirmed that the `ling05/06/07` numbering was correct and should not be reset per extraction run, because Ling subagent run IDs use a daemon-lifetime shared counter and earlier activity had already consumed `ling01`-`ling04`.
+- Decided to move the app-skill dashboard hint text out of hardcoded Rust and into the TOML prompt store, matching the rest of the system-prompt architecture.
+- Confirmed that `PageUpdate` is a real skill tool delivered alongside other tools, and that under native tool calling its schema is sent via the API `tools` parameter rather than embedded in the visible system prompt.
+- Decided that system-prompt export should include native tool schemas in addition to the prompt text so debugging reflects the full model-facing context.
+
+### Learned
+- Historic session messages are delivered to the UI over the control channel via fetch-over-RPC, while live per-session streaming events use the `sess-{id}` session channel; the UI merges persisted history with streamed updates client-side.
+- Session chat data stored in `messages.jsonl`, workspace-state responses, and page-state pushes do not contain the assembled system prompt or tool schemas; the prompt is rebuilt on demand from agent spec, active skill, memory, tool registry, permission context, and project instructions.
+- The system prompt can change after session creation because it depends on mutable inputs such as memory files, active skill content, working directory/project context, permission mode, allowed tools, and plan mode.
+- In native-tools mode, exported system prompts do not visibly include tool schemas unless the export endpoint adds them explicitly; otherwise tools like `PageUpdate` are still available to the model through the API-level `tools` payload.
+- The memory skill prompt export the user reviewed correctly included both the global Ling instruction block and the active memory skill body, with `$SKILL_DIR` resolved to an absolute path.
+
+## SUGGEST for CLAUDE.md (project-specific — do NOT promote to global)
+- /Users/lianghuang/workspace/linggen: Session-scoped RTC broadcasts must not be delivered over both control and session channels when the session channel is subscribed, or subagent/activity events will render twice in views listening on both.
+- /Users/lianghuang/workspace/linggen: Copy System Prompt should build from a throwaway engine snapshot rather than the live session engine lock, otherwise WebRTC control-channel fetches can time out during active turns.
+- /Users/lianghuang/workspace/linggen: If a skill already documents `PageUpdate` in SKILL.md, suppress the generic app-skill dashboard hint to avoid duplicate prompt sections and wasted tokens.
+- /Users/lianghuang/workspace/linggen: Skill data tools with empty commands (such as `PageUpdate`) should bypass filesystem permission gating because they do not touch disk and otherwise can incorrectly trigger HOME-path permission prompts.
+- /Users/lianghuang/workspace/linggen: Keep prompt text fragments such as app-skill dashboard hints in `prompts/system-prompt.toml` rather than hardcoding them in Rust.
+- /Users/lianghuang/workspace/linggen: For native tool-calling debug export, include the API-level tool schemas in the copied/exported output so developers can inspect the full model-facing surface, including skill tools.
+
+## Duplicates skipped
+- User prefers autonomous memory extraction to use the extraction script first, inspect existing memory for dedup, and return only a structured report without writing files.
+- User prefers autonomous agents to work step by step, explore the codebase before making changes, and report outcomes only.
+- User prefers exported system prompts for the same session to be identical regardless of whether export is triggered from the main page or skill page.
+- Existing feedback already records that autonomous memory extraction should return only a structured report, avoid project-specific global memory, and inspect code before changing it.
+- Existing agent memory already records the prompt-export timeout/root-cause investigation, the duplicate subagent broadcast bug, and the fix to include tool schemas in exported system-prompt output.
+
+[11:21:24 AM] ling → ling
+## New facts for user_info.md
+- None
+
+## New rules for user_feedback.md
+- None
+
+## Agent actions for agent_done_week.md (2026-04-20)
+### Built / Fixed / Decided / Tried / Learned
+- Reviewed docking behavior in `rust-sanji` and clarified that U-shape entry is handled in the Enter phase, while Seat is the final slow crawl inside the dock pocket.
+- Analyzed real-world docking vs simulated wide U-dock behavior and identified that the existing simulator used custom AABB push-out collisions for dock walls instead of Rapier rigid-body contact.
+- Recommended migrating dock and obstacle collisions in `sanji-sim` from custom push-out logic to Rapier fixed/kinematic colliders with tunable restitution and friction to better approximate wall contact during docking.
+- Designed and then implemented a staged simulator migration:
+  - Stage 1: added obstacle physics config defaults (`restitution=0.2`, `friction=0.7`) and per-object optional overrides.
+  - Stage 2: replaced custom obstacle push-out with Rapier obstacle registration/sync APIs in the simulator runtime.
+  - Stage 3: verified sensor-facing geometry APIs remained unchanged, so radar/lidar/websocket/REST paths did not require updates.
+  - Stage 4: validated headless sim startup and scenario loading with Dock registration, confirming no Rapier panic.
+- Confirmed Stage 2 build/test status: workspace built cleanly; one failing test was verified as pre-existing and unrelated by stashing changes and re-running tests.
+- Clarified scope after migration: server-side simulator code changed; UI code was intentionally not changed because new obstacle material fields remained optional with config defaults.
+- Confirmed new simulator tunables were implemented via config rather than hard-coded behavior, with only numerical epsilon/invariant literals left in code.
+- Reviewed whether planner/control needed alignment after the simulator contact-physics upgrade and concluded no immediate planner/control code changes were necessary; current issues are better handled through config tuning first.
+- Identified key planner/control assumptions newly exposed by realistic contact:
+  - seated speed threshold may be too strict under bounce,
+  - docking corridor currently zeros obstacle cost in Seat phase,
+  - MPC hull model still uses a disk approximation that may miss corner-contact behavior in tighter docks.
+- Recommended a likely first tuning step outside the simulator: raise seated velocity tolerance to about `0.25 m/s` in vehicle config if real-contact bounce prevents Seat completion.
+
+## SUGGEST for CLAUDE.md (project-specific — do NOT promote to global)
+- `/Users/lianghuang/workspace/rust-sanji`: When changing docking/obstacle physics, keep simulator contact realism in `sanji-sim` separate from planner/control abstractions; prefer config tuning (`seated_eps_v_mps`, docking corridor width, hull collision radius) before changing planner/control code.
+- `/Users/lianghuang/workspace/rust-sanji`: For dock-contact simulation, avoid hybrid collision models; use Rapier colliders for physical obstacles instead of mixing Rapier boat dynamics with custom AABB push-out logic.
+- `/Users/lianghuang/workspace/rust-sanji`: UI changes are not required when adding optional simulator object physics fields if serde defaults and config fallbacks preserve backward compatibility.
+
+## Duplicates skipped
+- No existing memory entries could be checked because the referenced memory files were not present at the specified paths.
+
+[11:21:45 AM] ling → ling
+## New facts for user_info.md
+- Identity: User is leading detailed Sanji docking-control design review, focusing on runtime control flow, critic interactions, and close-range phase/damping behavior in U-shape dock scenarios (2026-04-20)
+- Claims: In U-shape dock docking, the boat zigzags and can spin because close-range docking currently has critic conflicts and insufficient damping before Seat engages (2026-04-20)
+
+## New rules for user_feedback.md
+- Do: For control-design debugging, first explain the full runtime docking flow end-to-end before proposing changes, so the user can reason from actual phase/critic behavior instead of isolated symptoms (2026-04-20)
+- Do: When tuning docking behavior, prefer explicit configuration thresholds for control-regime changes (for example Enter/Seat radii) instead of deriving them indirectly from unrelated geometry scalars like search radius or stop offset (2026-04-20)
+- Do: Treat Enter and Seat as the same low-speed wall-threading regime when their mechanics match; apply the same damping/smoothness logic if the user is trying to suppress zigzag/spin before final seating (2026-04-20)
+
+## Agent actions for agent_done_week.md (2026-04-20)
+### Built / Fixed / Decided / Tried / Learned
+- Built: Explained Sanji docking flow end-to-end, covering mission hint input, per-tick dock detection, detector-driven phase selection, docking tactical intent, corridor effects, and how planner/control pieces interact during docking.
+- Learned: In the reported U-shape docking failure, zigzag/spin was traced to three interacting causes: corridor tangent fighting detected dock heading, Seat damping engaging too late, and corridor-based wall suppression making spin-in-place too cheap at low throttle.
+- Decided: Use explicit `enter_radius_m` and `seat_radius_m` in `DockingConfig` rather than deriving Enter/Seat thresholds from `search_radius` and `stop_offset`.
+- Decided: Extend damped docking weights to Enter as well as Seat/Berth because Enter is already a low-speed wall-threading regime and needs the same anti-chatter behavior.
+- Built: Implemented explicit docking phase radii plumbed through config and mission-manager logic, updated tactical docking weights so Enter uses the damped regime, and exposed the new fields in `config/boats/blueboat.toml`.
+- Fixed: Changed the reported case where a boat at roughly 7.4 m from target still stayed in undamped Approach; with `enter_radius_m=10`, that range now enters the damped Enter phase with lower target speed and higher smoothness/speed penalties.
+- Learned: The updated Sanji build compiled cleanly aside from pre-existing warnings, and all 10 docking tests passed after the Enter/Seat threshold and damping changes.
+
+## SUGGEST for CLAUDE.md (project-specific — do NOT promote to global)
+- /Users/lianghuang/workspace/rust-sanji: When diagnosing docking instability, inspect the debug telemetry for phase, target speed, smoothness weight, tracking cost, obstacle cost, xy error, and yaw error together; large tracking cost with near-zero XTE usually means heading conflict rather than path-following error.
+- /Users/lianghuang/workspace/rust-sanji: In docking, corridor tangent and detected dock heading can diverge materially; if both are active in different critics, expect yaw-target conflict and oscillation unless proximity-gated or otherwise coordinated.
+- /Users/lianghuang/workspace/rust-sanji: Corridor-based dock-wall suppression makes berth entry possible but also removes wall cost that would otherwise discourage spin-in-place, so damping and phase timing become critical.
+- /Users/lianghuang/workspace/rust-sanji: `phase_from_distance` now should be treated as a control-regime selector, not a geometry-derived heuristic; keep Enter/Seat thresholds explicit in config.
+- /Users/lianghuang/workspace/rust-sanji: Extending damped weights into Enter is intentional because threading the dock opening is mechanically similar to Seat and needs anti-chatter behavior before final seating.
+
+## Duplicates skipped
+- Already in memory: User is leading Sanji docking behavior/design decisions globally.
+- Already in memory: User prefers design/discussion first for docking behavior before implementation.
+- Already in memory: U-shape dock scenarios still show zigzag/spin during docking.
+- Already in memory: Docking phase tuning was changed by adding explicit Enter/Seat radii and extending damped weights into Enter.
+- Already in memory: The prior root-cause summary that close-range zigzag/spin comes from heading-control conflict, late damping, corridor wall suppression, and cheap low-throttle yaw.
+
+[11:24:59 AM] ling → user
+  > Reading file: /Users/lianghuang/.linggen/memory/user_info.md
+  > Reading file: /Users/lianghuang/.linggen/memory/user_feedback.md
+  > Reading file: /Users/lianghuang/.linggen/memory/agent_done_week.md
+  > Reading file: /Users/lianghuang/.linggen/memory/agent_done_month.md
+  > Reading file: /Users/lianghuang/.linggen/memory/agent_done_year.md
+  > Read file: user_info.md
+  > Read file: user_feedback.md
+  > Read file: agent_done_week.md
+  > Read file: agent_done_month.md
+  > Read file: agent_done_year.md
+  > Editing file: /Users/lianghuang/.linggen/memory/user_info.md
+  > Edited file: user_info.md
+  > Reading file: /Users/lianghuang/.linggen/memory/user_feedback.md
+  > Read file: user_feedback.md
+  > Editing file: /Users/lianghuang/.linggen/memory/user_feedback.md
+  > Edited file: user_feedback.md
+  > Reading file: /Users/lianghuang/.linggen/memory/agent_done_week.md
+  > Read file: agent_done_week.md
+  > Editing file: /Users/lianghuang/.linggen/memory/agent_done_week.md
+  > Edited file: agent_done_week.md
+  > Reading file: /Users/lianghuang/.linggen/memory/agent_done_week.md
+  > Read file: agent_done_week.md
+  > Editing file: /Users/lianghuang/.linggen/memory/agent_done_week.md
+  > Edited file: agent_done_week.md
+  > Reading file: /Users/lianghuang/.linggen/memory/agent_done_week.md
+  > Read file: agent_done_week.md
+  > Used tool: PageUpdate
+Scan complete: I merged the new cross-project facts and refreshed the dashboard with file-by-file deltas. No weekly compression was needed yet, so month/year memory stayed unchanged.

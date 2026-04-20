@@ -1,6 +1,8 @@
 mod agent_manager;
+mod anthropic;
 #[allow(dead_code)]
 mod check;
+mod claude_auth;
 mod cli;
 mod codex_auth;
 mod config;

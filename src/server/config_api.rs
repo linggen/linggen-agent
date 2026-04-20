@@ -202,3 +202,34 @@ pub(crate) async fn codex_auth_logout() -> impl IntoResponse {
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Claude Code OAuth API — status only (no login/logout)
+// ---------------------------------------------------------------------------
+//
+// Unlike ChatGPT, Claude Code OAuth tokens are managed by the `claude` CLI —
+// sign-in and refresh happen there, Linggen just reads the OS-native store
+// on every inference call. So we expose a status endpoint but no login /
+// logout routes; the UI instead tells the user to run `claude`.
+
+/// Get Claude Code OAuth status. Never returns the actual access token —
+/// the UI only needs metadata (subscription, scopes, expiry) for display.
+pub(crate) async fn get_claude_auth_status() -> impl IntoResponse {
+    match crate::claude_auth::load() {
+        Ok(tokens) => Json(serde_json::json!({
+            "authenticated": !tokens.is_expired(),
+            "expires_at": tokens.expires_at,
+            "expired": tokens.is_expired(),
+            "subscription_type": tokens.subscription_type,
+            "rate_limit_tier": tokens.rate_limit_tier,
+            "scopes": tokens.scopes,
+            "can_do_inference": tokens.can_do_inference(),
+        }))
+        .into_response(),
+        Err(e) => Json(serde_json::json!({
+            "authenticated": false,
+            "error": e.to_string(),
+        }))
+        .into_response(),
+    }
+}

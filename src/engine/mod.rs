@@ -82,6 +82,16 @@ impl AgentEngine {
             if self.cfg.consumer_allowed_tools.is_some() || self.cfg.mission_allowed_tools.is_some() {
                 self.session_permissions
                     .set_policy(permission::PermissionPolicy::trusted());
+            } else if self.session_permissions.policy == permission::PermissionPolicy::default() {
+                // First-time load (permission.json absent or at defaults) —
+                // apply the user's configured default policy from
+                // `[agent] default_policy`. Skill/mission/consumer sessions
+                // already picked their own policy above, so this only affects
+                // fresh user chats.
+                if let Some(ref name) = self.cfg.default_policy {
+                    self.session_permissions
+                        .set_policy(permission::PermissionPolicy::from_preset(name));
+                }
             }
 
             // Initialize default path_modes if empty (new session = read on cwd).
@@ -148,13 +158,19 @@ impl AgentEngine {
             .run_id
             .clone()
             .unwrap_or_else(|| "root".to_string());
+        // Task strings can be 100+ lines (e.g. MEMORY_EXTRACT embeds the full
+        // dashboard-page-layout prompt). Logging the whole thing at INFO
+        // overwhelms the log. Show the first non-blank line + size so a
+        // human can match run IDs to tasks; full text remains at DEBUG.
+        let task_summary = summarize_task_for_log(task.as_ref());
         info!(
             "[{}] Starting agent loop for role {:?} (depth={}) task: {}",
             log_run,
             self.role,
             self.tools.builtins.delegation_depth(),
-            task,
+            task_summary,
         );
+        tracing::debug!("[{}] Full task: {}", log_run, task);
         self.push_context_record(
             ContextType::Status,
             Some("autonomous_loop_start".to_string()),
@@ -805,5 +821,32 @@ impl AgentEngine {
         // Check if the agent cd'd into/out of a git project
         self.check_working_folder_change();
         None
+    }
+}
+
+/// Build a single-line preview of an agent task for the INFO log. Strips
+/// `[HIDDEN]` marker tags (used internally to hide prompts from UI), then
+/// keeps the first non-empty line. Multi-line/very long tasks (e.g. the
+/// full MEMORY_EXTRACT payload that embeds the dashboard schema) are
+/// truncated with an ellipsis and a byte/line count so the reader can tell
+/// there's more hidden at DEBUG.
+fn summarize_task_for_log(task: &str) -> String {
+    const MAX: usize = 160;
+    let stripped = task.trim_start_matches("[HIDDEN] ").trim_start();
+    // Collapse the leading marker again if the model double-marked it.
+    let stripped = stripped.trim_start_matches("[HIDDEN] ").trim();
+    let first_line = stripped.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let total_bytes = task.len();
+    let total_lines = task.lines().count();
+    let one_line = if first_line.chars().count() > MAX {
+        let cut: String = first_line.chars().take(MAX).collect();
+        format!("{cut}…")
+    } else {
+        first_line.to_string()
+    };
+    if total_lines <= 1 && total_bytes <= MAX {
+        one_line
+    } else {
+        format!("{one_line} ({total_bytes}B/{total_lines}L — full at DEBUG)")
     }
 }
