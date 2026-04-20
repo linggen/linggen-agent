@@ -109,20 +109,25 @@ function handlePlanUpdate(item: UiEvent): void {
 function handleSubagentSpawned(item: UiEvent): void {
   if (!item.data) return;
   const parentId = String(item.agent_id || '').toLowerCase();
-  const subagentId = String(item.data.subagent_id || '');
+  // Prefer the unique run_id (distinguishes parallel subagents that share
+  // the same agent_id, e.g. six "ling" subagents). Fall back to subagent_id
+  // (agent spec name) for back-compat with older events.
+  const agentName = String(item.data.subagent_id || '');
+  const trackingId = String(item.data.subagent_run_id || item.data.subagent_id || '');
   const task = String(item.data.task || '');
-  if (!subagentId || !parentId) return;
+  if (!trackingId || !parentId) return;
 
-  agentTracker.registerSubagent(subagentId, parentId);
+  agentTracker.registerSubagent(trackingId, parentId);
   const newEntry: SubagentTreeEntry = {
-    subagentId,
-    agentName: subagentId,
+    subagentId: trackingId,
+    agentName: agentName || trackingId,
     task,
     status: 'running',
     toolCount: 0,
     contextTokens: 0,
     currentActivity: null,
     toolSteps: [],
+    timestampMs: Date.now(),
   };
   useChatStore.getState().addSubagentToTree(parentId, newEntry);
 }
@@ -130,10 +135,10 @@ function handleSubagentSpawned(item: UiEvent): void {
 function handleSubagentResult(item: UiEvent): void {
   if (!item.data) return;
   const parentId = String(item.agent_id || '').toLowerCase();
-  const subagentId = String(item.data.subagent_id || '');
-  if (!subagentId || !parentId) return;
+  const trackingId = String(item.data.subagent_run_id || item.data.subagent_id || '');
+  if (!trackingId || !parentId) return;
 
-  useChatStore.getState().updateSubagentTree(parentId, subagentId,
+  useChatStore.getState().updateSubagentTree(parentId, trackingId,
     (entry) => ({ ...entry, status: 'done', currentActivity: null }));
-  agentTracker.unregisterSubagent(subagentId);
+  agentTracker.unregisterSubagent(trackingId);
 }

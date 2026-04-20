@@ -14,16 +14,20 @@ export function handleActivity(item: UiEvent): void {
   const nextStatus = normalizeAgentStatus(statusRaw) as AgentStatusValue;
   const statusText = String(item.text || '').trim();
 
-  // Route subagent activity to parent tree before touching top-level state.
+  // Route subagent activity to parent tree. Prefer the emitter's unique
+  // run_id as the tracking key — distinguishes parallel subagents that
+  // share the same agent_id (e.g. six "ling" subagents running in parallel).
+  const runIdFromData = item.data?.run_id ? String(item.data.run_id) : null;
+  const trackingId = runIdFromData || agentId;
   const parentIdFromData = item.data?.parent_id ? String(item.data.parent_id) : null;
   const parentIdForSubagent =
-    agentTracker.getParent(agentId) ||
+    agentTracker.getParent(trackingId) ||
     (parentIdFromData ? parentIdFromData.toLowerCase() : null);
 
   if (parentIdForSubagent && statusRaw !== 'mission_triggered') {
     applySubagentActivity({
       parentId: parentIdForSubagent,
-      agentId,
+      agentId: trackingId,
       phase: item.phase,
       nextStatus,
       statusText,

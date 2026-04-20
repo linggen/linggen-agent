@@ -18,6 +18,7 @@ pub mod keys {
     pub const SYSTEM_SKILLS_HEADER: &str = "system-prompt.skills_header";
     pub const SYSTEM_SKILL_ENTRY: &str = "system-prompt.skill_entry";
     pub const SYSTEM_ACTIVE_SKILL_FRAME: &str = "system-prompt.active_skill_frame";
+    pub const SYSTEM_APP_SKILL_DASHBOARD_HINT: &str = "system-prompt.app_skill_dashboard_hint";
     pub const SYSTEM_PROJECT_INSTRUCTIONS_HEADER: &str =
         "system-prompt.project_instructions_header";
     pub const SYSTEM_PROJECT_INSTRUCTIONS_ENTRY: &str = "system-prompt.project_instructions_entry";
@@ -73,6 +74,12 @@ pub mod keys {
     // -- Single-table files (legacy compat) -------------------------------
     pub const RESPONSE_FORMAT: &str = "response-format.default";
     pub const RESPONSE_FORMAT_NATIVE: &str = "response-format.native";
+    pub const RESPONSE_FORMAT_NATIVE_ASKUSER_BULLET: &str = "response-format.native_askuser_bullet";
+    pub const RESPONSE_FORMAT_NATIVE_CONVERSATIONAL: &str = "response-format.native_conversational";
+    pub const RESPONSE_FORMAT_NATIVE_PLAN_MODE: &str = "response-format.native_plan_mode";
+    pub const RESPONSE_FORMAT_NATIVE_UPDATE_PLAN: &str = "response-format.native_update_plan";
+    pub const RESPONSE_FORMAT_NATIVE_RULES_BASE: &str = "response-format.native_rules_base";
+    pub const RESPONSE_FORMAT_NATIVE_RULES_TASK: &str = "response-format.native_rules_task";
     pub const PLAN_MODE: &str = "plan-mode.default";
     pub const PLAN_EXECUTE: &str = "plan-execute.default";
     pub const TASK_BOOTSTRAP: &str = "task-bootstrap.default";
@@ -312,6 +319,7 @@ mod tests {
             keys::SYSTEM_SKILLS_HEADER,
             keys::SYSTEM_SKILL_ENTRY,
             keys::SYSTEM_ACTIVE_SKILL_FRAME,
+            keys::SYSTEM_APP_SKILL_DASHBOARD_HINT,
             keys::SYSTEM_PROJECT_INSTRUCTIONS_HEADER,
             keys::SYSTEM_PROJECT_INSTRUCTIONS_ENTRY,
             keys::SYSTEM_PROJECT_INSTRUCTIONS_FOOTER,
@@ -355,6 +363,12 @@ mod tests {
             keys::BAILOUT_REPETITION_LOOP,
             keys::RESPONSE_FORMAT,
             keys::RESPONSE_FORMAT_NATIVE,
+            keys::RESPONSE_FORMAT_NATIVE_ASKUSER_BULLET,
+            keys::RESPONSE_FORMAT_NATIVE_CONVERSATIONAL,
+            keys::RESPONSE_FORMAT_NATIVE_PLAN_MODE,
+            keys::RESPONSE_FORMAT_NATIVE_UPDATE_PLAN,
+            keys::RESPONSE_FORMAT_NATIVE_RULES_BASE,
+            keys::RESPONSE_FORMAT_NATIVE_RULES_TASK,
             keys::PLAN_MODE,
             keys::PLAN_EXECUTE,
             keys::TASK_BOOTSTRAP,

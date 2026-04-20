@@ -257,7 +257,7 @@ pub(crate) async fn run_delegation(
             &ws_root,
             session_id.as_deref(),
             &target_agent_id,
-            parent_run_id,
+            parent_run_id.clone(),
             Some(format!("delegated by {}", caller_id)),
         )
         .await?;
@@ -275,6 +275,8 @@ pub(crate) async fn run_delegation(
             parent_id: caller_id.clone(),
             subagent_id: target_agent_id.clone(),
             task: task.clone(),
+            subagent_run_id: Some(run_id.clone()),
+            parent_run_id: parent_run_id.clone(),
         }, session_id.clone())
         .await;
 
@@ -296,6 +298,7 @@ pub(crate) async fn run_delegation(
     };
 
     engine.set_parent_agent(Some(caller_id.clone()));
+    engine.set_parent_run_id(parent_run_id.clone());
     engine.set_delegation_depth(delegation_depth + 1, max_delegation_depth);
     engine.set_run_id(Some(run_id.clone()));
     engine.set_task(task);
@@ -337,6 +340,8 @@ pub(crate) async fn run_delegation(
             parent_id: caller_id,
             subagent_id: target_agent_id,
             outcome: outcome.clone(),
+            subagent_run_id: Some(run_id.clone()),
+            parent_run_id: parent_run_id.clone(),
         }, session_id.clone())
         .await;
 

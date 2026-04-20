@@ -99,7 +99,7 @@ export const SessionList: React.FC<{
   const storeSessions = useSessionStore((s) => s.allSessions);
   const allSessions = filterSessions ?? storeSessions;
   const agentStatus = useServerStore((s) => s.agentStatus);
-  const [filter, setFilter] = useState<CreatorFilter>('all');
+  const [filter, setFilter] = useState<CreatorFilter>('user');
   const [search, setSearch] = useState('');
   const [showSearch, setShowSearch] = useState(false);
   const [missionsOpen, setMissionsOpen] = useState(false);
@@ -134,10 +134,22 @@ export const SessionList: React.FC<{
     }
   }, [allSessions]);
 
+  // Per-creator counts (computed before search/filter so tab counts reflect the full set)
+  const counts = useMemo(() => {
+    let user = 0, mission = 0, skill = 0;
+    for (const s of allSessions) {
+      if (s.creator === 'mission') mission++;
+      else if (s.creator === 'skill') skill++;
+      else user++;
+    }
+    return { user, mission, skill, all: allSessions.length };
+  }, [allSessions]);
+
   // Filter and search
   const filtered = useMemo(() => {
     let list = allSessions;
-    if (filter !== 'all') list = list.filter((s) => s.creator === filter);
+    if (filter === 'user') list = list.filter((s) => !s.creator || s.creator === 'user');
+    else if (filter !== 'all') list = list.filter((s) => s.creator === filter);
     if (search.trim()) {
       const q = search.toLowerCase();
       list = list.filter((s) =>
@@ -223,13 +235,13 @@ export const SessionList: React.FC<{
 
       {/* Filter tabs */}
       <div className="flex items-center gap-0.5 px-2 py-1.5 border-b border-slate-100 dark:border-white/[0.03]">
-        {(['all', 'user', 'mission', 'skill'] as const).map((f) => (
+        {(['user', 'mission', 'skill', 'all'] as const).map((f) => (
           <button key={f} onClick={() => setFilter(f)}
             className={cn('px-2 py-0.5 text-[11px] font-semibold rounded-full transition-colors capitalize',
               filter === f
                 ? 'bg-blue-100 dark:bg-blue-500/15 text-blue-600 dark:text-blue-400'
                 : 'text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5')}>
-            {f === 'all' ? `All (${allSessions.length})` : f}
+            {`${f === 'all' ? 'All' : f} (${counts[f]})`}
           </button>
         ))}
       </div>

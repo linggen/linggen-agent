@@ -60,7 +60,35 @@ impl SkillToolDef {
             if param.required {
                 let has_arg = obj.map(|o| o.contains_key(name)).unwrap_or(false);
                 if !has_arg {
-                    anyhow::bail!("missing required argument: {}", name);
+                    anyhow::bail!(
+                        "{} call missing required argument '{}'. Description: {}. \
+                         Retry with the argument populated.",
+                        self.name,
+                        name,
+                        param.description.trim_end_matches('.'),
+                    );
+                }
+                // For object/array types, also reject empty values — common
+                // mistake where the model calls the tool as a "trigger" with
+                // {} or []. Forcing a re-call with content is better than
+                // silently emitting an empty update.
+                if param.param_type == "object" || param.param_type == "array" {
+                    if let Some(val) = obj.and_then(|o| o.get(name)) {
+                        let is_empty = match val {
+                            Value::Object(m) => m.is_empty(),
+                            Value::Array(a) => a.is_empty(),
+                            _ => false,
+                        };
+                        if is_empty {
+                            anyhow::bail!(
+                                "{} call has empty '{}' ({}). {}. Retry with the full payload.",
+                                self.name,
+                                name,
+                                if param.param_type == "object" { "{}" } else { "[]" },
+                                param.description.trim_end_matches('.'),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -68,6 +96,30 @@ impl SkillToolDef {
         // Data tool: no cmd → return args as JSON. The value is in the
         // content_block event (tool name + args), not the return value.
         if self.cmd.is_empty() {
+            // Reject calls where every argument is missing or empty — the
+            // tool is being used as a "trigger" with no payload, which the
+            // consuming UI cannot render. Required-arg validation above
+            // already covered this for required params; this covers
+            // optional-only data tools like PageUpdate.
+            let any_non_empty = self.args.keys().any(|name| {
+                obj.and_then(|o| o.get(name))
+                    .map(|v| match v {
+                        Value::Null => false,
+                        Value::Object(m) => !m.is_empty(),
+                        Value::Array(a) => !a.is_empty(),
+                        Value::String(s) => !s.is_empty(),
+                        _ => true,
+                    })
+                    .unwrap_or(false)
+            });
+            if !any_non_empty {
+                anyhow::bail!(
+                    "{} call has no payload — provide at least one non-empty argument ({}). {}",
+                    self.name,
+                    self.args.keys().cloned().collect::<Vec<_>>().join(", "),
+                    self.description.trim_end_matches('.'),
+                );
+            }
             info!("Skill data tool '{}': passthrough", self.name);
             return Ok(ToolResult::CommandOutput {
                 exit_code: Some(0),

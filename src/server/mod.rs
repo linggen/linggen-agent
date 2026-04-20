@@ -172,12 +172,20 @@ pub enum ServerEvent {
         subagent_id: String,
         task: String,
         session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_run_id: Option<String>,
     },
     SubagentResult {
         parent_id: String,
         subagent_id: String,
         outcome: crate::engine::AgentOutcome,
         session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_run_id: Option<String>,
     },
     AgentStatus {
         agent_id: String,
@@ -190,6 +198,10 @@ pub enum ServerEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_agent_id: Option<String>,
         session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_run_id: Option<String>,
     },
     QueueUpdated {
         project_root: String,
@@ -303,6 +315,10 @@ pub enum ServerEvent {
         args: Option<String>,
         parent_id: Option<String>,
         session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_run_id: Option<String>,
     },
     /// Update an existing content block (status change, result summary).
     ContentBlockUpdate {
@@ -315,6 +331,10 @@ pub enum ServerEvent {
         /// Optional extra payload (e.g. diff data for Edit/Write tools).
         extra: Option<serde_json::Value>,
         session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_run_id: Option<String>,
     },
     /// Signal that the assistant turn is complete (single finalizer).
     TurnComplete {
@@ -323,6 +343,10 @@ pub enum ServerEvent {
         context_tokens: Option<usize>,
         parent_id: Option<String>,
         session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_run_id: Option<String>,
     },
     /// Working folder changed — agent cd'd to a new directory.
     WorkingFolderChanged {
@@ -352,11 +376,11 @@ impl ServerEvent {
             AgentEvent::Message { from, to, content } => {
                 Some(Self::Message { from, to, content, session_id })
             }
-            AgentEvent::SubagentSpawned { parent_id, subagent_id, task } => {
-                Some(Self::SubagentSpawned { parent_id, subagent_id, task, session_id })
+            AgentEvent::SubagentSpawned { parent_id, subagent_id, task, subagent_run_id, parent_run_id } => {
+                Some(Self::SubagentSpawned { parent_id, subagent_id, task, session_id, subagent_run_id, parent_run_id })
             }
-            AgentEvent::SubagentResult { parent_id, subagent_id, outcome } => {
-                Some(Self::SubagentResult { parent_id, subagent_id, outcome, session_id })
+            AgentEvent::SubagentResult { parent_id, subagent_id, outcome, subagent_run_id, parent_run_id } => {
+                Some(Self::SubagentResult { parent_id, subagent_id, outcome, session_id, subagent_run_id, parent_run_id })
             }
             AgentEvent::Outcome { agent_id, outcome } => {
                 Some(Self::Outcome { agent_id, outcome, session_id })
@@ -382,15 +406,15 @@ impl ServerEvent {
             AgentEvent::ToolProgress { agent_id, tool, line, stream } => {
                 Some(Self::ToolProgress { agent_id, tool, line, stream, session_id })
             }
-            AgentEvent::ContentBlockStart { agent_id, block_id, block_type, tool, args, parent_id } => {
+            AgentEvent::ContentBlockStart { agent_id, block_id, block_type, tool, args, parent_id, run_id, parent_run_id } => {
                 tracing::debug!("ContentBlockStart: agent={} type={} tool={:?}", agent_id, block_type, tool);
-                Some(Self::ContentBlockStart { agent_id, block_id, block_type, tool, args, parent_id, session_id })
+                Some(Self::ContentBlockStart { agent_id, block_id, block_type, tool, args, parent_id, session_id, run_id, parent_run_id })
             }
-            AgentEvent::ContentBlockUpdate { agent_id, block_id, status, summary, is_error, parent_id, extra } => {
-                Some(Self::ContentBlockUpdate { agent_id, block_id, status, summary, is_error, parent_id, extra, session_id })
+            AgentEvent::ContentBlockUpdate { agent_id, block_id, status, summary, is_error, parent_id, extra, run_id, parent_run_id } => {
+                Some(Self::ContentBlockUpdate { agent_id, block_id, status, summary, is_error, parent_id, extra, session_id, run_id, parent_run_id })
             }
-            AgentEvent::TurnComplete { agent_id, duration_ms, context_tokens, parent_id } => {
-                Some(Self::TurnComplete { agent_id, duration_ms, context_tokens, parent_id, session_id })
+            AgentEvent::TurnComplete { agent_id, duration_ms, context_tokens, parent_id, run_id, parent_run_id } => {
+                Some(Self::TurnComplete { agent_id, duration_ms, context_tokens, parent_id, session_id, run_id, parent_run_id })
             }
             // AgentStatus and TaskUpdate need special handling — return None.
             AgentEvent::AgentStatus { .. } | AgentEvent::TaskUpdate { .. } => None,
@@ -483,6 +507,8 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             lifecycle,
             parent_agent_id,
             session_id,
+            run_id,
+            parent_run_id,
         } => {
             if status.eq_ignore_ascii_case("idle") && lifecycle.is_none() {
                 // Still emit the idle event so the UI can transition agent status.
@@ -497,7 +523,12 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
                     agent_id: Some(agent_id),
                     session_id,
                     project_root: None,
-                    data: Some(json!({ "status": "idle", "parent_id": parent_agent_id })),
+                    data: Some(json!({
+                        "status": "idle",
+                        "parent_id": parent_agent_id,
+                        "run_id": run_id,
+                        "parent_run_id": parent_run_id,
+                    })),
                 });
             }
             let phase = lifecycle.or_else(|| {
@@ -528,7 +559,12 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
                 agent_id: Some(agent_id),
                 session_id,
                 project_root: None,
-                data: Some(json!({ "status": status, "parent_id": parent_agent_id })),
+                data: Some(json!({
+                    "status": status,
+                    "parent_id": parent_agent_id,
+                    "run_id": run_id,
+                    "parent_run_id": parent_run_id,
+                })),
             })
         }
         ServerEvent::QueueUpdated {
@@ -620,8 +656,11 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             subagent_id,
             task,
             session_id,
+            subagent_run_id,
+            parent_run_id,
         } => Some(UiEvent {
-            id: format!("run-subagent-spawned-{subagent_id}-{seq}"),
+            id: format!("run-subagent-spawned-{}-{seq}",
+                subagent_run_id.as_deref().unwrap_or(&subagent_id)),
             seq,
             rev: seq,
             ts_ms,
@@ -631,15 +670,23 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             agent_id: Some(parent_id),
             session_id,
             project_root: None,
-            data: Some(json!({ "subagent_id": subagent_id, "task": task })),
+            data: Some(json!({
+                "subagent_id": subagent_id,
+                "task": task,
+                "subagent_run_id": subagent_run_id,
+                "parent_run_id": parent_run_id,
+            })),
         }),
         ServerEvent::SubagentResult {
             parent_id,
             subagent_id,
             outcome,
             session_id,
+            subagent_run_id,
+            parent_run_id,
         } => Some(UiEvent {
-            id: format!("run-subagent-result-{subagent_id}-{seq}"),
+            id: format!("run-subagent-result-{}-{seq}",
+                subagent_run_id.as_deref().unwrap_or(&subagent_id)),
             seq,
             rev: seq,
             ts_ms,
@@ -649,7 +696,12 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             agent_id: Some(parent_id),
             session_id,
             project_root: None,
-            data: Some(json!({ "subagent_id": subagent_id, "outcome": outcome })),
+            data: Some(json!({
+                "subagent_id": subagent_id,
+                "outcome": outcome,
+                "subagent_run_id": subagent_run_id,
+                "parent_run_id": parent_run_id,
+            })),
         }),
         ServerEvent::Token {
             agent_id,
@@ -916,6 +968,8 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             args,
             parent_id,
             session_id,
+            run_id,
+            parent_run_id,
         } => {
             let phase = if block_type == "tool_use" { "start" } else { "start" };
             Some(UiEvent {
@@ -935,6 +989,8 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
                     "tool": tool,
                     "args": args,
                     "parent_id": parent_id,
+                    "run_id": run_id,
+                    "parent_run_id": parent_run_id,
                 })),
             })
         }
@@ -947,6 +1003,8 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             parent_id,
             extra,
             session_id,
+            run_id,
+            parent_run_id,
         } => {
             let mut data_obj = json!({
                 "block_id": block_id,
@@ -954,6 +1012,8 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
                 "summary": summary,
                 "is_error": is_error,
                 "parent_id": parent_id,
+                "run_id": run_id,
+                "parent_run_id": parent_run_id,
             });
             // Merge extra fields into the data object so the frontend receives them flat.
             if let Some(extra_val) = &extra {
@@ -983,6 +1043,8 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             context_tokens,
             parent_id,
             session_id,
+            run_id,
+            parent_run_id,
         } => Some(UiEvent {
             id: format!("turn-complete-{agent_id}-{seq}"),
             seq,
@@ -998,6 +1060,8 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
                 "duration_ms": duration_ms,
                 "context_tokens": context_tokens,
                 "parent_id": parent_id,
+                "run_id": run_id,
+                "parent_run_id": parent_run_id,
             })),
         }),
         ServerEvent::WorkingFolderChanged {
@@ -1051,6 +1115,8 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
 }
 
 impl ServerState {
+    /// Back-compat shim — callers that don't yet thread run_id can keep using
+    /// this. Internally forwards to `send_agent_status_with_ids` with None.
     pub async fn send_agent_status(
         &self,
         agent_id: String,
@@ -1058,6 +1124,25 @@ impl ServerState {
         detail: Option<String>,
         parent_agent_id: Option<String>,
         session_id: Option<String>,
+    ) {
+        self.send_agent_status_with_ids(
+            agent_id, status, detail, parent_agent_id, session_id, None, None,
+        )
+        .await
+    }
+
+    /// Full variant that carries the emitting agent's run_id and its
+    /// parent's run_id so the UI can route status to the right subagent
+    /// even when multiple subagents share the same `agent_id`.
+    pub async fn send_agent_status_with_ids(
+        &self,
+        agent_id: String,
+        status: AgentStatusKind,
+        detail: Option<String>,
+        parent_agent_id: Option<String>,
+        session_id: Option<String>,
+        run_id: Option<String>,
+        parent_run_id: Option<String>,
     ) {
         let mut done_event: Option<ServerEvent> = None;
         let mut status_id: Option<String> = None;
@@ -1081,6 +1166,8 @@ impl ServerState {
                         lifecycle: Some(UI_PHASE_DONE.to_string()),
                         parent_agent_id: parent_agent_id.clone(),
                         session_id: session_id.clone(),
+                        run_id: run_id.clone(),
+                        parent_run_id: parent_run_id.clone(),
                     });
                 }
             } else {
@@ -1094,6 +1181,8 @@ impl ServerState {
                             lifecycle: Some(UI_PHASE_DONE.to_string()),
                             parent_agent_id: parent_agent_id.clone(),
                             session_id: session_id.clone(),
+                            run_id: run_id.clone(),
+                            parent_run_id: parent_run_id.clone(),
                         });
                         active.remove(&status_key);
                     } else {
@@ -1139,6 +1228,8 @@ impl ServerState {
             parent_agent_id,
             lifecycle,
             session_id,
+            run_id,
+            parent_run_id,
         });
     }
 }
@@ -1205,10 +1296,13 @@ async fn prepare_server(
                 match event {
                     // Special cases that need extra logic beyond a 1:1 mapping.
                     crate::agent_manager::AgentEvent::AgentStatus {
-                        agent_id, status, detail, parent_id,
+                        agent_id, status, detail, parent_id, run_id, parent_run_id,
                     } => {
                         state_clone
-                            .send_agent_status(agent_id, AgentStatusKind::from_str_loose(&status), detail, parent_id, session_id)
+                            .send_agent_status_with_ids(
+                                agent_id, AgentStatusKind::from_str_loose(&status), detail,
+                                parent_id, session_id, run_id, parent_run_id,
+                            )
                             .await;
                     }
                     crate::agent_manager::AgentEvent::TaskUpdate { .. } => {
@@ -1605,12 +1699,16 @@ mod tests {
                 subagent_id: "coder".into(),
                 task: "fix bug".into(),
                 session_id: None,
+                subagent_run_id: None,
+                parent_run_id: None,
             },
             ServerEvent::SubagentResult {
                 parent_id: "ling".into(),
                 subagent_id: "coder".into(),
                 outcome: crate::engine::AgentOutcome::None,
                 session_id: None,
+                subagent_run_id: None,
+                parent_run_id: None,
             },
             ServerEvent::AgentStatus {
                 agent_id: "ling".into(),
@@ -1620,6 +1718,8 @@ mod tests {
                 lifecycle: Some("doing".into()),
                 parent_agent_id: None,
                 session_id: None,
+                run_id: None,
+                parent_run_id: None,
             },
             ServerEvent::QueueUpdated {
                 project_root: "/tmp".into(),
@@ -1706,6 +1806,8 @@ mod tests {
                 args: Some("foo.rs".into()),
                 parent_id: None,
                 session_id: None,
+                run_id: None,
+                parent_run_id: None,
             },
             ServerEvent::ContentBlockUpdate {
                 agent_id: "ling".into(),
@@ -1716,6 +1818,8 @@ mod tests {
                 parent_id: None,
                 extra: None,
                 session_id: None,
+                run_id: None,
+                parent_run_id: None,
             },
             ServerEvent::TurnComplete {
                 agent_id: "ling".into(),
@@ -1723,6 +1827,8 @@ mod tests {
                 context_tokens: Some(5000),
                 parent_id: None,
                 session_id: None,
+                run_id: None,
+                parent_run_id: None,
             },
             ServerEvent::RoomChat {
                 sender_id: "user-1".into(),

@@ -1,10 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Copy, Eraser, FileText, LogIn, Menu, Settings, Sparkles } from 'lucide-react';
+import { LogIn, Menu, Settings, Sparkles } from 'lucide-react';
 import { cn } from '../lib/cn';
 import { useUiStore } from '../stores/uiStore';
 import { useUserStore } from '../stores/userStore';
-import { useSessionStore } from '../stores/sessionStore';
-import { useServerStore } from '../stores/serverStore';
 import logoUrl from '../assets/logo.svg';
 
 /** Cached user profile from linggen.dev (fetched once on mount). */
@@ -108,23 +106,16 @@ const UserAvatar: React.FC = () => {
 };
 
 export const HeaderBar: React.FC<{
-  copyChat: () => void;
-  copyChatStatus: 'idle' | 'copied' | 'error';
-  clearChat: () => void;
   isRunning: boolean;
   onOpenSettings?: () => void;
   onToggleMobileMenu?: () => void;
   onToggleInfoPanel?: () => void;
 }> = ({
-  copyChat,
-  copyChatStatus,
-  clearChat,
   isRunning,
   onOpenSettings,
   onToggleMobileMenu,
   onToggleInfoPanel,
 }) => {
-  const [spStatus, setSpStatus] = useState<'idle' | 'copied' | 'error'>('idle');
   const connectionStatus = useUserStore((s) => s.connectionStatus);
   const userRoomName = useUserStore((s) => s.userRoomName);
   const userType = useUserStore((s) => s.userType);
@@ -220,77 +211,6 @@ export const HeaderBar: React.FC<{
             <span className="text-[8px] opacity-60">consumer</span>
           </button>
         )}
-      </div>
-
-      {/* Center: Chat actions */}
-      <div className="flex items-center gap-1">
-        <button
-          onClick={copyChat}
-          className={cn(
-            'p-1.5 rounded-md transition-colors text-slate-400 shrink-0',
-            copyChatStatus === 'copied'
-              ? 'bg-green-500/10 text-green-600'
-              : copyChatStatus === 'error'
-                ? 'bg-red-500/10 text-red-500'
-                : 'hover:bg-slate-100 dark:hover:bg-white/5'
-          )}
-          title={copyChatStatus === 'copied' ? 'Copied' : copyChatStatus === 'error' ? 'Copy failed' : 'Copy Chat'}
-        >
-          <Copy size={14} />
-        </button>
-        <button
-          onClick={async () => {
-            const projectRoot = useSessionStore.getState().selectedProjectRoot;
-            const agentId = useServerStore.getState().selectedAgent;
-            if (!projectRoot) { setSpStatus('error'); setTimeout(() => setSpStatus('idle'), 1500); return; }
-            try {
-              const url = new URL('/api/chat/system-prompt', window.location.origin);
-              url.searchParams.append('project_root', projectRoot);
-              url.searchParams.append('agent_id', agentId);
-              const resp = await fetch(url.toString());
-              if (!resp.ok) { setSpStatus('error'); setTimeout(() => setSpStatus('idle'), 1500); return; }
-              const data = await resp.json();
-              const text = data.system_prompt;
-              if (!text) { setSpStatus('error'); setTimeout(() => setSpStatus('idle'), 1500); return; }
-              // Try clipboard API first, fall back to textarea+execCommand.
-              try {
-                await navigator.clipboard.writeText(text);
-              } catch {
-                const ta = document.createElement('textarea');
-                ta.value = text;
-                ta.style.position = 'fixed';
-                ta.style.opacity = '0';
-                document.body.appendChild(ta);
-                ta.select();
-                document.execCommand('copy');
-                document.body.removeChild(ta);
-              }
-              setSpStatus('copied');
-            } catch (e) {
-              console.error('Failed to copy system prompt:', e);
-              setSpStatus('error');
-            }
-            setTimeout(() => setSpStatus('idle'), 1500);
-          }}
-          className={cn(
-            'p-1.5 rounded-md transition-colors text-slate-400 shrink-0',
-            spStatus === 'copied'
-              ? 'bg-green-500/10 text-green-600'
-              : spStatus === 'error'
-                ? 'bg-red-500/10 text-red-500'
-                : 'hover:bg-slate-100 dark:hover:bg-white/5'
-          )}
-          title={spStatus === 'copied' ? 'Copied!' : spStatus === 'error' ? 'Failed' : 'Copy System Prompt'}
-        >
-          <FileText size={14} />
-        </button>
-        <button
-          onClick={clearChat}
-          className="p-1.5 hover:bg-red-500/10 hover:text-red-500 rounded-md text-slate-400 transition-colors shrink-0"
-          title="Clear Chat"
-        >
-          <Eraser size={14} />
-        </button>
       </div>
 
       {/* Right: Status + Info + Settings + Avatar */}

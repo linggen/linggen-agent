@@ -89,7 +89,11 @@ export function handleMessage(item: UiEvent): void {
   if (!content) return;
   if (shouldHideInternalChatMessage(from, content)) return;
 
-  if (agentTracker.getParent(from)) return;
+  // Subagent returns used to be dropped here and shown only inside the parent
+  // bubble's subagent tree. That made the live chat diverge from the replay
+  // path (which reads messages.jsonl and shows each return as its own bubble).
+  // Let them through — they appear as their own chat entries and the chat
+  // always appends instead of inserting activity into an older bubble.
 
   try {
     const parsed = JSON.parse(content);
@@ -124,10 +128,13 @@ export function handleContentBlock(item: UiEvent): void {
   if (!agentId) return;
   const data = item.data || {};
 
-  // Route subagent content blocks to parent tree
-  const parentId = agentTracker.getParent(agentId);
+  // Route subagent content blocks to parent tree. Prefer run_id as the
+  // tracking key so parallel subagents with the same agent_id don't collide.
+  const runIdFromData = data?.run_id ? String(data.run_id) : null;
+  const trackingId = runIdFromData || agentId;
+  const parentId = agentTracker.getParent(trackingId);
   if (parentId) {
-    applySubagentContentBlock(parentId, agentId, item.phase, data);
+    applySubagentContentBlock(parentId, trackingId, item.phase, data);
     return;
   }
 
@@ -154,6 +161,7 @@ function applySubagentContentBlock(
       toolName: data.tool || 'Tool',
       args: data.args || '',
       status: 'running',
+      timestampMs: Date.now(),
     };
     chatStore.updateSubagentTree(parentId, agentId,
       (entry) => ({
@@ -185,6 +193,7 @@ function applyContentBlockStart(item: UiEvent, data: any): void {
 
   const block: ContentBlock = {
     type: blockType as ContentBlock['type'],
+    timestampMs: Date.now(),
     id: String(data.block_id || ''),
     tool: data.tool || undefined,
     args: data.args || undefined,

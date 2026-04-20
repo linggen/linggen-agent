@@ -188,15 +188,14 @@ impl AgentEngine {
             ));
 
             // App-skills receive the built-in PageUpdate tool. Remind the
-            // model to call it whenever state the user should see has changed.
-            if skill.app.is_some() {
-                prompt.push_str(
-                    "\n\n## Dashboard updates\n\nThis skill has a dashboard UI. \
-                     Call `PageUpdate({ page: {...} })` whenever your work produces \
-                     state the user should see — task complete, new results, progress \
-                     changed. The page JSON schema is defined in your skill \
-                     instructions above. Do not emit page JSON as text; use the tool.\n",
-                );
+            // model to call it whenever state the user should see has changed —
+            // unless the skill body already documents PageUpdate itself, in
+            // which case the generic hint is redundant duplication.
+            if skill.app.is_some() && !resolved_content.contains("PageUpdate") {
+                prompt.push_str(&self.prompt_store.render_or_fallback(
+                    keys::SYSTEM_APP_SKILL_DASHBOARD_HINT,
+                    &[],
+                ));
             }
         }
 
@@ -364,10 +363,55 @@ impl AgentEngine {
         if has_tools {
             if native_tools {
                 // Native tool calling: model gets tool schemas via the API `tools` parameter.
-                // Use a lightweight prompt with usage guidelines only (no JSON format instructions).
-                if let Some(content) = self.prompt_store.get(crate::prompts::RESPONSE_FORMAT_NATIVE) {
+                // Use a lightweight prompt with usage guidelines only (no JSON format
+                // instructions). Sections that reference specific tools (AskUser, Plan
+                // Mode, UpdatePlan, Task delegation) are appended only when those tools
+                // are actually in `allowed_tools`. Advertising a tool the session can't
+                // call wastes tokens and invites failed calls.
+                let tool_allowed = |name: &str| -> bool {
+                    allowed_tools.as_ref().map_or(true, |s| s.contains(name))
+                };
+                if let Some(base) = self.prompt_store.get(crate::prompts::RESPONSE_FORMAT_NATIVE) {
                     system.push_str("\n\n");
-                    system.push_str(content);
+                    system.push_str(base);
+                    if tool_allowed("AskUser") {
+                        if let Some(b) = self.prompt_store.get(
+                            crate::prompts::keys::RESPONSE_FORMAT_NATIVE_ASKUSER_BULLET,
+                        ) {
+                            system.push_str(b);
+                        }
+                    }
+                    if let Some(c) = self.prompt_store.get(
+                        crate::prompts::keys::RESPONSE_FORMAT_NATIVE_CONVERSATIONAL,
+                    ) {
+                        system.push_str(c);
+                    }
+                    if tool_allowed("EnterPlanMode") {
+                        if let Some(p) = self.prompt_store.get(
+                            crate::prompts::keys::RESPONSE_FORMAT_NATIVE_PLAN_MODE,
+                        ) {
+                            system.push_str(p);
+                        }
+                    }
+                    if tool_allowed("UpdatePlan") {
+                        if let Some(u) = self.prompt_store.get(
+                            crate::prompts::keys::RESPONSE_FORMAT_NATIVE_UPDATE_PLAN,
+                        ) {
+                            system.push_str(u);
+                        }
+                    }
+                    if let Some(r) = self.prompt_store.get(
+                        crate::prompts::keys::RESPONSE_FORMAT_NATIVE_RULES_BASE,
+                    ) {
+                        system.push_str(r);
+                    }
+                    if tool_allowed("Task") {
+                        if let Some(t) = self.prompt_store.get(
+                            crate::prompts::keys::RESPONSE_FORMAT_NATIVE_RULES_TASK,
+                        ) {
+                            system.push_str(t);
+                        }
+                    }
                 }
             } else {
                 // Legacy mode: inject JSON action format + inline tool schemas.

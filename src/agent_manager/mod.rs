@@ -51,6 +51,9 @@ pub struct AgentManager {
     last_activity: Mutex<HashMap<String, Instant>>,
     /// Interface mode passed into every EngineConfig.
     interface_mode: InterfaceMode,
+    /// Monotonic per-agent seq counter for short, memorable run ids
+    /// (e.g. `ling01`, `ling02`). Resets on process restart.
+    run_id_counters: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,16 +76,33 @@ pub enum AgentEvent {
         status: String,
         detail: Option<String>,
         parent_id: Option<String>,
+        /// Unique run_id of the emitting agent (distinguishes parallel
+        /// subagents that share the same `agent_id`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        /// Unique run_id of the parent agent when this is a subagent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_run_id: Option<String>,
     },
     SubagentSpawned {
         parent_id: String,
         subagent_id: String,
         task: String,
+        /// Unique run_id of the spawned subagent — the stable key for UI
+        /// tracking when multiple subagents share the same `subagent_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_run_id: Option<String>,
     },
     SubagentResult {
         parent_id: String,
         subagent_id: String,
         outcome: AgentOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_run_id: Option<String>,
     },
     ContextUsage {
         agent_id: String,
@@ -128,6 +148,10 @@ pub enum AgentEvent {
         tool: Option<String>,
         args: Option<String>,
         parent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_run_id: Option<String>,
     },
     /// Update an existing content block (status change, result summary).
     ContentBlockUpdate {
@@ -139,6 +163,10 @@ pub enum AgentEvent {
         parent_id: Option<String>,
         /// Optional extra payload (e.g. diff data for Edit/Write tools).
         extra: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_run_id: Option<String>,
     },
     /// Signal that the assistant turn is complete.
     TurnComplete {
@@ -146,6 +174,10 @@ pub enum AgentEvent {
         duration_ms: Option<u64>,
         context_tokens: Option<usize>,
         parent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_run_id: Option<String>,
     },
     StateUpdated,
 }
@@ -373,16 +405,11 @@ impl AgentManager {
             .find(|entry| entry.agent_id == wanted))
     }
 
-    fn make_run_id(agent_id: &str) -> String {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        format!(
-            "run-{}-{}-{}",
-            agent_id,
-            now.as_secs(),
-            now.subsec_nanos()
-        )
+    fn make_run_id(&self, agent_id: &str) -> String {
+        let mut counters = self.run_id_counters.lock().unwrap();
+        let seq = counters.entry(agent_id.to_string()).or_insert(0);
+        *seq += 1;
+        format!("{}{:02}", agent_id, *seq)
     }
 
     pub fn new(
@@ -414,6 +441,7 @@ impl AgentManager {
                 interface_mode,
                 global_sessions: SessionStore::with_sessions_dir(crate::paths::global_sessions_dir()),
                 session_engines: Mutex::new(HashMap::new()),
+                run_id_counters: std::sync::Mutex::new(HashMap::new()),
             }),
             rx,
         )
@@ -859,7 +887,7 @@ impl AgentManager {
         let project_root = project_root
             .canonicalize()
             .unwrap_or_else(|_| project_root.clone());
-        let run_id = Self::make_run_id(agent_id);
+        let run_id = self.make_run_id(agent_id);
         let started_at = crate::util::now_ts_secs();
         let repo_path = project_root.to_string_lossy().to_string();
 

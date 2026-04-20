@@ -6,20 +6,17 @@
  * Layout mirrors the owner's main page: header + left sidebar (sessions) + center (chat)
  * + right sidebar (allowed skills). No settings button, no file browser.
  */
-import React, { useCallback, useRef, useState } from 'react';
-import { ShieldAlert, Copy, Eraser, Menu, LogOut } from 'lucide-react';
-import { cn } from '../lib/cn';
+import React, { useCallback, useState } from 'react';
+import { ShieldAlert, Menu, LogOut } from 'lucide-react';
 import { getTransport } from '../lib/transport';
 import { ChatWidget } from './chat/ChatWidget';
 import { SessionList } from './SessionList';
 import { SkillsCard } from './SkillsCard';
 import { CollapsibleCard } from './CollapsibleCard';
 import { RoomChatPanel } from './RoomChatPanel';
-import { useChatActions } from '../hooks/useChatActions';
 import { useSessionStore } from '../stores/sessionStore';
 import { useServerStore } from '../stores/serverStore';
 import { useUserStore } from '../stores/userStore';
-import { useUiStore } from '../stores/uiStore';
 export const ConsumerChatPage: React.FC = () => {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const selectedProjectRoot = useSessionStore((s) => s.selectedProjectRoot);
@@ -27,13 +24,7 @@ export const ConsumerChatPage: React.FC = () => {
   const skills = useServerStore((s) => s.skills);
   const userRoomName = useUserStore((s) => s.userRoomName);
   const userTokenBudget = useUserStore((s) => s.userTokenBudget);
-  const copyChatStatus = useUiStore((s) => s.copyChatStatus);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const scrollToBottomRef = useRef<() => void>(() => {});
-  const { copyChat, clearChat } = useChatActions(
-    () => scrollToBottomRef.current?.(),
-    {},
-  );
 
   // Skills are already filtered by the server in page_state
   const filteredSkills = skills;
@@ -88,28 +79,6 @@ export const ConsumerChatPage: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Chat actions */}
-          <button
-            onClick={copyChat}
-            className={cn(
-              'p-1.5 rounded-md transition-colors text-slate-400 shrink-0',
-              copyChatStatus === 'copied'
-                ? 'bg-green-500/10 text-green-600'
-                : copyChatStatus === 'error'
-                  ? 'bg-red-500/10 text-red-500'
-                  : 'hover:bg-slate-100 dark:hover:bg-white/5'
-            )}
-            title={copyChatStatus === 'copied' ? 'Copied' : copyChatStatus === 'error' ? 'Copy failed' : 'Copy Chat'}
-          >
-            <Copy size={14} />
-          </button>
-          <button
-            onClick={clearChat}
-            className="p-1.5 hover:bg-red-500/10 hover:text-red-500 rounded-md text-slate-400 transition-colors shrink-0"
-            title="Clear Chat"
-          >
-            <Eraser size={14} />
-          </button>
           {/* Privacy indicator */}
           <div className="flex items-center gap-1.5">
             <ShieldAlert size={12} className="text-amber-500" />

@@ -66,7 +66,7 @@ export const MainApp: React.FC = () => {
   const { selectedProjectRoot, sessions, activeSessionId, isMissionSession } = projectStore;
   const { agents, models, skills, selectedAgent, agentStatus, agentStatusText, defaultModels, ollamaStatus, reloadingSkills, agentTreesByProject } = agentStore;
   const { messages: chatMessages } = chatStore;
-  const { currentPage, editingMission, showAgentSpecEditor, openApp, selectedFileContent, selectedFilePath, copyChatStatus } = uiStore;
+  const { currentPage, editingMission, showAgentSpecEditor, openApp, selectedFileContent, selectedFilePath } = uiStore;
 
   const isRunning = agentStore.isRunning();
   const mainAgents = agents;
@@ -98,9 +98,9 @@ export const MainApp: React.FC = () => {
   // --- Run info ---
   const { runningMainRunIds } = useRunInfo();
 
-  // --- Chat actions (for header clear/copy) ---
+  // --- Chat actions ---
   const scrollToBottomNoop = useCallback(() => {}, []);
-  const { clearChat, copyChat, sendChatMessage } = useChatActions(scrollToBottomNoop, runningMainRunIds);
+  const { sendChatMessage } = useChatActions(scrollToBottomNoop, runningMainRunIds);
 
   // --- Initial data load ---
   // Most data is delivered via server-pushed page_state after WebRTC connects.
@@ -286,9 +286,6 @@ export const MainApp: React.FC = () => {
       <div className={`flex flex-col h-screen bg-slate-100/70 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200 font-sans overflow-hidden${currentPage !== 'main' ? ' hidden' : ''}`}>
         {/* Header */}
         <HeaderBar
-          copyChat={copyChat}
-          copyChatStatus={copyChatStatus}
-          clearChat={clearChat}
           isRunning={isRunning}
           onOpenSettings={() => uiStore.setCurrentPage('settings')}
           onToggleMobileMenu={() => setMobileMenuOpen(!mobileMenuOpen)}

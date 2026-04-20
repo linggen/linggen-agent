@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Sparkles, ArrowDown } from 'lucide-react';
+import { Sparkles, ArrowDown, Copy, FileText, Eraser } from 'lucide-react';
 import 'highlight.js/styles/github.css';
 import { cn } from '../../lib/cn';
 import { useSessionStore } from '../../stores/sessionStore';
@@ -22,6 +22,84 @@ import { ChatInput } from './ChatInput';
 import { SubagentDrawer } from './SubagentDrawer';
 import { statusBadgeClass } from './MessageHelpers';
 import { SessionModelSelector, SessionModeSelector, SessionStats } from './SessionSelectors';
+import { useChatActions } from '../../hooks/useChatActions';
+
+/**
+ * Debug action buttons shown inside the expanded session header.
+ * Hidden by default — only visible when the user clicks the session bar open.
+ */
+const ChatDebugActions: React.FC<{ projectRoot?: string | null; sessionId?: string | null }> = ({ projectRoot, sessionId }) => {
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
+  const [spStatus, setSpStatus] = useState<'idle' | 'copied' | 'error'>('idle');
+  const { copyChat, clearChat } = useChatActions(() => {}, {}, projectRoot);
+
+  const handleCopyChat = useCallback(async () => {
+    try { await copyChat(); setCopyStatus('copied'); }
+    catch { setCopyStatus('error'); }
+    setTimeout(() => setCopyStatus('idle'), 1500);
+  }, [copyChat]);
+
+  const handleCopySystemPrompt = useCallback(async () => {
+    const root = projectRoot || useSessionStore.getState().selectedProjectRoot || '';
+    const agentId = useServerStore.getState().selectedAgent;
+    const sid = sessionId || useSessionStore.getState().activeSessionId;
+    try {
+      const url = new URL('/api/chat/system-prompt', window.location.origin);
+      url.searchParams.append('project_root', root);
+      url.searchParams.append('agent_id', agentId);
+      if (sid) url.searchParams.append('session_id', sid);
+      const resp = await fetch(url.toString());
+      if (!resp.ok) throw new Error(`${resp.status}`);
+      const payload = await resp.json();
+      const promptText = payload.system_prompt || '';
+      const tools = Array.isArray(payload.tools) ? payload.tools : [];
+      if (!promptText && tools.length === 0) throw new Error('empty');
+      // Combine the system prompt and the tool schemas so the copy shows the
+      // full model-facing surface. Tool schemas travel via the native API
+      // `tools` parameter, not the prompt text, but they are part of what the
+      // model actually receives.
+      const toolsSection = tools.length > 0
+        ? `\n\n--- TOOLS (passed via native function calling) ---\n${JSON.stringify(tools, null, 2)}\n--- END TOOLS ---\n`
+        : '';
+      const text = `${promptText}${toolsSection}`;
+      try { await navigator.clipboard.writeText(text); }
+      catch {
+        const ta = document.createElement('textarea');
+        ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+      }
+      setSpStatus('copied');
+    } catch {
+      setSpStatus('error');
+    }
+    setTimeout(() => setSpStatus('idle'), 1500);
+  }, [projectRoot, sessionId]);
+
+  const btnClass = (status: 'idle' | 'copied' | 'error') => cn(
+    'p-1 rounded transition-colors text-slate-400 shrink-0',
+    status === 'copied' ? 'bg-green-500/10 text-green-600'
+      : status === 'error' ? 'bg-red-500/10 text-red-500'
+      : 'hover:bg-slate-100 dark:hover:bg-white/5',
+  );
+
+  return (
+    <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+      <button onClick={handleCopyChat} className={btnClass(copyStatus)}
+        title={copyStatus === 'copied' ? 'Copied' : copyStatus === 'error' ? 'Copy failed' : 'Copy chat'}>
+        <Copy size={13} />
+      </button>
+      <button onClick={handleCopySystemPrompt} className={btnClass(spStatus)}
+        title={spStatus === 'copied' ? 'Copied' : spStatus === 'error' ? 'Failed' : 'Copy system prompt'}>
+        <FileText size={13} />
+      </button>
+      <button onClick={clearChat}
+        className="p-1 rounded text-slate-400 hover:bg-red-500/10 hover:text-red-500 transition-colors shrink-0"
+        title="Clear chat">
+        <Eraser size={13} />
+      </button>
+    </div>
+  );
+};
 
 /** Render a single message row. */
 const ChatMessageRow = React.memo<{
@@ -220,7 +298,6 @@ export const ChatPanel: React.FC<{
   showScrollButton: showScrollButtonProp,
 }) => {
   const [openSubagentId, setOpenSubagentId] = useState<string | null>(null);
-  const [mainMessageFilter, setMainMessageFilter] = useState('');
   const [subagentMessageFilter, setSubagentMessageFilter] = useState('');
 
   const [expandedMessages, setExpandedMessages] = useState<Set<string>>(new Set());
@@ -334,27 +411,10 @@ export const ChatPanel: React.FC<{
     });
     return sortMessagesByTime(filtered);
   }, [chatMessages, selectedSubagent]);
-  const displayedMainMessages = useMemo(
+  const filteredMainMessages = useMemo(
     () => collapseProgressMessages(sortMessagesByTime(visibleMessages)),
     [visibleMessages]
   );
-  const filteredMainMessages = useMemo(() => {
-    const q = mainMessageFilter.trim().toLowerCase();
-    if (!q) return displayedMainMessages;
-    return displayedMainMessages.filter((msg) => {
-      const from = normalizeAgentKey(msg.from || msg.role);
-      const to = normalizeAgentKey(msg.to || '');
-      const activitySummary = (msg.activitySummary || '').toLowerCase();
-      const activityLines = (msg.activityEntries || []).join('\n').toLowerCase();
-      return (
-        msg.text.toLowerCase().includes(q) ||
-        activitySummary.includes(q) ||
-        activityLines.includes(q) ||
-        from.includes(q) ||
-        to.includes(q)
-      );
-    });
-  }, [displayedMainMessages, mainMessageFilter]);
 
   // Show floating banner with nearest user message scrolled above viewport
   const filteredMainMessagesRef = useRef(filteredMainMessages);
@@ -471,22 +531,25 @@ export const ChatPanel: React.FC<{
               <SessionModelSelector />
               <SessionStats />
             </summary>
-            <div className="mt-1.5 flex flex-wrap items-center gap-2">
-              {selectedMainRunningRunId && onCancelRun && (
-                <button
-                  onClick={() => onCancelRun(selectedMainRunningRunId)}
-                  disabled={!!cancellingRunIds?.[selectedMainRunningRunId]}
-                  className={cn(
-                    'px-2 py-1 rounded border text-[11px] font-semibold transition-colors',
-                    cancellingRunIds?.[selectedMainRunningRunId]
-                      ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
-                      : 'bg-red-50 text-red-600 border-red-200 hover:bg-red-100'
-                  )}
-                  title={selectedMainRunningRunId}
-                >
-                  {cancellingRunIds?.[selectedMainRunningRunId] ? 'Cancelling...' : 'Cancel Run'}
-                </button>
-              )}
+            <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                {selectedMainRunningRunId && onCancelRun && (
+                  <button
+                    onClick={() => onCancelRun(selectedMainRunningRunId)}
+                    disabled={!!cancellingRunIds?.[selectedMainRunningRunId]}
+                    className={cn(
+                      'px-2 py-1 rounded border text-[11px] font-semibold transition-colors',
+                      cancellingRunIds?.[selectedMainRunningRunId]
+                        ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+                        : 'bg-red-50 text-red-600 border-red-200 hover:bg-red-100'
+                    )}
+                    title={selectedMainRunningRunId}
+                  >
+                    {cancellingRunIds?.[selectedMainRunningRunId] ? 'Cancelling...' : 'Cancel Run'}
+                  </button>
+                )}
+              </div>
+              <ChatDebugActions projectRoot={projectRoot} sessionId={sessionId} />
             </div>
           </details>
         )}
@@ -536,14 +599,6 @@ export const ChatPanel: React.FC<{
             </p>
           </div>
         )}
-        <div className="flex items-center justify-end gap-2 mb-1">
-          <input
-            value={mainMessageFilter}
-            onChange={(e) => setMainMessageFilter(e.target.value)}
-            placeholder="Filter messages"
-            className="w-52 text-[12px] bg-white dark:bg-black/30 border border-slate-200 dark:border-white/10 rounded px-2 py-1 outline-none"
-          />
-        </div>
         <ChatMessageList
           messages={historicalMessages}
           expandedMessages={expandedMessages}

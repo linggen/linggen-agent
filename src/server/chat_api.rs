@@ -180,22 +180,58 @@ pub(crate) async fn get_system_prompt_api(
     State(state): State<Arc<ServerState>>,
     Query(query): Query<SystemPromptQuery>,
 ) -> impl IntoResponse {
-    let root = match PathBuf::from(&query.project_root).canonicalize() {
+    let sid = query.session_id.as_deref().unwrap_or("default");
+    // Skill iframes call this without project_root (they clear selectedProjectRoot
+    // so API calls use the session's cwd). Derive the root from session meta
+    // when the query omits it.
+    let root_str = if query.project_root.trim().is_empty() {
+        state.manager.global_sessions.get_session_meta(sid)
+            .ok()
+            .flatten()
+            .and_then(|m| m.cwd.clone().or(m.project.clone()))
+            .unwrap_or_else(|| "/".to_string())
+    } else {
+        query.project_root.clone()
+    };
+    let root = match PathBuf::from(&root_str).canonicalize() {
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    // Look up the session engine; fall back to creating a temporary one
-    let sid = query.session_id.as_deref().unwrap_or("default");
-    let agent = match state.manager.get_or_create_session_agent(sid, &root, &query.agent_id).await {
-        Ok(a) => a,
+
+    // Build the prompt on a throwaway engine instead of locking the live one.
+    // The live engine holds its lock for the duration of an agent turn, which
+    // can be minutes — long enough for the control-channel RPC (30s) to time
+    // out and leave the Copy-System-Prompt button silently unusable while the
+    // agent is working. A fresh engine yields the same prompt (same spec,
+    // same skill, same memory, same tool schemas) without touching live state.
+    let mut engine = match state.manager.spawn_delegation_engine(&root, &query.agent_id).await {
+        Ok(e) => e,
         Err(_) => return (StatusCode::NOT_FOUND, format!("Agent '{}' not found", query.agent_id)).into_response(),
     };
-    let mut engine = agent.lock().await;
-    let (messages, _, _) = engine.prepare_loop_messages("(export)", true);
+
+    // Apply session-bound skill so the exported prompt matches what the model
+    // actually sees during a chat turn. Without this, the export shows a
+    // "cold engine" view without SKILL.md content or app-skill tool hints.
+    if let Ok(Some(meta)) = state.manager.global_sessions.get_session_meta(sid) {
+        if let Some(skill_name) = meta.skill {
+            if let Some(skill) = state.manager.skill_manager.get_skill(&skill_name).await {
+                engine.active_skill = Some(skill);
+            }
+        }
+    }
+
+    let (messages, allowed_tools, _) = engine.prepare_loop_messages("(export)", true);
     let system_prompt = messages.first()
         .map(|m| m.content.clone())
         .unwrap_or_default();
-    Json(serde_json::json!({ "system_prompt": system_prompt })).into_response()
+    // Tool schemas delivered to the model via the native function-calling
+    // `tools` API parameter — not embedded in the system prompt text. Expose
+    // them alongside so the debug export shows the full model-facing surface.
+    let tools = engine.tools.oai_tool_definitions(allowed_tools.as_ref());
+    Json(serde_json::json!({
+        "system_prompt": system_prompt,
+        "tools": tools,
+    })).into_response()
 }
 
 pub(crate) async fn compact_chat_api(
@@ -1541,22 +1577,15 @@ pub(crate) async fn chat_handler(
                                                 }
                                             }
 
-                                            // Seed session cwd to the first granted path so Bash
-                                            // (which has no file_path arg) resolves permission
-                                            // checks against the granted path, not the workspace
-                                            // root. Only set if not already chosen by the user.
-                                            if let Some(first) = perm.paths.first() {
-                                                let expanded = if let Some(stripped) = first.strip_prefix("~/") {
-                                                    dirs::home_dir().map(|h| h.join(stripped))
-                                                } else if first == "~" {
-                                                    dirs::home_dir()
-                                                } else {
-                                                    Some(std::path::PathBuf::from(first))
-                                                };
-                                                if let Some(abs) = expanded {
-                                                    engine.tools.builtins.seed_session_cwd_if_unset(abs);
-                                                }
-                                            }
+                                            // NOTE: we intentionally do NOT seed session cwd to
+                                            // perm.paths[0]. Earlier versions did this to make
+                                            // Bash permission checks resolve to the granted path,
+                                            // but that broke relative-path tools (Edit, Write)
+                                            // because the model's mental model of cwd stays at
+                                            // the workspace root. Bash permission is now handled
+                                            // by `check_permission`'s 4c rule (scans the command
+                                            // string for granted paths), which works regardless
+                                            // of cwd. See permission-spec.md.
                                         }
                                     }
                                     engine.active_skill = Some(skill);
@@ -1588,6 +1617,8 @@ pub(crate) async fn chat_handler(
                     context_tokens: None,
                     parent_id: None,
                     session_id: session_id.clone(),
+                    run_id: None,
+                    parent_run_id: None,
                 });
                 state_clone
                     .send_agent_status(
@@ -1778,6 +1809,8 @@ pub(crate) async fn approve_plan_handler(
             context_tokens: None,
             parent_id: None,
             session_id: session_id_for_cleanup.clone(),
+            run_id: None,
+            parent_run_id: None,
         });
         state_clone
             .send_agent_status(agent_id.clone(), AgentStatusKind::Idle, Some("Idle".to_string()), None, session_id_for_cleanup.clone())

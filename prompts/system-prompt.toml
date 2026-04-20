@@ -26,6 +26,25 @@ Description: {description}
 {content}
 -------------------'''
 
+[app_skill_dashboard_hint]
+description = "Generic PageUpdate reminder appended after an app-skill body. Only used when the skill body itself does not already document PageUpdate."
+text = '''
+
+
+## Dashboard updates
+
+This skill has a dashboard UI. Call `PageUpdate` whenever state the user should see has changed — task complete, new results, progress changed.
+
+Pass `top_bar`, `body`, and/or `footer` as flat top-level arguments — there is NO `page` wrapper. Omit any section you don't want to change (previous values persist). At least one section must be provided and non-empty; an empty call is an error and will be rejected.
+
+Example shape (fill in per your skill's schema):
+```
+PageUpdate({ "top_bar": [...], "body": [...], "footer": {"text": "..."} })
+```
+
+Do not emit page JSON as text — always use the tool.
+'''
+
 [project_instructions_header]
 description = "Opening delimiter for project context files"
 text = "\n\n--- PROJECT INSTRUCTIONS ---"

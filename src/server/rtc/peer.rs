@@ -1175,6 +1175,12 @@ fn forward_event_to_channels(
         None => return,
     };
 
+    let dbg_sid = ui_msg.session_id.clone().unwrap_or_else(|| "-".to_string());
+    let dbg_kind = ui_msg.kind.clone();
+    let dbg_view = filter.view.unwrap_or("-");
+    let dbg_pinned = filter.pinned_session_id.unwrap_or("-");
+    let dbg_user = filter.user_id;
+
     // Session isolation: non-admin peers only see their own sessions.
     // Admin peers skip filtering entirely.
     if !filter.is_admin {
@@ -1182,7 +1188,8 @@ fn forward_event_to_channels(
             Some("global") | None => {
                 // Room chat must reach all peers regardless of permission level.
                 if ui_msg.kind != "room_chat" {
-                    // Global events — drop for non-admin (they get page_state instead)
+                    tracing::debug!("[fwd] DROP(user-filter global) user={} view={} sid={} kind={}",
+                        dbg_user, dbg_view, dbg_sid, dbg_kind);
                     return;
                 }
             }
@@ -1196,6 +1203,8 @@ fn forward_event_to_channels(
                     }
                 }
                 if !filter.session_ids.contains(sid) {
+                    tracing::debug!("[fwd] DROP(sid-not-in-filter) user={} view={} sid={} kind={} known={}",
+                        dbg_user, dbg_view, dbg_sid, dbg_kind, filter.session_ids.len());
                     return;
                 }
             }
@@ -1212,6 +1221,8 @@ fn forward_event_to_channels(
             let is_user_level = matches!(ui_msg.kind.as_str(), "room_chat")
                 || sid == "global";
             if !is_user_level && sid != pinned {
+                tracing::debug!("[fwd] DROP(embed-pin-mismatch) user={} pinned={} sid={} kind={}",
+                    dbg_user, dbg_pinned, dbg_sid, dbg_kind);
                 return;
             }
         }
@@ -1226,9 +1237,13 @@ fn forward_event_to_channels(
     // All writes go through the pending_dc_writes queue — writing directly to
     // str0m channels without a poll_output() in between causes SCTP corruption.
     //
-    // Broadcast events (notifications, agent_status, activity, run) are also
-    // sent to the control channel so the main page can react (e.g. session list
-    // updates when a skill or mission creates a new session).
+    // Broadcast events (notifications, agent_status, activity, run) fall back
+    // to the control channel when the peer has NO session channel for the
+    // event's session — so the main page can still react (e.g. session list
+    // updates when a skill or mission creates a new session). If the session
+    // channel IS open, we must not also push to control, or the peer sees the
+    // same event twice and UI handlers that append (subagent tree, activity
+    // lines) produce duplicates.
     let is_broadcast = matches!(ui_msg.kind.as_str(),
         "agent_status" | "activity" | "run" | "notification"
         | "ask_user" | "widget_resolved" | "room_chat"
@@ -1246,20 +1261,31 @@ fn forward_event_to_channels(
             if let Some(&cid) = session_channels.get(sid) {
                 if pending_dc_writes.len() < MAX_DC_WRITE_QUEUE {
                     pending_dc_writes.push_back((cid, json.clone()));
+                    tracing::debug!("[fwd] SEND user={} view={} sid={} kind={} cid={:?}",
+                        dbg_user, dbg_view, dbg_sid, dbg_kind, cid);
+                } else {
+                    tracing::debug!("[fwd] DROP(write-queue-full) user={} sid={} kind={}",
+                        dbg_user, dbg_sid, dbg_kind);
                 }
-            } else if !is_broadcast {
-                // Channel not yet open — buffer the event
-                let (_, buf) = pending_events.entry(sid.to_string()).or_insert_with(|| (Instant::now(), Vec::new()));
-                if buf.len() < MAX_PENDING_EVENTS {
-                    buf.push(json.clone());
-                }
-            }
-            // Also send broadcast events to control channel for main page
-            if is_broadcast {
+            } else if is_broadcast {
+                // No session channel — send broadcast events to control so the
+                // main page still reacts (session list updates etc).
                 if let Some(cid) = control_channel_id {
                     if pending_dc_writes.len() < MAX_DC_WRITE_QUEUE {
                         pending_dc_writes.push_back((cid, json.clone()));
                     }
+                } else {
+                    tracing::debug!("[fwd] DROP(broadcast-no-channel) user={} view={} sid={} kind={} known_chans={}",
+                        dbg_user, dbg_view, dbg_sid, dbg_kind, session_channels.len());
+                }
+            } else {
+                // Non-broadcast event, session channel not yet open — buffer
+                // until the channel opens and flush on open.
+                let (_, buf) = pending_events.entry(sid.to_string()).or_insert_with(|| (Instant::now(), Vec::new()));
+                if buf.len() < MAX_PENDING_EVENTS {
+                    buf.push(json.clone());
+                    tracing::debug!("[fwd] BUFFER(channel-not-open) user={} view={} sid={} kind={} known_chans={}",
+                        dbg_user, dbg_view, dbg_sid, dbg_kind, session_channels.len());
                 }
             }
         }

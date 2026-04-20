@@ -53,6 +53,18 @@ impl ToolRegistry {
         self.skill_tools.contains_key(tool)
     }
 
+    /// Returns true if `tool` is a skill data tool — a tool with no `cmd`
+    /// that just echoes its args back as a JSON content block (e.g. the
+    /// built-in `PageUpdate` for app skills). Data tools touch no files,
+    /// run no commands, and pose no privilege risk, so the permission layer
+    /// should skip its path/tier check entirely for them.
+    pub fn is_skill_data_tool(&self, tool: &str) -> bool {
+        self.skill_tools
+            .get(tool)
+            .map(|def| def.cmd.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Merge builtin and skill tool schemas, filtered by the allowed set.
     pub fn tool_schema_json(&self, allowed_tools: Option<&HashSet<String>>) -> String {
         let mut tools_arr = tools::full_tool_schema_entries();

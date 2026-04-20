@@ -181,7 +181,11 @@ impl AgentEngine {
             serde_json::to_string(&safe_args).unwrap_or_else(|_| "{}".to_string()),
             serde_json::json!({ "args": safe_args.clone() }),
         );
-        info!("Tool: {} {}", canonical_tool, safe_args);
+        let log_run = self
+            .run_id
+            .clone()
+            .unwrap_or_else(|| "root".to_string());
+        info!("[{}] Tool: {} {}", log_run, canonical_tool, safe_args);
         if canonical_tool == "Read" {
             if let Some(path) = normalize_tool_path_arg(&self.tools.builtins.cwd(), &args) {
                 read_paths.insert(path);
@@ -266,6 +270,15 @@ impl AgentEngine {
 
         // --- new permission gate (permission-spec.md) ---
 
+        // Skill data tools (empty cmd, e.g. PageUpdate) pass their args
+        // straight through as a content block — they don't read files, run
+        // commands, or reach outside the process. Running them through the
+        // path/tier permission gate produces nonsense prompts like
+        // "PageUpdate /Users/lianghuang — switch to admin?" because the gate
+        // synthesizes cwd as the file_path_arg and classifies unknown tools
+        // as Admin tier. Skip the gate entirely for pure data tools.
+        let skip_permission_gate = self.tools.is_skill_data_tool(&canonical_tool);
+
         // Extract bash command and file path for permission checking.
         let bash_command = if canonical_tool == "Bash" {
             args.get("cmd")
@@ -315,16 +328,21 @@ impl AgentEngine {
             }
         }
 
-        // Run the new permission check.
-        let check_result = permission::check_permission(
-            &canonical_tool,
-            bash_command.as_deref(),
-            file_path_arg.as_deref(),
-            &self.tools.builtins.cwd(),
-            &self.session_permissions,
-            &self.cfg.deny_rules,
-            &self.cfg.ask_rules,
-        );
+        // Run the new permission check (skipped for skill data tools, which
+        // don't touch the filesystem or run anything).
+        let check_result = if skip_permission_gate {
+            permission::PermissionCheckResult::Allowed
+        } else {
+            permission::check_permission(
+                &canonical_tool,
+                bash_command.as_deref(),
+                file_path_arg.as_deref(),
+                &self.tools.builtins.cwd(),
+                &self.session_permissions,
+                &self.cfg.deny_rules,
+                &self.cfg.ask_rules,
+            )
+        };
 
         match check_result {
             permission::PermissionCheckResult::Allowed => { /* proceed */ }
@@ -570,6 +588,8 @@ impl AgentEngine {
                     tool: Some(canonical_tool.clone()),
                     args: Some(compact_args),
                     parent_id: self.parent_agent_id.clone(),
+                    run_id: self.run_id.clone(),
+                    parent_run_id: self.parent_run_id.clone(),
                 }, self.session_id.clone())
                 .await;
             // Persist tool call to session store as an observation (not loaded
@@ -704,6 +724,8 @@ impl AgentEngine {
                             is_error: Some(false),
                             parent_id: self.parent_agent_id.clone(),
                             extra,
+                            run_id: self.run_id.clone(),
+                            parent_run_id: self.parent_run_id.clone(),
                         }, self.session_id.clone())
                         .await;
                     manager
@@ -715,6 +737,8 @@ impl AgentEngine {
                             status: "thinking".to_string(),
                             detail: Some(format!("Thinking ({})", self.model_id)),
                             parent_id: self.parent_agent_id.clone(),
+                            run_id: self.run_id.clone(),
+                            parent_run_id: self.parent_run_id.clone(),
                         }, self.session_id.clone())
                         .await;
                 }
@@ -822,6 +846,8 @@ impl AgentEngine {
                             is_error: Some(true),
                             parent_id: self.parent_agent_id.clone(),
                             extra: None,
+                            run_id: self.run_id.clone(),
+                            parent_run_id: self.parent_run_id.clone(),
                         }, self.session_id.clone())
                         .await;
                     manager
@@ -830,6 +856,8 @@ impl AgentEngine {
                             status: "thinking".to_string(),
                             detail: Some(format!("Thinking ({})", self.model_id)),
                             parent_id: self.parent_agent_id.clone(),
+                            run_id: self.run_id.clone(),
+                            parent_run_id: self.parent_run_id.clone(),
                         }, self.session_id.clone())
                         .await;
                 }

@@ -34,7 +34,7 @@ export const SubagentTreeView: React.FC<{
             <div className="flex items-start gap-0">
               <span className="shrink-0">&nbsp;&nbsp;</span>
               <span className={cn('text-[11px] mr-0.5', bulletColor, isRunning && 'animate-pulse')}>⏺</span>
-              <span className="text-cyan-600 dark:text-cyan-400 font-semibold">{entry.agentName || 'Task'}</span>
+              <span className="text-cyan-600 dark:text-cyan-400 font-semibold">{entry.subagentId || entry.agentName || 'Task'}</span>
               <span className="text-slate-700 dark:text-slate-200">({taskPreview})</span>
             </div>
 

@@ -191,6 +191,12 @@ pub struct AgentEngine {
     /// Metadata for agents available for delegation via the Task tool: (id, description).
     pub available_agents_metadata: Vec<(String, String)>,
     pub parent_agent_id: Option<String>,
+    /// Unique run_id of the parent agent when this is a subagent.
+    /// Populated by `run_delegation` so subagents can tag emitted events
+    /// with the parent's run_id, letting the UI route their activity to
+    /// the correct subagent tree entry even when multiple instances share
+    /// the same `agent_id` (e.g. several "ling" subagents in parallel).
+    pub parent_run_id: Option<String>,
     pub run_id: Option<String>,
     /// Session this engine is running in — threaded into every emitted event
     /// so the server can route events without a shared mutable map.
@@ -384,6 +390,7 @@ impl AgentEngine {
             available_skills_metadata: Vec::new(),
             available_agents_metadata: Vec::new(),
             parent_agent_id: None,
+            parent_run_id: None,
             run_id: None,
             session_id: None,
             thinking_tx: None,
@@ -453,6 +460,10 @@ impl AgentEngine {
 
     pub fn set_parent_agent(&mut self, parent_agent_id: Option<String>) {
         self.parent_agent_id = parent_agent_id;
+    }
+
+    pub fn set_parent_run_id(&mut self, parent_run_id: Option<String>) {
+        self.parent_run_id = parent_run_id;
     }
 
     pub fn set_delegation_depth(&mut self, depth: usize, max_depth: usize) {

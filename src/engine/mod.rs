@@ -125,6 +125,8 @@ impl AgentEngine {
                     status: "working".to_string(),
                     detail: Some("Running".to_string()),
                     parent_id: self.parent_agent_id.clone(),
+                    run_id: self.run_id.clone(),
+                    parent_run_id: self.parent_run_id.clone(),
                 }, self.session_id.clone())
                 .await;
         }
@@ -142,9 +144,16 @@ impl AgentEngine {
             anyhow::bail!("no task set; use /task <text>");
         };
 
+        let log_run = self
+            .run_id
+            .clone()
+            .unwrap_or_else(|| "root".to_string());
         info!(
-            "Starting agent loop for role {:?} with task: {}",
-            self.role, task
+            "[{}] Starting agent loop for role {:?} (depth={}) task: {}",
+            log_run,
+            self.role,
+            self.tools.builtins.delegation_depth(),
+            task,
         );
         self.push_context_record(
             ContextType::Status,
@@ -193,8 +202,8 @@ impl AgentEngine {
 
         let use_native_tools = self.model_manager.supports_tools(&self.model_id);
         info!(
-            "Agent loop: model_id={}, native_tools={}",
-            self.model_id, use_native_tools
+            "[{}] Agent loop: model_id={}, native_tools={}",
+            log_run, self.model_id, use_native_tools
         );
         let (messages, allowed_tools, read_paths) =
             self.prepare_loop_messages(&task, use_native_tools);
@@ -260,6 +269,8 @@ impl AgentEngine {
                         status: "thinking".to_string(),
                         detail: Some(format!("Thinking ({})", self.model_id)),
                         parent_id: self.parent_agent_id.clone(),
+                        run_id: self.run_id.clone(),
+                        parent_run_id: self.parent_run_id.clone(),
                     }, self.session_id.clone())
                     .await;
             }
@@ -298,13 +309,15 @@ impl AgentEngine {
                 .unwrap_or_else(|| "null".to_string());
             if !native_tool_calls.is_empty() {
                 debug!(
-                    "Model response (native): text='{}' tool_calls={}",
+                    "[{}] Model response (native): text='{}' tool_calls={}",
+                    log_run,
                     text_part.replace('\n', "\\n"),
                     native_tool_calls.len()
                 );
             } else {
                 debug!(
-                    "Model response: text='{}' json={}",
+                    "[{}] Model response: text='{}' json={}",
+                    log_run,
                     text_part.replace('\n', "\\n"),
                     json_rendered
                 );
@@ -395,6 +408,8 @@ impl AgentEngine {
                                 tool: None,
                                 args: Some(visible_text),
                                 parent_id: self.parent_agent_id.clone(),
+                                run_id: self.run_id.clone(),
+                                parent_run_id: self.parent_run_id.clone(),
                             }, self.session_id.clone())
                             .await;
                     }
@@ -508,6 +523,8 @@ impl AgentEngine {
                                 tool: None,
                                 args: Some(raw.clone()),
                                 parent_id: self.parent_agent_id.clone(),
+                                run_id: self.run_id.clone(),
+                                parent_run_id: self.parent_run_id.clone(),
                             }, self.session_id.clone())
                             .await;
                     }
@@ -550,6 +567,8 @@ impl AgentEngine {
                                 tool: None,
                                 args: Some(text_before),
                                 parent_id: self.parent_agent_id.clone(),
+                                run_id: self.run_id.clone(),
+                                parent_run_id: self.parent_run_id.clone(),
                             }, self.session_id.clone())
                             .await;
                     }

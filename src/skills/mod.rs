@@ -17,13 +17,40 @@ use tokio::sync::Mutex;
 fn page_update_tool_def() -> SkillToolDef {
     let mut args = HashMap::new();
     args.insert(
-        "page".to_string(),
+        "body".to_string(),
         SkillParamDef {
-            param_type: "object".to_string(),
-            required: true,
+            param_type: "array".to_string(),
+            required: false,
             default: None,
             description:
-                "The page layout JSON (top_bar, body, footer, etc. — schema defined by the skill)."
+                "Array of body widgets stacked vertically (main content). \
+                 Widget shapes are defined in the skill's SKILL.md (e.g. `info`, \
+                 `table`, `action-cards`, `progress`)."
+                    .to_string(),
+            items: None,
+        },
+    );
+    args.insert(
+        "top_bar".to_string(),
+        SkillParamDef {
+            param_type: "array".to_string(),
+            required: false,
+            default: None,
+            description:
+                "Array of compact metric widgets shown at the top of the dashboard. \
+                 Each item: {\"widget\":\"custom\",\"data\":{...}}."
+                    .to_string(),
+            items: None,
+        },
+    );
+    args.insert(
+        "footer".to_string(),
+        SkillParamDef {
+            param_type: "object".to_string(),
+            required: false,
+            default: None,
+            description:
+                "Optional status line at the bottom. Shape: {\"text\":\"...\"}."
                     .to_string(),
             items: None,
         },
@@ -31,7 +58,10 @@ fn page_update_tool_def() -> SkillToolDef {
     SkillToolDef {
         name: "PageUpdate".to_string(),
         description:
-            "Refresh the skill's dashboard UI with a new page layout. Call this when state changes the user should see."
+            "Refresh the skill's dashboard UI. Pass `top_bar`, `body`, and/or `footer` \
+             as top-level arguments — omit any section you don't want to change \
+             (previous values persist). At least one of the three must be provided \
+             and non-empty. See the skill's SKILL.md for widget shapes."
                 .to_string(),
         cmd: String::new(),
         args,

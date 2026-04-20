@@ -3,6 +3,8 @@ import type { EventKind } from './lib/eventKinds';
 export interface SubagentToolStep {
   toolName: string;
   args: string;
+  /** Client-side stamp for ordering/diagnostics. */
+  timestampMs?: number;
   status: 'running' | 'done' | 'failed';
 }
 
@@ -15,6 +17,8 @@ export interface SubagentTreeEntry {
   contextTokens: number;
   currentActivity: string | null;
   toolSteps: SubagentToolStep[];
+  /** Client-side stamp for ordering/diagnostics (set when subagent is spawned). */
+  timestampMs?: number;
 }
 
 export interface MessageSegment {
@@ -26,6 +30,9 @@ export interface MessageSegment {
 /** Structured content block — Claude Code-style message model. */
 export interface ContentBlock {
   type: 'text' | 'tool_use' | 'tool_result' | 'thinking';
+  /** Client-side stamp (ms) set when the block is first inserted. Used for
+   * ordering diagnostics — the renderer uses array insertion order, not this. */
+  timestampMs?: number;
   id?: string;           // unique block ID (for tool_use blocks)
   text?: string;         // for text/thinking blocks
   tool?: string;         // for tool_use: "Read", "Edit", "Bash"
