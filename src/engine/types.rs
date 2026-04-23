@@ -15,6 +15,23 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
+// Mission frame — analogous to active_skill, used for system-prompt injection
+// ---------------------------------------------------------------------------
+
+/// Mission context injected into the agent's system prompt when the scheduler
+/// dispatches a mission. Mirrors the `--- ACTIVE SKILL ---` frame shape so
+/// authors can write mission bodies in the same SKILL.md style.
+#[derive(Debug, Clone)]
+pub struct ActiveMission {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+    /// Absolute path to the mission directory on disk. Used to replace the
+    /// `$MISSION_DIR` literal inside the body, matching `$SKILL_DIR` behavior.
+    pub mission_dir: Option<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
 // Plan mode data structures
 // ---------------------------------------------------------------------------
 
@@ -193,6 +210,10 @@ pub struct AgentEngine {
     pub chat_history: Vec<ChatMessage>,
     // Active skill if any
     pub active_skill: Option<Skill>,
+    // Active mission frame, set when the scheduler dispatches a mission.
+    // The mission's body is injected into the system prompt like a skill's
+    // body, so the agent treats it as instructions rather than a user turn.
+    pub active_mission: Option<ActiveMission>,
     /// Metadata for skills available to the model via the Skill tool: (name, description).
     pub available_skills_metadata: Vec<(String, String)>,
     /// Metadata for agents available for delegation via the Task tool: (id, description).
@@ -394,6 +415,7 @@ impl AgentEngine {
             next_context_id: 1,
             chat_history: Vec::new(),
             active_skill: None,
+            active_mission: None,
             available_skills_metadata: Vec::new(),
             available_agents_metadata: Vec::new(),
             parent_agent_id: None,

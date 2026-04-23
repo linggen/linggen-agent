@@ -51,7 +51,8 @@ use projects_api::{
 use marketplace_api::{builtin_skills_install, builtin_skills_list, clawhub_scan, community_search, marketplace_install, marketplace_move_to_global, marketplace_uninstall};
 use missions_api::{
     create_mission, delete_mission,
-    get_mission_session_state, list_mission_runs, list_missions,
+    get_mission_run_output, get_mission_session_state,
+    list_mission_runs, list_missions,
     trigger_mission, update_mission,
 };
 use storage_api::{storage_roots, storage_tree, storage_read_file, storage_write_file, storage_delete_file};
@@ -1406,6 +1407,7 @@ async fn prepare_server(
         .route("/api/missions/sessions/state", get(get_mission_session_state))
         .route("/api/missions/{id}", put(update_mission).delete(delete_mission))
         .route("/api/missions/{id}/runs", get(list_mission_runs))
+        .route("/api/missions/{id}/runs/{run_id}/output", get(get_mission_run_output))
         .route("/api/missions/{id}/trigger", post(trigger_mission))
         // Chat & plan (also accessible via named WebRTC RPC)
         .route("/api/chat", post(chat_handler))

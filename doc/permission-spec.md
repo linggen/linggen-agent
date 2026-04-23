@@ -191,7 +191,7 @@ Policy applies to the *whole session*. It's set by:
 
 - Interactive user sessions → `interactive` (default)
 - Consumer (proxy-room) sessions → `trusted` (no prompts, still denies `ask:` rules like `git push`)
-- Mission sessions → declared in the mission's `policy:` field, defaults to `trusted` for backward-compat. Strict is opt-in for safer runs.
+- Mission sessions → declared in the mission's `policy:` field, defaults to `strict`. `trusted` / `sandbox` are opt-in for missions that need out-of-scope actions to pass. `interactive` is discouraged — prompts queue unseen.
 
 A policy where either lever is not `ask` is *locked* — the agent never prompts the user in that session.
 
@@ -298,8 +298,9 @@ Three ways to create a session, each with different initial permissions:
 
 ### Mission session
 
-- Mode and path set by the mission creator (readonly / standard / full).
-- Always **locked** — no prompts, pre-configured permissions only.
+- Mode (`read` / `edit` / `admin`) and paths set in the mission's `permission:` block.
+- Policy (`strict` / `trusted` / `sandbox` / `interactive`) defaults to `strict`; see mission-spec.md.
+- Always **locked** — no prompts, pre-configured permissions only (`interactive` is discouraged).
 - Config deny rules still apply.
 - Session promotion (user sends message) clears locked flag, resets to interactive.
 

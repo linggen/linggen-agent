@@ -1,26 +1,10 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { ArrowLeft, Target, Plus, Play, Trash2, Clock, Check, X, Eye, ChevronDown, ChevronRight, Pause } from 'lucide-react';
+import { ArrowLeft, Target, Plus, Trash2, Check, X, Eye } from 'lucide-react';
 import { cn } from '../lib/cn';
-import type { AgentInfo, CronMission, MissionRunEntry } from '../types';
-import { ChatWidget } from './chat/ChatWidget';
+import type { AgentInfo, CronMission } from '../types';
 import { useSessionStore } from '../stores/sessionStore';
 
 // ---- Helpers ----------------------------------------------------------------
-
-const formatTimestamp = (ts: number) => {
-  if (!ts || ts <= 0) return '-';
-  const d = new Date(ts * 1000);
-  return d.toLocaleString();
-};
-
-const formatShortTime = (ts: number) => {
-  if (!ts || ts <= 0) return '-';
-  const d = new Date(ts * 1000);
-  const now = new Date();
-  const isToday = d.toDateString() === now.toDateString();
-  if (isToday) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-};
 
 const describeCron = (schedule: string): string => {
   const parts = schedule.split(/\s+/);
@@ -49,14 +33,6 @@ const folderLabel = (path: string | null | undefined): string | null => {
   return path.split('/').pop() || path;
 };
 
-const statusBadgeClass = (run: MissionRunEntry) => {
-  if (run.skipped) return 'bg-amber-500/15 text-amber-600';
-  if (run.status === 'completed') return 'bg-green-500/15 text-green-600';
-  if (run.status === 'failed') return 'bg-red-500/15 text-red-600';
-  if (run.status === 'running') return 'bg-blue-500/15 text-blue-600';
-  return 'bg-slate-500/15 text-slate-500';
-};
-
 // ---- API helpers ------------------------------------------------------------
 
 async function fetchMissions(): Promise<CronMission[]> {
@@ -68,14 +44,19 @@ async function fetchMissions(): Promise<CronMission[]> {
 
 interface CreateMissionArgs {
   name?: string;
+  description?: string;
   schedule: string;
   prompt?: string;
   model?: string;
-  project?: string;
-  permission_tier?: string;
-  mode?: string;
+  cwd?: string;
   entry?: string;
   policy?: string;
+  permission_mode?: string;
+  permission_paths?: string[];
+  permission_warning?: string;
+  allow_skills?: string[];
+  requires?: string[];
+  allowed_tools?: string[];
 }
 
 async function createMission(args: CreateMissionArgs): Promise<CronMission | null> {
@@ -84,14 +65,19 @@ async function createMission(args: CreateMissionArgs): Promise<CronMission | nul
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       name: args.name || null,
+      description: args.description || '',
       schedule: args.schedule,
       prompt: args.prompt || null,
       model: args.model || null,
-      project: args.project || null,
-      permission_tier: args.permission_tier || 'full',
-      mode: args.mode || 'agent',
+      cwd: args.cwd || null,
       entry: args.entry || null,
-      policy: args.policy || 'trusted',
+      policy: args.policy || 'strict',
+      permission_mode: args.permission_mode || 'admin',
+      permission_paths: args.permission_paths || [],
+      permission_warning: args.permission_warning || null,
+      allow_skills: args.allow_skills || [],
+      requires: args.requires || [],
+      allowed_tools: args.allowed_tools || [],
     }),
   });
   if (!resp.ok) { throw new Error(await resp.text()); }
@@ -112,45 +98,25 @@ async function deleteMission(id: string): Promise<void> {
   await fetch(`/api/missions/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
-async function fetchMissionRuns(id: string): Promise<MissionRunEntry[]> {
-  const resp = await fetch(`/api/missions/${encodeURIComponent(id)}/runs`);
-  if (!resp.ok) return [];
-  const data = await resp.json();
-  return Array.isArray(data.runs) ? data.runs : [];
-}
-
-async function triggerMission(id: string, project?: string): Promise<void> {
-  const resp = await fetch(`/api/missions/${encodeURIComponent(id)}/trigger`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ project_root: project || null }),
-  });
-  if (!resp.ok) { throw new Error(await resp.text()); }
-}
 
 
-// ---- Left Sidebar: Mission Nav with expandable runs -------------------------
+// ---- Left Sidebar: Mission Nav ---------------------------------------------
 
-/** Selected item in the sidebar: a run, the inline editor (existing or new), or nothing. */
+/** Selected item in the sidebar: inline editor (existing or new), agent viewer, or nothing.
+ *  Run sessions are viewed via the main-page session list, not here. */
 type SidebarSelection =
-  | { type: 'run'; missionId: string; run: MissionRunEntry }
   | { type: 'editor'; missionId: string | null }
   | { type: 'agent-viewer' }
   | null;
 
 const MissionNav: React.FC<{
   missions: CronMission[];
-  runsMap: Record<string, MissionRunEntry[]>;
-  expandedMissions: Set<string>;
   selection: SidebarSelection;
-  onToggleExpand: (id: string) => void;
   onSelectMission: (m: CronMission) => void;
-  onSelectRun: (mission: CronMission, run: MissionRunEntry) => void;
   onToggleEnabled: (id: string, enabled: boolean) => void;
   onDelete: (id: string) => void;
-  onTrigger: (m: CronMission) => void;
   onCreate: () => void;
-}> = ({ missions, runsMap, expandedMissions, selection, onToggleExpand, onSelectMission, onSelectRun, onToggleEnabled: _onToggleEnabled, onDelete, onTrigger, onCreate }) => {
+}> = ({ missions, selection, onSelectMission, onToggleEnabled: _onToggleEnabled, onDelete, onCreate }) => {
   const enabledCount = missions.filter(m => m.enabled).length;
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
@@ -180,36 +146,23 @@ const MissionNav: React.FC<{
         )}
 
         {missions.map(mission => {
-          const isExpanded = expandedMissions.has(mission.id);
-          const runs = runsMap[mission.id] || [];
-          const sortedRuns = [...runs].reverse();
-          const projLabel = folderLabel(mission.project);
+          const projLabel = folderLabel(mission.cwd || mission.project);
 
           return (
             <div key={mission.id} className="rounded-lg">
-              {/* Mission header */}
+              {/* Mission header. Per-mission run history was removed — run
+                  sessions now live in the main page's unified session list
+                  under the "Mission" tab. */}
               <div className={cn(
                 'relative group rounded-lg transition-colors',
                 selection?.type === 'editor' && selection.missionId === mission.id
                   ? 'bg-blue-50 dark:bg-blue-500/10'
-                  : selection?.type === 'run' && selection.missionId === mission.id
-                  ? 'bg-blue-50/50 dark:bg-blue-500/5'
                   : 'hover:bg-slate-50 dark:hover:bg-white/5',
               )}>
                 <div className="flex items-stretch">
                   <button
-                    onClick={(e) => { e.stopPropagation(); onToggleExpand(mission.id); }}
-                    className="pl-2 pr-0.5 py-2 text-slate-400 hover:text-slate-600 shrink-0"
-                    title={isExpanded ? 'Collapse runs' : 'Expand runs'}
-                  >
-                    {isExpanded
-                      ? <ChevronDown size={13} />
-                      : <ChevronRight size={13} />
-                    }
-                  </button>
-                  <button
                     onClick={() => onSelectMission(mission)}
-                    className="flex-1 text-left pr-2.5 py-2 min-w-0"
+                    className="flex-1 text-left px-2.5 py-2 min-w-0"
                   >
                     <div className="flex items-center gap-1.5">
                       <span className={cn(
@@ -224,23 +177,12 @@ const MissionNav: React.FC<{
                       {describeCron(mission.schedule)}
                       {projLabel && <> &middot; {projLabel}</>}
                     </div>
-                    {!isExpanded && runs.length > 0 && (
-                      <div className="text-[11px] text-slate-400 mt-0.5">
-                        {runs.length} run{runs.length !== 1 ? 's' : ''}
-                      </div>
-                    )}
                   </button>
                 </div>
 
-                {/* Action buttons on hover */}
+                {/* Action buttons on hover. Run is intentionally absent —
+                    trigger missions from the main-page session list instead. */}
                 <div className="absolute right-1.5 top-1.5 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-all">
-                  <button
-                    onClick={(e) => { e.stopPropagation(); onTrigger(mission); }}
-                    className="p-1 rounded hover:bg-green-100 dark:hover:bg-green-500/10 text-slate-400 hover:text-green-600"
-                    title="Run now"
-                  >
-                    <Play size={11} />
-                  </button>
                   {confirmDeleteId === mission.id ? (
                     <>
                       <button
@@ -269,40 +211,6 @@ const MissionNav: React.FC<{
                   )}
                 </div>
               </div>
-
-              {/* Expanded: run sessions list */}
-              {isExpanded && (
-                <div className="ml-3 mt-0.5 space-y-0.5">
-                  {sortedRuns.length === 0 ? (
-                    <div className="px-2.5 py-2 text-[11px] text-slate-400 italic">
-                      No runs yet
-                    </div>
-                  ) : sortedRuns.map((run, i) => {
-                    const isActive = selection?.type === 'run' && selection.missionId === mission.id && selection.run.run_id === run.run_id;
-                    return (
-                      <button
-                        key={`${run.run_id}-${i}`}
-                        onClick={() => onSelectRun(mission, run)}
-                        className={cn(
-                          'w-full text-left px-2.5 py-1.5 rounded-lg transition-colors text-[12px]',
-                          isActive
-                            ? 'bg-blue-100/80 dark:bg-blue-500/15 border-l-2 border-blue-500'
-                            : 'hover:bg-slate-50 dark:hover:bg-white/5',
-                        )}
-                      >
-                        <div className="flex items-center gap-2">
-                          <span className="text-slate-600 dark:text-slate-300 font-medium">
-                            {formatShortTime(run.triggered_at)}
-                          </span>
-                          <span className={cn('text-[10px] font-bold px-1 py-0 rounded uppercase tracking-wide', statusBadgeClass(run))}>
-                            {run.skipped ? 'skip' : run.status === 'completed' ? 'ok' : run.status}
-                          </span>
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
             </div>
           );
         })}
@@ -322,10 +230,17 @@ const CRON_PRESETS = [
   { label: 'Weekly Sunday', value: '0 0 * * 0' },
 ];
 
-export const PERMISSION_TIERS = [
-  { value: 'readonly', label: 'Read-only', desc: 'Analyze and report only. No file changes or commands.', color: 'green' },
-  { value: 'standard', label: 'Standard', desc: 'Read + edit files, run build/test commands. Requires a project.', color: 'blue' },
-  { value: 'full', label: 'Full access', desc: 'All tools, no restrictions. Use with caution.', color: 'amber' },
+export const PERMISSION_MODES = [
+  { value: 'read', label: 'Read-only', desc: 'Analyze and report only — no Write, Edit, or Bash.', color: 'green' },
+  { value: 'edit', label: 'Edit', desc: 'Write + edit files within the working directory and declared paths.', color: 'blue' },
+  { value: 'admin', label: 'Admin', desc: 'Full access, no restrictions. Use with caution.', color: 'amber' },
+] as const;
+
+export const POLICY_OPTIONS = [
+  { value: 'strict',      label: 'Strict',      desc: 'Silently deny anything outside the grant. Safest default for headless runs.',  color: 'green' },
+  { value: 'trusted',     label: 'Trusted',     desc: 'Silently allow out-of-scope. Ask-rules (git push, etc.) still deny.',           color: 'blue' },
+  { value: 'sandbox',     label: 'Sandbox',     desc: 'Allow everything. For Docker/VM runs where the OS is the guardrail.',          color: 'amber' },
+  { value: 'interactive', label: 'Interactive', desc: 'Prompt for out-of-scope. Discouraged for missions — prompts queue unseen.',    color: 'red'   },
 ] as const;
 
 export const MissionEditor: React.FC<{
@@ -336,16 +251,28 @@ export const MissionEditor: React.FC<{
   onViewAgent: () => void;
 }> = ({ editing, workingFolders, onSave, onCancel, onViewAgent }) => {
   const [name, setName] = useState(editing?.name || '');
+  const [description, setDescription] = useState(editing?.description || '');
   const [schedule, setSchedule] = useState(editing?.schedule || '*/30 * * * *');
   const [prompt, setPrompt] = useState(editing?.prompt || '');
   const [model, setModel] = useState(editing?.model || '');
-  const [selectedProject, setSelectedProject] = useState(editing?.project || '');
-  const [permissionTier, setPermissionTier] = useState(editing?.permission_tier || 'full');
-  const [mode, setMode] = useState<'agent' | 'app'>((editing?.mode as 'agent' | 'app') || 'agent');
+  const [selectedCwd, setSelectedCwd] = useState(editing?.cwd || editing?.project || '');
   const [entry, setEntry] = useState(editing?.entry || '');
-  const [policy, setPolicy] = useState<'trusted' | 'strict' | 'interactive'>(
-    (editing?.policy as 'trusted' | 'strict' | 'interactive') || 'trusted',
+
+  const [policy, setPolicy] = useState<'strict' | 'trusted' | 'sandbox' | 'interactive'>(
+    ((editing?.policy as 'strict' | 'trusted' | 'sandbox' | 'interactive') || 'strict'),
   );
+  const [permissionMode, setPermissionMode] = useState<'read' | 'edit' | 'admin'>(
+    (editing?.permission?.mode as 'read' | 'edit' | 'admin') || 'admin',
+  );
+  const [permissionPathsText, setPermissionPathsText] = useState(
+    (editing?.permission?.paths || []).join('\n'),
+  );
+  const [permissionWarning, setPermissionWarning] = useState(editing?.permission?.warning || '');
+
+  const [allowSkillsText, setAllowSkillsText] = useState((editing?.allow_skills || []).join(', '));
+  const [requiresText, setRequiresText] = useState((editing?.requires || []).join(', '));
+  const [allowedToolsText, setAllowedToolsText] = useState((editing?.allowed_tools || []).join(', '));
+
   const [models, setModels] = useState<{ id: string; model: string; provider: string }[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -354,48 +281,46 @@ export const MissionEditor: React.FC<{
     fetch('/api/config').then(r => r.ok ? r.json() : null).then(data => { if (data?.models) setModels(data.models); }).catch(() => {});
   }, []);
 
-  // Standard tier requires a project
-  const tierError = permissionTier === 'standard' && !selectedProject
-    ? 'Standard tier requires a project to scope file edits.'
-    : null;
+  const splitList = (s: string): string[] =>
+    s.split(/[\s,]+/).map(x => x.trim()).filter(Boolean);
+
+  const splitLines = (s: string): string[] =>
+    s.split('\n').map(x => x.trim()).filter(Boolean);
 
   const handleSave = async () => {
     if (!schedule.trim()) { setError('Schedule is required'); return; }
-    if (mode === 'agent') {
-      if (!prompt.trim()) { setError('Prompt is required for agent missions'); return; }
-      if (tierError) { setError(tierError); return; }
-    } else if (mode === 'app') {
-      if (!entry.trim()) { setError('Entry URL is required for app missions'); return; }
+    if (!prompt.trim() && !entry.trim()) {
+      setError('Mission needs either a prompt body or an entry script');
+      return;
     }
     setSaving(true); setError(null);
     try {
+      const permPaths = splitLines(permissionPathsText);
+      const payload = {
+        name: name || undefined,
+        description: description || '',
+        schedule,
+        prompt: prompt || undefined,
+        model: model || undefined,
+        cwd: selectedCwd || undefined,
+        entry: entry || undefined,
+        policy,
+        permission_mode: permissionMode,
+        permission_paths: permPaths,
+        permission_warning: permissionWarning || undefined,
+        allow_skills: splitList(allowSkillsText),
+        requires: splitList(requiresText),
+        allowed_tools: splitList(allowedToolsText),
+      };
       const result = editing
-        ? await updateMission(editing.id, {
-            name: name || null,
-            schedule,
-            prompt: mode === 'agent' ? prompt : '',
-            model: mode === 'agent' ? (model || null) : null,
-            project: mode === 'agent' ? (selectedProject || null) : null,
-            permission_tier: permissionTier,
-            mode,
-            entry: mode === 'app' ? entry : null,
-            policy: mode === 'agent' ? policy : null,
-          })
-        : await createMission({
-            name: name || undefined,
-            schedule,
-            prompt: mode === 'agent' ? prompt : undefined,
-            model: mode === 'agent' ? (model || undefined) : undefined,
-            project: mode === 'agent' ? (selectedProject || undefined) : undefined,
-            permission_tier: permissionTier,
-            mode,
-            entry: mode === 'app' ? entry : undefined,
-            policy: mode === 'agent' ? policy : undefined,
-          });
+        ? await updateMission(editing.id, payload)
+        : await createMission(payload);
       if (result) onSave(result);
     } catch (e: any) { setError(e.message || 'Failed to save mission'); }
     setSaving(false);
   };
+
+  const scriptOnly = !prompt.trim() && entry.trim().length > 0;
 
   return (
     <div className="flex-1 overflow-y-auto p-6">
@@ -407,37 +332,15 @@ export const MissionEditor: React.FC<{
         {error && <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-3 text-xs text-red-600 dark:text-red-400">{error}</div>}
 
         <div>
-          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">Mode</label>
-          <div className="grid grid-cols-2 gap-2">
-            {([
-              { value: 'agent', label: 'Agent', desc: 'Run a prompt with the mission agent on each trigger' },
-              { value: 'app', label: 'App', desc: 'Open a URL in the browser. No agent session.' },
-            ] as const).map(m => {
-              const selected = mode === m.value;
-              return (
-                <button
-                  key={m.value}
-                  type="button"
-                  onClick={() => setMode(m.value)}
-                  className={cn(
-                    'flex flex-col items-start gap-0.5 px-3 py-2 rounded-lg border text-left transition-colors',
-                    selected
-                      ? 'border-blue-500/40 bg-blue-500/10'
-                      : 'border-slate-200 dark:border-white/10 hover:bg-slate-50 dark:hover:bg-white/5',
-                  )}
-                >
-                  <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">{m.label}</div>
-                  <div className="text-[11px] text-slate-500 dark:text-slate-400">{m.desc}</div>
-                </button>
-              );
-            })}
-          </div>
+          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">Name</label>
+          <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. dream"
+            className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-blue-500/30" />
         </div>
 
         <div>
-          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">Name</label>
-          <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Daily code review"
-            className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-blue-500/30" />
+          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">Description</label>
+          <textarea value={description} onChange={e => setDescription(e.target.value)} placeholder="One-line summary — shown in the mission list" rows={2}
+            className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 resize-y focus:outline-none focus:ring-2 focus:ring-blue-500/30" />
         </div>
 
         <div>
@@ -455,71 +358,56 @@ export const MissionEditor: React.FC<{
           <div className="text-[11px] text-slate-400 mt-1.5">{describeCron(schedule)}</div>
         </div>
 
-        {mode === 'app' && (
-          <div>
-            <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">Entry URL</label>
-            <input
-              type="text"
-              value={entry}
-              onChange={e => setEntry(e.target.value)}
-              placeholder="/apps/memory/  or  https://example.com"
-              className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
-            />
-            <div className="text-[11px] text-slate-400 mt-1.5">
-              Relative paths (starting with <code>/</code>) are opened against the Linggen server. Absolute <code>http(s)://</code> URLs are opened as-is.
-            </div>
-          </div>
-        )}
-
-        {mode === 'agent' && (
         <div>
           <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">Agent</label>
           <div className="flex items-center gap-2">
             <div className="flex-1 px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-white/10 bg-slate-50 dark:bg-white/[0.03] text-slate-500">
-              <span className="font-semibold text-purple-600 dark:text-purple-400">mission</span>
-              <span className="text-slate-400 ml-2">— Autonomous (no human interaction)</span>
+              <span className="font-semibold text-purple-600 dark:text-purple-400">ling</span>
+              <span className="text-slate-400 ml-2">— Autonomous (no AskUser, no UI)</span>
             </div>
             <button onClick={onViewAgent} className="flex items-center gap-1 px-2.5 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5 transition-colors shrink-0" title="View mission.md">
               <Eye size={13} /> View
             </button>
           </div>
         </div>
-        )}
 
-        {mode === 'agent' && (<>
         <div>
           <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
-            Autonomy
-            <span className="text-slate-400 font-normal ml-1">(how to handle actions outside the grant)</span>
+            Entry script <span className="text-slate-400 font-normal">(optional — runs before the agent)</span>
+          </label>
+          <input type="text" value={entry} onChange={e => setEntry(e.target.value)}
+            placeholder="scripts/collect.sh  or  inline bash -c '...'"
+            className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-blue-500/30" />
+          <div className="text-[11px] text-slate-400 mt-1.5">
+            Relative paths resolve against the mission directory. Entry receives <code>MISSION_ID</code>, <code>MISSION_DIR</code>, <code>MISSION_CWD</code>, <code>MISSION_OUTPUT_DIR</code>, <code>MISSION_LAST_RUN_AT</code>, <code>MISSION_RUN_ID</code>.
+          </div>
+        </div>
+
+        <div>
+          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
+            Autonomy policy
           </label>
           <div className="space-y-2">
-            {([
-              { value: 'trusted', label: 'Trusted', desc: 'Silently allow out-of-scope. Ask-rules (git push, etc.) still deny. Matches legacy mission behavior.', color: 'blue' },
-              { value: 'strict', label: 'Strict', desc: 'Silently deny anything outside the grant. Safest — the agent must stay within what it\'s told.', color: 'green' },
-              { value: 'interactive', label: 'Interactive', desc: 'Prompt for out-of-scope. Rare — no one is there to click, so prompts queue.', color: 'amber' },
-            ] as const).map(opt => {
+            {POLICY_OPTIONS.map(opt => {
               const selected = policy === opt.value;
-              const colorMap = {
+              const colorMap: Record<string, string> = {
                 blue: selected ? 'border-blue-500/40 bg-blue-500/10' : '',
                 green: selected ? 'border-green-500/40 bg-green-500/10' : '',
                 amber: selected ? 'border-amber-500/40 bg-amber-500/10' : '',
+                red: selected ? 'border-red-500/40 bg-red-500/10' : '',
               };
-              const dotMap = {
-                blue: 'bg-blue-500',
-                green: 'bg-green-500',
-                amber: 'bg-amber-500',
+              const dotMap: Record<string, string> = {
+                blue: 'bg-blue-500', green: 'bg-green-500',
+                amber: 'bg-amber-500', red: 'bg-red-500',
               };
               return (
-                <button
-                  key={opt.value}
-                  type="button"
-                  onClick={() => setPolicy(opt.value)}
+                <button key={opt.value} type="button" onClick={() => setPolicy(opt.value as any)}
                   className={cn(
                     'w-full flex items-start gap-3 px-3 py-2.5 rounded-lg border text-left transition-colors',
                     selected ? colorMap[opt.color] : 'border-slate-200 dark:border-white/10 hover:bg-slate-50 dark:hover:bg-white/5',
-                  )}
-                >
-                  <div className={cn('w-3 h-3 rounded-full mt-0.5 shrink-0 border-2', selected ? dotMap[opt.color] + ' border-transparent' : 'border-slate-300 dark:border-white/20')} />
+                  )}>
+                  <div className={cn('w-3 h-3 rounded-full mt-0.5 shrink-0 border-2',
+                    selected ? dotMap[opt.color] + ' border-transparent' : 'border-slate-300 dark:border-white/20')} />
                   <div className="min-w-0">
                     <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">{opt.label}</div>
                     <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">{opt.desc}</div>
@@ -531,55 +419,79 @@ export const MissionEditor: React.FC<{
         </div>
 
         <div>
-          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">Permissions</label>
+          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">Permission ceiling</label>
           <div className="space-y-2">
-            {PERMISSION_TIERS.map(tier => {
-              const selected = permissionTier === tier.value;
-              const disabled = tier.value === 'standard' && !selectedProject;
-              const colorMap = {
+            {PERMISSION_MODES.map(m => {
+              const selected = permissionMode === m.value;
+              const colorMap: Record<string, string> = {
                 green: selected ? 'border-green-500/40 bg-green-500/10' : '',
                 blue: selected ? 'border-blue-500/40 bg-blue-500/10' : '',
                 amber: selected ? 'border-amber-500/40 bg-amber-500/10' : '',
               };
-              const dotMap = {
-                green: 'bg-green-500',
-                blue: 'bg-blue-500',
-                amber: 'bg-amber-500',
+              const dotMap: Record<string, string> = {
+                green: 'bg-green-500', blue: 'bg-blue-500', amber: 'bg-amber-500',
               };
               return (
-                <button
-                  key={tier.value}
-                  onClick={() => !disabled && setPermissionTier(tier.value)}
-                  disabled={disabled}
+                <button key={m.value} type="button" onClick={() => setPermissionMode(m.value as any)}
                   className={cn(
                     'w-full flex items-start gap-3 px-3 py-2.5 rounded-lg border text-left transition-colors',
-                    selected
-                      ? colorMap[tier.color]
-                      : 'border-slate-200 dark:border-white/10 hover:bg-slate-50 dark:hover:bg-white/5',
-                    disabled && 'opacity-40 cursor-not-allowed',
-                  )}
-                >
-                  <div className={cn('w-3 h-3 rounded-full mt-0.5 shrink-0 border-2', selected ? dotMap[tier.color] + ' border-transparent' : 'border-slate-300 dark:border-white/20')} />
+                    selected ? colorMap[m.color] : 'border-slate-200 dark:border-white/10 hover:bg-slate-50 dark:hover:bg-white/5',
+                  )}>
+                  <div className={cn('w-3 h-3 rounded-full mt-0.5 shrink-0 border-2',
+                    selected ? dotMap[m.color] + ' border-transparent' : 'border-slate-300 dark:border-white/20')} />
                   <div className="min-w-0">
-                    <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">{tier.label}</div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">{tier.desc}</div>
-                    {tier.value === 'standard' && !selectedProject && (
-                      <div className="text-[11px] text-amber-600 dark:text-amber-400 mt-0.5">Select a project below to enable this tier</div>
-                    )}
-                    {tier.value === 'readonly' && selected && (
-                      <div className="text-[11px] text-slate-400 mt-0.5">Tools: Read, Glob, Grep, WebSearch, WebFetch, Task</div>
-                    )}
-                    {tier.value === 'standard' && selected && (
-                      <div className="text-[11px] text-slate-400 mt-0.5">Tools: Read, Write, Edit, Glob, Grep, Bash (build/test only), WebSearch, WebFetch, Task, Skill</div>
-                    )}
-                    {tier.value === 'full' && selected && (
-                      <div className="text-[11px] text-slate-400 mt-0.5">All tools including unrestricted Bash</div>
-                    )}
+                    <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">{m.label}</div>
+                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">{m.desc}</div>
                   </div>
                 </button>
               );
             })}
           </div>
+        </div>
+
+        <div>
+          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
+            Permission paths <span className="text-slate-400 font-normal">(one per line — extra grants beyond cwd)</span>
+          </label>
+          <textarea value={permissionPathsText} onChange={e => setPermissionPathsText(e.target.value)}
+            placeholder={'~/.linggen/memory\n~/.claude/projects'} rows={3}
+            className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 resize-y focus:outline-none focus:ring-2 focus:ring-blue-500/30" />
+        </div>
+
+        <div>
+          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
+            Permission warning <span className="text-slate-400 font-normal">(shown in UI before enabling)</span>
+          </label>
+          <input type="text" value={permissionWarning} onChange={e => setPermissionWarning(e.target.value)}
+            placeholder="e.g. Reads session files and writes to ~/.linggen/memory"
+            className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-blue-500/30" />
+        </div>
+
+        <div>
+          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
+            Allowed tools <span className="text-slate-400 font-normal">(comma-separated; empty = unrestricted)</span>
+          </label>
+          <input type="text" value={allowedToolsText} onChange={e => setAllowedToolsText(e.target.value)}
+            placeholder="Read, Write, Edit, Bash, Glob, Grep, Task, Memory_add, Memory_search"
+            className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-blue-500/30" />
+        </div>
+
+        <div>
+          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
+            Allow skills <span className="text-slate-400 font-normal">(via Skill tool — empty removes Skill, * allows any)</span>
+          </label>
+          <input type="text" value={allowSkillsText} onChange={e => setAllowSkillsText(e.target.value)}
+            placeholder="memory, linggen"
+            className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-blue-500/30" />
+        </div>
+
+        <div>
+          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
+            Requires <span className="text-slate-400 font-normal">(capabilities — validated at load)</span>
+          </label>
+          <input type="text" value={requiresText} onChange={e => setRequiresText(e.target.value)}
+            placeholder="memory"
+            className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-blue-500/30" />
         </div>
 
         <div>
@@ -593,10 +505,9 @@ export const MissionEditor: React.FC<{
 
         <div>
           <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
-            Working Folder {permissionTier === 'standard' && <span className="text-amber-600 dark:text-amber-400">(required for Standard tier)</span>}
-            {permissionTier !== 'standard' && <span className="text-slate-400">(optional, defaults to HOME)</span>}
+            Working folder <span className="text-slate-400 font-normal">(optional, defaults to HOME)</span>
           </label>
-          <select value={selectedProject} onChange={e => setSelectedProject(e.target.value)}
+          <select value={selectedCwd} onChange={e => setSelectedCwd(e.target.value)}
             className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-blue-500/30">
             <option value="">HOME (default)</option>
             {workingFolders.map(p => <option key={p} value={p}>{p.split('/').pop() || p}</option>)}
@@ -604,14 +515,16 @@ export const MissionEditor: React.FC<{
         </div>
 
         <div>
-          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">Prompt</label>
-          <textarea value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="The instruction to send to the agent on each trigger..." rows={6}
+          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
+            Prompt body {scriptOnly && <span className="text-amber-600 dark:text-amber-400">(empty — this is a script-only mission)</span>}
+          </label>
+          <textarea value={prompt} onChange={e => setPrompt(e.target.value)}
+            placeholder="Step-by-step instructions for the agent. Leave empty for a script-only mission." rows={8}
             className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 resize-y focus:outline-none focus:ring-2 focus:ring-blue-500/30" />
         </div>
-        </>)}
 
         <div className="flex items-center gap-3 pt-2">
-          <button onClick={handleSave} disabled={saving || (mode === 'agent' && (!prompt.trim() || !!tierError)) || (mode === 'app' && !entry.trim())}
+          <button onClick={handleSave} disabled={saving || (!prompt.trim() && !entry.trim())}
             className="px-4 py-2 text-sm font-semibold rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
             {saving ? 'Saving...' : editing ? 'Update Mission' : 'Create Mission'}
           </button>
@@ -663,58 +576,24 @@ const AgentViewer: React.FC<{ onBack: () => void; projectRoot: string }> = ({ on
   );
 };
 
-// ---- Right Panel: Session chat or empty state -------------------------------
+// ---- Right Panel: empty-state placeholder ----------------------------------
+//
+// The mission page no longer views run sessions inline — mission run sessions
+// are in the main page's unified session list under the "Mission" tab. This
+// panel just shows a placeholder when nothing is being edited.
 
 const RightPanel: React.FC<{
   selection: SidebarSelection;
-  projectRoot: string;
-  missions: CronMission[];
-  onOpenSession?: (sessionId: string) => void;
-}> = ({ selection, projectRoot, missions, onOpenSession }) => {
-  const selectedMission = selection?.type === 'run' ? missions.find(m => m.id === selection.missionId) : null;
-  const _selectedRun = selection?.type === 'run' ? selection.run : null;
-
+}> = ({ selection }) => {
   if (!selection) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center text-slate-400">
         <Target size={32} className="mb-3 opacity-30" />
-        <p className="text-sm">Select a mission run to view its session</p>
-        <p className="text-[12px] mt-1 text-slate-400">Or create a new mission to get started</p>
+        <p className="text-sm">Select a mission to edit, or create a new one.</p>
+        <p className="text-[12px] mt-1 text-slate-400">Run sessions appear in the main page's session list under the Mission tab.</p>
       </div>
     );
   }
-
-  if (selection.type === 'run') {
-    const run = selection.run;
-
-    if (run.skipped) {
-      return (
-        <div className="flex-1 flex flex-col items-center justify-center text-slate-400">
-          <Pause size={28} className="mb-2 opacity-40 text-amber-500" />
-          <p className="text-sm">Run was skipped</p>
-          <p className="text-[12px] mt-1">Agent was busy when this trigger fired</p>
-        </div>
-      );
-    }
-
-    if (!run.session_id) {
-      return (
-        <div className="flex-1 flex flex-col items-center justify-center text-slate-400">
-          <Clock size={28} className="mb-2 opacity-40" />
-          <p className="text-sm">No session recorded</p>
-        </div>
-      );
-    }
-
-    const resolvedProject = selectedMission?.project || projectRoot;
-    return (
-      <ChatWidget
-        sessionId={run.session_id}
-        projectRoot={resolvedProject}
-      />
-    );
-  }
-
   return null;
 };
 
@@ -726,7 +605,7 @@ export const MissionPage: React.FC<{
   agents: AgentInfo[];
   embedded?: boolean;
   onOpenSession?: (sessionId: string) => void;
-}> = ({ onBack: rawOnBack, projectRoot, agents: _agents, embedded, onOpenSession }) => {
+}> = ({ onBack: rawOnBack, projectRoot, agents: _agents, embedded, onOpenSession: _onOpenSession }) => {
   // Reset mission session state when navigating away
   const onBack = useCallback(() => {
     useSessionStore.setState({ isMissionSession: false, activeMissionId: null });
@@ -734,8 +613,6 @@ export const MissionPage: React.FC<{
   }, [rawOnBack]);
   const [missions, setMissions] = useState<CronMission[]>([]);
   const [loading, setLoading] = useState(true);
-  const [expandedMissions, setExpandedMissions] = useState<Set<string>>(new Set());
-  const [runsMap, setRunsMap] = useState<Record<string, MissionRunEntry[]>>({});
   const [selection, setSelection] = useState<SidebarSelection>(null);
   const [rightView, setRightView] = useState<'session' | 'editor' | 'agent-viewer'>('session');
   const [editingMission, setEditingMission] = useState<CronMission | null>(null);
@@ -758,33 +635,6 @@ export const MissionPage: React.FC<{
 
   useEffect(() => { setLoading(true); loadMissions(); }, [loadMissions]);
 
-  // Fetch runs when a mission is expanded
-  const loadRuns = useCallback(async (missionId: string) => {
-    const runs = await fetchMissionRuns(missionId);
-    setRunsMap(prev => ({ ...prev, [missionId]: runs }));
-  }, []);
-
-  const handleToggleExpand = useCallback((id: string) => {
-    setExpandedMissions(prev => {
-      const next = new Set(prev);
-      if (next.has(id)) { next.delete(id); } else { next.add(id); loadRuns(id); }
-      return next;
-    });
-  }, [loadRuns]);
-
-  const handleSelectRun = useCallback((mission: CronMission, run: MissionRunEntry) => {
-    setSelection({ type: 'run', missionId: mission.id, run });
-    setRightView('session');
-    // Set store state so ChatWidget uses mission session endpoints
-    if (run.session_id) {
-      useSessionStore.setState({
-        activeSessionId: run.session_id,
-        isMissionSession: true,
-        activeMissionId: mission.id,
-      });
-    }
-  }, []);
-
   const handleToggle = async (id: string, enabled: boolean) => {
     try { await updateMission(id, { enabled }); await loadMissions(); } catch (e) { console.error('Failed to toggle mission:', e); }
   };
@@ -797,14 +647,6 @@ export const MissionPage: React.FC<{
     setEditingMission(m);
     setSelection({ type: 'editor', missionId: m.id });
     setRightView('editor');
-  };
-
-  const handleTrigger = async (m: CronMission) => {
-    try {
-      await triggerMission(m.id, m.project || undefined);
-      // Refresh runs after a short delay to pick up the new run
-      setTimeout(() => loadRuns(m.id), 2000);
-    } catch (e: any) { console.error('Failed to trigger mission:', e); }
   };
 
   const handleCreate = () => {
@@ -839,15 +681,10 @@ export const MissionPage: React.FC<{
       <div className="w-72 border-r border-slate-200 dark:border-white/5 flex flex-col bg-white dark:bg-[#0f0f0f] h-full">
         <MissionNav
           missions={missions}
-          runsMap={runsMap}
-          expandedMissions={expandedMissions}
           selection={selection}
-          onToggleExpand={handleToggleExpand}
           onSelectMission={handleSelectMission}
-          onSelectRun={handleSelectRun}
           onToggleEnabled={handleToggle}
           onDelete={handleDelete}
-          onTrigger={handleTrigger}
           onCreate={handleCreate}
         />
       </div>
@@ -870,12 +707,7 @@ export const MissionPage: React.FC<{
             projectRoot={projectRoot}
           />
         ) : (
-          <RightPanel
-            selection={selection}
-            projectRoot={projectRoot}
-            missions={missions}
-            onOpenSession={onOpenSession}
-          />
+          <RightPanel selection={selection} />
         )}
       </main>
     </div>

@@ -18,6 +18,7 @@ pub mod keys {
     pub const SYSTEM_SKILLS_HEADER: &str = "system-prompt.skills_header";
     pub const SYSTEM_SKILL_ENTRY: &str = "system-prompt.skill_entry";
     pub const SYSTEM_ACTIVE_SKILL_FRAME: &str = "system-prompt.active_skill_frame";
+    pub const SYSTEM_ACTIVE_MISSION_FRAME: &str = "system-prompt.active_mission_frame";
     pub const SYSTEM_APP_SKILL_DASHBOARD_HINT: &str = "system-prompt.app_skill_dashboard_hint";
     pub const SYSTEM_PROJECT_INSTRUCTIONS_HEADER: &str =
         "system-prompt.project_instructions_header";
@@ -318,6 +319,7 @@ mod tests {
             keys::SYSTEM_SKILLS_HEADER,
             keys::SYSTEM_SKILL_ENTRY,
             keys::SYSTEM_ACTIVE_SKILL_FRAME,
+            keys::SYSTEM_ACTIVE_MISSION_FRAME,
             keys::SYSTEM_APP_SKILL_DASHBOARD_HINT,
             keys::SYSTEM_PROJECT_INSTRUCTIONS_HEADER,
             keys::SYSTEM_PROJECT_INSTRUCTIONS_ENTRY,

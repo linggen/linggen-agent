@@ -20,18 +20,18 @@ Persistent knowledge across sessions — about the user, their work, and what th
 
 ## Core principle
 
-Memory has two layers:
+Memory has two layers with distinct ownership:
 
-1. **Built-in** (owned by Linggen) — a small pair of markdown files capturing universals about the user. Read and inlined into the stable system prompt every session.
-2. **Skill memory** (pluggable) — a skill that advertises `provides: [memory]` and serves the `Memory.*` tool family over HTTP. Default skill: `linggen-memory` (a daemon backed by LanceDB). Handles facts, semantic retrieval, data UI.
+1. **Core** — two markdown files (`identity.md`, `style.md`) under `~/.linggen/memory/`. **Consumed by the engine** — the engine reads them and inlines their content into the stable system prompt every session. The storage path is engine-managed: no skill invents, relocates, or deletes these files. **Writers include** the user (hand-edits), the engine's own agent (on explicit user request), and the active memory skill's extraction pipeline (when it identifies a durable universal worth promoting out of RAG).
+2. **Extension** — **owned by a skill.** Pluggable RAG-backed memory. A skill advertises `provides: [memory]` and serves the `Memory_*` tool family over HTTP. Default skill: `memory` (a thin wrapper that downloads and calls the `linggen-memory` binary, a LanceDB-backed RAG engine). Handles semantic retrieval, fact storage, and the dashboard UI.
 
-The built-in layer is stable and minimal. Skill memory is where the work happens — and users can swap providers without touching Linggen itself.
+The core layer is stable and minimal — a curated summary of who the user is and how they work, always visible to every agent. The RAG layer is the bulk store — everything retrieval-based. Extraction routes each candidate fact to one or the other based on durability: universals go to core, scoped facts go to RAG.
 
-## Layer 1 — Built-in (Linggen core)
+## Layer 1 — Core (engine-owned)
 
 ### Files
 
-Two markdown files under `~/.linggen/memory/`:
+Two markdown files under `~/.linggen/memory/`, owned by the engine:
 
 | File | Purpose | Contents |
 |:-----|:--------|:---------|
@@ -42,21 +42,25 @@ Both must be **universal** — true in any context, any project, any domain. If 
 
 ### Loading
 
-Linggen reads both files and inlines their content into the stable system prompt (the cacheable prefix). Files are re-hashed each turn, so turn-by-turn caching is preserved and user edits invalidate the cache on the next turn.
+The engine reads both files and inlines their content into the stable system prompt (the cacheable prefix). Files are re-hashed each turn, so turn-by-turn caching is preserved and user edits invalidate the cache on the next turn.
 
 ### Writing
 
-- The user can edit either file directly (any editor — they're plain markdown).
-- The agent edits them via the standard `Edit` / `Write` tools when the user explicitly asks to remember something universal. No dedicated "built-in memory" tool exists; the agent uses the same file-editing tools it uses everywhere, and the same path-permission plumbing applies.
-- A daily consolidation mission (run by the active memory skill) can propose additions for user review.
+Three writer paths, all using the same `Edit` / `Write` tools and the same path-permission plumbing:
 
-The built-in layer is deliberately tiny (~30–50 lines combined). High bar for entry — no activity logs, no project-specific rules, no meta-feedback about how memory should work.
+- **User** — edits either file directly in any editor. Plain markdown.
+- **Engine's own agent** — edits them when the user explicitly asks during a regular session (e.g. "remember I'm based in Vancouver").
+- **Memory skill's extraction pipeline** — when the extractor classifies a candidate as a durable universal (passes the "would this still be true in 6 months, in any project?" test), it writes to `identity.md` or `style.md` instead of RAG. Everything that doesn't clear the universal bar goes to RAG.
 
-## Layer 2 — Memory skill (pluggable)
+No dedicated "core memory" tool exists — writers use `Edit` / `Write` like any other file. The memory skill's `allowed-tools` therefore includes `Edit` / `Write`, and its `permission.paths` must grant edit access to `~/.linggen/memory/` so the extractor can promote universals.
+
+The core layer is deliberately tiny (~30–50 lines combined). High bar for entry — no activity logs, no project-specific rules, no meta-feedback about how memory should work. The extractor's durability test is the gatekeeper — most candidates land in RAG, not here.
+
+## Layer 2 — Memory skill (pluggable RAG extension)
 
 ### The `provides: [memory]` contract
 
-A skill becomes the active memory provider by declaring `provides: [memory]` in its `SKILL.md` frontmatter. Linggen detects the capability on skill load, adds the declared tools to its registry, and routes `Memory.*` calls to that skill's daemon.
+A skill becomes the active memory provider by declaring `provides: [memory]` in its `SKILL.md` frontmatter. Linggen detects the capability on skill load, adds the declared tools to its registry, and routes `Memory_*` calls to that skill's daemon.
 
 Only one memory provider is active per session. If multiple are installed, resolution is deterministic (see `skill-spec.md` for capability arbitration rules) and the user can override via config.
 
@@ -118,18 +122,25 @@ When a `Memory_*` tool is called, the engine routes to the active provider's dae
 
 ### Per-provider data layout
 
-Under `~/.linggen/memory/<skill-name>/`:
+Under `~/.linggen/memory/<engine-name>/`:
 
 - `data/` — provider-internal store (LanceDB files for `linggen-memory`)
 - `logs/` — daemon logs
 - `config.toml` — optional user overrides (e.g. non-default port)
 - `daemon.json` — pidfile written by the daemon for its own `ling-mem status` command (the engine doesn't consult it; dispatch uses the `base_url` from the manifest directly)
 
-The exact layout inside `data/` is provider-internal.
+The `<engine-name>` namespace is owned by the engine binary, not the skill wrapping it — multiple skills could share the same engine by calling the same daemon. The default engine `linggen-memory` stores at `~/.linggen/memory/linggen-memory/`. The exact layout inside `data/` is provider-internal.
 
-### Default skill: `linggen-memory`
+The core files `identity.md` and `style.md` live directly at `~/.linggen/memory/`, alongside (not inside) any engine's data directory.
 
-Shipped as Linggen's default memory provider. Lives in its own repo (`linggen-memory/`), released as a platform-specific binary on GitHub. The skill package in `skills/memory/` is a thin wrapper: `SKILL.md` + `install.sh` (downloads the binary).
+### Default skill: `memory` (wraps the `linggen-memory` engine)
+
+Shipped as Linggen's default memory provider. The name split is deliberate:
+
+- **`memory`** — the *skill* (the plug-point). Lives at `skills/memory/` in this repo, declares `provides: [memory]` + `implements.memory`, ships the dashboard UI + mission file + install script. User-facing name (appears as `/memory`).
+- **`linggen-memory`** — the *engine*. A separate repo that builds into the `ling-mem` binary (a LanceDB-backed RAG daemon). The skill's `install.sh` downloads this binary; `autostart: "ling-mem start"` launches it. Users never interact with `linggen-memory` directly.
+
+The skill is a wrapper — `SKILL.md` (extraction prompt + UI plumbing), `install.sh` (binary download + mission install), `assets/mission.md` (cron schedule), and a dashboard under `scripts/`. All real data work lives in the engine.
 
 - **Runtime model:** HTTP daemon (`ling-mem start`). All data operations go through the daemon; there is no per-call subprocess.
 - **Storage:** LanceDB — vector + metadata, semantic search.
@@ -145,10 +156,10 @@ Users who prefer a different memory strategy can write their own skill that conf
 
 The memory skill presents two separate UI surfaces — decoupled, each with a single responsibility:
 
-- **Data UI** (served by the daemon, default `http://127.0.0.1:9888`) — pure CRUD over the LanceDB store. Filter, edit, archive, forget. No side-effects on open.
-- **Skill dashboard** (served by Linggen as an `app:` skill) — summary cards, extraction mission controls, chat widget for the memory agent. Deep-links into the data UI when the user wants row-level editing.
+- **Data UI** (served by the daemon, default `http://127.0.0.1:9888`) — pure CRUD over the LanceDB store. Filter, edit, archive, forget. **No side-effects on open** — strictly read-only until the user clicks. This surface is a data browser, not an agent.
+- **Skill dashboard** (served by Linggen as an `app:` skill) — agentic surface: summary cards, extraction mission controls, chat widget for the memory skill. Auto-scans the last 24 hours of conversations on open, shows existing memory, and offers scan-range actions (today / week / month / all). Deep-links into the data UI for row-level editing.
 
-Opening either surface never triggers a mutating task (extraction, rebuild, etc.). Mutations are always explicit actions — a button click, a `Memory.*` tool call, or a scheduled mission firing.
+The dashboard's auto-scan is a deliberate UX choice: memory value comes from staying fresh, and expecting the user to click *Extract* every session defeats the purpose. The extraction writes only to the skill's RAG store — never to the engine-owned core files.
 
 ## Data model (default skill)
 
@@ -167,29 +178,36 @@ Any schema drift between this document and `linggen-memory/DESIGN.md` is a bug i
 
 Three access modes, all backed by the active memory skill:
 
-1. **Push (active injection).** Linggen calls `Memory.search` with the user's message at turn start and prefixes matched snippets to the user message. Runs per turn. Cache-safe (doesn't invalidate the stable system prompt).
-2. **Pull (tool).** The model calls `Memory.search` / `Memory.list` when it decides memory would help. Standard tool dispatch.
+1. **Push (active injection).** Linggen calls `Memory_search` with the user's message at turn start and prefixes matched snippets to the user message. Runs per turn. Cache-safe (doesn't invalidate the stable system prompt).
+2. **Pull (tool).** The model calls `Memory_search` / `Memory_list` when it decides memory would help. Standard tool dispatch.
 3. **Browse (UI).** The user opens the daemon's data UI for row-level review, edit, archive, forget — or uses the memory skill's dashboard UI for a higher-level summary with extraction controls.
 
-Built-in files are always inlined — they're small enough that inlining beats querying.
+Core files are always inlined by the engine — they're small enough that inlining beats querying.
 
 ## Extraction
 
-Extraction — turning session transcripts into `Memory.add` calls — is driven by **Linggen**, not by the memory skill's daemon. The daemon has no model and no agent; it's a data service.
+Extraction — turning session transcripts into `Memory_add` calls — is driven by **Linggen**, not by the memory skill's daemon. The daemon has no model and no agent; it's a RAG data service.
 
-The memory skill ships a mission file in its `assets/` directory; `install.sh` copies it to `~/.linggen/missions/memory/` (following the pattern in `skill-spec.md`). Linggen's mission scheduler picks it up and fires the extraction agent on schedule. The agent reads session transcripts and makes `Memory.add` calls as it finds durable facts.
+The memory skill ships a mission file in its `assets/` directory; `install.sh` copies it to `~/.linggen/missions/memory/` (following the pattern in `skill-spec.md`). Linggen's mission scheduler picks it up and fires the extraction agent on schedule. The agent reads session transcripts and makes `Memory_add` calls as it finds durable facts.
+
+Extraction routes each candidate by durability:
+
+- **Durable universal** (true in any project, any time) → `Edit` into `identity.md` or `style.md`.
+- **Everything else** → `Memory_add` into RAG as a typed row (`fact`, `preference`, `decision`, `tried`, `fixed`, `learned`, `built`) retrieved semantically.
+
+Most candidates land in RAG. The core files grow slowly by design — the durability bar is high, and a noisy `identity.md` pollutes every unrelated session.
 
 The skill owns the *prompt* and the *cadence*; Linggen owns the *runtime* (scheduling, agent, LLM). Disabling extraction is removing the mission file or turning off its schedule — no daemon-side knob involved.
 
 ## Forgetting
 
-Forgetting is skill-internal — Linggen provides `Memory.forget` for bulk-delete-by-filter, but decay policy (time-based, access-based), durability filters at write time, and any compaction passes are all owned by the active memory provider. See `linggen-memory/DESIGN.md`.
+Forgetting is skill-internal — Linggen provides `Memory_forget` for bulk-delete-by-filter, but decay policy (time-based, access-based), durability filters at write time, and any compaction passes are all owned by the active memory provider. See `linggen-memory/DESIGN.md`.
 
-Linggen's only contract: when the user explicitly says "forget everything about X," the model calls `Memory.forget` with the matching filter and trusts the result.
+Linggen's only contract: when the user explicitly says "forget everything about X," the model calls `Memory_forget` with the matching filter and trusts the result.
 
 ## Mid-session self-review
 
-Linggen fires a hidden nudge every N user messages (configurable via `[agent] memory_nudge_interval`, default 6, 0 disables). The nudge asks the model whether the recent exchange produced anything worth saving — either an `Edit` to `identity.md` / `style.md` for universals, or a `Memory.add` call for scoped facts. Gated behind `include_memory` like the rest of memory.
+Linggen fires a hidden nudge every N user messages (configurable via `[agent] memory_nudge_interval`, default 6, 0 disables). The nudge asks the model whether the recent exchange produced anything worth saving — either an `Edit` to `identity.md` / `style.md` for durable universals, or a `Memory_add` call for scoped facts. Gated behind `include_memory` like the rest of memory.
 
 The nudge text lives in the active skill's manifest (under `prompts.nudge`) so alternate providers can customize the wording. If the active skill doesn't declare a nudge, Linggen falls back to a generic default.
 
@@ -197,12 +215,12 @@ The nudge text lives in the active skill's manifest (under `prompts.nudge`) so a
 
 The memory skill is a composite package — one `SKILL.md` reached via multiple paths:
 
-- **User types `/memory`** → skill body is loaded as session context. The model "thinks in memory mode" for that session and can use `Memory.*` tools, open the dashboard, start extractions, etc. But the slash command is not required — the tools are ambient.
-- **Model calls `Memory.search`** → Linggen dispatches to the daemon over HTTP. Works in any owner session, regardless of whether `/memory` was invoked.
+- **User types `/memory`** → skill body is loaded as session context. The model "thinks in memory mode" for that session and can use `Memory_*` tools, open the dashboard, start extractions, etc. But the slash command is not required — the tools are ambient.
+- **Model calls `Memory_search`** → Linggen dispatches to the daemon over HTTP. Works in any owner session, regardless of whether `/memory` was invoked.
 - **Model calls `RunApp memory-dashboard`** → the skill's dashboard UI opens in a panel.
-- **Mission scheduler fires** → the extraction agent runs, populates memory via `Memory.add`.
+- **Mission scheduler fires** → the extraction agent runs, populates memory via `Memory_add`.
 
-Tool dispatch always routes to the `provides: [memory]` **active provider**, not to whichever skill was named in a slash command. If two memory skills are installed and the user invokes `/memory-alt`, the `Memory.*` tools still hit the ambient active provider. The slash command frames the model's attention; the data plane remains anchored to the active provider.
+Tool dispatch always routes to the `provides: [memory]` **active provider**, not to whichever skill was named in a slash command. If two memory skills are installed and the user invokes `/memory-alt`, the `Memory_*` tools still hit the ambient active provider. The slash command frames the model's attention; the data plane remains anchored to the active provider.
 
 ## Fresh build — no migration
 
@@ -218,15 +236,16 @@ The v1 5-markdown-file system (`user_info.md`, `user_feedback.md`, `agent_done_{
 | Human-readable surface | Built-in layer is markdown. Skill rows are browsable via the daemon's data UI. Nothing is opaque. |
 | Export to markdown | Default skill nightly-exports LanceDB to markdown for backup/git-sync |
 | Durability filter | The active memory skill decides what's durable before committing — not Linggen |
-| Localhost-only bind | Daemons bind `127.0.0.1`; `Memory.*` never exposed to remote consumers |
+| Localhost-only bind | Daemons bind `127.0.0.1`; `Memory_*` never exposed to remote consumers |
 | Per-provider isolation | All data under `~/.linggen/memory/<skill-name>/`; swapping providers keeps old data intact |
 | Capability-routed dispatch | Swapping memory skills is one config setting, no data loss |
-| No side-effects on UI open | Opening any memory UI never triggers a mutating task; mutations are always explicit |
+| Data UI is read-only on open | The daemon's `127.0.0.1:9888` data browser never mutates on open; every change is an explicit click. The skill dashboard auto-scans by design. |
+| Core writes are durability-gated | Extraction only promotes to `identity.md` / `style.md` when a candidate passes the universal-durability test; everything else lands in RAG. The skill's `Edit` / `Write` access to the core is narrow by convention, not by path — it writes only those two files. |
 
 ## Future
 
 - **Cross-device sync** — LanceDB exports + git is v1; real sync is P2P via Linggen's WebRTC transport.
 - **Temporal tracking** — record how facts change over time (inspired by Zep). `supersedes` links already support this structurally.
 - **Multi-provider** — use a local fast skill + a cloud/persistent skill simultaneously, with merged results. Design TBD.
-- **`Memory.archive`** — soft-forget (hidden from default search but recoverable). Eighth tool to add once the default skill supports it; canonical contract will extend to eight.
+- **`Memory_archive`** — soft-forget (hidden from default search but recoverable). Eighth tool to add once the default skill supports it; canonical contract will extend to eight.
 - **Memory health scoring** — auto-detect and propose cleanup for degraded memories.

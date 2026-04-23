@@ -90,25 +90,26 @@ pub async fn mission_scheduler_loop(state: Arc<ServerState>) {
                 continue;
             }
 
-            // Agent mode missions require the "mission" skill.
-            if mission.mode != "app" && mission.mode != "script" {
-                if state.skill_manager.get_skill("mission").await.is_none() {
-                    warn!("Mission scheduler: \"mission\" skill not installed, skipping '{}'. Run `ling init` to install.", mission.id);
-                    continue;
-                }
-            }
+            // Missions are a first-class subsystem — no "mission" skill is
+            // required. Per-mission dependencies are declared in `requires:`
+            // and checked at dispatch by find_missing_requires.
 
-            // Determine project root for this mission
-            let project_path = mission
-                .project
+            // Determine working directory for this mission. Prefer `cwd`
+            // (the new field); fall back to legacy `project`, then env cwd.
+            // Expand `~` and `$VAR` so frontmatter like `cwd: ~/.linggen`
+            // resolves to an absolute path the agent's Bash tool can spawn in.
+            let raw_cwd = mission
+                .cwd
                 .clone()
+                .or_else(|| mission.project.clone())
                 .unwrap_or_else(|| {
                     std::env::current_dir()
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_string()
                 });
-            let root = std::path::PathBuf::from(&project_path);
+            let root = crate::util::resolve_path(std::path::Path::new(&raw_cwd));
+            let project_path = root.to_string_lossy().to_string();
 
             // Busy-skip: if previous run is still executing, skip and log.
             if ms.running.load(std::sync::atomic::Ordering::Relaxed) {
@@ -116,7 +117,12 @@ pub async fn mission_scheduler_loop(state: Arc<ServerState>) {
                     "Mission scheduler: mission '{}' still running, skipping trigger",
                     mission.id
                 );
-                record_mission_run(&state, mission, "", None, "skipped", true);
+                let skip_id = format!(
+                    "mission-run-{}-{}",
+                    crate::util::now_ts_secs(),
+                    &uuid::Uuid::new_v4().to_string()[..8]
+                );
+                record_mission_run(&state, mission, &skip_id, None, "skipped", true);
                 ms.last_fire_minute = Some(current_minute);
                 continue;
             }
@@ -126,63 +132,12 @@ pub async fn mission_scheduler_loop(state: Arc<ServerState>) {
             ms.daily_count += 1;
 
             info!(
-                "Mission scheduler: triggering mission '{}' (mode: {}, project: {:?})",
-                mission.id, mission.mode, mission.project
+                "Mission scheduler: triggering mission '{}' (cwd: {:?})",
+                mission.id, mission.cwd
             );
 
-            // App mode: open URL in browser, no session or agent loop.
-            // Relative entries (starting with "/") are resolved against the
-            // current server port so missions survive port reconfiguration.
-            if mission.mode == "app" {
-                if let Some(ref entry) = mission.entry {
-                    let full_url = if entry.starts_with("http://") || entry.starts_with("https://") {
-                        entry.clone()
-                    } else {
-                        format!("http://localhost:{}{}", state.port, entry)
-                    };
-                    info!("Mission scheduler: opening app URL: {}", full_url);
-                    let _ = crate::server::chat_api::open_in_browser(&full_url);
-                } else {
-                    warn!("Mission scheduler: app mode mission '{}' has no entry URL", mission.id);
-                }
-                record_mission_run(&state, mission, "", None, "completed", false);
-                continue;
-            }
-
-            // Script mode: run entry as shell command, no session or agent loop.
-            if mission.mode == "script" {
-                if let Some(ref cmd) = mission.entry {
-                    info!("Mission scheduler: running script: {}", cmd);
-                    let cmd_owned = cmd.clone();
-                    let state_clone = state.clone();
-                    let mission_owned = mission.clone();
-                    tokio::spawn(async move {
-                        let output = tokio::process::Command::new("bash")
-                            .arg("-c")
-                            .arg(&cmd_owned)
-                            .output()
-                            .await;
-                        let status = match output {
-                            Ok(o) if o.status.success() => "completed",
-                            Ok(o) => {
-                                let stderr = String::from_utf8_lossy(&o.stderr);
-                                warn!("Mission script failed: {}", stderr.trim());
-                                "failed"
-                            }
-                            Err(e) => {
-                                warn!("Mission script error: {}", e);
-                                "failed"
-                            }
-                        };
-                        record_mission_run(&state_clone, &mission_owned, "", None, status, false);
-                    });
-                } else {
-                    warn!("Mission scheduler: script mode mission '{}' has no entry command", mission.id);
-                }
-                continue;
-            }
-
-            // Agent mode (default): create session and run agent loop.
+            // Agent dispatch. Entry-script pre-stage lands in Phase 2 — today
+            // every mission runs the agent loop directly.
             ms.running.store(true, std::sync::atomic::Ordering::Relaxed);
 
             state
@@ -257,15 +212,18 @@ pub fn create_mission_session(mission: &Mission) -> Option<String> {
     let store = crate::state_fs::SessionStore::with_sessions_dir(
         crate::paths::global_sessions_dir(),
     );
+    let mission_cwd = mission.cwd.clone().or_else(|| mission.project.clone());
     let meta = crate::state_fs::sessions::SessionMeta {
         id: session_id.clone(),
         title: mission_session_title(mission),
         created_at: crate::util::now_ts_secs(),
-        skill: Some("mission".to_string()),
+        // Missions are a first-class subsystem; they don't bind a skill.
+        // `creator: "mission"` alone distinguishes mission sessions.
+        skill: None,
         creator: "mission".into(),
-        cwd: mission.project.clone(),
-        project: mission.project.clone(),
-        project_name: mission.project.as_ref().and_then(|p| {
+        cwd: mission_cwd.clone(),
+        project: mission_cwd.clone(),
+        project_name: mission_cwd.as_ref().and_then(|p| {
             std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string())
         }),
         mission_id: Some(mission.id.clone()),
@@ -305,6 +263,113 @@ async fn dispatch_mission_prompt(
 
     let agent_id = MISSION_AGENT_ID;
 
+    // Mission-level run id. Used for the per-run output dir, the
+    // MISSION_RUN_ID env var, and the MissionRunEntry.run_id.
+    let mission_run_id = format!(
+        "mission-run-{}-{}",
+        crate::util::now_ts_secs(),
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+
+    // Fast-fail: requires-check. A missing capability → no point running.
+    if let Some(missing) = find_missing_requires(&state, mission).await {
+        warn!(
+            "Mission scheduler: mission '{}' requires '{}' which is not registered — skipping",
+            mission.id, missing
+        );
+        record_mission_run_full(
+            &state,
+            mission,
+            &mission_run_id,
+            None,
+            "failed",
+            false,
+            None,
+            None,
+        );
+        return;
+    }
+
+    // Create the per-run output directory. Entry script writes here; agent
+    // reads files from here. See doc/mission-spec.md → Entry script contract.
+    let output_dir = state
+        .manager
+        .missions
+        .mission_dir(&mission.id)
+        .join("runs")
+        .join(&mission_run_id);
+    if let Err(e) = std::fs::create_dir_all(&output_dir) {
+        warn!(
+            "Mission scheduler: failed to create output dir for '{}': {}",
+            mission.id, e
+        );
+        record_mission_run_full(
+            &state,
+            mission,
+            &mission_run_id,
+            None,
+            "failed",
+            false,
+            None,
+            Some(output_dir.to_string_lossy().into_owned()),
+        );
+        return;
+    }
+
+    // Entry script pre-stage. Runs before the agent (if any). Non-zero exit
+    // aborts the mission run before the agent is created.
+    let entry_exit_code = if let Some(ref entry) = mission.entry {
+        match run_entry_script(mission, entry, &output_dir, &mission_run_id, &state).await {
+            Ok(code) => Some(code),
+            Err(e) => {
+                warn!("Mission scheduler: entry script error for '{}': {}", mission.id, e);
+                record_mission_run_full(
+                    &state,
+                    mission,
+                    &mission_run_id,
+                    None,
+                    "failed",
+                    false,
+                    Some(-1),
+                    Some(output_dir.to_string_lossy().into_owned()),
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    if matches!(entry_exit_code, Some(c) if c != 0) {
+        record_mission_run_full(
+            &state,
+            mission,
+            &mission_run_id,
+            None,
+            "failed",
+            false,
+            entry_exit_code,
+            Some(output_dir.to_string_lossy().into_owned()),
+        );
+        return;
+    }
+
+    // Script-only mission: entry ran successfully and there's no agent prompt.
+    // No session, no agent loop — just record completion.
+    if mission.prompt.trim().is_empty() {
+        record_mission_run_full(
+            &state,
+            mission,
+            &mission_run_id,
+            None,
+            "completed",
+            false,
+            entry_exit_code,
+            Some(output_dir.to_string_lossy().into_owned()),
+        );
+        return;
+    }
+
     // Use pre-created session or create a new one
     let has_pre_session = pre_session_id.is_some();
     let session_id = pre_session_id.or_else(|| create_mission_session(mission));
@@ -317,7 +382,16 @@ async fn dispatch_mission_prompt(
                 "Mission scheduler: failed to get mission agent: {}",
                 e
             );
-            record_mission_run(&state, mission, "", None, "failed", false);
+            record_mission_run_full(
+                &state,
+                mission,
+                &mission_run_id,
+                None,
+                "failed",
+                false,
+                entry_exit_code,
+                Some(output_dir.to_string_lossy().into_owned()),
+            );
             return;
         }
     };
@@ -330,15 +404,16 @@ async fn dispatch_mission_prompt(
     // Emit session_created so the unified session list updates in real-time
     if !has_pre_session {
         if let Some(ref sid) = session_id {
+            let evt_cwd = mission.cwd.clone().or_else(|| mission.project.clone()).unwrap_or_default();
             let _ = events_tx.send(crate::server::ServerEvent::SessionCreated {
                 session_id: sid.clone(),
                 title: mission_session_title(mission),
                 creator: "mission".into(),
-                project: Some(mission.project.clone().unwrap_or_default()),
-                project_name: std::path::Path::new(&mission.project.clone().unwrap_or_default())
+                project: Some(evt_cwd.clone()),
+                project_name: std::path::Path::new(&evt_cwd)
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string()),
-                skill: Some("mission".to_string()),
+                skill: None,
                 mission_id: Some(mission.id.clone()),
             });
         }
@@ -364,10 +439,12 @@ async fn dispatch_mission_prompt(
         }
     };
 
-    // Construct the mission message
+    // The mission body is injected into the system prompt via active_mission
+    // (below). The user turn is a short kickoff so the agent starts executing
+    // against the instructions it already has in context.
     let message = format!(
-        "[Mission: {}]\n\n{}",
-        mission.id, mission.prompt
+        "Run the \"{}\" mission now per the instructions in your system prompt. Report results in your final message.",
+        mission.name.clone().unwrap_or_else(|| mission.id.clone())
     );
 
     // Persist the mission prompt as a "user" message so it appears in the session chat.
@@ -413,6 +490,16 @@ async fn dispatch_mission_prompt(
     engine.task = Some(message.clone());
     engine.set_parent_agent(None);
     engine.set_run_id(Some(run_id.clone()));
+
+    // Inject the mission body into the system prompt so the agent reads it as
+    // instructions (not as a user turn). Matches how skill bodies are injected
+    // via active_skill — see engine/prompt.rs.
+    engine.active_mission = Some(crate::engine::ActiveMission {
+        name: mission.name.clone().unwrap_or_else(|| mission.id.clone()),
+        description: mission.description.clone(),
+        body: mission.prompt.clone(),
+        mission_dir: Some(state.manager.missions.mission_dir(&mission.id)),
+    });
     // Force Auto permission mode (legacy — kept for backward compat with old check flow).
     engine.cfg.tool_permission_mode = crate::config::ToolPermissionMode::Auto;
 
@@ -423,24 +510,41 @@ async fn dispatch_mission_prompt(
     //     strict  → silently deny (safe default for unattended runs)
     //     trusted → silently allow (legacy locked-mission behavior)
     //     interactive → prompt (rare for missions — nothing to click)
-    // - Path-mode grants come from (a) the mission's permission_tier on
-    //   the mission cwd, and (b) if a skill is bound to the session,
+    // - Path-mode grants come from (a) the mission's permission.mode on
+    //   cwd + declared paths, and (b) if a skill is bound to the session,
     //   the skill's declared permission.paths.
     {
         use crate::engine::permission::{PermissionMode, PermissionPolicy};
-        let tier_mode = match mission.permission_tier.as_str() {
-            "readonly" => PermissionMode::Read,
-            "standard" => PermissionMode::Edit,
-            _ => PermissionMode::Admin, // "full" or unknown
+        let tier_mode = match mission
+            .permission
+            .as_ref()
+            .map(|p| p.mode.as_str())
+            .unwrap_or("admin")
+        {
+            "read" => PermissionMode::Read,
+            "edit" => PermissionMode::Edit,
+            _ => PermissionMode::Admin,
         };
         let policy = match mission.policy.as_str() {
             "strict" => PermissionPolicy::strict(),
             "interactive" => PermissionPolicy::interactive(),
+            "sandbox" => PermissionPolicy::sandbox(),
             _ => PermissionPolicy::trusted(),
         };
-        let cwd = mission.project.clone().unwrap_or_else(|| "~/".to_string());
+        let cwd = mission
+            .cwd
+            .clone()
+            .or_else(|| mission.project.clone())
+            .unwrap_or_else(|| "~/".to_string());
         engine.session_permissions.set_policy(policy);
         engine.session_permissions.set_path_mode(&cwd, tier_mode);
+
+        // Apply extra narrow grants declared in permission.paths.
+        if let Some(ref perm) = mission.permission {
+            for path in &perm.paths {
+                engine.session_permissions.set_path_mode(path, tier_mode);
+            }
+        }
 
         // If the session binds a skill, apply its declared permission grants.
         // These are narrower than the tier grant (e.g. admin on ~/.linggen)
@@ -473,8 +577,8 @@ async fn dispatch_mission_prompt(
         }
     }
 
-    // Apply legacy permission tier restrictions (bash prefixes, tool set).
-    apply_permission_tier(&mut engine, &mission.permission_tier);
+    // Apply allowed-tools and allow-skills from frontmatter.
+    apply_mission_tool_scope(&mut engine, mission);
 
     // Wire up thinking channel so tokens are emitted as SSE events,
     // allowing the UI to stream mission output in real time.
@@ -555,8 +659,18 @@ async fn dispatch_mission_prompt(
         .update_agent_activity(project_path, agent_id)
         .await;
 
-    // Record mission run
-    record_mission_run(&state, mission, &run_id, session_id.as_deref(), status, false);
+    // Record mission run. Uses the mission-level run id so MissionRunEntry
+    // stays aligned with the per-run output dir and env vars.
+    record_mission_run_full(
+        &state,
+        mission,
+        &mission_run_id,
+        session_id.as_deref(),
+        status,
+        false,
+        entry_exit_code,
+        Some(output_dir.to_string_lossy().into_owned()),
+    );
 
     // Notify UI that the mission finished.
     let _ = state.events_tx.send(ServerEvent::Notification(
@@ -564,78 +678,77 @@ async fn dispatch_mission_prompt(
             mission_id: mission.id.clone(),
             mission_name: mission.name.clone().unwrap_or_else(|| mission.id.clone()),
             status: status.to_string(),
-            run_id: run_id.clone(),
+            run_id: mission_run_id.clone(),
             session_id: session_id.clone(),
         },
     ));
 }
 
-/// Configure engine restrictions based on the mission's permission tier.
+/// Apply the mission's `allowed-tools` and `allow-skills` to the engine.
 ///
-/// - **readonly**: Only read/search/web tools. No Write, Edit, Bash.
-/// - **standard**: All tools, but Bash restricted to build/test/git-read commands.
-/// - **full** (default): All tools, no restrictions.
-fn apply_permission_tier(engine: &mut crate::engine::AgentEngine, tier: &str) {
+/// Pure computation in `compute_mission_tool_scope` so it's unit-testable;
+/// this wrapper mutates the engine.
+fn apply_mission_tool_scope(engine: &mut crate::engine::AgentEngine, mission: &Mission) {
+    let scope = compute_mission_tool_scope(&mission.allowed_tools, &mission.allow_skills);
+    engine.cfg.mission_allowed_tools = scope.mission_allowed_tools;
+    engine.cfg.consumer_allowed_skills = scope.consumer_allowed_skills;
+    engine.cfg.bash_allow_prefixes = None; // frontmatter controls bash, not tier
+}
+
+/// Resolved tool scope derived from frontmatter.
+#[derive(Debug, PartialEq)]
+struct MissionToolScope {
+    mission_allowed_tools: Option<std::collections::HashSet<String>>,
+    consumer_allowed_skills: Option<std::collections::HashSet<String>>,
+}
+
+/// Compute the effective tool + skill restrictions for a mission.
+///
+/// - `allowed-tools` becomes the explicit tool allowlist. Empty → unrestricted.
+/// - `allow-skills`:
+///     - `[]` (empty) — `Skill` tool not added; skills unreachable.
+///     - `["*"]` — `Skill` tool available, no whitelist gate.
+///     - `[name, …]` — `Skill` tool available + `consumer_allowed_skills` gate.
+///
+/// The whitelist gate is independent of `allowed-tools`: a mission with
+/// concrete `allow-skills` always sets `consumer_allowed_skills` so the Skill
+/// tool cannot invoke unlisted skills, even when `allowed-tools` is empty
+/// (unrestricted). Otherwise `allow-skills: [memory]` with no `allowed-tools`
+/// would silently allow any skill — a real hazard.
+fn compute_mission_tool_scope(
+    allowed_tools: &[String],
+    allow_skills: &[String],
+) -> MissionToolScope {
     use std::collections::HashSet;
 
-    match tier {
-        "readonly" => {
-            let allowed: HashSet<String> = [
-                "Read", "Glob", "Grep", "WebSearch", "WebFetch", "Task",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-            engine.cfg.mission_allowed_tools = Some(allowed);
+    let star = allow_skills.iter().any(|s| s == "*");
+    let has_concrete_skills = !allow_skills.is_empty() && !star;
+
+    let mut mission_allowed_tools: Option<HashSet<String>> =
+        if allowed_tools.is_empty() {
+            None
+        } else {
+            Some(allowed_tools.iter().cloned().collect())
+        };
+
+    // Ensure `Skill` is in the allowlist when the mission declares any
+    // skills — but only if an allowlist exists. An empty `allowed_tools`
+    // means unrestricted, so `Skill` is already implicitly available.
+    if (has_concrete_skills || star) && mission_allowed_tools.is_some() {
+        if let Some(ref mut set) = mission_allowed_tools {
+            set.insert("Skill".to_string());
         }
-        "standard" => {
-            // All tools allowed, but bash restricted to safe commands.
-            let prefixes = vec![
-                // Build & test
-                "cargo ".to_string(),
-                "npm ".to_string(),
-                "npx ".to_string(),
-                "yarn ".to_string(),
-                "pnpm ".to_string(),
-                "make".to_string(),
-                "pytest".to_string(),
-                "python -m pytest".to_string(),
-                "python -m unittest".to_string(),
-                "go ".to_string(),
-                "mvn ".to_string(),
-                "gradle ".to_string(),
-                // Git read-only
-                "git status".to_string(),
-                "git log".to_string(),
-                "git diff".to_string(),
-                "git show".to_string(),
-                "git branch".to_string(),
-                "git remote".to_string(),
-                // Safe read commands
-                "ls".to_string(),
-                "pwd".to_string(),
-                "wc ".to_string(),
-                "cat ".to_string(),
-                "head ".to_string(),
-                "tail ".to_string(),
-                "find ".to_string(),
-                "which ".to_string(),
-                "echo ".to_string(),
-                "env".to_string(),
-                "printenv".to_string(),
-                "uname".to_string(),
-                "whoami".to_string(),
-                "date".to_string(),
-                "df ".to_string(),
-                "du ".to_string(),
-                "tree ".to_string(),
-                "file ".to_string(),
-            ];
-            engine.cfg.bash_allow_prefixes = Some(prefixes);
-        }
-        _ => {
-            // "full" or unknown: no restrictions
-        }
+    }
+
+    let consumer_allowed_skills = if has_concrete_skills {
+        Some(allow_skills.iter().cloned().collect())
+    } else {
+        None
+    };
+
+    MissionToolScope {
+        mission_allowed_tools,
+        consumer_allowed_skills,
     }
 }
 
@@ -647,15 +760,328 @@ fn record_mission_run(
     status: &str,
     skipped: bool,
 ) {
+    record_mission_run_full(state, mission, run_id, session_id, status, skipped, None, None);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_mission_run_full(
+    state: &Arc<ServerState>,
+    mission: &Mission,
+    run_id: &str,
+    session_id: Option<&str>,
+    status: &str,
+    skipped: bool,
+    entry_exit_code: Option<i32>,
+    output_dir: Option<String>,
+) {
     let entry = MissionRunEntry {
         run_id: run_id.to_string(),
         session_id: session_id.map(|s| s.to_string()),
         triggered_at: crate::util::now_ts_secs(),
         status: status.to_string(),
         skipped,
+        entry_exit_code,
+        output_dir,
     };
     let _ = state
         .manager
         .missions
         .append_mission_run(&mission.id, &entry);
 }
+
+/// Check `mission.requires` against registered skill capabilities. Returns
+/// the name of the first missing capability, or `None` if everything resolves.
+async fn find_missing_requires(
+    state: &Arc<ServerState>,
+    mission: &Mission,
+) -> Option<String> {
+    if mission.requires.is_empty() {
+        return None;
+    }
+    let all_skills = state.skill_manager.list_skills().await;
+    for cap in &mission.requires {
+        let resolved = all_skills.iter().any(|s| {
+            s.provides
+                .as_ref()
+                .map(|p| p.iter().any(|c| c == cap))
+                .unwrap_or(false)
+        });
+        if !resolved {
+            return Some(cap.clone());
+        }
+    }
+    None
+}
+
+/// Run the mission's entry script, pulling mission_dir and last_run_at from
+/// state. Thin wrapper around `execute_entry_script`.
+async fn run_entry_script(
+    mission: &Mission,
+    entry: &str,
+    output_dir: &std::path::Path,
+    mission_run_id: &str,
+    state: &Arc<ServerState>,
+) -> anyhow::Result<i32> {
+    let mission_dir = state.manager.missions.mission_dir(&mission.id);
+    let last_run_at = state
+        .manager
+        .missions
+        .last_successful_run_at(&mission.id)
+        .map(|t| t.to_string())
+        .unwrap_or_default();
+
+    let cwd_str = mission
+        .cwd
+        .clone()
+        .or_else(|| mission.project.clone())
+        .unwrap_or_else(|| mission_dir.to_string_lossy().into_owned());
+    let cwd_resolved = crate::util::resolve_path(std::path::Path::new(&cwd_str));
+    let cwd = if cwd_resolved.is_dir() {
+        cwd_resolved
+    } else {
+        mission_dir.clone()
+    };
+
+    execute_entry_script(
+        entry,
+        &mission.id,
+        &mission_dir,
+        &cwd,
+        output_dir,
+        mission_run_id,
+        &last_run_at,
+    )
+    .await
+}
+
+/// Pure entry-script runner. No shared state; takes explicit paths so it's
+/// unit-testable. Captures stdout/stderr to `output_dir/{stdout,stderr}.log`
+/// and returns the exit code. See doc/mission-spec.md → Entry script contract.
+async fn execute_entry_script(
+    entry: &str,
+    mission_id: &str,
+    mission_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    output_dir: &std::path::Path,
+    mission_run_id: &str,
+    last_run_at: &str,
+) -> anyhow::Result<i32> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let mission_dir_abs = mission_dir
+        .canonicalize()
+        .unwrap_or_else(|_| mission_dir.to_path_buf());
+
+    // If `entry` resolves to a real file inside the mission dir, run it directly.
+    // Otherwise treat entry as an inline bash command.
+    let script_candidate = mission_dir.join(entry);
+
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.current_dir(cwd)
+        .env("MISSION_ID", mission_id)
+        .env("MISSION_DIR", &mission_dir_abs)
+        .env("MISSION_CWD", cwd)
+        .env("MISSION_OUTPUT_DIR", output_dir)
+        .env("MISSION_LAST_RUN_AT", last_run_at)
+        .env("MISSION_RUN_ID", mission_run_id)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if script_candidate.is_file() {
+        cmd.arg(&script_candidate);
+    } else {
+        cmd.arg("-c").arg(entry);
+    }
+
+    info!(
+        "Mission scheduler: running entry for '{}' (output_dir={})",
+        mission_id,
+        output_dir.display()
+    );
+    let output = cmd.output().await?;
+
+    let mut stdout_file = tokio::fs::File::create(output_dir.join("stdout.log")).await?;
+    stdout_file.write_all(&output.stdout).await?;
+    let mut stderr_file = tokio::fs::File::create(output_dir.join("stderr.log")).await?;
+    stderr_file.write_all(&output.stderr).await?;
+
+    let code = output.status.code().unwrap_or(-1);
+    if code != 0 {
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        warn!(
+            "Mission scheduler: entry script for '{}' exited {}: {}",
+            mission_id,
+            code,
+            stderr_str.trim()
+        );
+    }
+    Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempMission {
+        mission_dir: std::path::PathBuf,
+        output_dir: std::path::PathBuf,
+        _tmp: tempfile::TempDir,
+    }
+
+    fn fresh_mission(id: &str) -> TempMission {
+        let tmp = tempfile::tempdir().unwrap();
+        let mission_dir = tmp.path().join(id);
+        let output_dir = mission_dir.join("runs").join("r1");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        TempMission { mission_dir, output_dir, _tmp: tmp }
+    }
+
+    #[tokio::test]
+    async fn entry_inline_command_runs_and_captures_output() {
+        let m = fresh_mission("inline");
+        let code = execute_entry_script(
+            "echo hello from entry && echo err >&2",
+            "inline",
+            &m.mission_dir,
+            &m.mission_dir,
+            &m.output_dir,
+            "run-1",
+            "0",
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
+
+        let stdout = std::fs::read_to_string(m.output_dir.join("stdout.log")).unwrap();
+        assert!(stdout.contains("hello from entry"));
+        let stderr = std::fs::read_to_string(m.output_dir.join("stderr.log")).unwrap();
+        assert!(stderr.contains("err"));
+    }
+
+    #[tokio::test]
+    async fn entry_nonzero_exit_is_returned() {
+        let m = fresh_mission("fail");
+        let code = execute_entry_script(
+            "exit 7",
+            "fail",
+            &m.mission_dir,
+            &m.mission_dir,
+            &m.output_dir,
+            "run-2",
+            "0",
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 7);
+    }
+
+    #[tokio::test]
+    async fn entry_env_vars_are_set() {
+        let m = fresh_mission("envcheck");
+        // Script writes MISSION_* env vars so we can assert they're set.
+        let cmd = r#"printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+            "$MISSION_ID" "$MISSION_CWD" "$MISSION_OUTPUT_DIR" \
+            "$MISSION_RUN_ID" "$MISSION_LAST_RUN_AT" "$MISSION_DIR""#;
+        let code = execute_entry_script(
+            cmd,
+            "envcheck",
+            &m.mission_dir,
+            &m.mission_dir,
+            &m.output_dir,
+            "run-42",
+            "1700000000",
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
+
+        let stdout = std::fs::read_to_string(m.output_dir.join("stdout.log")).unwrap();
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines[0], "envcheck");
+        // cwd/output_dir strings come back resolved; just check they're non-empty.
+        assert!(!lines[1].is_empty());
+        assert!(!lines[2].is_empty());
+        assert_eq!(lines[3], "run-42");
+        assert_eq!(lines[4], "1700000000");
+        assert!(!lines[5].is_empty());
+    }
+
+    #[tokio::test]
+    async fn entry_resolves_relative_script_file() {
+        let m = fresh_mission("scripted");
+        let scripts = m.mission_dir.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let script = scripts.join("hi.sh");
+        std::fs::write(&script, "#!/usr/bin/env bash\necho ran-$MISSION_RUN_ID\n").unwrap();
+
+        let code = execute_entry_script(
+            "scripts/hi.sh",
+            "scripted",
+            &m.mission_dir,
+            &m.mission_dir,
+            &m.output_dir,
+            "abc",
+            "0",
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
+
+        let stdout = std::fs::read_to_string(m.output_dir.join("stdout.log")).unwrap();
+        assert!(stdout.contains("ran-abc"), "got: {}", stdout);
+    }
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn tool_scope_empty_means_unrestricted() {
+        let s = compute_mission_tool_scope(&[], &[]);
+        assert!(s.mission_allowed_tools.is_none(), "empty allowed_tools → no restriction");
+        assert!(s.consumer_allowed_skills.is_none(), "no allow-skills → no gate");
+    }
+
+    #[test]
+    fn tool_scope_star_adds_skill_no_whitelist() {
+        let s = compute_mission_tool_scope(&v(&["Read", "Bash"]), &v(&["*"]));
+        let set = s.mission_allowed_tools.unwrap();
+        assert!(set.contains("Skill"), "star should add Skill to allowlist");
+        assert!(set.contains("Read"));
+        assert!(s.consumer_allowed_skills.is_none(), "star disables whitelist gate");
+    }
+
+    #[test]
+    fn tool_scope_concrete_skills_gate_and_add_skill() {
+        let s = compute_mission_tool_scope(&v(&["Read"]), &v(&["memory", "linggen"]));
+        let set = s.mission_allowed_tools.unwrap();
+        assert!(set.contains("Skill"));
+        assert!(set.contains("Read"));
+        let gate = s.consumer_allowed_skills.unwrap();
+        assert!(gate.contains("memory"));
+        assert!(gate.contains("linggen"));
+    }
+
+    #[test]
+    fn tool_scope_concrete_skills_gate_without_tool_list() {
+        // Regression: when allowed_tools is empty (unrestricted), a concrete
+        // allow-skills list still gates the Skill tool. Previously this path
+        // silently skipped the gate, allowing any skill to be called.
+        let s = compute_mission_tool_scope(&[], &v(&["memory"]));
+        assert!(s.mission_allowed_tools.is_none(), "still unrestricted");
+        let gate = s.consumer_allowed_skills.expect("gate must still apply");
+        assert!(gate.contains("memory"));
+        assert_eq!(gate.len(), 1);
+    }
+
+    #[test]
+    fn tool_scope_empty_allow_skills_no_skill_tool() {
+        // allow-skills: [] means Skill tool stays out of the allowlist.
+        let s = compute_mission_tool_scope(&v(&["Read", "Bash"]), &[]);
+        let set = s.mission_allowed_tools.unwrap();
+        assert!(!set.contains("Skill"), "empty allow-skills → no Skill tool");
+        assert!(s.consumer_allowed_skills.is_none());
+    }
+}
+

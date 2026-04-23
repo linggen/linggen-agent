@@ -155,6 +155,25 @@ impl AgentEngine {
             }
         }
 
+        // Mission frame — analogous to active_skill, used when the scheduler
+        // dispatches a mission. The body is the agent's instructions for this
+        // run, written in the same step-by-step style as a SKILL.md.
+        if let Some(mission) = &self.active_mission {
+            let resolved_content = if let Some(ref dir) = mission.mission_dir {
+                mission.body.replace("$MISSION_DIR", &dir.to_string_lossy())
+            } else {
+                mission.body.clone()
+            };
+            prompt.push_str(&self.prompt_store.render_or_fallback(
+                keys::SYSTEM_ACTIVE_MISSION_FRAME,
+                &[
+                    ("name", mission.name.as_str()),
+                    ("description", mission.description.as_str()),
+                    ("content", &resolved_content),
+                ],
+            ));
+        }
+
         prompt
     }
 

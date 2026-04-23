@@ -209,13 +209,38 @@ pub(crate) async fn get_system_prompt_api(
         Err(_) => return (StatusCode::NOT_FOUND, format!("Agent '{}' not found", query.agent_id)).into_response(),
     };
 
-    // Apply session-bound skill so the exported prompt matches what the model
-    // actually sees during a chat turn. Without this, the export shows a
-    // "cold engine" view without SKILL.md content or app-skill tool hints.
+    // Apply session-bound skill or mission so the exported prompt matches
+    // what the model actually sees during a chat turn. Without this, the
+    // export shows a "cold engine" view missing SKILL.md / mission body.
     if let Ok(Some(meta)) = state.manager.global_sessions.get_session_meta(sid) {
-        if let Some(skill_name) = meta.skill {
-            if let Some(skill) = state.manager.skill_manager.get_skill(&skill_name).await {
+        if let Some(ref skill_name) = meta.skill {
+            if let Some(skill) = state.manager.skill_manager.get_skill(skill_name).await {
                 engine.active_skill = Some(skill);
+            }
+        }
+        if let Some(ref mission_id) = meta.mission_id {
+            if let Ok(Some(mission)) = state.manager.missions.get_mission(mission_id) {
+                // Mirror what mission_scheduler does at dispatch time:
+                // - inject the mission body via active_mission
+                // - apply allowed-tools / allow-skills so the `tools` array
+                //   and system-prompt skill list reflect the real run.
+                engine.active_mission = Some(crate::engine::ActiveMission {
+                    name: mission.name.clone().unwrap_or_else(|| mission.id.clone()),
+                    description: mission.description.clone(),
+                    body: mission.prompt.clone(),
+                    mission_dir: Some(state.manager.missions.mission_dir(&mission.id)),
+                });
+                if !mission.allowed_tools.is_empty() {
+                    engine.cfg.mission_allowed_tools =
+                        Some(mission.allowed_tools.iter().cloned().collect());
+                }
+                let has_concrete_skills =
+                    !mission.allow_skills.is_empty()
+                        && !mission.allow_skills.iter().any(|s| s == "*");
+                if has_concrete_skills {
+                    engine.cfg.consumer_allowed_skills =
+                        Some(mission.allow_skills.iter().cloned().collect());
+                }
             }
         }
     }

@@ -8,40 +8,168 @@ guide: |
 
 # Mission System
 
-Cron-based scheduled agent work. A project can have **multiple active missions** — like a crontab with multiple entries.
+Scheduled background agent work. **Missions are a first-class linggen subsystem**, parallel to skills — both are markdown-frontmatter artifacts the engine discovers, loads, and runs. A mission is the headless, scheduled variant: cron-triggered, no human in the loop.
+
+A project or global config can have **multiple active missions** — like a crontab with multiple entries, each an independent task.
 
 ## Related docs
 
+- `skill-spec.md`: skill format — missions mirror this shape.
 - `agent-spec.md`: agent types, lifecycle, delegation.
+- `permission-spec.md`: modes, policies, rule evaluation.
 - `product-spec.md`: mission system overview, OS analogy.
 - `storage-spec.md`: mission JSON format, filesystem layout.
 
-## Core concepts
+## Mental model
 
-A **mission** is a cron job:
+Two sibling subsystems in the linggen engine, discovered and loaded the same way:
 
-| Field | Required | Description |
-|:------|:---------|:------------|
-| `id` | yes | Unique identifier (generated) |
+**Skill = capability provider.** User-invocable, can ask questions, may render UI, registers capability bindings (`provides:` + `implements:`).
+
+**Mission = headless scheduled task.** Cron-triggered, never asks the user. Consumes tools and capabilities that skills register. No interactive channel — no `AskUser`, no `EnterPlanMode`, no in-mission Web UI.
+
+A mission looks like a `SKILL.md` with a `schedule:` field and none of the interactive affordances. It uses capability tools (like `Memory_*`) that installed skills have registered. It can also delegate to another skill via the `Skill` tool when needed, but that's the exception — typically missions just use tools directly.
+
+## File layout
+
+Missions live under `~/.linggen/missions/` and mirror the skill directory shape:
+
+```
+~/.linggen/missions/dream/
+├── mission.md         # frontmatter + agent prompt (body)
+├── scripts/           # optional — entry scripts, helpers
+│   └── collect.sh
+├── assets/            # optional — static files
+└── runs.jsonl         # run history
+```
+
+The mission name is the directory name. One mission per directory. Run history is kept alongside the definition — delete the directory, the mission and its history are gone.
+
+## Frontmatter
+
+```yaml
+---
+name: dream
+description: >-
+  Nightly memory consolidation. Collects sessions from the last 24h,
+  extracts durable facts, dedupes, and routes into core markdown / RAG.
+
+# Schedule
+schedule: "0 3 * * *"
+enabled: true
+cwd: ~/.linggen                    # working directory for entry + agent
+model: <optional override>
+entry: scripts/collect.sh          # optional pre-agent script (relative to mission dir)
+
+# Autonomy
+policy: strict                     # interactive | strict | trusted | sandbox
+allow-skills: []                   # whitelist for Skill tool — empty means mission calls no skill directly
+requires: [memory]                 # optional — capabilities that must be registered at load
+
+# Tools (SKILL.md shape)
+allowed-tools:
+  - Read
+  - Write
+  - Edit
+  - Bash
+  - Glob
+  - Grep
+  - Task
+  - Memory_add
+  - Memory_search
+  - Memory_list
+
+permission:
+  mode: admin                      # read | edit | admin — ceiling on cwd + paths
+  paths: ["~/.linggen/memory", "~/.claude/projects", "~/.linggen/sessions"]
+  warning: "..."                   # surfaced in UI
+---
+
+(step-by-step prompt body — same style as SKILL.md)
+```
+
+### Field reference
+
+| Field | Required | Meaning |
+|:------|:---------|:--------|
+| `name` | yes | Mission id (matches directory name) |
+| `description` | yes | Short human-readable summary — shown in UI |
 | `schedule` | yes | Cron expression (5-field standard) |
-| `prompt` | yes | The instruction sent to the agent |
-| `model` | no | Model override for this mission |
-| `permission_tier` | no | `"readonly"`, `"standard"`, or `"full"` (default: `"full"`) — sets the path-mode ceiling on the mission cwd |
-| `policy` | no | `"trusted"` (default), `"strict"`, or `"interactive"` — autonomy policy for out-of-scope actions. See `permission-spec.md` → Session policy. |
-| `enabled` | yes | Whether this mission is active |
-| `created_at` | yes | Timestamp |
+| `enabled` | yes | On/off |
+| `cwd` | yes | Working directory for entry script + agent |
+| `model` | no | Model override |
+| `entry` | no | Pre-agent script — path relative to mission dir, or inline `bash -c "..."` |
+| `policy` | no | `interactive` / `strict` / `trusted` / `sandbox` — default `strict` for missions |
+| `allow-skills` | no | Whitelist of skill names callable via `Skill`. Empty/omitted → `Skill` tool absent. `"*"` → any installed skill |
+| `requires` | no | Capability names that must be resolvable at load time — else mission disabled with reason |
+| `allowed-tools` | yes | Explicit tool list. `AskUser` / `EnterPlanMode` always stripped |
+| `permission.mode` | yes | Capability ceiling on `cwd` and `paths` |
+| `permission.paths` | no | Extra narrow path grants (like skill's `permission.paths`) |
+| `permission.warning` | no | Displayed in the UI before enabling |
 
-### Mission skill
+### Why body == SKILL.md
 
-All missions run the **`ling` agent** with the **`mission` skill** bound to the session (`skills/mission/SKILL.md`). The mission skill sets autonomous execution mode:
+The mission body is the agent's prompt, written in the same step-by-step style as `SKILL.md`. This is deliberate: a mission IS an auto-run skill, minus the interactive parts. Copying SKILL.md format lets skill authors write missions without learning a second format.
 
-- **No interactive tools**: `allowed-tools` excludes `AskUser`, `EnterPlanMode`.
-- **Work tools**: `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `Task`, `WebSearch`, `WebFetch`.
-- **Delegation**: can use `Task` to spawn sub-tasks for focused work.
-- **Self-documenting**: the agent's final message serves as the run report.
-- **Auto permissions**: `tool_permission_mode` forced to `Auto` — no human approval gates.
+## Execution flow
 
-### Cron syntax
+```
+ scheduler tick (every ~10s)
+   │
+   ▼
+ cron match? ─── no ──► skip
+   │ yes
+   ▼
+ busy-skip check (previous run still running?) ─── yes ──► record skipped
+   │ no
+   ▼
+ run entry script (if present)
+   │
+   ├─ exit != 0 ──► mission failed; agent not invoked
+   │ exit == 0
+   ▼
+ body present? ─── no ──► record completed (script-only mission)
+   │ yes
+   ▼
+ create session + run agent loop with body as prompt
+   │
+   ▼
+ finalize: record run + emit events + write runs.jsonl
+```
+
+### Entry script contract
+
+When `entry:` is set, the scheduler runs it **before** invoking the agent. This replaces the old `script` mode and lets missions pre-compute expensive work (collecting session files, extracting raw material) cheaply — without burning LLM tokens.
+
+Environment passed to entry:
+
+| Var | Meaning |
+|:----|:--------|
+| `MISSION_ID` | Mission directory name |
+| `MISSION_DIR` | Absolute path to the mission directory |
+| `MISSION_CWD` | Resolved working directory (from `cwd:`) |
+| `MISSION_OUTPUT_DIR` | Per-run scratch dir — scheduler creates it, entry writes to it, agent reads from it |
+| `MISSION_LAST_RUN_AT` | Unix timestamp of the last successful run (or empty on first run) |
+| `MISSION_RUN_ID` | Unique id for this run |
+
+The script runs under the mission's permission bubble (same `allowed-tools`/`permission` constraints do **not** apply to entry — entry is shell, not an agent). Guardrails on entry are the mission author's responsibility.
+
+Entry output conventions:
+- **Structured data** → write to files under `$MISSION_OUTPUT_DIR/`. Agent `Read`s them in the body.
+- **Stdout** → captured to `$MISSION_OUTPUT_DIR/stdout.log` as a fallback.
+- **Stderr** → captured to `$MISSION_OUTPUT_DIR/stderr.log` for debugging.
+
+If entry exits non-zero, the mission is marked failed and the agent loop is skipped. The captured logs are surfaced in the run record for diagnosis.
+
+### Agent-only and script-only missions
+
+- **Agent only** (no `entry:`) — classic prompt-driven mission. Same as today's agent mode.
+- **Script only** (no body, `entry:` set) — pure background script. No LLM loop, no session, no cost. Replaces today's `mode: script`.
+- **Hybrid** (entry + body) — entry pre-processes; agent consumes. Default for data-processing missions like `dream`.
+
+The old `mode: app` (open a URL in browser on a schedule) is removed entirely. That use case is better served by a separate reminder feature, not missions.
+
+## Cron syntax
 
 Standard 5-field cron: `minute hour day-of-month month day-of-week`.
 
@@ -54,120 +182,140 @@ Standard 5-field cron: `minute hour day-of-month month day-of-week`.
 
 No seconds field. No `@reboot` or non-standard extensions.
 
-## Multiple missions
+## Permission model
 
-A project has a **list of missions**, each independently scheduled. Like a crontab file with multiple entries:
+Missions run without a human in the loop. Two orthogonal levers govern what the agent can do and how out-of-scope actions are handled:
 
-```
-# Mission 1: Architecture review — daily at 9am
-0 9 * * *   "Review code changes and update dependency graphs"
+- **`permission.mode`** — sets the capability ceiling (path-mode) on the mission cwd + declared paths.
+- **`policy`** — decides what happens when an action exceeds the ceiling or matches an ask-rule.
 
-# Mission 2: Disk cleanup — every Sunday
-0 0 * * 0   "Analyze disk usage and suggest cleanup"
+See `permission-spec.md` for the full model.
 
-# Mission 3: Status check — every 30 minutes
-*/30 * * * * "Check CI/CD status and report issues"
-```
+### Path-mode ceiling (`permission.mode`)
 
-Each mission is independent — its own schedule, prompt, and optional model. Missions can be enabled/disabled individually.
+| Mode | Typical use |
+|:-----|:------------|
+| **read** | Monitoring, analysis missions |
+| **edit** | Build / test / maintenance missions |
+| **admin** | Trusted automation (memory, backups, system tasks) |
 
-## Session per run
-
-Each mission trigger creates a **new session**. This is the key design difference from interactive chat — the session is the run log.
-
-- **Session title**: `"Mission: {prompt_preview} — {timestamp}"` (prompt truncated to ~50 chars).
-- **All tool calls, messages, observations** are recorded in the session — same as a user chat session.
-- **Viewable in UI**: mission run sessions appear in the session list and can be opened read-only.
-- **Run entry links to session**: `MissionRunEntry` includes `session_id` so the UI can navigate from run history to the session.
-
-## Scheduler behavior
-
-Background task evaluates all enabled missions against their cron schedules:
-
-1. **Tick**: scheduler wakes periodically (every ~10s) and checks all enabled missions.
-2. **Match**: for each mission whose cron expression matches the current time window, fire the prompt.
-3. **Create session**: create a new session for this run.
-4. **Spawn mission agent**: run the `mission` agent in that session with the mission prompt.
-5. **Busy skip**: if the mission agent is already running, skip this trigger and log it.
-6. **Run record**: each trigger creates a standard `AgentRunRecord` (see `agent-spec.md`) + a `MissionRunEntry`.
-
-### Deduplication
-
-The scheduler tracks the last fire time per mission. A cron match only fires if the current minute differs from the last fire minute — prevents double-firing within the same tick window.
-
-## Run history
-
-Each mission trigger creates:
-- A **session** containing the full conversation (tool calls, agent messages).
-- An `AgentRunRecord` in `runs/` (standard format).
-- A `mission_run` entry in `missions/{id}/runs.jsonl` linking the run to the mission and session.
-
-```json
-{ "run_id": "run-mission-1700000000-123456", "session_id": "sess-1700000000-abcd1234", "triggered_at": 1700000000, "status": "completed", "skipped": false }
-```
-
-Skipped triggers (agent busy) are also logged with `"skipped": true` and no `session_id`.
-
-## Autonomous permissions
-
-Missions run without a human in the loop. Mission sessions never prompt the user. Two orthogonal levers govern what the agent can do and how out-of-scope actions are handled:
-
-- **`permission_tier`** — sets the capability ceiling (path-mode) on the mission cwd.
-- **`policy`** — decides what happens when an action exceeds the ceiling.
-
-See `permission-spec.md` for the full permission model.
-
-- **No AskUser tool**: the mission agent cannot ask questions.
-- **No interactive commands**: the agent prompt forbids commands requiring stdin (`git rebase -i`, `vim`, etc.).
-- **Config deny rules always apply**: `linggen.toml` deny rules are hard-blocks that no policy can bypass.
-
-### Permission tiers
-
-Each mission has a `permission_tier` that maps to a session permission mode on the mission cwd:
-
-| Tier | Mode | Bash | Use case |
-|:-----|:-----|:-----|:---------|
-| **Read-only** | read | read-class only | Monitoring, analysis |
-| **Standard** | edit | write-class + curated prefixes | Build, test, maintenance |
-| **Full access** | admin | Unrestricted | Trusted automation |
+The mode applies to `cwd` plus every path under `permission.paths`. Skill grants loaded via `Skill` invocation compose via longest-path-match — a mission with `admin` on `~/.linggen` can safely invoke a skill that declares narrower `admin` on `~/.linggen/memory` without widening anything.
 
 ### Autonomy policy
 
-The `policy:` field controls how the agent handles actions outside the tier's grants:
+| Policy | `on_exceed` | `on_ask_rule` | Fit for missions |
+|:-------|:-----------:|:-------------:|:-----------------|
+| **interactive** | ask | ask | **Discouraged** — queues prompts nobody clicks |
+| **strict** | deny | deny | **Default for missions.** Safely bounded — model must course-correct within grants |
+| **trusted** | allow | deny | Legacy locked-session behavior. Out-of-scope passes; `ask:` rules still deny |
+| **sandbox** | allow | allow | Containerized/Docker runs where the OS is the guardrail |
 
-| Policy | `on_exceed` | `on_ask_rule` | Semantics |
-|:-------|:-----------:|:-------------:|:----------|
-| **trusted** (default) | allow | deny | Legacy locked-mission behavior. Out-of-scope passes; `ask:` rules (e.g. `git push`) are denied. |
-| **strict** | deny | deny | Safer for unattended runs. Out-of-scope fails silently — model course-corrects within the grant. |
-| **interactive** | ask | ask | Rare. Opens prompts that nobody is there to click — they queue. Use only for debugging. |
+`interactive` remains available for parity with session policy, but the scheduler logs a warning when a mission loads with it.
 
-`trusted` is the default to preserve behavior of existing missions. Choose `strict` when the mission should be bounded tightly (e.g. nightly memory extraction limited to `~/.linggen/memory` and `~/.claude`).
+### Config deny rules
 
-### Skill-bound missions
+`linggen.toml` deny rules (`Bash(rm -rf *)`, `Bash(sudo *)`, etc.) are hard floors that no policy can bypass. They apply to missions exactly as they apply to interactive sessions.
 
-A mission may bind a skill via the session's `skill:` field. When it does, the skill's declared `permission.paths` are applied as path-mode grants at mission start, in addition to the tier grant on cwd. This is how skills like `memory` get narrow admin access (e.g. `~/.linggen`, `~/.claude`) without widening the entire mission cwd.
+## Capability resolution
 
-### Safety
+Missions consume tools and capabilities; skills register them.
 
-1. **Permission tiers**: users choose the minimum access level needed.
-2. **Config deny rules**: hard-block specific commands (e.g., `Bash(rm -rf *)`).
-3. **`max_iters` cap**: bounds total tool calls per run.
-4. **Daily trigger cap**: 100 triggers per mission per day.
-5. **Session audit trail**: every action is logged, fully reviewable.
+- Skills declare `provides: [memory]` and `implements: { memory: { base_url: ..., tools: ... } }`. When a skill is installed, the engine registers its capability tools globally — any session (user, skill, mission) can call them.
+- Missions list the capability tools they need (e.g. `Memory_add`, `Memory_search`) directly in `allowed-tools`. They do **not** invoke the skill — they use the tools the skill registered.
+- The `dream` mission uses `Memory_*` tools because the `memory` skill registered them. `memory` is a skill; `linggen-memory` (the RAG engine `ling-mem` binds to) is not.
+
+Missions never declare `implements:` themselves — the binding lives with the skill that registered the capability. If a capability isn't registered by any installed skill, `requires:` catches it at load; otherwise the tool call fails at runtime.
+
+### Skill invocation via `Skill` tool
+
+Separate from capability tools, a mission can delegate a whole sub-task to another skill via the `Skill` tool. This is the exception, not the rule. `allow-skills` gates it:
+
+| Value | Effect |
+|:------|:-------|
+| omitted or `[]` | `Skill` tool absent from the effective set — mission calls no skill directly |
+| `[skiller, ...]` | `Skill` tool added; only these skills invokable |
+| `"*"` | `Skill` tool added; any installed skill invokable |
+
+For the `dream` mission: `allow-skills: []`. It uses `Memory_*` tools directly, no skill invocation.
+
+Invoked skills (when `allow-skills` is non-empty) inherit the **mission's** permission bubble (mode + policy + paths), not the skill's own defaults. A `strict`-policy mission that does invoke a skill runs that skill under `strict` — the skill can't widen the mission's autonomy by being called.
+
+## Skill-bundled missions
+
+Skills can ship missions as assets. The install script places them under `~/.linggen/missions/<name>/`:
+
+```
+skills/memory/
+├── SKILL.md
+├── install.sh                  # copies assets/dream.md → ~/.linggen/missions/dream/mission.md
+└── assets/
+    └── dream.md
+```
+
+Co-installation guarantees the dependency — the skill and its mission version together. This is the recommended pattern for domain-specific missions (memory → dream, backup → nightly-snapshot, etc.). For standalone missions authored by hand, `requires:` declares the dependency explicitly.
+
+## Session per run
+
+Every agent-mode run creates a new session. The session is the run log.
+
+- **Session title**: `"Mission: <name> — <timestamp>"`.
+- **All tool calls, messages, observations** recorded same as a user chat.
+- **Viewable in UI**: runs appear in the session list (read-only).
+- **Run entry links to session**: `MissionRunEntry.session_id` lets the UI navigate from run history to the full transcript.
+
+Script-only missions (no body) do not create sessions. Their run record carries entry logs only.
+
+## Scheduler behavior
+
+Background task evaluates all enabled missions against their cron schedules every ~10 seconds:
+
+1. **Tick** — wake, list enabled missions.
+2. **Match** — for each, check if its cron expression matches the current minute window.
+3. **Busy-skip** — if the previous run is still executing, record `skipped` and move on.
+4. **Entry** — run the entry script if declared. Non-zero exit → fail fast, skip agent.
+5. **Agent** — create session, construct prompt from body, run the agent loop.
+6. **Record** — write `runs.jsonl` entry; emit events; finalize run record.
+
+### Deduplication
+
+The scheduler tracks the last fire minute per mission. A cron match only fires once per minute window — prevents double-firing on the same tick.
+
+## Run history
+
+Each trigger creates:
+
+- A **session** (agent-mode runs only) containing the full conversation.
+- An `AgentRunRecord` in `runs/` (standard format).
+- A `mission_run` entry in `missions/<name>/runs.jsonl` linking run → mission → session.
+
+```json
+{
+  "run_id": "mission-run-1700000000-a1b2c3d4",
+  "session_id": "sess-1700000000-def",
+  "triggered_at": 1700000000,
+  "status": "completed",
+  "skipped": false,
+  "entry_exit_code": 0,
+  "output_dir": "/Users/u/.linggen/missions/dream/runs/mission-run-1700000000-a1b2c3d4"
+}
+```
+
+The mission-level `run_id` (format `mission-run-<ts>-<uuid8>`) keys the output dir, the `MISSION_RUN_ID` env var, and the `runs.jsonl` entry. It's distinct from the agent's internal `AgentRunRecord.run_id`, which stays an engine-internal concern.
+
+Skipped triggers (busy / daily cap) are logged with `skipped: true` and no `session_id`; they still get a real `run_id` so downstream tooling can reference them. Script-only runs omit `session_id` and include `entry_exit_code`.
 
 ## Safety
 
 | Guard | Value | Rationale |
 |:------|:------|:----------|
-| Minimum interval | 1 minute | Cron can't express sub-minute; prevents runaway |
-| Max triggers per mission | 100 per day | Caps runaway missions |
-| Max concurrent missions | No hard limit | Busy-skip naturally throttles |
+| Minimum interval | 1 minute | Cron can't express sub-minute |
+| Max triggers per mission | 100 per day | Caps runaway cost |
+| Max concurrent missions | No hard limit | Busy-skip throttles naturally |
 | `max_iters` | Per agent config | Bounds each triggered run |
-| No mission = no triggers | — | Missions must be explicitly created |
-| Disabled missions | Skip silently | `enabled: false` stops all triggers |
-| No interactive tools | — | Mission agent cannot block waiting for human input |
-| Locked session | Always | No prompts; blocked if action exceeds ceiling. See `permission-spec.md` |
-| Config deny rules | Still enforced | Hard-block mechanism for restricting mission capabilities |
+| Default policy | `strict` | Safe by default; authors opt into `trusted`/`sandbox` explicitly |
+| No interactive tools | — | `AskUser`/`EnterPlanMode` stripped regardless of `allowed-tools` |
+| Config deny rules | Enforced | Hard-block commands at all policies |
+| Entry script failure | Skips agent | Prevents garbage-in agent work |
 
 ## Lifecycle
 
@@ -175,43 +323,78 @@ A mission may bind a skill via the session's `skill:` field. When it does, the s
 create → enabled → (triggers run on schedule, each run creates a session) → disabled → delete
 ```
 
-- **Create**: user defines schedule + prompt via Web UI or API.
-- **Enable/Disable**: toggle without deleting. Disabled missions keep their config and history.
-- **Delete**: removes the mission. Run history and sessions are preserved.
-- **Edit**: update schedule, prompt, or model. Takes effect on next tick.
+- **Create** — user defines via Web UI, CLI, or hand-authored file. Skill-bundled missions created by `install.sh`.
+- **Enable / disable** — toggle without deleting. Disabled missions keep config and history.
+- **Delete** — removes the directory. Sessions created by past runs are preserved (they live in the global session store).
+- **Edit** — update frontmatter or body. Takes effect on next tick. Entry script changes take effect on next run.
 
 ## UI
 
-### Mission editor
+### Mission management page (Linggen Web UI)
 
-- **Schedule**: cron expression with presets.
-- **Permissions**: tier selector (Read-only / Standard / Full access) with inline descriptions.
-- **Prompt**: the instruction text.
-- **Model override**: optional.
-- **Agent**: shown as readonly "mission" label — not editable.
-- **View agent**: link/button to view `mission.md` content (readonly).
+- **List** — all missions with status, schedule, last run, next run.
+- **Editor** — edit frontmatter fields + body. Body shown as markdown with step headings.
+- **Permissions panel** — mode + policy + allow-skills + requires. Warnings from `permission.warning` surfaced before enable.
+- **Agent tab** — read-only view of the mission body (prompt).
+- **Run history** — list of `MissionRunEntry`; clicking a row opens the session read-only.
+- **Manual trigger** — "Run now" button. Same permission bubble as scheduled runs.
 
-### Run history
+### No in-mission UI
 
-Each run entry shows:
-- Timestamp, status (completed/failed/skipped).
-- Link to the session — opens the full conversation log.
+Missions do not render UI during execution. They have no chat partner to render for. Skills invoked from missions also do not render (the skill's app launcher is ignored when called from a mission context).
 
 ## API operations
 
 | Operation | Description |
 |:----------|:------------|
-| List missions | All missions for a project (with status, last run) |
-| Create mission | New mission with schedule + prompt |
-| Update mission | Edit schedule, prompt, model, or enabled flag |
-| Delete mission | Remove mission (history preserved) |
-| Mission runs | Run history for a specific mission (with session links) |
+| List missions | All missions (with status, last run, next run) |
+| Get mission | Full mission definition |
+| Create mission | New mission (generates directory + `mission.md`) |
+| Update mission | Edit frontmatter or body |
+| Delete mission | Remove mission directory |
+| Enable / disable | Toggle `enabled` flag |
+| List runs | Run history for a mission (paginated) |
+| Get run session | Read-only session view for a specific run |
+| Get run output | Captured entry-script `stdout` / `stderr` for a specific run |
+| Trigger mission | Fire now, ignoring schedule |
+
+## Subsystem structure
+
+Missions and skills are sibling subsystems inside linggen. They share shape (markdown + frontmatter), discovery (filesystem scan at startup + filewatcher), and runtime (agent engine + permission model). They differ only in trigger: skills are invoked on demand, missions are fired by cron.
+
+| Concern | Skill subsystem | Mission subsystem |
+|:--------|:----------------|:------------------|
+| Root dir | `~/.linggen/skills/` | `~/.linggen/missions/` |
+| Entry file | `SKILL.md` | `mission.md` |
+| Trigger | User invocation or `Skill` tool call | Cron / manual trigger |
+| Registers capabilities | Yes (`provides` + `implements`) | No (consumer only) |
+| Interactive (`AskUser`, UI) | Yes | No |
+| Stored under | `skills/<name>/` | `missions/<name>/` |
+| Manager module | `skills/` | `project_store/missions.rs` |
+
+Both subsystems are first-class — engine boot treats them symmetrically.
 
 ## Implementation
 
 | Module | Responsibility |
 |:-------|:---------------|
-| `agents/mission.md` | Mission agent definition (autonomous, no AskUser) |
-| `mission_scheduler.rs` | Cron evaluation, tick loop, session creation, trigger firing |
-| `project_store/missions.rs` | Mission CRUD, run history persistence |
-| `server/missions_api.rs` | HTTP endpoints for mission management |
+| `project_store/missions.rs` | Mission CRUD on disk, frontmatter parse/serialize, run history |
+| `server/mission_scheduler.rs` | Cron evaluation, tick loop, entry execution, session creation, agent dispatch |
+| `server/missions_api.rs` | HTTP endpoints for management and manual trigger |
+| `engine/permission.rs` | Policy + path-mode enforcement shared with interactive sessions |
+| `skills/` | Capability registration — mission resolves tools through the same registry |
+
+## Migration from old format
+
+Existing missions use the pre-redesign schema (flat `permission_tier`, `mode: agent|app|script`, top-level `prompt`). The store reads both; on next write, re-serializes to the new shape.
+
+| Old field | New field |
+|:----------|:----------|
+| `permission_tier: readonly` | `permission.mode: read` |
+| `permission_tier: standard` | `permission.mode: edit` |
+| `permission_tier: full` | `permission.mode: admin` |
+| `mode: agent` | *(removed — default)* |
+| `mode: script` | remove `mode`, move command to `entry:`, clear body |
+| `mode: app` | **dropped — no migration path**; authors convert to an external reminder |
+| top-level `prompt` | markdown body below frontmatter |
+| `agent_id` | *(removed — always `ling`)* |

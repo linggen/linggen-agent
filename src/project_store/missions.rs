@@ -7,96 +7,180 @@ use std::path::PathBuf;
 /// The agent that always runs missions.
 pub const MISSION_AGENT_ID: &str = "ling";
 
-/// YAML frontmatter fields for a mission `.md` file.
+// ---------------------------------------------------------------------------
+// Permission block (mirrors skills::SkillPermission)
+// ---------------------------------------------------------------------------
+
+/// Permission request declared in mission frontmatter.
+///
+/// Mirrors the `permission:` block in SKILL.md so authors can reuse the shape.
+/// See `doc/mission-spec.md` → Permission model.
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MissionPermission {
+    /// Path-mode ceiling: "read", "edit", or "admin".
+    pub mode: String,
+    /// Paths to grant the mode on (in addition to cwd). Empty means cwd only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// Human-readable warning surfaced in the UI before enabling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+impl Default for MissionPermission {
+    fn default() -> Self {
+        Self {
+            mode: "admin".to_string(),
+            paths: Vec::new(),
+            warning: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Frontmatter — new (skill-shaped) format
+// ---------------------------------------------------------------------------
+
+/// YAML frontmatter for a `mission.md` file.
+///
+/// Mirrors SKILL.md fields (`description`, `allowed-tools`, `permission`) and
+/// adds mission-specific scheduling/autonomy fields. See `doc/mission-spec.md`.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 struct MissionFrontmatter {
+    /// Display name. Defaults to the directory name if omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    description: String,
+
+    // Scheduling
     #[serde(default)]
     schedule: String,
     #[serde(default)]
     enabled: bool,
-    /// Mission mode: "agent" (default), "app", or "script".
-    /// Agent: scheduler creates session and runs agent loop.
-    /// App: scheduler opens `entry` URL in browser. No session created.
-    /// Script: scheduler runs `entry` as a shell command. No session created.
-    #[serde(default = "default_mode", skip_serializing_if = "is_default_mode")]
-    mode: String,
-    /// Entry point for app/script mode. URL (app) or command (script). Ignored in agent mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    entry: Option<String>,
+    cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    project: Option<String>,
-    /// Permission tier: "readonly", "standard", "full". Default: "full".
-    #[serde(default = "default_permission_tier", skip_serializing_if = "is_default_permission_tier")]
-    permission_tier: String,
-    /// Autonomy policy: "trusted" (default, allow out-of-scope),
-    /// "strict" (deny out-of-scope), or "interactive" (prompt — rare).
-    /// Only consulted for agent-mode missions. See permission-spec.md.
+    entry: Option<String>,
+
+    // Autonomy
     #[serde(default = "default_policy", skip_serializing_if = "is_default_policy")]
     policy: String,
+    #[serde(
+        rename = "allow-skills",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    allow_skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    requires: Vec<String>,
+
+    // Capabilities (SKILL.md shape)
+    #[serde(
+        rename = "allowed-tools",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permission: Option<MissionPermission>,
+
+    // Legacy project field kept for back-compat on write; old sessions used it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    created_at: u64,
+}
+
+fn default_policy() -> String {
+    "strict".to_string()
+}
+
+fn is_default_policy(s: &str) -> bool {
+    s == "strict"
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+// ---------------------------------------------------------------------------
+// Legacy frontmatter — pre-redesign format. Parser falls back to this shape
+// when the new parse succeeds but looks empty, or when it fails outright.
+// Migrated to the new format on next write. See doc/mission-spec.md Migration.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct LegacyFrontmatter {
+    #[serde(default)]
+    schedule: String,
+    #[serde(default)]
+    enabled: bool,
+    /// Legacy: "agent" | "app" | "script". "app" is unsupported — rejected at load.
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    entry: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+    /// Legacy: "readonly" | "standard" | "full". Maps to permission.mode.
+    #[serde(default)]
+    permission_tier: Option<String>,
+    #[serde(default)]
+    policy: Option<String>,
     #[serde(default)]
     created_at: u64,
 }
 
-fn default_mode() -> String {
-    "agent".to_string()
-}
-
-fn is_default_mode(s: &str) -> bool {
-    s == "agent"
-}
-
-fn default_permission_tier() -> String {
-    "full".to_string()
-}
-
-fn is_default_permission_tier(s: &str) -> bool {
-    s == "full"
-}
-
-fn default_policy() -> String {
-    // "trusted" matches pre-policy behavior of locked mission sessions:
-    // silently allow out-of-scope, but still deny ask-rules (git push etc).
-    "trusted".to_string()
-}
-
-fn is_default_policy(s: &str) -> bool {
-    s == "trusted"
-}
+// ---------------------------------------------------------------------------
+// Mission — runtime representation
+// ---------------------------------------------------------------------------
 
 /// A cron-scheduled mission stored as `~/.linggen/missions/<id>/mission.md`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Mission {
-    /// The mission ID — directory name under `~/.linggen/missions/`.
     pub id: String,
-    /// Display name (same as id for md-based missions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+
     pub schedule: String,
-    /// Mission mode: "agent" (default), "app", or "script".
-    #[serde(default = "default_mode")]
-    pub mode: String,
-    /// Entry point for app/script mode.
+    pub enabled: bool,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub entry: Option<String>,
-    /// Always "mission".
-    #[serde(default = "default_mission_agent")]
-    pub agent_id: String,
-    pub prompt: String,
+    pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Optional project path this mission is scoped to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+
+    pub policy: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<MissionPermission>,
+
+    /// Mission agent prompt — the body of the `.md` file.
+    pub prompt: String,
+
+    /// Always "ling". Kept as a field for UI display compat.
+    #[serde(default = "default_mission_agent")]
+    pub agent_id: String,
+
+    /// Legacy project scoping. Prefer `cwd` for new missions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
-    /// Permission tier: "readonly", "standard", "full". Default: "full".
-    #[serde(default = "default_permission_tier")]
-    pub permission_tier: String,
-    /// Autonomy policy: "trusted" (default), "strict", or "interactive".
-    /// Only consulted for agent-mode missions.
-    #[serde(default = "default_policy")]
-    pub policy: String,
-    pub enabled: bool,
+
     pub created_at: u64,
 }
 
@@ -113,6 +197,36 @@ pub struct MissionRunEntry {
     pub triggered_at: u64,
     pub status: String,
     pub skipped: bool,
+    /// Set when an entry script ran; None for agent-only missions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_exit_code: Option<i32>,
+    /// Per-run scratch dir (where entry output and agent temp files live).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_dir: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// MissionDraft — builder used by CRUD to avoid unreadable positional args
+// ---------------------------------------------------------------------------
+
+/// Input to `MissionStore::create_mission` / `update_mission`.
+/// All fields optional; update applies only what's `Some`.
+#[derive(Debug, Default, Clone)]
+pub struct MissionDraft {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub schedule: Option<String>,
+    pub enabled: Option<bool>,
+    pub cwd: Option<Option<String>>,
+    pub model: Option<Option<String>>,
+    pub entry: Option<Option<String>>,
+    pub policy: Option<String>,
+    pub allow_skills: Option<Vec<String>>,
+    pub requires: Option<Vec<String>>,
+    pub allowed_tools: Option<Vec<String>>,
+    pub permission: Option<Option<MissionPermission>>,
+    pub prompt: Option<String>,
+    pub project: Option<Option<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,7 +272,6 @@ fn to_seven_field(schedule: &str) -> Result<String> {
     ))
 }
 
-/// Validate a 5-field cron expression.
 pub fn validate_cron(schedule: &str) -> Result<()> {
     let seven = to_seven_field(schedule)?;
     seven.parse::<cron::Schedule>().map_err(|e| {
@@ -167,7 +280,6 @@ pub fn validate_cron(schedule: &str) -> Result<()> {
     Ok(())
 }
 
-/// Parse a 5-field cron expression into a `cron::Schedule`.
 pub fn parse_cron(schedule: &str) -> Result<cron::Schedule> {
     let seven = to_seven_field(schedule)?;
     seven
@@ -176,84 +288,170 @@ pub fn parse_cron(schedule: &str) -> Result<cron::Schedule> {
 }
 
 // ---------------------------------------------------------------------------
-// Markdown serialisation helpers
+// Markdown serialisation
 // ---------------------------------------------------------------------------
 
-/// Parse a mission `.md` file: YAML frontmatter + markdown body = prompt.
+/// Split `---\n<yaml>\n---\n<body>` into (yaml_str, body). Returns (None, full)
+/// if no frontmatter block present.
+fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
+    if !content.starts_with("---") {
+        return (None, content);
+    }
+    let Some(end) = content[3..].find("\n---") else {
+        return (None, content);
+    };
+    let yaml = &content[3..3 + end];
+    let body = &content[3 + end + 4..];
+    (Some(yaml.trim()), body)
+}
+
+/// True if the YAML has legacy markers: a `permission_tier:` field, or a
+/// top-level `mode:` line. `line.starts_with("mode:")` only matches at
+/// column zero, so the new format's nested `permission.mode:` (indented)
+/// does not trigger a false positive.
+fn yaml_looks_legacy(yaml: &str) -> bool {
+    yaml.contains("permission_tier:")
+        || yaml.lines().any(|line| line.starts_with("mode:"))
+}
+
+/// Map legacy `permission_tier` → new `permission.mode`.
+fn legacy_tier_to_mode(tier: &str) -> &'static str {
+    match tier {
+        "readonly" => "read",
+        "standard" => "edit",
+        _ => "admin", // "full" or unknown
+    }
+}
+
+/// Parse a mission `.md` file. Tries the new format first; on failure (or when
+/// the YAML looks legacy) falls back to the legacy parser and maps fields.
+///
+/// Returns an error for missions with `mode: app` — unsupported in the redesign.
 fn parse_mission_md(id: &str, content: &str) -> Result<Mission> {
     let id = id.to_string();
+    let (yaml_opt, body_raw) = split_frontmatter(content);
+    let body = body_raw.trim_start_matches('\n').trim_end().to_string();
 
-    let (fm, body) = if content.starts_with("---") {
-        // Find closing ---
-        if let Some(end) = content[3..].find("\n---") {
-            let yaml = &content[3..3 + end];
-            let body = &content[3 + end + 4..]; // skip "\n---"
-            let fm: MissionFrontmatter = serde_yml::from_str(yaml.trim())
-                .map_err(|e| anyhow::anyhow!("Bad frontmatter in {}: {}", id, e))?;
-            (fm, body.trim().to_string())
-        } else {
-            // No closing --- — treat entire file as prompt
-            (
-                MissionFrontmatter {
-                    schedule: String::new(),
-                    enabled: false,
-                    mode: default_mode(),
-                    entry: None,
-                    model: None,
-                    project: None,
-                    permission_tier: default_permission_tier(),
-                    policy: default_policy(),
-                    created_at: 0,
-                },
-                content.to_string(),
-            )
-        }
-    } else {
-        // No frontmatter at all
-        (
-            MissionFrontmatter {
-                schedule: String::new(),
-                enabled: false,
-                mode: default_mode(),
-                entry: None,
-                model: None,
-                project: None,
-                permission_tier: default_permission_tier(),
-                policy: default_policy(),
-                created_at: 0,
-            },
-            content.to_string(),
-        )
+    // No frontmatter → treat body as prompt, everything else default.
+    let Some(yaml) = yaml_opt else {
+        return Ok(default_mission(id, content.to_string()));
     };
 
+    if yaml_looks_legacy(yaml) {
+        return parse_legacy(&id, yaml, body);
+    }
+
+    let fm: MissionFrontmatter = serde_yml::from_str(yaml)
+        .map_err(|e| anyhow::anyhow!("Bad frontmatter in {}: {}", id, e))?;
+
     Ok(Mission {
-        name: Some(id_to_display_name(&id)),
-        id,
+        id: id.clone(),
+        name: fm.name.clone().or_else(|| Some(id_to_display_name(&id))),
+        description: fm.description,
         schedule: fm.schedule,
-        mode: fm.mode,
-        entry: fm.entry,
-        agent_id: MISSION_AGENT_ID.to_string(),
-        prompt: body,
-        model: fm.model,
-        project: fm.project,
-        permission_tier: fm.permission_tier,
-        policy: fm.policy,
         enabled: fm.enabled,
+        cwd: fm.cwd,
+        model: fm.model,
+        entry: fm.entry,
+        policy: fm.policy,
+        allow_skills: fm.allow_skills,
+        requires: fm.requires,
+        allowed_tools: fm.allowed_tools,
+        permission: fm.permission,
+        prompt: body,
+        agent_id: MISSION_AGENT_ID.to_string(),
+        project: fm.project,
         created_at: fm.created_at,
     })
 }
 
-/// Convert a mission to its `.md` file content.
+fn default_mission(id: String, prompt: String) -> Mission {
+    Mission {
+        name: Some(id_to_display_name(&id)),
+        id,
+        description: String::new(),
+        schedule: String::new(),
+        enabled: false,
+        cwd: None,
+        model: None,
+        entry: None,
+        policy: default_policy(),
+        allow_skills: Vec::new(),
+        requires: Vec::new(),
+        allowed_tools: Vec::new(),
+        permission: None,
+        prompt,
+        agent_id: MISSION_AGENT_ID.to_string(),
+        project: None,
+        created_at: 0,
+    }
+}
+
+fn parse_legacy(id: &str, yaml: &str, body: String) -> Result<Mission> {
+    let fm: LegacyFrontmatter = serde_yml::from_str(yaml)
+        .map_err(|e| anyhow::anyhow!("Bad legacy frontmatter in {}: {}", id, e))?;
+
+    if fm.mode.as_deref() == Some("app") {
+        bail!(
+            "Mission '{}' uses legacy mode: app — no longer supported. \
+             Convert to a script-only mission or remove.",
+            id
+        );
+    }
+
+    // Legacy script missions: command lived in `entry`, prompt was ignored.
+    // New shape: entry is the pre-agent script, prompt is the body. For
+    // script-mode legacy missions we keep entry, drop body. For agent-mode
+    // (the common case) the legacy `prompt` was the body of the file.
+    let prompt = if fm.mode.as_deref() == Some("script") {
+        String::new()
+    } else {
+        body
+    };
+
+    let permission = fm.permission_tier.as_deref().map(|tier| MissionPermission {
+        mode: legacy_tier_to_mode(tier).to_string(),
+        paths: Vec::new(),
+        warning: None,
+    });
+
+    Ok(Mission {
+        id: id.to_string(),
+        name: Some(id_to_display_name(id)),
+        description: String::new(),
+        schedule: fm.schedule,
+        enabled: fm.enabled,
+        cwd: fm.project.clone(),
+        model: fm.model,
+        entry: fm.entry,
+        policy: fm.policy.unwrap_or_else(default_policy),
+        allow_skills: Vec::new(),
+        requires: Vec::new(),
+        allowed_tools: Vec::new(),
+        permission,
+        prompt,
+        agent_id: MISSION_AGENT_ID.to_string(),
+        project: fm.project,
+        created_at: fm.created_at,
+    })
+}
+
+/// Convert a mission to its `.md` file content in the new format.
 fn mission_to_md(mission: &Mission) -> String {
     let fm = MissionFrontmatter {
+        name: mission.name.clone(),
+        description: mission.description.clone(),
         schedule: mission.schedule.clone(),
         enabled: mission.enabled,
-        mode: mission.mode.clone(),
-        entry: mission.entry.clone(),
+        cwd: mission.cwd.clone(),
         model: mission.model.clone(),
-        project: mission.project.clone(),
-        permission_tier: mission.permission_tier.clone(),
+        entry: mission.entry.clone(),
         policy: mission.policy.clone(),
+        allow_skills: mission.allow_skills.clone(),
+        requires: mission.requires.clone(),
+        allowed_tools: mission.allowed_tools.clone(),
+        permission: mission.permission.clone(),
+        project: mission.project.clone(),
         created_at: mission.created_at,
     };
     let yaml = serde_yml::to_string(&fm).unwrap_or_default();
@@ -288,7 +486,6 @@ fn name_to_filename(name: &str) -> String {
             }
         })
         .collect();
-    // Collapse multiple hyphens
     let mut result = String::new();
     let mut prev_hyphen = false;
     for c in sanitized.chars() {
@@ -334,7 +531,6 @@ impl MissionStore {
         store
     }
 
-    /// Reload missions from disk into the in-memory cache.
     pub fn reload(&self) {
         let missions = self.scan_disk().unwrap_or_default();
         *self.cache.lock().unwrap() = missions;
@@ -345,7 +541,7 @@ impl MissionStore {
         Ok(())
     }
 
-    fn mission_dir(&self, id: &str) -> PathBuf {
+    pub fn mission_dir(&self, id: &str) -> PathBuf {
         self.dir.join(id)
     }
 
@@ -357,28 +553,31 @@ impl MissionStore {
         self.dir.join(id).join("runs.jsonl")
     }
 
-    pub fn create_mission(
-        &self,
-        name: Option<String>,
-        schedule: &str,
-        prompt: &str,
-        model: Option<String>,
-        project: Option<String>,
-        permission_tier: Option<String>,
-        mode: Option<String>,
-        entry: Option<String>,
-        policy: Option<String>,
-    ) -> Result<Mission> {
+    /// Create a mission from a draft. Required: schedule, prompt (unless
+    /// draft.entry is set, indicating a script-only mission).
+    pub fn create_mission(&self, draft: MissionDraft) -> Result<Mission> {
+        let schedule = draft
+            .schedule
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("schedule is required"))?;
         validate_cron(schedule)?;
+
+        let prompt = draft.prompt.clone().unwrap_or_default();
+        let entry = draft.entry.clone().flatten();
+        if prompt.trim().is_empty() && entry.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            bail!("Mission requires a prompt body or an entry script");
+        }
+
         self.ensure_dir()?;
 
-        let display_name = name.unwrap_or_else(|| "new-mission".to_string());
+        let display_name = draft
+            .name
+            .clone()
+            .unwrap_or_else(|| "new-mission".to_string());
         let mut id = name_to_filename(&display_name);
         if id.is_empty() {
             id = format!("mission-{}", crate::util::now_ts_secs());
         }
-
-        // Ensure unique directory name
         if self.mission_dir(&id).exists() {
             let base = id.clone();
             let mut n = 2;
@@ -391,26 +590,28 @@ impl MissionStore {
             }
         }
 
-        let tier = permission_tier.unwrap_or_else(|| "full".to_string());
         let mission = Mission {
             id: id.clone(),
             name: Some(display_name),
+            description: draft.description.clone().unwrap_or_default(),
             schedule: schedule.to_string(),
-            mode: mode.unwrap_or_else(default_mode),
+            enabled: draft.enabled.unwrap_or(true),
+            cwd: draft.cwd.clone().flatten(),
+            model: draft.model.clone().flatten(),
             entry,
+            policy: draft.policy.clone().unwrap_or_else(default_policy),
+            allow_skills: draft.allow_skills.clone().unwrap_or_default(),
+            requires: draft.requires.clone().unwrap_or_default(),
+            allowed_tools: draft.allowed_tools.clone().unwrap_or_default(),
+            permission: draft.permission.clone().flatten(),
+            prompt,
             agent_id: MISSION_AGENT_ID.to_string(),
-            prompt: prompt.to_string(),
-            model,
-            project,
-            permission_tier: tier,
-            policy: policy.unwrap_or_else(default_policy),
-            enabled: true,
+            project: draft.project.clone().flatten(),
             created_at: crate::util::now_ts_secs(),
         };
 
         fs::create_dir_all(self.mission_dir(&id))?;
-        let content = mission_to_md(&mission);
-        fs::write(self.mission_path(&id), content)?;
+        fs::write(self.mission_path(&id), mission_to_md(&mission))?;
         self.reload();
 
         Ok(mission)
@@ -426,60 +627,58 @@ impl MissionStore {
         Ok(Some(mission))
     }
 
-    pub fn update_mission(
-        &self,
-        mission_id: &str,
-        name: Option<Option<String>>,
-        schedule: Option<&str>,
-        prompt: Option<&str>,
-        model: Option<Option<String>>,
-        project: Option<Option<String>>,
-        enabled: Option<bool>,
-        permission_tier: Option<String>,
-        mode: Option<String>,
-        entry: Option<Option<String>>,
-        policy: Option<String>,
-    ) -> Result<Mission> {
+    /// Update a mission by applying a draft. Fields left `None` are untouched.
+    pub fn update_mission(&self, mission_id: &str, draft: MissionDraft) -> Result<Mission> {
         let Some(mut mission) = self.get_mission(mission_id)? else {
             bail!("Mission '{}' not found", mission_id);
         };
 
-        if let Some(n) = name {
-            mission.name = n;
+        if let Some(n) = draft.name {
+            mission.name = Some(n);
         }
-        if let Some(s) = schedule {
-            validate_cron(s)?;
-            mission.schedule = s.to_string();
+        if let Some(d) = draft.description {
+            mission.description = d;
         }
-        if let Some(p) = prompt {
-            mission.prompt = p.to_string();
+        if let Some(s) = draft.schedule {
+            validate_cron(&s)?;
+            mission.schedule = s;
         }
-        if let Some(m) = model {
-            mission.model = m;
-        }
-        if let Some(p) = project {
-            mission.project = p;
-        }
-        if let Some(e) = enabled {
+        if let Some(e) = draft.enabled {
             mission.enabled = e;
         }
-        if let Some(t) = permission_tier {
-            mission.permission_tier = t;
+        if let Some(cwd) = draft.cwd {
+            mission.cwd = cwd;
         }
-        if let Some(m) = mode {
-            mission.mode = m;
+        if let Some(m) = draft.model {
+            mission.model = m;
         }
-        if let Some(e) = entry {
+        if let Some(e) = draft.entry {
             mission.entry = e;
         }
-        if let Some(p) = policy {
+        if let Some(p) = draft.policy {
             mission.policy = p;
         }
+        if let Some(s) = draft.allow_skills {
+            mission.allow_skills = s;
+        }
+        if let Some(r) = draft.requires {
+            mission.requires = r;
+        }
+        if let Some(t) = draft.allowed_tools {
+            mission.allowed_tools = t;
+        }
+        if let Some(perm) = draft.permission {
+            mission.permission = perm;
+        }
+        if let Some(p) = draft.prompt {
+            mission.prompt = p;
+        }
+        if let Some(p) = draft.project {
+            mission.project = p;
+        }
 
-        let content = mission_to_md(&mission);
-        fs::write(self.mission_path(mission_id), content)?;
+        fs::write(self.mission_path(mission_id), mission_to_md(&mission))?;
         self.reload();
-
         Ok(mission)
     }
 
@@ -507,7 +706,6 @@ impl MissionStore {
             .collect())
     }
 
-    /// Scan disk for all missions. Used by reload().
     fn scan_disk(&self) -> Result<Vec<Mission>> {
         if !self.dir.exists() {
             return Ok(Vec::new());
@@ -560,10 +758,7 @@ impl MissionStore {
         self.list_mission_runs_paginated(mission_id, None, None)
     }
 
-    /// List mission runs with optional pagination.
-    /// Results are in chronological order (oldest first) from the JSONL file.
-    /// `limit` and `offset` apply after reading. For newest-first with limit,
-    /// callers should reverse the result.
+    /// List mission runs newest-first with optional pagination.
     pub fn list_mission_runs_paginated(
         &self,
         mission_id: &str,
@@ -590,13 +785,13 @@ impl MissionStore {
             }
         }
         let total = entries.len();
-        // Reverse to newest-first, then apply offset/limit
         entries.reverse();
         let off = offset.unwrap_or(0);
-        if off > 0 && off < total {
-            entries = entries.into_iter().skip(off).collect();
-        } else if off >= total {
+        if off >= total {
             return Ok(Vec::new());
+        }
+        if off > 0 {
+            entries = entries.into_iter().skip(off).collect();
         }
         if let Some(lim) = limit {
             entries.truncate(lim);
@@ -623,6 +818,16 @@ impl MissionStore {
         }
         Ok(())
     }
+
+    /// Look up the most recent completed (non-skipped) run for a mission.
+    /// Used by the scheduler to set `MISSION_LAST_RUN_AT` env for the entry script.
+    pub fn last_successful_run_at(&self, mission_id: &str) -> Option<u64> {
+        self.list_mission_runs(mission_id)
+            .ok()?
+            .into_iter()
+            .find(|e| !e.skipped && e.status == "completed")
+            .map(|e| e.triggered_at)
+    }
 }
 
 
@@ -634,6 +839,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = MissionStore::with_dir(dir.path().to_path_buf());
         (store, dir)
+    }
+
+    fn draft_min(name: &str, schedule: &str, prompt: &str) -> MissionDraft {
+        MissionDraft {
+            name: Some(name.to_string()),
+            schedule: Some(schedule.to_string()),
+            prompt: Some(prompt.to_string()),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -651,58 +865,82 @@ mod tests {
     }
 
     #[test]
-    fn test_create_and_list_missions() {
+    fn test_create_and_list() {
         let (store, _dir) = temp_store();
-
         let m1 = store
-            .create_mission(Some("Check Status".into()), "*/30 * * * *", "Check status", None, None, None, None, None, None)
+            .create_mission(draft_min("Check Status", "*/30 * * * *", "Check status"))
             .unwrap();
         assert_eq!(m1.id, "check-status");
         assert!(m1.enabled);
+        assert_eq!(m1.policy, "strict");
         assert_eq!(m1.agent_id, MISSION_AGENT_ID);
 
         let m2 = store
-            .create_mission(Some("Review Code".into()), "0 9 * * 1-5", "Review code", Some("gpt-4".into()), Some("/tmp/proj".into()), None, None, None, None)
+            .create_mission(draft_min("Review Code", "0 9 * * 1-5", "Review"))
             .unwrap();
         assert_eq!(m2.id, "review-code");
-        assert_eq!(m2.project, Some("/tmp/proj".to_string()));
 
-        let all = store.list_all_missions().unwrap();
-        assert_eq!(all.len(), 2);
+        assert_eq!(store.list_all_missions().unwrap().len(), 2);
     }
 
     #[test]
-    fn test_md_roundtrip() {
+    fn test_md_roundtrip_new_format() {
         let (store, _dir) = temp_store();
-
-        let created = store
-            .create_mission(Some("Daily Cleanup".into()), "0 9 * * *", "Clean up old files\n\nRemove build artifacts.", Some("gpt-4".into()), Some("/tmp/proj".into()), None, None, None, None)
-            .unwrap();
+        let draft = MissionDraft {
+            name: Some("Daily Cleanup".into()),
+            description: Some("Clean up old files".into()),
+            schedule: Some("0 9 * * *".into()),
+            prompt: Some("Clean up old files\n\nRemove build artifacts.".into()),
+            model: Some(Some("gpt-4".into())),
+            cwd: Some(Some("/tmp/proj".into())),
+            policy: Some("strict".into()),
+            allow_skills: Some(vec!["memory".into()]),
+            requires: Some(vec!["memory".into()]),
+            allowed_tools: Some(vec!["Read".into(), "Bash".into()]),
+            permission: Some(Some(MissionPermission {
+                mode: "admin".into(),
+                paths: vec!["~/.linggen".into()],
+                warning: Some("test warn".into()),
+            })),
+            ..Default::default()
+        };
+        let created = store.create_mission(draft).unwrap();
 
         let loaded = store.get_mission("daily-cleanup").unwrap().unwrap();
         assert_eq!(loaded.schedule, "0 9 * * *");
         assert_eq!(loaded.prompt, "Clean up old files\n\nRemove build artifacts.");
         assert_eq!(loaded.model, Some("gpt-4".to_string()));
-        assert_eq!(loaded.project, Some("/tmp/proj".to_string()));
-        assert_eq!(loaded.enabled, true);
+        assert_eq!(loaded.cwd, Some("/tmp/proj".to_string()));
+        assert_eq!(loaded.allow_skills, vec!["memory".to_string()]);
+        assert_eq!(loaded.requires, vec!["memory".to_string()]);
+        assert_eq!(loaded.allowed_tools, vec!["Read".to_string(), "Bash".to_string()]);
+        assert_eq!(loaded.permission.as_ref().unwrap().mode, "admin");
+        assert_eq!(loaded.permission.as_ref().unwrap().paths, vec!["~/.linggen".to_string()]);
+        assert!(loaded.enabled);
         assert_eq!(loaded.created_at, created.created_at);
     }
 
     #[test]
-    fn test_update_delete() {
+    fn test_update() {
         let (store, _dir) = temp_store();
-
         let m = store
-            .create_mission(Some("Test".into()), "0 * * * *", "Hello", None, None, None, None, None, None)
+            .create_mission(draft_min("Test", "0 * * * *", "Hello"))
             .unwrap();
 
         let updated = store
-            .update_mission(&m.id, None, Some("*/15 * * * *"), Some("Updated prompt"), None, None, Some(false), None, None, None, None)
+            .update_mission(
+                &m.id,
+                MissionDraft {
+                    schedule: Some("*/15 * * * *".into()),
+                    prompt: Some("Updated prompt".into()),
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert_eq!(updated.schedule, "*/15 * * * *");
         assert_eq!(updated.prompt, "Updated prompt");
         assert!(!updated.enabled);
-
         assert_eq!(store.list_enabled_missions().unwrap().len(), 0);
 
         store.delete_mission(&m.id).unwrap();
@@ -712,9 +950,8 @@ mod tests {
     #[test]
     fn test_run_history() {
         let (store, _dir) = temp_store();
-
         let m = store
-            .create_mission(Some("Test".into()), "0 * * * *", "Test", None, None, None, None, None, None)
+            .create_mission(draft_min("Test", "0 * * * *", "Test"))
             .unwrap();
 
         let entry1 = MissionRunEntry {
@@ -723,6 +960,8 @@ mod tests {
             triggered_at: 1000,
             status: "completed".into(),
             skipped: false,
+            entry_exit_code: None,
+            output_dir: None,
         };
         let entry2 = MissionRunEntry {
             run_id: "run-2".into(),
@@ -730,17 +969,112 @@ mod tests {
             triggered_at: 2000,
             status: "skipped".into(),
             skipped: true,
+            entry_exit_code: None,
+            output_dir: None,
         };
-
         store.append_mission_run(&m.id, &entry1).unwrap();
         store.append_mission_run(&m.id, &entry2).unwrap();
 
         let runs = store.list_mission_runs(&m.id).unwrap();
         assert_eq!(runs.len(), 2);
-        // Newest first (reverse chronological)
         assert_eq!(runs[0].run_id, "run-2");
         assert_eq!(runs[1].run_id, "run-1");
         assert!(runs[0].skipped);
+    }
+
+    #[test]
+    fn test_legacy_frontmatter_parses() {
+        // Legacy mission file — permission_tier + mode + top-level policy.
+        let content = "---\n\
+            schedule: 0 23 * * *\n\
+            enabled: true\n\
+            permission_tier: standard\n\
+            policy: strict\n\
+            created_at: 123\n\
+            ---\n\
+            \n\
+            Do the nightly scan.\n";
+        let m = parse_mission_md("nightly", content).unwrap();
+        assert_eq!(m.schedule, "0 23 * * *");
+        assert!(m.enabled);
+        assert_eq!(m.policy, "strict");
+        assert_eq!(m.permission.as_ref().unwrap().mode, "edit"); // standard → edit
+        assert_eq!(m.prompt, "Do the nightly scan.");
+        assert_eq!(m.created_at, 123);
+    }
+
+    #[test]
+    fn test_legacy_permission_tier_mapping() {
+        let ro = "---\nschedule: 0 * * * *\nenabled: true\npermission_tier: readonly\n---\nHi\n";
+        let std_ = "---\nschedule: 0 * * * *\nenabled: true\npermission_tier: standard\n---\nHi\n";
+        let full = "---\nschedule: 0 * * * *\nenabled: true\npermission_tier: full\n---\nHi\n";
+
+        assert_eq!(parse_mission_md("a", ro).unwrap().permission.as_ref().unwrap().mode, "read");
+        assert_eq!(parse_mission_md("b", std_).unwrap().permission.as_ref().unwrap().mode, "edit");
+        assert_eq!(parse_mission_md("c", full).unwrap().permission.as_ref().unwrap().mode, "admin");
+    }
+
+    #[test]
+    fn test_legacy_app_mode_rejected() {
+        let content = "---\n\
+            schedule: 0 9 * * *\n\
+            enabled: true\n\
+            mode: app\n\
+            entry: /some/url\n\
+            ---\n\
+            \n";
+        let result = parse_mission_md("bad", content);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("mode: app"), "error was: {}", err);
+    }
+
+    #[test]
+    fn test_legacy_script_mode_drops_body() {
+        // Legacy script mode: entry was the command, body was unused.
+        let content = "---\n\
+            schedule: 0 9 * * *\n\
+            enabled: true\n\
+            mode: script\n\
+            entry: echo hi\n\
+            ---\n\
+            \n\
+            Some ignored body.\n";
+        let m = parse_mission_md("s", content).unwrap();
+        assert_eq!(m.entry.as_deref(), Some("echo hi"));
+        assert_eq!(m.prompt, ""); // body dropped for script mode
+    }
+
+    #[test]
+    fn test_legacy_rewrites_to_new_format_on_update() {
+        let (store, dir) = temp_store();
+        // Seed a legacy mission file directly on disk.
+        let legacy_md = "---\n\
+            schedule: 0 9 * * *\n\
+            enabled: true\n\
+            permission_tier: full\n\
+            ---\n\
+            Hello\n";
+        let mdir = dir.path().join("legacy");
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(mdir.join("mission.md"), legacy_md).unwrap();
+        store.reload();
+
+        // Update triggers a re-serialize in the new format.
+        store
+            .update_mission(
+                "legacy",
+                MissionDraft {
+                    description: Some("migrated".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let content = std::fs::read_to_string(mdir.join("mission.md")).unwrap();
+        assert!(!content.contains("permission_tier"));
+        assert!(content.contains("description: migrated"));
+        assert!(content.contains("permission:"));
     }
 
     #[test]
@@ -754,23 +1088,43 @@ mod tests {
     #[test]
     fn test_duplicate_name_gets_suffix() {
         let (store, _dir) = temp_store();
-
-        let m1 = store.create_mission(Some("Test".into()), "0 * * * *", "First", None, None, None, None, None, None).unwrap();
+        let m1 = store.create_mission(draft_min("Test", "0 * * * *", "First")).unwrap();
         assert_eq!(m1.id, "test");
-
-        let m2 = store.create_mission(Some("Test".into()), "0 * * * *", "Second", None, None, None, None, None, None).unwrap();
+        let m2 = store.create_mission(draft_min("Test", "0 * * * *", "Second")).unwrap();
         assert_eq!(m2.id, "test-2");
+    }
+
+    #[test]
+    fn test_create_requires_prompt_or_entry() {
+        let (store, _dir) = temp_store();
+        let err = store.create_mission(MissionDraft {
+            name: Some("empty".into()),
+            schedule: Some("0 * * * *".into()),
+            ..Default::default()
+        });
+        assert!(err.is_err());
+
+        // Entry-only mission OK.
+        let ok = store.create_mission(MissionDraft {
+            name: Some("script-only".into()),
+            schedule: Some("0 * * * *".into()),
+            entry: Some(Some("scripts/run.sh".into())),
+            ..Default::default()
+        });
+        assert!(ok.is_ok());
     }
 
     #[test]
     fn test_update_invalid_cron_rejected() {
         let (store, _dir) = temp_store();
-
-        let m = store
-            .create_mission(Some("Test".into()), "0 * * * *", "Test", None, None, None, None, None, None)
-            .unwrap();
-
-        let result = store.update_mission(&m.id, None, Some("bad cron"), None, None, None, None, None, None, None, None);
+        let m = store.create_mission(draft_min("Test", "0 * * * *", "Test")).unwrap();
+        let result = store.update_mission(
+            &m.id,
+            MissionDraft {
+                schedule: Some("bad cron".into()),
+                ..Default::default()
+            },
+        );
         assert!(result.is_err());
     }
 
@@ -778,27 +1132,22 @@ mod tests {
     fn test_directory_structure() {
         let (store, dir) = temp_store();
         let root = dir.path().to_path_buf();
-
-        let m = store
-            .create_mission(Some("Test Dir".into()), "0 * * * *", "Hello", None, None, None, None, None, None)
-            .unwrap();
-
-        // Verify directory-based layout
+        let m = store.create_mission(draft_min("Test Dir", "0 * * * *", "Hello")).unwrap();
         assert!(root.join("test-dir").is_dir());
         assert!(root.join("test-dir").join("mission.md").exists());
 
-        // Runs go inside the same directory
         let entry = MissionRunEntry {
             run_id: "r1".into(),
             session_id: None,
             triggered_at: 1000,
             status: "completed".into(),
             skipped: false,
+            entry_exit_code: None,
+            output_dir: None,
         };
         store.append_mission_run(&m.id, &entry).unwrap();
         assert!(root.join("test-dir").join("runs.jsonl").exists());
 
-        // Delete removes entire directory
         store.delete_mission(&m.id).unwrap();
         assert!(!root.join("test-dir").exists());
     }

@@ -136,23 +136,33 @@ Agent run records (`AgentRunRecord`) are held in-memory only — they track live
 
 ### Mission (`mission.md`)
 
-Markdown file with YAML frontmatter. Stored at `~/.linggen/missions/{id}/mission.md`.
+Markdown file with YAML frontmatter, shaped like `SKILL.md`. Stored at `~/.linggen/missions/{id}/mission.md`, with optional `scripts/` and `assets/` subdirs alongside. See [`mission-spec.md`](mission-spec.md) for the authoritative field reference.
 
 ```markdown
 ---
+name: ci-watcher
+description: Check CI/CD status every 30 minutes and report issues.
 schedule: '*/30 * * * *'
 enabled: true
-project: /path/to/project
-permission_tier: standard
+cwd: /path/to/project
+policy: strict
+entry: scripts/poll.sh            # optional pre-agent script
+allow-skills: []
+requires: []
+allowed-tools: [Read, Bash, Task]
+permission:
+  mode: edit
+  paths: []
+  warning: ""
 created_at: 1700000000
 ---
 
-Check CI/CD status and report issues
+Check CI/CD status and report issues.
 ```
 
-Frontmatter fields: `schedule` (5-field cron), `enabled`, `model` (optional), `project` (optional), `permission_tier` ("readonly", "standard", "full"), `created_at`.
+Core frontmatter fields: `name`, `description`, `schedule` (5-field cron), `enabled`, `cwd`, `policy` (`strict` | `trusted` | `sandbox` | `interactive`), `entry` (optional script path or inline bash), `allow-skills`, `requires`, `allowed-tools`, `permission` (nested `mode` / `paths` / `warning`), `created_at`. Legacy `permission_tier` and top-level `mode: agent|script|app` are still read by the parser and rewritten to the new shape on next save; `mode: app` is unsupported.
 
-The markdown body is the mission prompt. Multiple missions can be active simultaneously — each in its own directory. See [`mission-spec.md`](mission-spec.md) for full details.
+The markdown body is the mission prompt (step-by-step instructions for the agent). Multiple missions can be active simultaneously — each in its own directory.
 
 ### Mission sessions
 
@@ -161,10 +171,10 @@ Mission sessions are stored in `~/.linggen/sessions/` alongside all other sessio
 ### Mission run history (`runs.jsonl`)
 
 ```json
-{ "run_id": "run-mission-1700000000-123456", "session_id": "sess-1700000000-abc12345", "triggered_at": 1700000000, "status": "completed", "skipped": false }
+{ "run_id": "mission-run-1700000000-a1b2c3d4", "session_id": "sess-1700000000-abc12345", "triggered_at": 1700000000, "status": "completed", "skipped": false, "entry_exit_code": 0, "output_dir": "/Users/u/.linggen/missions/ci-watcher/runs/mission-run-1700000000-a1b2c3d4" }
 ```
 
-Append-only. Skipped triggers (agent busy) logged with `"skipped": true`.
+Append-only. Skipped triggers (agent busy / daily cap) are logged with `"skipped": true` and no `session_id`. Each agent-mode run also writes `stdout.log` / `stderr.log` under `output_dir/` when an entry script ran.
 
 ### Plan messages (in `messages.jsonl`)
 

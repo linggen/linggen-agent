@@ -315,23 +315,49 @@ export type ManagementTab = 'models' | 'agents' | 'skills' | 'tools' | 'general'
 
 export type MissionTab = 'list' | 'create' | 'edit' | 'runs' | 'agent';
 
+/** Permission block — mirrors SkillPermission. See doc/mission-spec.md. */
+export interface MissionPermission {
+  /** Path-mode ceiling: "read" | "edit" | "admin". */
+  mode: string;
+  /** Extra narrow path grants. */
+  paths?: string[];
+  /** Warning shown in UI before enabling. */
+  warning?: string | null;
+}
+
 export interface CronMission {
   id: string;
   name?: string | null;
+  description?: string;
   schedule: string;
-  agent_id: string;
-  prompt: string;
-  model?: string | null;
-  project?: string | null;
-  /** Permission tier: "readonly", "standard", "full". Default: "full". */
-  permission_tier?: string;
-  /** Mission mode: "agent" (default), "app", or "script". */
-  mode?: string;
-  /** Entry URL (app) or command (script). */
-  entry?: string | null;
-  /** Autonomy policy: "trusted" (default), "strict", or "interactive". */
-  policy?: string;
   enabled: boolean;
+  agent_id: string;
+
+  /** Markdown body — step-by-step instructions. */
+  prompt: string;
+
+  /** Working directory. */
+  cwd?: string | null;
+  /** Model override. */
+  model?: string | null;
+  /** Optional pre-agent script (path relative to mission dir, or inline bash). */
+  entry?: string | null;
+
+  /** Autonomy policy: "interactive" | "strict" | "trusted" | "sandbox". Default "strict". */
+  policy: string;
+  /** Whitelist for Skill tool. Empty → Skill tool absent. ["*"] → any skill. */
+  allow_skills?: string[];
+  /** Capability names required — validated at load. */
+  requires?: string[];
+
+  /** Explicit tool allowlist. Empty → unrestricted. */
+  allowed_tools?: string[];
+  /** Permission block (mode + paths + warning). */
+  permission?: MissionPermission | null;
+
+  /** Legacy project field — kept for back-compat. Prefer `cwd`. */
+  project?: string | null;
+
   created_at: number;
 }
 
@@ -341,7 +367,26 @@ export interface MissionRunEntry {
   triggered_at: number;
   status: string;
   skipped: boolean;
+  /** Set when an entry script ran. */
+  entry_exit_code?: number | null;
+  /** Per-run output directory path. */
+  output_dir?: string | null;
 }
+
+export interface MissionRunOutput {
+  run_id: string;
+  mission_id: string;
+  output_dir: string;
+  stdout: string;
+  stderr: string;
+}
+
+export const MISSION_POLICIES = ['strict', 'trusted', 'sandbox', 'interactive'] as const;
+export const MISSION_PERMISSION_MODES = ['read', 'edit', 'admin'] as const;
+export const MISSION_TOOL_CATALOG = [
+  'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Task', 'WebSearch', 'WebFetch',
+  'Memory_add', 'Memory_get', 'Memory_search', 'Memory_list', 'Memory_update', 'Memory_delete',
+] as const;
 
 // --- Storage browser types ---
 

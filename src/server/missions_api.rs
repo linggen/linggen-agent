@@ -1,4 +1,4 @@
-use crate::project_store::missions::{self, MISSION_AGENT_ID};
+use crate::project_store::missions::{self, MissionDraft, MissionPermission, MISSION_AGENT_ID};
 use crate::server::{ServerEvent, ServerState};
 use axum::{
     extract::{Path, Query, State},
@@ -8,6 +8,36 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
+
+/// Accepted values for permission.mode.
+const VALID_MODES: &[&str] = &["read", "edit", "admin"];
+
+/// Accepted values for the autonomy policy.
+const VALID_POLICIES: &[&str] = &["interactive", "strict", "trusted", "sandbox"];
+
+fn validate_mode(mode: &str) -> Result<(), String> {
+    if VALID_MODES.contains(&mode) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid permission.mode '{}'. Allowed: {}",
+            mode,
+            VALID_MODES.join(", ")
+        ))
+    }
+}
+
+fn validate_policy(policy: &str) -> Result<(), String> {
+    if VALID_POLICIES.contains(&policy) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid policy '{}'. Allowed: {}",
+            policy,
+            VALID_POLICIES.join(", ")
+        ))
+    }
+}
 
 /// GET /api/missions — list all global missions.
 pub(crate) async fn list_missions(
@@ -29,25 +59,50 @@ pub(crate) async fn list_missions(
 pub(crate) struct CreateMissionRequest {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
     schedule: String,
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
-    project: Option<String>,
-    /// Permission tier: "readonly", "standard", "full".
+    /// Working directory. Accepts legacy `project` alias during Phase 1.
+    #[serde(default, alias = "project")]
+    cwd: Option<String>,
+    /// Permission mode: "read", "edit", "admin". Legacy `permission_tier`
+    /// accepted and mapped for back-compat.
     #[serde(default)]
     permission_tier: Option<String>,
-    /// Mission mode: "agent" (default), "app", or "script".
+    #[serde(default)]
+    permission_mode: Option<String>,
+    #[serde(default)]
+    permission_paths: Option<Vec<String>>,
+    #[serde(default)]
+    permission_warning: Option<String>,
+    /// Legacy mission mode: "agent" | "app" | "script".
+    /// Phase 1 compat: "app" rejected, "script" maps to entry-only.
     #[serde(default)]
     mode: Option<String>,
-    /// Entry URL (app) or command (script). Required when mode != "agent".
     #[serde(default)]
     entry: Option<String>,
-    /// Autonomy policy: "trusted" (default), "strict", or "interactive".
+    /// Autonomy policy.
     #[serde(default)]
     policy: Option<String>,
+    #[serde(default)]
+    allow_skills: Option<Vec<String>>,
+    #[serde(default)]
+    requires: Option<Vec<String>>,
+    #[serde(default)]
+    allowed_tools: Option<Vec<String>>,
+}
+
+/// Map legacy `permission_tier` values to new mode names.
+fn map_legacy_tier(tier: &str) -> &'static str {
+    match tier {
+        "readonly" => "read",
+        "standard" => "edit",
+        _ => "admin",
+    }
 }
 
 /// POST /api/missions
@@ -55,40 +110,85 @@ pub(crate) async fn create_mission(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CreateMissionRequest>,
 ) -> impl IntoResponse {
-    // Missions require the "mission" skill to be installed.
-    if state.skill_manager.get_skill("mission").await.is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "The \"mission\" skill is not installed. Run `ling init` to install default skills.".to_string(),
-        ).into_response();
-    }
-
     if let Err(e) = missions::validate_cron(&req.schedule) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
+    if let Some(ref p) = req.policy {
+        if let Err(e) = validate_policy(p) {
+            return (StatusCode::BAD_REQUEST, e).into_response();
+        }
+    }
+    if let Some(ref m) = req.permission_mode {
+        if let Err(e) = validate_mode(m) {
+            return (StatusCode::BAD_REQUEST, e).into_response();
+        }
+    }
 
+    // Legacy mode handling — kept to absorb old UI payloads.
     let mode = req.mode.as_deref().unwrap_or("agent");
+    if mode == "app" {
+        return (
+            StatusCode::BAD_REQUEST,
+            "mode: app is no longer supported".to_string(),
+        )
+            .into_response();
+    }
+
     let prompt = req.prompt.unwrap_or_default();
-    if mode == "agent" && prompt.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "Agent-mode missions require a prompt".to_string()).into_response();
+    let entry = req.entry.clone();
+    let entry_is_empty = entry.as_deref().map(str::trim).unwrap_or("").is_empty();
+    let prompt_is_empty = prompt.trim().is_empty();
+
+    if mode == "agent" && prompt_is_empty && entry_is_empty {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Mission requires a prompt body or an entry script".to_string(),
+        )
+            .into_response();
     }
-    if mode != "agent" && req.entry.as_deref().unwrap_or("").trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, format!("{mode}-mode missions require an entry URL")).into_response();
+    if mode == "script" && entry_is_empty {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Script-mode missions require an entry command".to_string(),
+        )
+            .into_response();
     }
 
-    let project = req.project;
+    // Resolve permission block: explicit mode/paths win; else legacy tier
+    // mapping; else materialize the `admin`-on-cwd default so the on-disk
+    // file always carries an explicit permission block (no hidden defaults).
+    let permission = build_permission(
+        req.permission_mode.as_deref(),
+        req.permission_tier.as_deref(),
+        req.permission_paths.clone(),
+        req.permission_warning.clone(),
+    )
+    .or_else(|| {
+        Some(MissionPermission {
+            mode: "admin".to_string(),
+            paths: Vec::new(),
+            warning: None,
+        })
+    });
 
-    match state.manager.missions.create_mission(
-        req.name,
-        &req.schedule,
-        &prompt,
-        req.model,
-        project,
-        req.permission_tier,
-        Some(mode.to_string()),
-        req.entry,
-        req.policy,
-    ) {
+    let draft = MissionDraft {
+        name: req.name,
+        description: req.description,
+        schedule: Some(req.schedule),
+        prompt: if prompt_is_empty { None } else { Some(prompt) },
+        enabled: Some(true),
+        cwd: Some(req.cwd.clone()),
+        model: Some(req.model),
+        entry: Some(entry),
+        policy: req.policy,
+        allow_skills: req.allow_skills,
+        requires: req.requires,
+        allowed_tools: req.allowed_tools,
+        permission: Some(permission),
+        project: Some(req.cwd),
+    };
+
+    match state.manager.missions.create_mission(draft) {
         Ok(mission) => {
             let _ = state.events_tx.send(ServerEvent::StateUpdated);
             Json(mission).into_response()
@@ -101,32 +201,58 @@ pub(crate) async fn create_mission(
     }
 }
 
+fn build_permission(
+    mode: Option<&str>,
+    legacy_tier: Option<&str>,
+    paths: Option<Vec<String>>,
+    warning: Option<String>,
+) -> Option<MissionPermission> {
+    let mode_str = mode
+        .map(|s| s.to_string())
+        .or_else(|| legacy_tier.map(|t| map_legacy_tier(t).to_string()));
+    mode_str.map(|mode| MissionPermission {
+        mode,
+        paths: paths.unwrap_or_default(),
+        warning,
+    })
+}
+
 #[derive(Deserialize)]
 pub(crate) struct UpdateMissionRequest {
     #[serde(default)]
     name: Option<Option<String>>,
+    #[serde(default)]
+    description: Option<String>,
     #[serde(default)]
     schedule: Option<String>,
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
     model: Option<Option<String>>,
-    #[serde(default)]
-    project: Option<Option<String>>,
+    #[serde(default, alias = "project")]
+    cwd: Option<Option<String>>,
     #[serde(default)]
     enabled: Option<bool>,
-    /// Permission tier: "readonly", "standard", "full".
     #[serde(default)]
     permission_tier: Option<String>,
-    /// Mission mode: "agent", "app", or "script".
+    #[serde(default)]
+    permission_mode: Option<String>,
+    #[serde(default)]
+    permission_paths: Option<Vec<String>>,
+    #[serde(default)]
+    permission_warning: Option<String>,
     #[serde(default)]
     mode: Option<String>,
-    /// Entry URL (app) or command (script).
     #[serde(default)]
     entry: Option<Option<String>>,
-    /// Autonomy policy: "trusted", "strict", or "interactive".
     #[serde(default)]
     policy: Option<String>,
+    #[serde(default)]
+    allow_skills: Option<Vec<String>>,
+    #[serde(default)]
+    requires: Option<Vec<String>>,
+    #[serde(default)]
+    allowed_tools: Option<Vec<String>>,
 }
 
 /// PUT /api/missions/:id
@@ -140,20 +266,67 @@ pub(crate) async fn update_mission(
             return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
         }
     }
+    if let Some(ref p) = req.policy {
+        if let Err(e) = validate_policy(p) {
+            return (StatusCode::BAD_REQUEST, e).into_response();
+        }
+    }
+    if let Some(ref m) = req.permission_mode {
+        if let Err(e) = validate_mode(m) {
+            return (StatusCode::BAD_REQUEST, e).into_response();
+        }
+    }
+    if req.mode.as_deref() == Some("app") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "mode: app is no longer supported".to_string(),
+        )
+            .into_response();
+    }
 
-    match state.manager.missions.update_mission(
-        &id,
-        req.name,
-        req.schedule.as_deref(),
-        req.prompt.as_deref(),
-        req.model,
-        req.project,
-        req.enabled,
-        req.permission_tier,
-        req.mode,
-        req.entry,
-        req.policy,
-    ) {
+    // Unwrap Option<Option<String>> for name; other Option<Option<T>> fields
+    // are passed through directly.
+    let name_draft = req.name;
+
+    // Resolve permission update only if caller provided any permission fields.
+    let permission_update: Option<Option<MissionPermission>> =
+        if req.permission_mode.is_some()
+            || req.permission_tier.is_some()
+            || req.permission_paths.is_some()
+            || req.permission_warning.is_some()
+        {
+            Some(build_permission(
+                req.permission_mode.as_deref(),
+                req.permission_tier.as_deref(),
+                req.permission_paths,
+                req.permission_warning,
+            ))
+        } else {
+            None
+        };
+
+    // cwd alias: update cwd and the legacy `project` field together so both
+    // stay in sync through the Phase 1 migration window.
+    let cwd_pair = req.cwd.clone();
+
+    let draft = MissionDraft {
+        name: name_draft.and_then(|n| n),
+        description: req.description,
+        schedule: req.schedule,
+        prompt: req.prompt,
+        enabled: req.enabled,
+        cwd: cwd_pair.clone(),
+        model: req.model,
+        entry: req.entry,
+        policy: req.policy,
+        allow_skills: req.allow_skills,
+        requires: req.requires,
+        allowed_tools: req.allowed_tools,
+        permission: permission_update,
+        project: cwd_pair,
+    };
+
+    match state.manager.missions.update_mission(&id, draft) {
         Ok(mission) => {
             let _ = state.events_tx.send(ServerEvent::StateUpdated);
             Json(mission).into_response()
@@ -199,26 +372,22 @@ pub(crate) async fn trigger_mission(
     Path(id): Path<String>,
     Json(req): Json<TriggerMissionRequest>,
 ) -> impl IntoResponse {
-    if state.skill_manager.get_skill("mission").await.is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "The \"mission\" skill is not installed. Run `ling init` to install default skills.".to_string(),
-        ).into_response();
-    }
-
     let mission = match state.manager.missions.get_mission(&id) {
         Ok(Some(m)) => m,
         Ok(None) => return (StatusCode::NOT_FOUND, "Mission not found".to_string()).into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    // Determine project root: from request, mission, or current dir
-    let project_path = req
+    // Determine project root: from request, mission cwd (or legacy project), or env cwd.
+    // Expand `~` and `$VAR` so `cwd: ~/.linggen` resolves to an absolute path
+    // the agent's Bash tool can spawn in.
+    let raw_cwd = req
         .project_root
+        .or_else(|| mission.cwd.clone())
         .or_else(|| mission.project.clone())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().to_string_lossy().to_string());
-
-    let root = std::path::PathBuf::from(&project_path);
+    let root = crate::util::resolve_path(std::path::Path::new(&raw_cwd));
+    let project_path = root.to_string_lossy().to_string();
 
     let _ = state.events_tx.send(ServerEvent::MissionTriggered {
         mission_id: mission.id.clone(),
@@ -235,9 +404,17 @@ pub(crate) async fn trigger_mission(
     // Pre-create the session so we can return its ID immediately
     let session_id = crate::server::mission_scheduler::create_mission_session(&mission);
 
-    // Persist the initial user message so the UI has content when it loads the session
+    // Persist a short kickoff user message so the UI has something to show
+    // when it loads the session. The mission body lives in the system prompt
+    // (via active_mission, set by the scheduler) — duplicating it here would
+    // mean the agent sees the instructions twice and the transcript is
+    // cluttered with thousands of characters of redundant context.
     if let Some(ref sid) = session_id {
-        let message = format!("[Mission: {}]\n\n{}", mission.id, mission.prompt);
+        let mission_label = mission.name.clone().unwrap_or_else(|| mission.id.clone());
+        let message = format!(
+            "Run the \"{}\" mission now per the instructions in your system prompt. Report results in your final message.",
+            mission_label
+        );
         let _ = state.manager.global_sessions.add_chat_message(
             sid,
             &crate::state_fs::sessions::ChatMsg {
@@ -346,4 +523,34 @@ pub(crate) async fn list_mission_runs(
         )
             .into_response(),
     }
+}
+
+/// GET /api/missions/:id/runs/:run_id/output — return captured stdout/stderr
+/// from the entry-script pre-stage. Missing logs return empty strings.
+///
+/// Rejects run_id values containing `/` or `..` so malformed URLs can't
+/// traverse out of the runs/ directory.
+pub(crate) async fn get_mission_run_output(
+    State(state): State<Arc<ServerState>>,
+    Path((id, run_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if run_id.is_empty() || run_id.contains('/') || run_id.contains("..") {
+        return (StatusCode::BAD_REQUEST, "Invalid run_id".to_string()).into_response();
+    }
+    let dir = state
+        .manager
+        .missions
+        .mission_dir(&id)
+        .join("runs")
+        .join(&run_id);
+    let stdout = std::fs::read_to_string(dir.join("stdout.log")).unwrap_or_default();
+    let stderr = std::fs::read_to_string(dir.join("stderr.log")).unwrap_or_default();
+    Json(serde_json::json!({
+        "run_id": run_id,
+        "mission_id": id,
+        "output_dir": dir.to_string_lossy(),
+        "stdout": stdout,
+        "stderr": stderr,
+    }))
+    .into_response()
 }

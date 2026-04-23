@@ -144,6 +144,26 @@ async fn post_to_daemon(url: &str, args: &Value) -> Result<Value, DispatchError>
         }
     };
 
+    // Non-2xx: the daemon is telling us the request failed (e.g. 422 with
+    // a plain-text pydantic-style validation message). Surface the status
+    // + body verbatim so the model sees a real reason instead of the
+    // generic "parsing daemon response as JSON" that reqwest.json() would
+    // produce when the body isn't application/json. This is the only path
+    // that tells the user what they got wrong.
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<could not read body>".to_string());
+        let trimmed = body.trim();
+        return Err(DispatchError::Other(anyhow!(
+            "skill provider error [{}]: {}",
+            status.as_u16(),
+            if trimmed.is_empty() { "<empty body>" } else { trimmed }
+        )));
+    }
+
     let envelope: Value = response.json().await.map_err(|e| {
         DispatchError::Other(anyhow::Error::from(e).context("parsing daemon response as JSON"))
     })?;

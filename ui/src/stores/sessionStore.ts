@@ -32,6 +32,7 @@ interface SessionState {
 
   createSession: () => Promise<void>;
   removeSession: (id: string) => Promise<void>;
+  removeSessions: (ids: string[]) => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
 }
 
@@ -131,6 +132,41 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     } catch (e) {
       console.error('Error removing session:', e);
     }
+  },
+
+  removeSessions: async (ids) => {
+    if (ids.length === 0) return;
+    const { allSessions } = get();
+    const msg = ids.length === 1 ? 'Remove this session?' : `Remove ${ids.length} sessions?`;
+    if (!confirm(msg)) return;
+    const idSet = new Set(ids);
+    const targets = allSessions.filter(s => idSet.has(s.id));
+    await Promise.allSettled(targets.map(session =>
+      fetch('/api/sessions/all', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: session.id,
+          project: session.project || null,
+          mission_id: session.mission_id || null,
+          skill: session.skill || null,
+        }),
+      }),
+    ));
+    set((s) => {
+      const newAll = s.allSessions.filter(sess => !idSet.has(sess.id));
+      const newSessions = s.sessions.filter(sess => !idSet.has(sess.id));
+      const patch: Partial<SessionState> = { allSessions: newAll, sessions: newSessions };
+      if (s.activeSessionId && idSet.has(s.activeSessionId)) {
+        patch.activeSessionId = newAll.length > 0 ? newAll[0].id : null;
+        if (patch.activeSessionId) {
+          window.localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, patch.activeSessionId);
+        } else {
+          window.localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
+        }
+      }
+      return patch;
+    });
   },
 
   renameSession: async (id, title) => {

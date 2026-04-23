@@ -9,6 +9,7 @@ import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react'
 import {
   MessageSquare, Bot, Sparkles, Plus, Search, X, Trash2,
   Play, Pause, ChevronDown, ChevronRight, Settings, RefreshCw,
+  CheckSquare,
 } from 'lucide-react';
 import { cn } from '../lib/cn';
 import type { SessionInfo, CronMission } from '../types';
@@ -107,6 +108,8 @@ export const SessionList: React.FC<{
   const [triggeringMission, setTriggeringMission] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const [newSessionIds, setNewSessionIds] = useState<Set<string>>(new Set());
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   // Focus search
   useEffect(() => { if (showSearch) searchRef.current?.focus(); }, [showSearch]);
@@ -176,16 +179,64 @@ export const SessionList: React.FC<{
 
   const handleTriggerMission = useCallback(async (missionId: string) => {
     setTriggeringMission(missionId);
+    // Spin for at least 1s so the click is visibly acknowledged even if the
+    // API returns instantly. Matches the mission-settings page pattern.
+    const minSpin = new Promise(res => setTimeout(res, 1000));
     try {
-      await fetch(`/api/missions/${missionId}/trigger`, { method: 'POST' });
-      // Refresh sessions to show the new mission session
+      // Axum's Json<TriggerMissionRequest> extractor needs a real JSON body
+      // and Content-Type — a bodyless POST 415s silently.
+      const resp = await fetch(`/api/missions/${missionId}/trigger`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!resp.ok) {
+        console.error('Failed to trigger mission:', resp.status, await resp.text());
+      }
+      // New session appears via SessionCreated event; refresh just in case.
       setTimeout(() => useSessionStore.getState().fetchAllSessions(), 1000);
     } catch (e) {
       console.error('Failed to trigger mission:', e);
     } finally {
+      await minSpin;
       setTriggeringMission(null);
     }
   }, []);
+
+  const exitSelectMode = useCallback(() => {
+    setSelectMode(false);
+    setSelectedIds(new Set());
+  }, []);
+
+  const toggleSelectMode = useCallback(() => {
+    if (selectMode) exitSelectMode();
+    else setSelectMode(true);
+  }, [selectMode, exitSelectMode]);
+
+  const toggleSessionSelected = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const toggleGroupSelected = useCallback((groupIds: string[]) => {
+    setSelectedIds((prev) => {
+      const allSelected = groupIds.every((id) => prev.has(id));
+      const next = new Set(prev);
+      if (allSelected) groupIds.forEach((id) => next.delete(id));
+      else groupIds.forEach((id) => next.add(id));
+      return next;
+    });
+  }, []);
+
+  const handleBulkDelete = useCallback(async () => {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    await useSessionStore.getState().removeSessions(ids);
+    exitSelectMode();
+  }, [selectedIds, exitSelectMode]);
 
   const handleToggleMission = useCallback(async (missionId: string, enabled: boolean) => {
     try {
@@ -215,6 +266,16 @@ export const SessionList: React.FC<{
             className="p-1 rounded hover:bg-slate-100 dark:hover:bg-white/5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 transition-colors"
             title="Search sessions">
             {showSearch ? <X size={13} /> : <Search size={13} />}
+          </button>
+          <button onClick={toggleSelectMode}
+            className={cn(
+              'p-1 rounded transition-colors',
+              selectMode
+                ? 'bg-blue-100 dark:bg-blue-500/15 text-blue-600 dark:text-blue-400'
+                : 'hover:bg-slate-100 dark:hover:bg-white/5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300',
+            )}
+            title={selectMode ? 'Exit select mode' : 'Select sessions'}>
+            <CheckSquare size={13} />
           </button>
           <button onClick={onCreateSession}
             className="p-1 rounded hover:bg-slate-100 dark:hover:bg-white/5 text-slate-400 hover:text-blue-500 transition-colors"
@@ -246,6 +307,36 @@ export const SessionList: React.FC<{
         ))}
       </div>
 
+      {/* Select-mode action bar */}
+      {selectMode && (
+        <div className="flex items-center justify-between gap-2 px-3 py-1.5 border-b border-slate-200 dark:border-white/5 bg-blue-50/60 dark:bg-blue-500/[0.08]">
+          <span className="text-[11px] font-semibold text-blue-700 dark:text-blue-300 tabular-nums">
+            {selectedIds.size} selected
+          </span>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={handleBulkDelete}
+              disabled={selectedIds.size === 0}
+              className={cn(
+                'flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold rounded transition-colors',
+                selectedIds.size === 0
+                  ? 'text-slate-400 cursor-not-allowed'
+                  : 'text-red-600 hover:bg-red-100 dark:text-red-400 dark:hover:bg-red-500/10',
+              )}
+              title="Delete selected sessions">
+              <Trash2 size={11} />
+              Delete
+            </button>
+            <button
+              onClick={exitSelectMode}
+              className="px-2 py-0.5 text-[11px] font-semibold rounded text-slate-500 hover:bg-slate-200 dark:text-slate-400 dark:hover:bg-white/10 transition-colors"
+              title="Cancel selection">
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Session list (scrollable) */}
       <div className="flex-1 overflow-y-auto min-h-0">
         {groups.length === 0 && (
@@ -258,32 +349,69 @@ export const SessionList: React.FC<{
           </div>
         )}
 
-        {groups.map(([group, sessions]) => (
+        {groups.map(([group, sessions]) => {
+          const groupIds = sessions.map((s) => s.id);
+          const groupSelectedCount = groupIds.filter((id) => selectedIds.has(id)).length;
+          const groupAllSelected = groupSelectedCount === groupIds.length && groupIds.length > 0;
+          const groupSomeSelected = groupSelectedCount > 0 && !groupAllSelected;
+          return (
           <div key={group}>
-            <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-widest text-slate-400 dark:text-slate-500 bg-slate-50/80 dark:bg-white/[0.02] sticky top-0 z-10">
-              {group}
+            <div className="flex items-center gap-2 px-3 py-1 bg-slate-50/80 dark:bg-white/[0.02] sticky top-0 z-10">
+              {selectMode && (
+                <input
+                  type="checkbox"
+                  className="w-3 h-3 accent-blue-500 cursor-pointer"
+                  checked={groupAllSelected}
+                  ref={(el) => { if (el) el.indeterminate = groupSomeSelected; }}
+                  onChange={() => toggleGroupSelected(groupIds)}
+                  onClick={(e) => e.stopPropagation()}
+                  title={groupAllSelected ? `Deselect ${group}` : `Select all in ${group}`}
+                />
+              )}
+              <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 dark:text-slate-500">
+                {group}
+              </span>
+              {selectMode && groupSelectedCount > 0 && (
+                <span className="text-[10px] text-blue-500 tabular-nums">{groupSelectedCount}/{groupIds.length}</span>
+              )}
             </div>
             {sessions.map((session) => {
               const isActive = session.id === activeSessionId;
               const isNew = newSessionIds.has(session.id);
+              const isChecked = selectedIds.has(session.id);
+              const handleRowClick = () => {
+                if (selectMode) toggleSessionSelected(session.id);
+                else onSelectSession(session);
+              };
               return (
-                <div key={session.id} onClick={() => onSelectSession(session)} role="button" tabIndex={0}
-                  onKeyDown={(e) => { if (e.key === 'Enter') onSelectSession(session); }}
+                <div key={session.id} onClick={handleRowClick} role="button" tabIndex={0}
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleRowClick(); }}
                   className={cn(
                     'w-full flex items-start gap-2 px-3 py-2 text-left transition-all duration-150 group cursor-pointer',
                     'hover:bg-slate-100 dark:hover:bg-white/[0.04]',
-                    isActive && 'bg-blue-50 dark:bg-blue-500/[0.08] border-l-2 border-blue-500',
-                    !isActive && 'border-l-2 border-transparent',
+                    isActive && !selectMode && 'bg-blue-50 dark:bg-blue-500/[0.08] border-l-2 border-blue-500',
+                    (!isActive || selectMode) && 'border-l-2 border-transparent',
+                    selectMode && isChecked && 'bg-blue-50 dark:bg-blue-500/[0.08]',
                     isNew && 'animate-slide-in',
                   )}>
-                  <div className="mt-0.5">
-                    {agentStatus[session.id] && agentStatus[session.id] !== 'idle'
-                      ? <div className="w-[13px] h-[13px] rounded-full border-2 border-blue-500 border-t-transparent animate-spin shrink-0" />
-                      : creatorIcon(session.creator)}
-                  </div>
+                  {selectMode ? (
+                    <input
+                      type="checkbox"
+                      className="mt-1 w-3 h-3 accent-blue-500 cursor-pointer shrink-0"
+                      checked={isChecked}
+                      onChange={() => toggleSessionSelected(session.id)}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  ) : (
+                    <div className="mt-0.5">
+                      {agentStatus[session.id] && agentStatus[session.id] !== 'idle'
+                        ? <div className="w-[13px] h-[13px] rounded-full border-2 border-blue-500 border-t-transparent animate-spin shrink-0" />
+                        : creatorIcon(session.creator)}
+                    </div>
+                  )}
                   <div className="flex-1 min-w-0">
                     <span className={cn('text-xs font-medium truncate block',
-                      isActive ? 'text-blue-700 dark:text-blue-300' : 'text-slate-700 dark:text-slate-300')}>
+                      isActive && !selectMode ? 'text-blue-700 dark:text-blue-300' : 'text-slate-700 dark:text-slate-300')}>
                       {session.title || session.id.slice(0, 12)}
                     </span>
                     <div className="flex items-center gap-1.5 mt-0.5">
@@ -301,7 +429,7 @@ export const SessionList: React.FC<{
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
                     <span className="text-[11px] text-slate-400 tabular-nums">{relativeTime(session.created_at)}</span>
-                    {onDeleteSession && (
+                    {!selectMode && onDeleteSession && (
                       <button onClick={(e) => { e.stopPropagation(); onDeleteSession(session.id); }}
                         className="p-0.5 rounded opacity-100 md:opacity-0 md:group-hover:opacity-100 hover:bg-red-100 dark:hover:bg-red-500/10 text-slate-400 hover:text-red-500 transition-all"
                         title="Delete session">
@@ -313,14 +441,15 @@ export const SessionList: React.FC<{
               );
             })}
           </div>
-        ))}
+          );
+        })}
       </div>
 
       {/* ─── MISSIONS section ─── */}
       <SectionHeader title="Missions" open={missionsOpen} onToggle={() => setMissionsOpen(!missionsOpen)} action={
         <div className="flex items-center gap-0.5">
           {onOpenSettings && (
-            <button onClick={() => onOpenSettings('missions')}
+            <button onClick={() => onOpenSettings('mission')}
               className="p-0.5 rounded hover:bg-slate-200 dark:hover:bg-white/10 text-slate-400 hover:text-blue-500 transition-colors" title="Mission settings">
               <Settings size={11} />
             </button>
