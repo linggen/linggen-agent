@@ -62,7 +62,7 @@ fn memory_capability() -> Capability {
         tools: vec![
             CapabilityTool {
                 name: "Memory_add".to_string(),
-                description: "Store a new fact in memory. Use for durable, scoped info worth recalling in future unrelated sessions — identity, preferences, decisions with reasoning, failed attempts, symptom-indexed fixes. Not for activity logs or conversation micro-details.".to_string(),
+                description: "Store a new fact in memory. Auto-dedups server-side: if a near-duplicate of the same type already exists, the new content merges into it (contexts/tags unioned, longer content kept) and the response is `{action: \"merged\", similarity, previous_id, fact}` instead of `{action: \"added\", fact}`. Use for durable, scoped info worth recalling in future unrelated sessions — identity, preferences, decisions, tried/fixed/learned, things built. Not for activity logs or conversation micro-details. Pass `skip_dedup: true` only when the caller is running its own merge logic (e.g. a scan pipeline that also needs to delete-and-replace contradicting rows).".to_string(),
                 tier: PermissionMode::Edit,
                 args_schema: json!({
                     "type": "object",
@@ -75,7 +75,8 @@ fn memory_capability() -> Capability {
                         "outcome":    {"type": "string", "enum": ["positive", "negative", "neutral"], "description": "Only meaningful for action-flavored types (tried, fixed)."},
                         "cwd":        {"type": "string", "description": "Working directory where the fact was produced."},
                         "occurred_at":{"type": "string", "description": "RFC-3339 timestamp of the described event."},
-                        "source_session":{"type": "string", "description": "Opaque session id the fact was extracted from."}
+                        "source_session":{"type": "string", "description": "Opaque session id the fact was extracted from."},
+                        "skip_dedup": {"type": "boolean", "description": "Skip server-side merge-into-near-duplicate. Default false. Set to true when the caller is running its own dedup pass."}
                     },
                     "required": ["content"]
                 }),
@@ -92,7 +93,7 @@ fn memory_capability() -> Capability {
             },
             CapabilityTool {
                 name: "Memory_search".to_string(),
-                description: "Semantic search across stored facts. Use when the query is fuzzy or you want relevance ranking. Always run this before Memory_add to dedup.".to_string(),
+                description: "Semantic search across stored facts. Use when the query is fuzzy or you want relevance ranking. No longer needed as a dedup precheck — Memory_add handles that server-side.".to_string(),
                 tier: PermissionMode::Read,
                 args_schema: json!({
                     "type": "object",
