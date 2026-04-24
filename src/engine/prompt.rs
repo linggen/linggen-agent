@@ -76,6 +76,21 @@ impl AgentEngine {
             .as_ref()
             .is_some_and(|s| s.app.is_some());
 
+        // Hoist the first paragraph of the spec body (typically "You are X — <short
+        // self-description>") into the ## Identity block. Keeps the agent's name
+        // alive in app-skill / consumer sessions where the rest of the body is stripped,
+        // and labels personality traits with a section header for scan/debug clarity.
+        let spec_body_full = self.spec_system_prompt.as_deref().map(str::trim).unwrap_or("");
+        let (identity_preface, body_rest) = {
+            let (head, tail) = spec_body_full.split_once("\n\n").unwrap_or((spec_body_full, ""));
+            let head_trim = head.trim();
+            if head_trim.is_empty() || head_trim.len() > 300 {
+                ("", spec_body_full)
+            } else {
+                (head_trim, tail.trim_start())
+            }
+        };
+
         let body = if is_app_skill || self.prompt_profile.consumer_frame {
             // App skills: skill content becomes the primary prompt.
             // Consumer sessions: agent spec body describes owner capabilities
@@ -83,24 +98,25 @@ impl AgentEngine {
             // Skip it — the consumer frame in build_stable_system_content
             // provides appropriate instructions.
             String::new()
+        } else if body_rest.is_empty() && identity_preface.is_empty() {
+            self.prompt_store
+                .render_or_fallback(keys::SYSTEM_FALLBACK_IDENTITY, &[])
         } else {
-            self.spec_system_prompt
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    self.prompt_store
-                        .render_or_fallback(keys::SYSTEM_FALLBACK_IDENTITY, &[])
-                })
+            body_rest.to_string()
         };
 
-        let mut prompt = if personality.is_empty() {
-            body
-        } else if body.is_empty() {
-            personality.trim().to_string()
-        } else {
-            format!("{}\n\n{}", personality.trim(), body)
+        let identity_block = match (identity_preface.is_empty(), personality.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => format!("## Identity\n\n{}", identity_preface),
+            (true, false) => format!("## Identity\n\n{}", personality.trim()),
+            (false, false) => format!("## Identity\n\n{}\n\n{}", identity_preface, personality.trim()),
+        };
+
+        let mut prompt = match (identity_block.is_empty(), body.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => identity_block,
+            (true, false) => body,
+            (false, false) => format!("{}\n\n{}", identity_block, body),
         };
 
         // Don't list available skills for app skill sessions — the model
@@ -384,13 +400,6 @@ impl AgentEngine {
                         crate::prompts::keys::RESPONSE_FORMAT_NATIVE_RULES_BASE,
                     ) {
                         system.push_str(r);
-                    }
-                    if tool_allowed("Task") {
-                        if let Some(t) = self.prompt_store.get(
-                            crate::prompts::keys::RESPONSE_FORMAT_NATIVE_RULES_TASK,
-                        ) {
-                            system.push_str(t);
-                        }
                     }
                 }
             } else {

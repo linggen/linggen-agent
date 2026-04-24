@@ -62,7 +62,7 @@ fn memory_capability() -> Capability {
         tools: vec![
             CapabilityTool {
                 name: "Memory_add".to_string(),
-                description: "Store a new fact in memory. Auto-dedups server-side: if a near-duplicate of the same type already exists, the new content merges into it (contexts/tags unioned, longer content kept) and the response is `{action: \"merged\", similarity, previous_id, fact}` instead of `{action: \"added\", fact}`. Use for durable, scoped info worth recalling in future unrelated sessions — identity, preferences, decisions, tried/fixed/learned, things built. Not for activity logs or conversation micro-details. Pass `skip_dedup: true` only when the caller is running its own merge logic (e.g. a scan pipeline that also needs to delete-and-replace contradicting rows).".to_string(),
+                description: "Store a new memory fact. Memory is how the agent grows up — a deepening model of WHO the user is, not a log of what was done. Save only if a future session (any project, months from now) would make better predictions about this user because the fact exists. Primary types to emit: `fact` (user identity / goals), `preference` (commitment-language behavioral rule), `decision` (cross-project reasoning), `learned` (cross-project tech gotcha). Deprecated (emit only in narrow cases): `tried` / `fixed` / `built` — project-specific bug fixes, daily activity, and single-session attempts belong in git log, not memory. Route project-specific implementation detail to suggest_claude_md at the skill level, never via this tool. Auto-dedups server-side: near-duplicates merge instead of inserting (returns `{action: \"merged\", similarity, previous_id, fact}`). Pass `skip_dedup: true` only from a scan pipeline running its own dedup pass.".to_string(),
                 tier: PermissionMode::Edit,
                 args_schema: json!({
                     "type": "object",
@@ -70,11 +70,11 @@ fn memory_capability() -> Capability {
                         "content":    {"type": "string", "description": "The fact text. Self-contained; include scoping conditions inline if they matter."},
                         "contexts":   {"type": "array", "items": {"type": "string"}, "description": "Scope tags (e.g. [\"code/linggen\", \"trip-japan-2026\"]). Free-form; N:M with facts."},
                         "tags":       {"type": "array", "items": {"type": "string"}, "description": "Free-form metadata with prefix convention (e.g. \"topic:ui\", \"person:maria\")."},
-                        "type":       {"type": "string", "enum": ["fact", "preference", "decision", "tried", "fixed", "learned", "built"], "description": "Canonical fact type."},
+                        "type":       {"type": "string", "enum": ["fact", "preference", "decision", "tried", "fixed", "learned", "built"], "description": "Canonical fact type. Prefer `fact` / `preference` / `decision` / `learned` for new writes. `tried` / `fixed` / `built` are deprecated — emit only for trajectory-level patterns, cross-project diagnostic wisdom, or named shippable artifacts tied to user identity. See the memory skill's extractor-prompt.md for the full routing rules."},
                         "from":       {"type": "string", "enum": ["user", "agent", "derived"], "description": "Origin. Defaults to derived."},
-                        "outcome":    {"type": "string", "enum": ["positive", "negative", "neutral"], "description": "Only meaningful for action-flavored types (tried, fixed)."},
+                        "outcome":    {"type": "string", "enum": ["positive", "negative", "neutral"], "description": "Only meaningful for `tried` / `fixed` (deprecated action-flavored types). Omit for `fact` / `preference` / `decision` / `learned`."},
                         "cwd":        {"type": "string", "description": "Working directory where the fact was produced."},
-                        "occurred_at":{"type": "string", "description": "RFC-3339 timestamp of the described event."},
+                        "occurred_at":{"type": "string", "description": "RFC-3339 timestamp of the described event. Omit if unknown."},
                         "source_session":{"type": "string", "description": "Opaque session id the fact was extracted from."},
                         "skip_dedup": {"type": "boolean", "description": "Skip server-side merge-into-near-duplicate. Default false. Set to true when the caller is running its own dedup pass."}
                     },
@@ -103,7 +103,7 @@ fn memory_capability() -> Capability {
                         "type":     {"type": "string", "enum": ["fact", "preference", "decision", "tried", "fixed", "learned", "built"]},
                         "from":     {"type": "string", "enum": ["user", "agent", "derived"]},
                         "outcome":  {"type": "string", "enum": ["positive", "negative", "neutral"]},
-                        "since":    {"type": "string", "description": "RFC-3339 lower bound on effective timestamp."},
+                        "since":    {"type": "string", "description": "RFC-3339 lower bound on effective timestamp. Omit to skip."},
                         "limit":    {"type": "integer", "description": "Max rows to return. Defaults to 10."}
                     },
                     "required": ["query"]
@@ -120,8 +120,8 @@ fn memory_capability() -> Capability {
                         "type":     {"type": "string", "enum": ["fact", "preference", "decision", "tried", "fixed", "learned", "built"]},
                         "from":     {"type": "string", "enum": ["user", "agent", "derived"]},
                         "outcome":  {"type": "string", "enum": ["positive", "negative", "neutral"]},
-                        "since":    {"type": "string"},
-                        "until":    {"type": "string"},
+                        "since":    {"type": "string", "description": "RFC-3339 lower bound. Omit to skip."},
+                        "until":    {"type": "string", "description": "RFC-3339 upper bound. Omit to skip."},
                         "sort":     {"type": "string", "enum": ["newest", "oldest"], "description": "Defaults to newest."},
                         "limit":    {"type": "integer", "description": "Max rows to return. Defaults to 50."},
                         "offset":   {"type": "integer", "description": "Skip this many rows in sort order. Pairs with limit for pagination."}
@@ -171,8 +171,8 @@ fn memory_capability() -> Capability {
                         "type":     {"type": "string"},
                         "from":     {"type": "string"},
                         "outcome":  {"type": "string"},
-                        "since":    {"type": "string"},
-                        "until":    {"type": "string"}
+                        "since":    {"type": "string", "description": "RFC-3339 lower bound. Omit to skip."},
+                        "until":    {"type": "string", "description": "RFC-3339 upper bound. Omit to skip."}
                     },
                     "required": []
                 }),

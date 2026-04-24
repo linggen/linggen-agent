@@ -842,6 +842,22 @@ pub fn effective_mode_for_path(path_modes: &[PathMode], target: &Path) -> Option
     best.map(|(pm, _)| pm.mode.clone())
 }
 
+/// Effective mode with zone-based defaults. Explicit path grants win; if no
+/// grant covers the target and it lies in the Temp zone (`/tmp`, `/var/tmp`,
+/// `%TEMP%`), fall back to `Edit` — scratch space is always writable per
+/// `permission-spec.md` §"Path zones". Home and System zones have no default
+/// grant and return `None` here, so the UI badge shows `read` and the
+/// permission check prompts as usual.
+pub fn effective_mode_with_zone(path_modes: &[PathMode], target: &Path) -> Option<PermissionMode> {
+    if let Some(m) = effective_mode_for_path(path_modes, target) {
+        return Some(m);
+    }
+    if path_zone(target) == PathZone::Temp {
+        return Some(PermissionMode::Edit);
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Action tier for non-Bash tools
 // ---------------------------------------------------------------------------
@@ -1096,8 +1112,10 @@ pub fn check_permission(
     // session already has a grant covering the target path that satisfies
     // the required tier (e.g. a skill's `permission: admin on ~/.linggen`),
     // allow without prompting — the user already approved this grant when
-    // activating the skill.
-    if let Some(mode) = effective_mode_for_path(&session_perms.path_modes, &target_path) {
+    // activating the skill. Temp-zone paths (/tmp, /var/tmp) get an implicit
+    // Edit grant via effective_mode_with_zone — scratch space is always
+    // writable per permission-spec.md §"Path zones".
+    if let Some(mode) = effective_mode_with_zone(&session_perms.path_modes, &target_path) {
         if action_tier <= mode {
             return PermissionCheckResult::Allowed;
         }
@@ -1158,8 +1176,8 @@ pub fn check_permission(
         }
     }
 
-    // 6. Find effective mode for target path
-    let effective_mode = effective_mode_for_path(&session_perms.path_modes, &target_path);
+    // 6. Find effective mode for target path (with zone-based defaults)
+    let effective_mode = effective_mode_with_zone(&session_perms.path_modes, &target_path);
 
     match effective_mode {
         Some(ref mode) if action_tier <= *mode => {
@@ -1721,6 +1739,103 @@ mod tests {
             );
             assert_eq!(result, Some(PermissionMode::Read));
         }
+    }
+
+    #[test]
+    fn test_effective_mode_with_zone_temp_implicit_edit() {
+        let modes: Vec<PathMode> = vec![];
+        // No grants, but Temp zone implicitly grants Edit.
+        assert_eq!(
+            effective_mode_with_zone(&modes, Path::new("/tmp/arcadegame/index.html")),
+            Some(PermissionMode::Edit),
+        );
+        assert_eq!(
+            effective_mode_with_zone(&modes, Path::new("/var/tmp/build")),
+            Some(PermissionMode::Edit),
+        );
+        // macOS /private/tmp alias.
+        assert_eq!(
+            effective_mode_with_zone(&modes, Path::new("/private/tmp/scratch")),
+            Some(PermissionMode::Edit),
+        );
+    }
+
+    #[test]
+    fn test_effective_mode_with_zone_home_no_grant_returns_none() {
+        let modes: Vec<PathMode> = vec![];
+        if let Some(home) = dirs::home_dir() {
+            // Home zone with no grant → None (UI falls back to "read").
+            assert_eq!(
+                effective_mode_with_zone(&modes, &home.join("other-project/file.rs")),
+                None,
+            );
+        }
+        // System zone with no grant → None (per-action prompt path).
+        assert_eq!(
+            effective_mode_with_zone(&modes, Path::new("/etc/hosts")),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_effective_mode_with_zone_explicit_grant_wins() {
+        // An explicit grant (even Read) takes precedence over the zone default.
+        // This lets users downgrade /tmp if they want, and prevents surprise
+        // elevation when a grant already exists.
+        let modes = vec![
+            PathMode { path: "/tmp/sandbox".to_string(), mode: PermissionMode::Read },
+        ];
+        assert_eq!(
+            effective_mode_with_zone(&modes, Path::new("/tmp/sandbox/x")),
+            Some(PermissionMode::Read),
+        );
+        // Sibling path without a grant still gets the Temp default.
+        assert_eq!(
+            effective_mode_with_zone(&modes, Path::new("/tmp/other/y")),
+            Some(PermissionMode::Edit),
+        );
+    }
+
+    #[test]
+    fn test_check_permission_temp_zone_auto_allows_write() {
+        // Core UX fix: agent writes to /tmp without prompting, regardless of
+        // session cwd or existing grants. Scratch space is always writable
+        // per permission-spec.md §"Path zones".
+        let sp = SessionPermissions::default();
+        let deny: Vec<String> = vec![];
+        let ask: Vec<String> = vec![];
+        let cwd = dirs::home_dir().unwrap_or_default();
+
+        let result = check_permission(
+            "Write", None, Some("/tmp/arcadegame/index.html"),
+            &cwd, &sp, &deny, &ask, None,
+        );
+        assert!(matches!(result, PermissionCheckResult::Allowed));
+
+        // Edit on /var/tmp also auto-allowed.
+        let result = check_permission(
+            "Edit", None, Some("/var/tmp/build/out.o"),
+            &cwd, &sp, &deny, &ask, None,
+        );
+        assert!(matches!(result, PermissionCheckResult::Allowed));
+    }
+
+    #[test]
+    fn test_check_permission_temp_zone_admin_still_prompts() {
+        // Admin-tier actions (e.g. unknown bash commands) on /tmp still go
+        // through the normal ceiling check — Temp default is Edit, not Admin.
+        let sp = SessionPermissions::default();
+        let deny: Vec<String> = vec![];
+        let ask: Vec<String> = vec![];
+        let cwd = dirs::home_dir().unwrap_or_default();
+
+        let result = check_permission(
+            "Bash", Some("some-unknown-tool /tmp/foo"), None,
+            &cwd, &sp, &deny, &ask, None,
+        );
+        // Unknown bash command → Admin tier → prompt (session cwd is in Home zone,
+        // so this hits the ExceedsCeiling branch).
+        assert!(matches!(result, PermissionCheckResult::NeedsPrompt(_)));
     }
 
     #[test]

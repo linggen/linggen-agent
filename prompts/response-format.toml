@@ -146,15 +146,10 @@ text = '''
 For tasks with 3+ steps that you are actively executing, use UpdatePlan to show a progress checklist. Update item statuses as you complete each step. Status values: `pending`, `in_progress`, `completed`.'''
 
 [native_rules_base]
-description = "Closing rules — general rules always appended; the Task-delegation rule is added separately when Task is allowed."
+description = "Closing rules — general rules always appended. The Task-delegation rule lives in system-prompt.delegation_header (rendered together with the agent list) to avoid two back-to-back Task sections."
 text = '''
 
 ### Rules
 
 - Keep going until the task is fully resolved. Only signal done when you are confident the work is complete.
 - If you encounter an obstacle, try alternative approaches before giving up. Do not retry the same failing approach repeatedly.'''
-
-[native_rules_task]
-description = "Extra rule — appended to the Rules list when Task is in the allowed-tools set."
-text = '''
-- When delegating, use the Task tool with a concrete task description — do not just plan to delegate.'''

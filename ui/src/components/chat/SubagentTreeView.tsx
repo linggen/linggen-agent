@@ -27,8 +27,6 @@ export const SubagentTreeView: React.FC<{
           : entry.status === 'failed'
             ? 'text-red-500'
             : 'text-emerald-500';
-        const taskPreview = entry.task.length > 60 ? entry.task.slice(0, 57) + '…' : entry.task;
-
         const statusSuffix = isRunning
           ? ' — running…'
           : entry.status === 'failed'
@@ -46,7 +44,6 @@ export const SubagentTreeView: React.FC<{
               <span className="shrink-0">&nbsp;&nbsp;</span>
               <span className={cn('text-[11px] mr-0.5', bulletColor, isRunning && 'animate-pulse')}>⏺</span>
               <span className="text-cyan-600 dark:text-cyan-400 font-semibold">{entry.subagentId || entry.agentName || 'Task'}</span>
-              <span className="text-slate-700 dark:text-slate-200">({taskPreview})</span>
               <span className={cn('text-[11px] ml-1', statusColor)}>{statusSuffix}</span>
             </div>
 

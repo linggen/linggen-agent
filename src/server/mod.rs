@@ -1444,6 +1444,7 @@ async fn prepare_server(
         .route("/api/storage/roots", get(storage_roots))
         .route("/api/storage/tree", get(storage_tree))
         .route("/api/storage/file", get(storage_read_file).put(storage_write_file).delete(storage_delete_file))
+        .route("/apps/{skill_name}/capability/{tool_name}", post(capability_dispatch))
         .route("/apps/{skill_name}/{*file_path}", get(serve_app_file))
         .fallback(static_handler)
         .with_state(state.clone());
@@ -1497,6 +1498,57 @@ pub async fn start_server(
     let handle = prepare_server(manager, skill_manager, host, port, dev_mode, agent_events_rx).await?;
     handle.task.await??;
     Ok(())
+}
+
+/// Dispatch a capability tool on behalf of a skill's webpage.
+/// Route: POST /apps/{skill_name}/capability/{tool_name}
+///
+/// The same pipeline the agent uses (`capability_tools::dispatch`) —
+/// URL resolution from `implements:`, autostart on first miss, envelope
+/// unwrap. The skill's webpage gets tier-stable tool names instead of
+/// hard-coding the skill daemon's URL paths, and the call rides the
+/// existing WebRTC fetch proxy in remote mode (control channel forwards
+/// `/apps/*` to the host's linggen server).
+async fn capability_dispatch(
+    State(state): State<Arc<ServerState>>,
+    axum::extract::Path((skill_name, tool_name)): axum::extract::Path<(String, String)>,
+    body: Option<axum::Json<serde_json::Value>>,
+) -> Response {
+    use crate::engine::{capabilities, capability_tools};
+    use axum::http::StatusCode;
+
+    let args = body.map(|axum::Json(v)| v).unwrap_or(serde_json::Value::Object(Default::default()));
+
+    let Some((cap_name, _tool)) = capabilities::capability_for_tool(&tool_name) else {
+        return (StatusCode::NOT_FOUND, format!("Unknown capability tool '{}'", tool_name)).into_response();
+    };
+
+    let Some(skill) = state.skill_manager.get_skill(&skill_name).await else {
+        return (StatusCode::NOT_FOUND, format!("Skill '{}' not found", skill_name)).into_response();
+    };
+
+    // Scope: a skill's webpage can only invoke its own tools. Prevents the
+    // discord skill's page from invoking Memory_delete via this route.
+    let provides = skill
+        .provides
+        .as_ref()
+        .map(|v| v.iter().any(|c| c == cap_name))
+        .unwrap_or(false);
+    if !provides {
+        return (
+            StatusCode::FORBIDDEN,
+            format!("Skill '{}' does not provide capability '{}'", skill_name, cap_name),
+        )
+            .into_response();
+    }
+
+    match capability_tools::dispatch(&state.skill_manager, &tool_name, args).await {
+        Ok(data) => axum::Json(data).into_response(),
+        Err(e) => {
+            let msg = format!("{:#}", e);
+            (StatusCode::BAD_GATEWAY, msg).into_response()
+        }
+    }
 }
 
 /// Serve static files from an app-enabled skill's directory.

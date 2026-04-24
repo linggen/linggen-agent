@@ -313,12 +313,11 @@ pub async fn build_page_state(
                 .or_else(|| ctx.project_root.clone().filter(|s| !s.is_empty()));
 
             if let Some(ref root) = effective_root {
-                // Mode at session root. Falls back to the highest granted mode
-                // across any path_mode when the root has no direct grant — so
-                // skills that grant admin on subpaths (e.g. ~/.linggen) still
-                // show "admin" in the session header.
-                let mode = crate::engine::permission::effective_mode_for_path(&perms.path_modes, std::path::Path::new(root))
-                    .or_else(|| perms.path_modes.iter().map(|pm| pm.mode.clone()).max());
+                // Mode at session root, with zone-based defaults: Temp zone
+                // (/tmp, /var/tmp) implicitly grants edit. If no grant covers
+                // the cwd and it's not Temp, returns None → UI falls back to
+                // "read", matching permission-spec.md §"Directory changes".
+                let mode = crate::engine::permission::effective_mode_with_zone(&perms.path_modes, std::path::Path::new(root));
                 if let Some(mode) = mode {
                     perm_val.as_object_mut().map(|m| m.insert("effective_mode".to_string(), serde_json::Value::String(mode.to_string())));
                 }

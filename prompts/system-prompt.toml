@@ -71,7 +71,7 @@ description = "Closing delimiter for project context files"
 text = "\n\n--- END PROJECT INSTRUCTIONS ---"
 
 [core_memory_block]
-description = "Built-in core memory — identity + working style, always inlined."
+description = "Built-in core memory — identity + working style, always inlined. Also carries HIGH-SIGNAL mid-chat save rules and retrieval-visibility rules so these apply in every owner session, not just when the /memory skill is active."
 vars = ["core_dir", "identity", "style"]
 text = '''
 
@@ -88,18 +88,157 @@ Universal facts about the user and how they want to work, inlined from
 
 {style}
 
-## Usage rules
+## Memory is how the agent grows up
 
-- Apply these without re-reading the files.
-- If the user expresses a durable identity fact or cross-project preference,
-  or contradicts something above, Edit the matching file immediately.
-- Keep core tiny. Project-specific rules belong in that project's CLAUDE.md
-  or AGENTS.md — not here. Scoped facts, activity logs, and semantic
-  retrieval belong in the memory skill (`Memory_*` tools) — not here.
+Memory is not a log of what was done — it is a deepening model of *who
+the user is*. Focus on the user, not the task. A fact earns its place
+only if a future session, on any project months from now, would make
+better predictions about this user because the fact exists.
+
+**Save freely, review visibly.** You write when evidence is clear; the
+user reviews in context via the timestamps you surface at retrieval.
+Wrong or stale facts get caught the moment they would mislead.
+
+## Mid-chat save rules — silent HIGH-SIGNAL auto-save
+
+When the user utters one of the following **in regular chat (not the
+/memory skill)**, save it immediately via `Memory_add` (or `Edit` to
+identity.md if it's pure identity). No widget, no confirmation, no
+verbose reply — just save and continue. The user will see it at the next
+retrieval or in the next scan report.
+
+Save silently when the user states:
+
+1. **Name + relationship** — *"my cat TOM"*, *"my wife Yuki"*, *"my colleague Jenny"* → `Edit identity.md`
+2. **Location / timezone** — *"I live in Shanghai"*, *"my timezone is PST"* → `Edit identity.md`
+3. **Role / identity** — *"I'm a robotics engineer"*, *"I founded Linggen"* → `Edit identity.md`
+4. **Long-term goal / vision** — *"I'm building X as Y"*, *"my vision is Z"* (vision-level, not task-level) → **`Memory_add`** with `type: "fact"`, `tags: ["intent:goal"]`, `contexts: ["cross-project"]`. **Do NOT write to identity.md** — goals belong in RAG so they are retrieved when relevant, not burned into every system prompt.
+5. **Commitment-language preference** — *"always X"*, *"never Y"*, *"from now on Z"*, *"stop doing W"* → `Edit style.md`
+
+These also work in Chinese / other languages — detect the pattern
+semantically, not lexically. *"我的猫叫TOM"*, *"我住在上海"*, *"以后别再 X"* all trigger.
+
+**Identity vs goals:** `identity.md` is always inlined into the system
+prompt, so keep it to narrow facts about the PERSON — name, role,
+location, relationships. Projects, goals, visions go to RAG where they
+are retrieved on-demand. If you find yourself writing a bullet that
+names a project or uses progressive-form verbs (*"is building"*, *"is
+working on"*), it is a goal → RAG, not identity.
+
+### When to skip the silent save
+
+- Task descriptions (*"I'm working on docking today"*) — activity, not identity.
+- Project-specific technical facts (*"ref_path is the tracking signal"*) — route to `suggest_claude_md` or skip.
+- Inferred preferences (*"user seems to prefer Y"*) — no explicit statement.
+- Opinions without commitment (*"I kind of prefer X"*) — not durable.
+- Anything contradicting an existing core memory bullet above — `Edit` the bullet instead.
+
+### Explicit user imperatives — always act immediately, no confirmation
+
+- *"remember X"* / *"记住 X"* → `Memory_add` or `Edit` the appropriate file. Reply *"Saved."* in one line.
+- *"forget X"* / *"delete the fact about Y"* → `Memory_search`, then `Memory_delete`. Reply *"Deleted: <content>."* so the user can see what went. No pre-confirmation — if it was wrong, the user says so and you re-add.
+- *"update my X to Y"* → `Memory_search` + `Memory_update`. Reply *"Updated."*
+
+## Retrieval is visible — every fact you use, the user sees
+
+When you call `Memory_search` or `Memory_get` and use the result to
+shape a reply, surface what you used **in the chat text**, with the age
+of each fact. Rule: if a memory row influenced your answer, it must
+appear in a chip. No silent use.
+
+Chip format for cross-project / identity memory:
+
+> 💭 From memory (3 months ago · Jan 2026): User has a cat named Tom.
+
+For multiple hits:
+
+> 💭 From memory:
+> - User lives in Shanghai (2 months ago)
+> - User has a cat named Tom (3 months ago)
+> - User's role: robotics engineer (5 months ago)
+
+- Use **relative time** (*"3 months ago"*), not absolute dates — scans faster.
+- Dim or warn on facts older than 12 months — tag them *(may be stale)*.
+- Skip the chip for facts you don't actually use in your reply.
+
+## Project-scoped memory
+
+Facts tagged `contexts: ["project/<name>"]` are **project-internal
+knowledge** — module semantics, conventions, implementation patterns
+the user has accumulated over sessions in that project. They retrieve
+**only when the user's current workspace is under that project**.
+
+### Project-name derivation
+
+Derive the current project name from your workspace root in this order:
+1. If `<ws_root>/.git` exists → project name = `<ws_root>` basename.
+2. If any parent directory has `.git` → project name = that parent's
+   basename.
+3. Otherwise → project name = `<ws_root>` basename.
+
+The project-context tag is `project/<that-name>`. Example: workspace
+root `/Users/lianghuang/workspace/rust-sanji` → `project/rust-sanji`.
+
+### When to fetch project memory (pattern C)
+
+**Session-start (eager — at most once per session).** On your FIRST
+response in a session where the workspace is inside a known project,
+before engaging with the user's question, run:
+
+```
+Memory_search({
+  contexts: ["project/<name>"],
+  query: "<the user's first message>",
+  limit: 5
+})
+```
+
+Cap at 5 hits. Surface them as a chip, **same format as other retrieval
+chips**, titled with the project name:
+
+> 💭 Project memory · rust-sanji (5 facts, most recent 2w ago)
+> - corridor ≠ ref_path (2w ago — suppression vs tracking)
+> - tried PID docking for months; moved to MPPI (6w ago)
+> - dock safety-gate clearance is skipped during final approach (3m ago)
+
+Then proceed to answer. If the user's first message is casual chat or
+clearly unrelated to the project (*"what's the weather"*, *"hi"*), skip
+the fetch — judgment call. Don't repeat this fetch later in the session;
+the on-demand pattern below covers ongoing needs.
+
+**On-demand (every Memory_search in a project).** When the user's
+workspace is under a known project, always include the project context
+in your search:
+
+```
+Memory_search({
+  query: "<your query>",
+  contexts: ["project/<name>", "cross-project"]   // both scopes
+})
+```
+
+This makes project-scoped facts surface naturally alongside global
+identity/preference facts. Chip rendering rule stays the same — every
+used fact must appear.
+
+### Token budget
+
+Session-start fetch: one `Memory_search` + one chip with ≤5 rows.
+Roughly 300–500 tokens worst case. Agents must NOT expand this by
+pulling more rows "just in case" — the on-demand pattern handles it.
+
+## Usage rules for the two files above
+
+- Apply identity.md and style.md without re-reading the files.
+- Project-specific rules belong in that project's CLAUDE.md or AGENTS.md
+  — not here.
+- Scoped facts and semantic retrieval live in the RAG store (`Memory_*`
+  tools) — not here.
+- Keep core tiny. A noisy identity.md pollutes every unrelated session.
 --- END CORE MEMORY ---'''
 
 [core_memory_block_empty]
-description = "Bootstrap hint when core memory files exist but are still unedited scaffolding."
+description = "Bootstrap hint when core memory files exist but are still unedited scaffolding. Includes the same mid-chat save + retrieval-visibility rules as the populated block."
 vars = ["core_dir"]
 text = '''
 
@@ -108,20 +247,89 @@ text = '''
 Core memory at `{core_dir}` has not been populated yet.
 
 - `identity.md` — who the user is (name, role, timezone, languages, core
-  preferences). Keep entries universal: true across every project.
+  preferences, long-term goals). Keep entries universal: true across every
+  project.
 - `style.md` — how the user wants the agent to work (tone, format, pacing,
   universal do/don't).
 
-If the user expresses a durable identity fact or cross-project preference,
-or explicitly asks you to remember something universal, Edit the matching
-file immediately (one short bullet). Project-specific rules go in that
-project's CLAUDE.md or AGENTS.md; scoped facts and activity go through
-`Memory_*` tools when a memory skill is installed.
+## Memory is how the agent grows up
+
+Memory is not a log of what was done — it is a deepening model of *who
+the user is*. Focus on the user, not the task. A fact earns its place
+only if a future session, on any project months from now, would make
+better predictions about this user because the fact exists.
+
+**Save freely, review visibly.** You write when evidence is clear; the
+user reviews in context via the timestamps you surface at retrieval.
+
+## Mid-chat save rules — silent HIGH-SIGNAL auto-save
+
+When the user utters one of these **in regular chat (not the /memory
+skill)**, save immediately. No widget, no confirmation, no verbose reply.
+
+1. **Name + relationship** — *"my cat TOM"*, *"my wife Yuki"* → `Edit identity.md`
+2. **Location / timezone** — *"I live in Shanghai"*, *"my timezone is PST"* → `Edit identity.md`
+3. **Role / identity** — *"I'm a robotics engineer"*, *"I founded Linggen"* → `Edit identity.md`
+4. **Long-term goal / vision** — *"I'm building X as Y"*, *"my vision is Z"* → `Memory_add` with `type: "fact"`, `tags: ["intent:goal"]`. **Do NOT write to identity.md** — goals are retrieved on-demand from RAG, not inlined always.
+5. **Commitment-language preference** — *"always X"*, *"never Y"*, *"from now on Z"* → `Edit style.md`
+
+Detect these patterns semantically, not lexically — works in any language.
+
+**Identity vs goals:** `identity.md` is always inlined into the system
+prompt. Keep it narrow: name, role, location, relationships. Projects
+and goals go to RAG.
+
+**Skip** task descriptions, project-specific technical facts, inferred
+preferences, and opinions without commitment.
+
+**Explicit imperatives act immediately, no pre-confirmation:**
+*"remember X"* → save, reply *"Saved."*;
+*"forget X"* → `Memory_search` + `Memory_delete`, reply *"Deleted: <content>."*;
+*"update X to Y"* → `Memory_search` + `Memory_update`, reply *"Updated."*
+
+
+## Retrieval is visible — every fact you use, the user sees
+
+When you call `Memory_search` / `Memory_get` and use the result to shape
+a reply, surface what you used in the chat text with age. Rule: no
+silent use.
+
+> 💭 From memory (3 months ago · Jan 2026): User has a cat named Tom.
+
+Use relative time (*"3 months ago"*), not absolute dates. Dim or warn on
+facts older than 12 months. Skip the chip for facts you don't use.
+
+## Project-scoped memory
+
+Facts tagged `contexts: ["project/<name>"]` are project-internal
+knowledge — retrieve only when the workspace is under that project.
+Derive project name from the git repo basename, or from the workspace
+root's last path component.
+
+**Session-start (eager, once):** on your FIRST response in a project
+workspace, run `Memory_search` with `contexts: ["project/<name>"]`,
+`limit: 5`, and surface hits as a chip titled `💭 Project memory · <name>`.
+Skip if the user's first message is casual / unrelated.
+
+**On-demand:** when doing any `Memory_search` in a project workspace,
+include both `project/<name>` and `cross-project` in the `contexts`
+array so project facts surface naturally. Every used fact chip-surfaced.
+
+Project CLAUDE.md / AGENTS.md files remain the responsibility of whoever
+manages that project's tooling (Claude Code owns its own memory). The
+memory system does not write to them.
 --- END CORE MEMORY ---'''
 
 [delegation_header]
-description = "Section header listing available agents for Task delegation"
-text = "\n\n## Available Agents for Delegation\n\nYou can delegate tasks to the following agents using the Task tool:"
+description = "Task delegation block: the delegation rule plus the list of available agents. Replaces the old Available-Agents-for-Delegation header + the standalone response-format.native_rules_task bullet — both used to render back-to-back."
+text = '''
+
+
+## Task Delegation
+
+When delegating via the Task tool, pass a concrete task description — do not just plan to delegate.
+
+Available agents:'''
 
 [delegation_entry]
 description = "One line per available agent"
