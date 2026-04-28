@@ -1672,6 +1672,12 @@ pub(crate) async fn chat_handler(
                                                 if let Some(ref sdir) = engine.session_dir {
                                                     engine.session_permissions.save(sdir);
                                                 }
+                                                // Tell page_state to rebuild on the next 2s tick
+                                                // so the UI's mode pill reflects the skill grant
+                                                // immediately, instead of waiting for the chat
+                                                // task to finish (which is what currently emits
+                                                // the next StateUpdated).
+                                                let _ = ctx.events_tx.send(ServerEvent::StateUpdated);
                                             }
 
                                             // NOTE: we intentionally do NOT seed session cwd to

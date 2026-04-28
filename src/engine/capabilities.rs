@@ -62,7 +62,7 @@ fn memory_capability() -> Capability {
         tools: vec![
             CapabilityTool {
                 name: "Memory_query".to_string(),
-                description: "Read memory. Verb-dispatched: `get` (fetch one row by id), `search` (semantic search; ranked by relevance), `list` (filter-only browse, no semantic ranking — for audits or exact enumeration). Memory is the user's biography across sessions — durable identity, cross-project preferences, decisions with their reasoning, life context. Project-internal facts (code architecture, repo conventions) are NOT in memory — the agent reads the project's own files (source, the user's `AGENTS.md` / `CLAUDE.md` if any) directly when it needs that content.".to_string(),
+                description: "Read memory. Verb-dispatched: `get` (fetch one row by id), `search` (semantic search; ranked by relevance), `list` (filter-only browse, no semantic ranking — for audits or exact enumeration). Memory is the user's biography across sessions — durable identity, cross-project preferences, decisions with their reasoning, life context. Project-internal facts (code architecture, repo conventions) are NOT in memory — the agent reads the project's own files (source, the user's `AGENTS.md` / `CLAUDE.md` if any) directly when it needs that content.\n\n**All filters are optional and AND-combined; omit anything you aren't intentionally narrowing on.** Speculatively passing `from`, `outcome`, or a specific `type` is the #1 cause of empty results — most rows don't carry an `outcome`, and the user's actual data may not match the value you guessed. When unsure, start with just `verb` (+ `query` for search) and add filters only after you see what's there.".to_string(),
                 tier: PermissionMode::Read,
                 args_schema: json!({
                     "type": "object",
@@ -70,10 +70,10 @@ fn memory_capability() -> Capability {
                         "verb":     {"type": "string", "enum": ["get", "search", "list"], "description": "Read operation."},
                         "id":       {"type": "string", "description": "Required for verb=get. Fact UUID."},
                         "query":    {"type": "string", "description": "Required for verb=search. Natural-language description of what you're looking for."},
-                        "contexts": {"type": "array", "items": {"type": "string"}, "description": "Filter to these scope tags (AND semantics). For verb=search, narrows ranked results; for verb=list, primary filter."},
-                        "type":     {"type": "string", "enum": ["fact", "preference", "decision", "tried", "fixed", "learned", "built"], "description": "Filter by fact type."},
-                        "from":     {"type": "string", "enum": ["user", "agent", "derived"], "description": "Filter by origin."},
-                        "outcome":  {"type": "string", "enum": ["positive", "negative", "neutral"], "description": "Filter by outcome (for action-flavored types)."},
+                        "contexts": {"type": "array", "items": {"type": "string"}, "description": "Filter to these scope tags (AND semantics). For verb=search, narrows ranked results; for verb=list, primary filter. Omit to skip."},
+                        "type":     {"type": "string", "enum": ["fact", "preference", "decision", "tried", "fixed", "learned", "built"], "description": "Filter by fact type. Omit to return all types."},
+                        "from":     {"type": "string", "enum": ["user", "agent", "derived"], "description": "Filter by origin. Omit to skip — don't pass speculatively."},
+                        "outcome":  {"type": "string", "enum": ["positive", "negative", "neutral"], "description": "Filter by outcome. Most rows don't carry one; passing this almost always narrows the result. Omit to skip."},
                         "since":    {"type": "string", "description": "RFC-3339 lower bound on effective timestamp. Omit to skip."},
                         "until":    {"type": "string", "description": "RFC-3339 upper bound (verb=list only). Omit to skip."},
                         "sort":     {"type": "string", "enum": ["newest", "oldest"], "description": "verb=list only. Defaults to newest."},
