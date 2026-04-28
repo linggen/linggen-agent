@@ -43,17 +43,21 @@ const ChatDebugActions: React.FC<{ projectRoot?: string | null; sessionId?: stri
     const root = projectRoot || useSessionStore.getState().selectedProjectRoot || '';
     const agentId = useServerStore.getState().selectedAgent;
     const sid = sessionId || useSessionStore.getState().activeSessionId;
+    let url: URL | undefined;
     try {
-      const url = new URL('/api/chat/system-prompt', window.location.origin);
+      url = new URL('/api/chat/system-prompt', window.location.origin);
       url.searchParams.append('project_root', root);
       url.searchParams.append('agent_id', agentId);
       if (sid) url.searchParams.append('session_id', sid);
       const resp = await fetch(url.toString());
-      if (!resp.ok) throw new Error(`${resp.status}`);
+      if (!resp.ok) {
+        const bodyHint = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status}: ${bodyHint.slice(0, 200)}`);
+      }
       const payload = await resp.json();
       const promptText = payload.system_prompt || '';
       const tools = Array.isArray(payload.tools) ? payload.tools : [];
-      if (!promptText && tools.length === 0) throw new Error('empty');
+      if (!promptText && tools.length === 0) throw new Error('empty payload');
       // Combine the system prompt and the tool schemas so the copy shows the
       // full model-facing surface. Tool schemas travel via the native API
       // `tools` parameter, not the prompt text, but they are part of what the
@@ -63,13 +67,19 @@ const ChatDebugActions: React.FC<{ projectRoot?: string | null; sessionId?: stri
         : '';
       const text = `${promptText}${toolsSection}`;
       try { await navigator.clipboard.writeText(text); }
-      catch {
+      catch (clipErr) {
+        // Browser may block clipboard outside a user gesture (e.g. after the
+        // await round-trip) — fall back to the textarea+execCommand trick.
         const ta = document.createElement('textarea');
         ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
-        document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+        document.body.appendChild(ta); ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        if (!ok) throw new Error(`clipboard fallback failed: ${(clipErr as Error)?.message ?? 'unknown'}`);
       }
       setSpStatus('copied');
-    } catch {
+    } catch (err) {
+      console.error('[copy-system-prompt] failed:', err, { url: url?.toString() });
       setSpStatus('error');
     }
     setTimeout(() => setSpStatus('idle'), 1500);

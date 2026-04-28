@@ -97,7 +97,36 @@ pub(crate) async fn dispatch(
 
     let url = join_url(&impl_block.base_url, path);
 
-    match post_to_daemon(&url, &args).await {
+    // Strip "soft-empty" fields the model often fills in despite the
+    // schema saying they're optional. Empty string `""` for a datetime
+    // field crashes the daemon's serde parse; empty string for a filter
+    // narrows the result to 0 rows. Drop:
+    //   - empty strings
+    //   - empty arrays
+    //   - null
+    // Numeric and boolean values pass through (0 / false are meaningful).
+    if let Some(obj) = args.as_object_mut() {
+        obj.retain(|_, v| match v {
+            serde_json::Value::String(s) => !s.is_empty(),
+            serde_json::Value::Array(a) => !a.is_empty(),
+            serde_json::Value::Null => false,
+            _ => true,
+        });
+    }
+
+    // Log the full request body so failures (esp. "0 rows returned") are
+    // diagnosable from the linggen log without DC packet capture. The args
+    // are typically small JSON; a 200-char preview keeps log lines bounded.
+    let args_preview = serde_json::to_string(&args)
+        .unwrap_or_else(|_| "<unserializable>".to_string());
+    let args_preview = if args_preview.len() > 200 {
+        format!("{}…", &args_preview[..199])
+    } else {
+        args_preview
+    };
+    tracing::info!("capability dispatch → POST {url} body={args_preview}");
+
+    let result = match post_to_daemon(&url, &args).await {
         Ok(value) => Ok(value),
         Err(DispatchError::NoDaemon) => {
             autostart(provider.skill_dir.as_deref(), impl_block.autostart.as_deref())
@@ -111,7 +140,33 @@ pub(crate) async fn dispatch(
             post_to_daemon(&url, &args).await.map_err(Into::into)
         }
         Err(DispatchError::Other(e)) => Err(e),
+    };
+
+    match &result {
+        Ok(value) => {
+            // Surface response shape — for list/search this tells us at a
+            // glance whether the daemon returned 0 rows (model-filter bug)
+            // vs. an unexpected error envelope.
+            let summary = match value {
+                serde_json::Value::Array(a) => format!("array len={}", a.len()),
+                serde_json::Value::Object(o) => {
+                    let n = o.get("rows").and_then(|v| v.as_array()).map(|a| a.len());
+                    let err = o.get("error").and_then(|v| v.as_str());
+                    match (n, err) {
+                        (_, Some(e)) => format!("error={e}"),
+                        (Some(n), _) => format!("rows={n}"),
+                        _ => format!("object keys={:?}", o.keys().collect::<Vec<_>>()),
+                    }
+                }
+                serde_json::Value::Null => "null".to_string(),
+                _ => "scalar".to_string(),
+            };
+            tracing::info!("capability dispatch ← {tool_name}: {summary}");
+        }
+        Err(e) => tracing::warn!("capability dispatch ← {tool_name} failed: {e}"),
     }
+
+    result
 }
 
 /// Combine a skill's `base_url` with a per-tool path, tolerating a

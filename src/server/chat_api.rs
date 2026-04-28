@@ -181,21 +181,45 @@ pub(crate) async fn get_system_prompt_api(
     Query(query): Query<SystemPromptQuery>,
 ) -> impl IntoResponse {
     let sid = query.session_id.as_deref().unwrap_or("default");
-    // Skill iframes call this without project_root (they clear selectedProjectRoot
-    // so API calls use the session's cwd). Derive the root from session meta
-    // when the query omits it.
-    let root_str = if query.project_root.trim().is_empty() {
-        state.manager.global_sessions.get_session_meta(sid)
-            .ok()
-            .flatten()
-            .and_then(|m| m.cwd.clone().or(m.project.clone()))
-            .unwrap_or_else(|| "/".to_string())
-    } else {
-        query.project_root.clone()
-    };
-    let root = match PathBuf::from(&root_str).canonicalize() {
-        Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    // Resolve a usable filesystem root. Try, in order:
+    //   1. The query's `project_root` (when non-empty) — usually what the UI sends.
+    //   2. The session's stored `cwd` / `project` — for skill-embed sessions that
+    //      send empty project_root.
+    //   3. `"/"` — last-resort sentinel that always canonicalizes.
+    // We try canonicalize on each in turn instead of failing the first time it
+    // errors. A stale `selectedProjectRoot` in the UI (pointing at a deleted
+    // directory) used to 400 here; that's a session/UI staleness issue, not
+    // something the agent loop actually needs the user to fix before exporting
+    // the prompt.
+    let session_meta = state.manager.global_sessions.get_session_meta(sid).ok().flatten();
+    let mut candidates: Vec<String> = Vec::new();
+    let q_root = query.project_root.trim();
+    if !q_root.is_empty() {
+        candidates.push(q_root.to_string());
+    }
+    if let Some(ref m) = session_meta {
+        if let Some(cwd) = m.cwd.as_deref().filter(|s| !s.is_empty()) {
+            candidates.push(cwd.to_string());
+        }
+        if let Some(proj) = m.project.as_deref().filter(|s| !s.is_empty()) {
+            candidates.push(proj.to_string());
+        }
+    }
+    candidates.push("/".to_string());
+    let root = candidates
+        .iter()
+        .find_map(|p| PathBuf::from(p).canonicalize().ok())
+        .unwrap_or_else(|| PathBuf::from("/"));
+
+    // Skill-embed sessions render the chat sidebar with no project selection,
+    // so the frontend's selectedAgent is undefined and the query may carry
+    // `agent_id=` (empty) or `agent_id=undefined` (URLSearchParams stringifies
+    // `undefined` to the literal string). Default to the canonical "ling"
+    // agent — there's only one agent in the registry; this avoids a 404 on
+    // the Copy button regardless of how the frontend serialized "no agent".
+    let agent_id = match query.agent_id.trim() {
+        "" | "undefined" | "null" => "ling",
+        other => other,
     };
 
     // Build the prompt on a throwaway engine instead of locking the live one.
@@ -204,9 +228,9 @@ pub(crate) async fn get_system_prompt_api(
     // out and leave the Copy-System-Prompt button silently unusable while the
     // agent is working. A fresh engine yields the same prompt (same spec,
     // same skill, same memory, same tool schemas) without touching live state.
-    let mut engine = match state.manager.spawn_delegation_engine(&root, &query.agent_id).await {
+    let mut engine = match state.manager.spawn_delegation_engine(&root, agent_id).await {
         Ok(e) => e,
-        Err(_) => return (StatusCode::NOT_FOUND, format!("Agent '{}' not found", query.agent_id)).into_response(),
+        Err(_) => return (StatusCode::NOT_FOUND, format!("Agent '{}' not found", agent_id)).into_response(),
     };
 
     // Apply session-bound skill or mission so the exported prompt matches
@@ -536,6 +560,20 @@ async fn run_skill_dispatch(
 
     let interrupt_key = wire_interrupt_channel(ctx, engine).await;
     wire_ask_user_bridge(&ctx.state, engine, ctx.session_id.clone());
+
+    // Hydrate session_permissions from permission.json BEFORE the prompt gate.
+    // run_agent_loop normally does this (engine/mod.rs:79), but it runs *after*
+    // the gate — so without this preload, the gate sees the engine's default
+    // (unlocked) state and re-prompts the user every time, even after they
+    // already approved in a prior turn and the trusted policy was persisted
+    // to disk.
+    if let Some(ref sid) = ctx.session_id {
+        let sdir = crate::paths::global_sessions_dir().join(sid);
+        engine.session_permissions = crate::engine::permission::SessionPermissions::load(&sdir);
+        if engine.session_dir.is_none() {
+            engine.session_dir = Some(sdir);
+        }
+    }
 
     // Skill permission approval — prompt user if skill declares permission requirements.
     // Consumer sessions are locked — skills run with the permissions already set by SessionPolicy.

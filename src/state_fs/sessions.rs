@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 /// Flat-file session and chat message store.
 ///
@@ -15,6 +16,7 @@ use std::path::PathBuf;
 /// ```
 pub struct SessionStore {
     sessions_dir: PathBuf,
+    append_lock: Mutex<()>,
 }
 
 fn default_creator() -> String {
@@ -66,7 +68,7 @@ pub struct ChatMsg {
 impl SessionStore {
     /// Create a store with an explicit sessions directory (for ProjectStore).
     pub fn with_sessions_dir(sessions_dir: PathBuf) -> Self {
-        Self { sessions_dir }
+        Self { sessions_dir, append_lock: Mutex::new(()) }
     }
 
     // ------------------------------------------------------------------
@@ -222,12 +224,14 @@ impl SessionStore {
         let dir = self.session_dir(session_id);
         fs::create_dir_all(&dir)?;
         let msgs_path = dir.join("messages.jsonl");
-        let line = serde_json::to_string(msg)?;
+        let mut line = serde_json::to_string(msg)?;
+        line.push('\n');
+        let _guard = self.append_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(msgs_path)?;
-        writeln!(file, "{}", line)?;
+        file.write_all(line.as_bytes())?;
         Ok(())
     }
 
