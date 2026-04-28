@@ -803,28 +803,33 @@ fn classify_compound_command(cmd: &str) -> BashClass {
 // Effective mode lookup
 // ---------------------------------------------------------------------------
 
+/// Expand a leading `~` (or `~/`) to the user's home directory. Returns the
+/// input unchanged for paths that don't start with `~`, or when the home dir
+/// can't be resolved. Both grant paths and the target must run through this
+/// before string comparison — mission sessions persist `cwd` and grants in
+/// raw `~/...` form, so expanding only one side silently drops the match.
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().to_string();
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home.to_string_lossy().to_string();
+        }
+    }
+    path.to_string()
+}
+
 /// Find the effective permission mode for a target path by checking path_modes.
 /// Returns the mode from the most specific (longest) matching path.
 /// Returns `None` if no grant covers the target path.
 pub fn effective_mode_for_path(path_modes: &[PathMode], target: &Path) -> Option<PermissionMode> {
-    let target_str = target.to_string_lossy();
+    let target_str = expand_tilde(&target.to_string_lossy());
     let mut best: Option<(&PathMode, usize)> = None;
 
     for pm in path_modes {
-        // Expand ~ to home dir for comparison
-        let grant_path = if pm.path.starts_with("~/") {
-            if let Some(home) = dirs::home_dir() {
-                home.join(&pm.path[2..]).to_string_lossy().to_string()
-            } else {
-                pm.path.clone()
-            }
-        } else if pm.path == "~" {
-            dirs::home_dir()
-                .map(|h| h.to_string_lossy().to_string())
-                .unwrap_or_else(|| pm.path.clone())
-        } else {
-            pm.path.clone()
-        };
+        let grant_path = expand_tilde(&pm.path);
 
         // Check if target starts with the grant path (grant covers children)
         if target_str.starts_with(&grant_path)
@@ -867,7 +872,7 @@ pub fn effective_mode_with_zone(path_modes: &[PathMode], target: &Path) -> Optio
 /// For Bash, use `classify_bash_command` instead. Resolution order:
 /// 1. Built-in engine tools — matched here by literal name.
 /// 2. Capability tools — tier comes from `engine::capabilities` (so
-///    `Memory_forget` is Admin, `Memory_search` is Read, etc.).
+///    `Memory_query` is Read, `Memory_write` is Edit).
 /// 3. Skill-unique tools — caller should resolve the tier from the
 ///    SkillToolDef's manifest `tier:` field via `parse_skill_tier`
 ///    before consulting this function.
@@ -1718,6 +1723,26 @@ mod tests {
     }
 
     #[test]
+    fn test_effective_mode_for_path_tilde_target() {
+        // Mission sessions persist `cwd` and grant paths in raw `~/...` form
+        // (see SessionMeta and SessionPermissions). The lookup must match
+        // when both sides are tilde-prefixed — historically only the grant
+        // was expanded, so `"~/.linggen".starts_with("/Users/x/.linggen")`
+        // returned false and the UI silently fell back to "read".
+        let modes = vec![
+            PathMode { path: "~/.linggen".to_string(), mode: PermissionMode::Admin },
+        ];
+        assert_eq!(
+            effective_mode_for_path(&modes, Path::new("~/.linggen")),
+            Some(PermissionMode::Admin),
+        );
+        assert_eq!(
+            effective_mode_for_path(&modes, Path::new("~/.linggen/sessions/x")),
+            Some(PermissionMode::Admin),
+        );
+    }
+
+    #[test]
     fn test_effective_mode_most_specific_wins() {
         let modes = vec![
             PathMode { path: "~/workspace".to_string(), mode: PermissionMode::Read },
@@ -1872,9 +1897,8 @@ mod tests {
     fn test_capability_tool_tier_comes_from_registry() {
         // `Memory_*` tools route to tiers declared in
         // `engine::capabilities` — not the Admin default.
-        assert_eq!(tool_action_tier("Memory_search"), PermissionMode::Read);
-        assert_eq!(tool_action_tier("Memory_add"),    PermissionMode::Edit);
-        assert_eq!(tool_action_tier("Memory_forget"), PermissionMode::Admin);
+        assert_eq!(tool_action_tier("Memory_query"), PermissionMode::Read);
+        assert_eq!(tool_action_tier("Memory_write"), PermissionMode::Edit);
     }
 
     #[test]

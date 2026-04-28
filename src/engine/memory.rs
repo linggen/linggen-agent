@@ -31,12 +31,18 @@ pub(crate) fn nudge_message() -> ChatMessage {
         "user",
         "[MEMORY CHECK — hidden reminder, not from the user] \
          Did the last few exchanges produce anything durable — an \
-         identity fact, a cross-project preference, or a scoped fact \
-         worth saving? Or did the user contradict something already in \
-         memory? If yes, act now: Edit `~/.linggen/memory/identity.md` or \
-         `style.md` for universals (tiny, high-bar); call `Memory_add` \
-         (or `Memory_update`) for scoped facts when a memory provider \
-         is installed. Keep project-specific rules out of core. If \
+         identity fact, a cross-project preference, or a fact only the \
+         user can supply? Or did the user contradict something already \
+         in memory? If yes, act now: universals about the person → \
+         Edit `~/.linggen/memory/identity.md` or `style.md` (tiny, \
+         high-bar); cross-project user intent / decision / preference / \
+         learning → `Memory_write({verb: \"add\", ...})` when a memory \
+         provider is installed. Append, don't overwrite — if a row \
+         contradicts a new fact, add the new one and let live retrieval \
+         reconcile next time. **Do NOT write to project files** \
+         (`<project>/AGENTS.md`, `CLAUDE.md`, source, docs); those are \
+         user-curated. Project-internal implementation detail is not \
+         memory — drop it; the agent reads the source next time. If \
          nothing durable, reply briefly with `(no memory changes)` and \
          continue with the user's current request."
             .to_string(),

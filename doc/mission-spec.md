@@ -75,10 +75,8 @@ allowed-tools:
   - Glob
   - Grep
   - Task
-  - Memory_add
-  - Memory_search
-  - Memory_list
-
+  - Memory_query
+  - Memory_write
 permission:
   mode: admin                      # read | edit | admin — ceiling on cwd + paths
   paths: ["~/.linggen/memory", "~/.claude/projects", "~/.linggen/sessions"]
@@ -221,8 +219,8 @@ The mode applies to `cwd` plus every path under `permission.paths`. Skill grants
 Missions consume tools and capabilities; skills register them.
 
 - Skills declare `provides: [memory]` and `implements: { memory: { base_url: ..., tools: ... } }`. When a skill is installed, the engine registers its capability tools globally — any session (user, skill, mission) can call them.
-- Missions list the capability tools they need (e.g. `Memory_add`, `Memory_search`) directly in `allowed-tools`. They do **not** invoke the skill — they use the tools the skill registered.
-- The `dream` mission uses `Memory_*` tools because the `memory` skill registered them. `memory` is a skill; `linggen-memory` (the RAG engine `ling-mem` binds to) is not.
+- Missions list the capability tools they need (e.g. `Memory_write` (verb=add), `Memory_query` (verb=search)) directly in `allowed-tools`. They do **not** invoke the skill — they use the tools the skill registered.
+- The `dream` mission uses `Memory_*` tools because the `ling-mem` skill registered them. `ling-mem` is the skill (slash command + capability provider); `linggen-memory` is the GitHub repo / Cargo crate that builds the `ling-mem` binary.
 
 Missions never declare `implements:` themselves — the binding lives with the skill that registered the capability. If a capability isn't registered by any installed skill, `requires:` catches it at load; otherwise the tool call fails at runtime.
 
@@ -245,11 +243,11 @@ Invoked skills (when `allow-skills` is non-empty) inherit the **mission's** perm
 Skills can ship missions as assets. The install script places them under `~/.linggen/missions/<name>/`:
 
 ```
-skills/memory/
+skills/ling-mem/
 ├── SKILL.md
-├── install.sh                  # copies assets/dream.md → ~/.linggen/missions/dream/mission.md
+├── install.sh                  # copies assets/mission.md → ~/.linggen/missions/dream/mission.md
 └── assets/
-    └── dream.md
+    └── mission.md              # the dream mission
 ```
 
 Co-installation guarantees the dependency — the skill and its mission version together. This is the recommended pattern for domain-specific missions (memory → dream, backup → nightly-snapshot, etc.). For standalone missions authored by hand, `requires:` declares the dependency explicitly.

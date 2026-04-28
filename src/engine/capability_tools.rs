@@ -1,12 +1,13 @@
 //! HTTP dispatch for capability tools.
 //!
-//! A **capability tool** (e.g. `Memory_search`) has its schema defined by
-//! the engine in `capabilities::CAPABILITIES` and its implementation
-//! provided by a skill that `provides: [memory]` and declares an
-//! `implements:` block in SKILL.md. This module does the routing: given
-//! the tool name + JSON args, find the active provider's binding, combine
-//! `base_url + tool_path`, POST the args, and parse the standard
-//! `{ok, data} | {ok:false, error, code}` envelope.
+//! A **capability tool** (e.g. `Memory_query`, `Memory_write`) has its
+//! schema defined by the engine in `capabilities::CAPABILITIES` and its
+//! implementation provided by a skill that `provides: [memory]` and
+//! declares an `implements:` block in SKILL.md. This module does the
+//! routing: given the tool name + JSON args, find the active provider's
+//! binding, resolve the URL (verb-dispatched tools use `<tool>.<verb>`
+//! lookup keys), POST the args (with `verb` stripped), and parse the
+//! standard `{ok, data} | {ok:false, error, code}` envelope.
 //!
 //! Autostart: on a connection refuse or timeout on the first try, spawn
 //! the skill's declared `autostart` command and retry once. The daemon
@@ -45,7 +46,7 @@ const DEFAULT_AUTOSTART: &str = "ling-mem start";
 pub(crate) async fn dispatch(
     skills: &SkillManager,
     tool_name: &str,
-    args: Value,
+    mut args: Value,
 ) -> Result<Value> {
     let (cap_name, _contract) = capabilities::capability_for_tool(tool_name)
         .ok_or_else(|| anyhow!("{tool_name} is not a capability tool"))?;
@@ -70,9 +71,25 @@ pub(crate) async fn dispatch(
             )
         })?;
 
-    let path = impl_block.tools.get(tool_name).ok_or_else(|| {
+    // Verb-dispatched tools (e.g. Memory_query / Memory_write): the model
+    // passes a `verb` field which selects the underlying endpoint. The
+    // skill's `implements.tools` map is keyed `<tool_name>.<verb>` for
+    // these. We strip `verb` from the body before POST so the daemon
+    // sees its original schema, not a `verb` field it doesn't expect.
+    let lookup_key = match args.get("verb").and_then(|v| v.as_str()) {
+        Some(verb) => {
+            let key = format!("{tool_name}.{verb}");
+            if let Some(obj) = args.as_object_mut() {
+                obj.remove("verb");
+            }
+            key
+        }
+        None => tool_name.to_string(),
+    };
+
+    let path = impl_block.tools.get(&lookup_key).ok_or_else(|| {
         anyhow!(
-            "Skill `{}` does not expose `{tool_name}` in its `implements.{cap_name}.tools` \
+            "Skill `{}` does not expose `{lookup_key}` in its `implements.{cap_name}.tools` \
              map — add it or use a different provider.",
             provider.name
         )

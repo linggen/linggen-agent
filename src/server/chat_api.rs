@@ -1097,7 +1097,7 @@ async fn run_structured_loop(
     engine.task = Some(task_for_loop);
     // Add user message to chat history so subsequent turns have conversational context.
     // Per-turn semantic retrieval against skill memory will hook in here once
-    // a `provides: [memory]` skill is active and its `Memory_search` handler
+    // a `provides: [memory]` skill is active and `Memory_query({verb: "search"})`
     // is reachable via the memory dispatch layer (see memory-spec.md).
     engine.chat_history.push(crate::ollama::ChatMessage::new("user", ctx.clean_msg.clone()));
     engine.truncate_chat_history();
@@ -1632,6 +1632,26 @@ pub(crate) async fn chat_handler(
                                                 );
                                                 if current.as_ref() != Some(&mode) {
                                                     engine.session_permissions.set_path_mode(path, mode.clone());
+                                                    changed = true;
+                                                }
+                                            }
+                                            // Also grant the skill's mode on the session's own cwd
+                                            // so the page_state's `effective_mode` lookup (which
+                                            // queries against the session cwd, not the skill's
+                                            // declared paths) reflects the skill's ceiling. Without
+                                            // this, the UI dropdown shows "read" even when the
+                                            // skill has admin grants on its own paths — confusing
+                                            // because the skill *is* operating at admin tier.
+                                            // Mirrors what mission_scheduler does at line 565 for
+                                            // mission cwd.
+                                            let cwd_str = engine.cfg.ws_root.display().to_string();
+                                            if !cwd_str.is_empty() {
+                                                let current_cwd = crate::engine::permission::effective_mode_for_path(
+                                                    &engine.session_permissions.path_modes,
+                                                    &engine.cfg.ws_root,
+                                                );
+                                                if current_cwd.as_ref() != Some(&mode) {
+                                                    engine.session_permissions.set_path_mode(&cwd_str, mode.clone());
                                                     changed = true;
                                                 }
                                             }

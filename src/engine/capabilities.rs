@@ -61,120 +61,52 @@ fn memory_capability() -> Capability {
         name: "memory".to_string(),
         tools: vec![
             CapabilityTool {
-                name: "Memory_add".to_string(),
-                description: "Store a new memory fact. Memory is how the agent grows up — a deepening model of WHO the user is, not a log of what was done. Save only if a future session (any project, months from now) would make better predictions about this user because the fact exists. Primary types to emit: `fact` (user identity / goals), `preference` (commitment-language behavioral rule), `decision` (cross-project reasoning), `learned` (cross-project tech gotcha). Deprecated (emit only in narrow cases): `tried` / `fixed` / `built` — project-specific bug fixes, daily activity, and single-session attempts belong in git log, not memory. Route project-specific implementation detail to suggest_claude_md at the skill level, never via this tool. Auto-dedups server-side: near-duplicates merge instead of inserting (returns `{action: \"merged\", similarity, previous_id, fact}`). Pass `skip_dedup: true` only from a scan pipeline running its own dedup pass.".to_string(),
-                tier: PermissionMode::Edit,
-                args_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "content":    {"type": "string", "description": "The fact text. Self-contained; include scoping conditions inline if they matter."},
-                        "contexts":   {"type": "array", "items": {"type": "string"}, "description": "Scope tags (e.g. [\"code/linggen\", \"trip-japan-2026\"]). Free-form; N:M with facts."},
-                        "tags":       {"type": "array", "items": {"type": "string"}, "description": "Free-form metadata with prefix convention (e.g. \"topic:ui\", \"person:maria\")."},
-                        "type":       {"type": "string", "enum": ["fact", "preference", "decision", "tried", "fixed", "learned", "built"], "description": "Canonical fact type. Prefer `fact` / `preference` / `decision` / `learned` for new writes. `tried` / `fixed` / `built` are deprecated — emit only for trajectory-level patterns, cross-project diagnostic wisdom, or named shippable artifacts tied to user identity. See the memory skill's extractor-prompt.md for the full routing rules."},
-                        "from":       {"type": "string", "enum": ["user", "agent", "derived"], "description": "Origin. Defaults to derived."},
-                        "outcome":    {"type": "string", "enum": ["positive", "negative", "neutral"], "description": "Only meaningful for `tried` / `fixed` (deprecated action-flavored types). Omit for `fact` / `preference` / `decision` / `learned`."},
-                        "cwd":        {"type": "string", "description": "Working directory where the fact was produced."},
-                        "occurred_at":{"type": "string", "description": "RFC-3339 timestamp of the described event. Omit if unknown."},
-                        "source_session":{"type": "string", "description": "Opaque session id the fact was extracted from."},
-                        "skip_dedup": {"type": "boolean", "description": "Skip server-side merge-into-near-duplicate. Default false. Set to true when the caller is running its own dedup pass."}
-                    },
-                    "required": ["content"]
-                }),
-            },
-            CapabilityTool {
-                name: "Memory_get".to_string(),
-                description: "Fetch a single fact by id.".to_string(),
-                tier: PermissionMode::Read,
-                args_schema: json!({
-                    "type": "object",
-                    "properties": {"id": {"type": "string", "description": "Fact UUID."}},
-                    "required": ["id"]
-                }),
-            },
-            CapabilityTool {
-                name: "Memory_search".to_string(),
-                description: "Semantic search across stored facts. Use when the query is fuzzy or you want relevance ranking. No longer needed as a dedup precheck — Memory_add handles that server-side.".to_string(),
+                name: "Memory_query".to_string(),
+                description: "Read memory. Verb-dispatched: `get` (fetch one row by id), `search` (semantic search; ranked by relevance), `list` (filter-only browse, no semantic ranking — for audits or exact enumeration). Memory is the user's biography across sessions — durable identity, cross-project preferences, decisions with their reasoning, life context. Project-internal facts (code architecture, repo conventions) are NOT in memory — the agent reads the project's own files (source, the user's `AGENTS.md` / `CLAUDE.md` if any) directly when it needs that content.".to_string(),
                 tier: PermissionMode::Read,
                 args_schema: json!({
                     "type": "object",
                     "properties": {
-                        "query":    {"type": "string", "description": "Natural-language query — describe what you're looking for."},
-                        "contexts": {"type": "array", "items": {"type": "string"}, "description": "Narrow to these scope tags (AND semantics)."},
-                        "type":     {"type": "string", "enum": ["fact", "preference", "decision", "tried", "fixed", "learned", "built"]},
-                        "from":     {"type": "string", "enum": ["user", "agent", "derived"]},
-                        "outcome":  {"type": "string", "enum": ["positive", "negative", "neutral"]},
+                        "verb":     {"type": "string", "enum": ["get", "search", "list"], "description": "Read operation."},
+                        "id":       {"type": "string", "description": "Required for verb=get. Fact UUID."},
+                        "query":    {"type": "string", "description": "Required for verb=search. Natural-language description of what you're looking for."},
+                        "contexts": {"type": "array", "items": {"type": "string"}, "description": "Filter to these scope tags (AND semantics). For verb=search, narrows ranked results; for verb=list, primary filter."},
+                        "type":     {"type": "string", "enum": ["fact", "preference", "decision", "tried", "fixed", "learned", "built"], "description": "Filter by fact type."},
+                        "from":     {"type": "string", "enum": ["user", "agent", "derived"], "description": "Filter by origin."},
+                        "outcome":  {"type": "string", "enum": ["positive", "negative", "neutral"], "description": "Filter by outcome (for action-flavored types)."},
                         "since":    {"type": "string", "description": "RFC-3339 lower bound on effective timestamp. Omit to skip."},
-                        "limit":    {"type": "integer", "description": "Max rows to return. Defaults to 10."}
+                        "until":    {"type": "string", "description": "RFC-3339 upper bound (verb=list only). Omit to skip."},
+                        "sort":     {"type": "string", "enum": ["newest", "oldest"], "description": "verb=list only. Defaults to newest."},
+                        "limit":    {"type": "integer", "description": "Max rows. Defaults to 10 for search, 50 for list."},
+                        "offset":   {"type": "integer", "description": "verb=list only. Skip this many rows in sort order."}
                     },
-                    "required": ["query"]
+                    "required": ["verb"]
                 }),
             },
             CapabilityTool {
-                name: "Memory_list".to_string(),
-                description: "Browse facts without semantic ranking — filter-only. Use for audits or exact-match enumeration.".to_string(),
-                tier: PermissionMode::Read,
-                args_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "contexts": {"type": "array", "items": {"type": "string"}},
-                        "type":     {"type": "string", "enum": ["fact", "preference", "decision", "tried", "fixed", "learned", "built"]},
-                        "from":     {"type": "string", "enum": ["user", "agent", "derived"]},
-                        "outcome":  {"type": "string", "enum": ["positive", "negative", "neutral"]},
-                        "since":    {"type": "string", "description": "RFC-3339 lower bound. Omit to skip."},
-                        "until":    {"type": "string", "description": "RFC-3339 upper bound. Omit to skip."},
-                        "sort":     {"type": "string", "enum": ["newest", "oldest"], "description": "Defaults to newest."},
-                        "limit":    {"type": "integer", "description": "Max rows to return. Defaults to 50."},
-                        "offset":   {"type": "integer", "description": "Skip this many rows in sort order. Pairs with limit for pagination."}
-                    },
-                    "required": []
-                }),
-            },
-            CapabilityTool {
-                name: "Memory_update".to_string(),
-                description: "Edit fields of an existing fact. Use when the user corrects a recorded fact, or when dedup finds a better phrasing for the same meaning.".to_string(),
+                name: "Memory_write".to_string(),
+                description: "Modify memory. Verb-dispatched: `add` (insert a new row), `update` (edit fields of an existing row by id), `delete` (hard-delete a single row by id). Memory should grow with genuinely durable signal: cross-project user identity / goals (`fact`), commitment-language behavioral rules (`preference`), decisions whose reasoning is the retrieval value (`decision`), cross-project tech gotchas (`learned`). Don't store project-internal architecture, conventions, or implementation detail — drop those candidates entirely. Memory does NOT write to project files (`<project>/AGENTS.md`, `CLAUDE.md`, source, docs); those are user-curated, and the agent reads them directly when needed. **Append, don't overwrite**: when a new utterance contradicts or refines an existing row, prefer `verb=add` with an optional `supersedes` link (or just append) and let live retrieval reconcile. Reserve `verb=update` for mechanical rephrasing of the same fact and `verb=delete` for explicit user requests to forget. Bulk forget is not on this tool surface — handle it via the dashboard or by iterating verb=delete after explicit user confirmation.".to_string(),
                 tier: PermissionMode::Edit,
                 args_schema: json!({
                     "type": "object",
                     "properties": {
-                        "id":            {"type": "string"},
-                        "content":       {"type": "string"},
-                        "contexts":      {"type": "array", "items": {"type": "string"}},
-                        "tags":          {"type": "array", "items": {"type": "string"}},
-                        "type":          {"type": "string", "enum": ["fact", "preference", "decision", "tried", "fixed", "learned", "built"]},
-                        "from":          {"type": "string", "enum": ["user", "agent", "derived"]},
-                        "outcome":       {"type": "string", "enum": ["positive", "negative", "neutral"]},
-                        "clear_outcome": {"type": "boolean", "description": "Clear the outcome to null."},
-                        "cwd":           {"type": "string"},
-                        "clear_cwd":     {"type": "boolean", "description": "Clear cwd to null."}
+                        "verb":          {"type": "string", "enum": ["add", "update", "delete"], "description": "Write operation."},
+                        "id":            {"type": "string", "description": "Required for verb=update and verb=delete. UUID of the target row."},
+                        "content":       {"type": "string", "description": "Required for verb=add. Self-contained fact text. Optional for verb=update."},
+                        "contexts":      {"type": "array", "items": {"type": "string"}, "description": "Scope tags (e.g. [\"cross-project\", \"music/piano\"]). Free-form; N:M with facts."},
+                        "tags":          {"type": "array", "items": {"type": "string"}, "description": "Free-form metadata with prefix convention (e.g. \"topic:ui\", \"intent:goal\")."},
+                        "type":          {"type": "string", "enum": ["fact", "preference", "decision", "tried", "fixed", "learned", "built"], "description": "verb=add/update. Prefer `fact` / `preference` / `decision` / `learned` for new writes; `tried` / `fixed` / `built` are deprecated."},
+                        "from":          {"type": "string", "enum": ["user", "agent", "derived"], "description": "Origin. Pick `user` when the user said it directly, `derived` for cross-session synthesis, `agent` for agent observations."},
+                        "outcome":       {"type": "string", "enum": ["positive", "negative", "neutral"], "description": "Only meaningful for `tried` / `fixed` / `decision`. Omit for `fact` / `preference` / `learned`."},
+                        "clear_outcome": {"type": "boolean", "description": "verb=update only. Clear outcome to null."},
+                        "cwd":           {"type": "string", "description": "Working directory where the fact was produced. Pass through from the source session, don't substitute your own."},
+                        "clear_cwd":     {"type": "boolean", "description": "verb=update only. Clear cwd to null."},
+                        "occurred_at":   {"type": "string", "description": "verb=add only. RFC-3339 timestamp of the described event (e.g. \"2026-04-27T16:00:00Z\"). **Omit entirely if unknown** — do not pass empty strings, partial dates, or null. Date-only \"YYYY-MM-DD\" is also accepted (interpreted as midnight UTC)."},
+                        "source_session":{"type": "string", "description": "verb=add only. Opaque session id the fact was extracted from."},
+                        "supersedes":    {"type": "string", "description": "verb=add only. UUID of an existing row this row refines or replaces — metadata hint for retrieval ranking, not a destructive edit."},
+                        "skip_dedup":    {"type": "boolean", "description": "verb=add only. Skip server-side merge-into-near-duplicate. Set to true when running your own dedup pass."}
                     },
-                    "required": ["id"]
-                }),
-            },
-            CapabilityTool {
-                name: "Memory_delete".to_string(),
-                description: "Hard-delete a fact by id. Use for dedup (remove stale/contradicted rows before saving a better version) or when the user retracts a fact. Not reversible.".to_string(),
-                tier: PermissionMode::Edit,
-                args_schema: json!({
-                    "type": "object",
-                    "properties": {"id": {"type": "string"}},
-                    "required": ["id"]
-                }),
-            },
-            CapabilityTool {
-                name: "Memory_forget".to_string(),
-                description: "Bulk-delete rows by filter. Destructive. ONLY on explicit user request (\"forget everything about X\") and ONLY with a specific filter. Never run during extraction. Refuses empty filters — supply at least one of contexts / type / from / outcome / since / until.".to_string(),
-                tier: PermissionMode::Admin,
-                args_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "contexts": {"type": "array", "items": {"type": "string"}},
-                        "type":     {"type": "string"},
-                        "from":     {"type": "string"},
-                        "outcome":  {"type": "string"},
-                        "since":    {"type": "string", "description": "RFC-3339 lower bound. Omit to skip."},
-                        "until":    {"type": "string", "description": "RFC-3339 upper bound. Omit to skip."}
-                    },
-                    "required": []
+                    "required": ["verb"]
                 }),
             },
         ],
@@ -277,20 +209,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_capability_registered_with_seven_tools() {
+    fn memory_capability_registered_with_two_tools() {
         let mem = CAPABILITIES
             .iter()
             .find(|c| c.name == "memory")
             .expect("memory capability present");
-        assert_eq!(mem.tools.len(), 7);
+        assert_eq!(mem.tools.len(), 2);
+        let names: Vec<&str> = mem.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"Memory_query"));
+        assert!(names.contains(&"Memory_write"));
     }
 
     #[test]
     fn capability_for_tool_finds_memory_tools() {
         let (cap_name, tool) =
-            capability_for_tool("Memory_search").expect("Memory_search is a capability tool");
+            capability_for_tool("Memory_query").expect("Memory_query is a capability tool");
         assert_eq!(cap_name, "memory");
-        assert_eq!(tool.name, "Memory_search");
+        assert_eq!(tool.name, "Memory_query");
         assert_eq!(tool.tier, PermissionMode::Read);
     }
 
@@ -299,38 +234,37 @@ mod tests {
         assert!(capability_for_tool("Read").is_none());
         assert!(capability_for_tool("Bash").is_none());
         assert!(capability_for_tool("Unknown").is_none());
+        // Old per-verb names are no longer capability tools.
+        assert!(capability_for_tool("Memory_search").is_none());
+        assert!(capability_for_tool("Memory_add").is_none());
+        assert!(capability_for_tool("Memory_forget").is_none());
     }
 
     #[test]
     fn tool_tiers_match_canonical_contract() {
-        assert_eq!(tool_tier("Memory_search"), Some(PermissionMode::Read));
-        assert_eq!(tool_tier("Memory_list"),   Some(PermissionMode::Read));
-        assert_eq!(tool_tier("Memory_get"),    Some(PermissionMode::Read));
-        assert_eq!(tool_tier("Memory_add"),    Some(PermissionMode::Edit));
-        assert_eq!(tool_tier("Memory_update"), Some(PermissionMode::Edit));
-        assert_eq!(tool_tier("Memory_delete"), Some(PermissionMode::Edit));
-        assert_eq!(tool_tier("Memory_forget"), Some(PermissionMode::Admin));
+        assert_eq!(tool_tier("Memory_query"), Some(PermissionMode::Read));
+        assert_eq!(tool_tier("Memory_write"), Some(PermissionMode::Edit));
     }
 
     #[test]
     fn legacy_schema_entry_compacts_types() {
-        let tool = capability_for_tool("Memory_search").unwrap().1;
+        let tool = capability_for_tool("Memory_query").unwrap().1;
         let entry = legacy_schema_entry(tool);
-        assert_eq!(entry["name"], "Memory_search");
-        assert_eq!(entry["args"]["query"], "string");
+        assert_eq!(entry["name"], "Memory_query");
+        assert_eq!(entry["args"]["verb"], "string");
         assert_eq!(entry["args"]["contexts"], "string[]?");
         assert_eq!(entry["args"]["limit"], "integer?");
     }
 
     #[test]
     fn oai_schema_wraps_as_function() {
-        let tool = capability_for_tool("Memory_add").unwrap().1;
+        let tool = capability_for_tool("Memory_write").unwrap().1;
         let entry = oai_schema_entry(tool);
         assert_eq!(entry["type"], "function");
-        assert_eq!(entry["function"]["name"], "Memory_add");
+        assert_eq!(entry["function"]["name"], "Memory_write");
         let required = entry["function"]["parameters"]["required"]
             .as_array()
             .unwrap();
-        assert!(required.iter().any(|v| v == "content"));
+        assert!(required.iter().any(|v| v == "verb"));
     }
 }

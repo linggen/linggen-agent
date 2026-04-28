@@ -164,14 +164,11 @@ export const MainApp: React.FC = () => {
     useUiStore.getState().setSessionModel(sess?.model_id ?? null);
   }, [activeSessionId, allSessions, sessions]);
 
-  // --- Poll workspace state for mission sessions (backup; events also trigger reloads) ---
-  useEffect(() => {
-    if (!isMissionSession || !activeSessionId) return;
-    const interval = setInterval(() => {
-      useChatStore.getState().fetchSessionState();
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [isMissionSession, activeSessionId]);
+  // Mission session messages arrive via the same paths as user-chat sessions:
+  //   - one fetch when activeSessionId changes (existing useEffect),
+  //   - streaming events while the agent runs,
+  //   - StateUpdated → fetchSessionState in handleRunOutcome.
+  // No 5s polling — that flooded the control channel for no real benefit.
 
   // --- Auto-select agent ---
   useEffect(() => {

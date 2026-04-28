@@ -419,7 +419,7 @@ mod tests {
         assert!(required.iter().any(|v| v == "path"));
     }
 
-    // Memory tool schemas are now declared in skills/memory/SKILL.md
+    // Memory tool schemas are now declared in skills/ling-mem/SKILL.md
     // and rendered via SkillToolDef::to_oai_schema. Schema integrity is
     // exercised by skill-parsing tests in the skills module.
 }

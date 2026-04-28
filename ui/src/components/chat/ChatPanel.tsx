@@ -76,26 +76,30 @@ const ChatDebugActions: React.FC<{ projectRoot?: string | null; sessionId?: stri
   }, [projectRoot, sessionId]);
 
   const btnClass = (status: 'idle' | 'copied' | 'error') => cn(
-    'p-1 rounded transition-colors text-slate-400 shrink-0',
+    'px-1.5 py-1 rounded transition-colors text-slate-500 dark:text-slate-400 shrink-0 flex items-center gap-1 text-[11px] font-medium',
     status === 'copied' ? 'bg-green-500/10 text-green-600'
       : status === 'error' ? 'bg-red-500/10 text-red-500'
       : 'hover:bg-slate-100 dark:hover:bg-white/5',
   );
 
+  const labelFor = (status: 'idle' | 'copied' | 'error', idle: string) =>
+    status === 'copied' ? 'Copied' : status === 'error' ? 'Failed' : idle;
+
   return (
     <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-      <button onClick={handleCopyChat} className={btnClass(copyStatus)}
-        title={copyStatus === 'copied' ? 'Copied' : copyStatus === 'error' ? 'Copy failed' : 'Copy chat'}>
-        <Copy size={13} />
+      <button onClick={handleCopyChat} className={btnClass(copyStatus)} title="Copy chat transcript to clipboard">
+        <Copy size={12} />
+        <span>{labelFor(copyStatus, 'Chat')}</span>
       </button>
-      <button onClick={handleCopySystemPrompt} className={btnClass(spStatus)}
-        title={spStatus === 'copied' ? 'Copied' : spStatus === 'error' ? 'Failed' : 'Copy system prompt'}>
-        <FileText size={13} />
+      <button onClick={handleCopySystemPrompt} className={btnClass(spStatus)} title="Copy system prompt + tool schemas to clipboard">
+        <FileText size={12} />
+        <span>{labelFor(spStatus, 'System Prompt')}</span>
       </button>
       <button onClick={clearChat}
-        className="p-1 rounded text-slate-400 hover:bg-red-500/10 hover:text-red-500 transition-colors shrink-0"
-        title="Clear chat">
-        <Eraser size={13} />
+        className="px-1.5 py-1 rounded text-slate-500 dark:text-slate-400 hover:bg-red-500/10 hover:text-red-500 transition-colors shrink-0 flex items-center gap-1 text-[11px] font-medium"
+        title="Clear chat messages">
+        <Eraser size={12} />
+        <span>Clear</span>
       </button>
     </div>
   );

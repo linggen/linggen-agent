@@ -107,7 +107,7 @@ This is what makes providers swappable: two different memory skills expose ident
 
 ```yaml
 ---
-name: linggen-memory
+name: ling-mem
 description: Semantic memory — facts, activity, semantic retrieval
 provides: [memory]
 implements:
@@ -116,13 +116,12 @@ implements:
     autostart: "ling-mem start"
     healthcheck: /api/health
     tools:
-      Memory_add:    /api/memory/add
-      Memory_get:    /api/memory/get
-      Memory_search: /api/memory/search
-      Memory_list:   /api/memory/list
-      Memory_update: /api/memory/update
-      Memory_delete: /api/memory/delete
-      Memory_forget: /api/memory/forget
+      Memory_query.get:    /api/memory/get
+      Memory_query.search: /api/memory/search
+      Memory_query.list:   /api/memory/list
+      Memory_write.add:    /api/memory/add
+      Memory_write.update: /api/memory/update
+      Memory_write.delete: /api/memory/delete
 install: install.sh
 ---
 ```
@@ -136,19 +135,21 @@ install: install.sh
 | `base_url` | Root of the skill's HTTP surface. Include scheme + host + port. The engine concatenates this with each tool's path to form the dispatch URL. |
 | `autostart` | Command the engine runs when the daemon isn't reachable on the first call. Whitespace-split. First token resolved as `$SKILL_DIR/bin/<name>` first, else bare name on `$PATH`. Default: `ling-mem start`. |
 | `healthcheck` | Path returning 200 when the daemon is healthy. Default: `/api/health`. Reserved for the engine's future liveness probe. |
-| `tools` | Map from capability tool name (engine-defined) → path on the daemon. Must cover every tool in the capability's contract. |
+| `tools` | Map from capability tool name → path on the daemon. For verb-dispatched tools (e.g. `Memory_query`, `Memory_write`), keys are `<tool>.<verb>` (e.g. `Memory_query.search`). The engine reads `verb` from the call args, looks up the URL, strips the verb, and POSTs. Must cover every (tool, verb) pair the capability surfaces. |
 
 ### How dispatch works
 
-When the model calls a capability tool (e.g. `Memory_search`):
+When the model calls a capability tool:
 
 ```
-Model calls Memory_search({query: "dock calibration"})
-  → Engine capability registry:  Memory_search ∈ capability "memory"
-  → Active provider for memory:  linggen-memory
-  → Read implements.memory.tools[Memory_search]:  /api/memory/search
-  → URL = base_url + path:       http://127.0.0.1:9888/api/memory/search
-  → POST JSON args, parse {ok, data} envelope
+Model calls Memory_query({verb: "search", query: "dock calibration"})
+  → Engine capability registry:    Memory_query ∈ capability "memory"
+  → Active provider for memory:    linggen-memory
+  → Verb dispatch:                 read `verb` from args → "search"
+  → Lookup key:                    "Memory_query.search"
+  → Read implements.memory.tools["Memory_query.search"]:  /api/memory/search
+  → URL = base_url + path:         http://127.0.0.1:9888/api/memory/search
+  → Strip `verb` from args, POST JSON, parse {ok, data} envelope
   → Return data to the model
 ```
 
@@ -160,7 +161,7 @@ Resolution is deterministic when multiple skills claim the same capability: Proj
 
 ### Swapping providers
 
-Because tool names / schemas / tiers are engine-owned and capability-namespaced (`Memory_*` instead of provider-specific), users can swap providers without the model seeing any change. A new provider implements the same contract; the model continues to call `Memory_search` with the same arg shape.
+Because tool names / schemas / tiers are engine-owned and capability-namespaced (`Memory_*` instead of provider-specific), users can swap providers without the model seeing any change. A new provider implements the same contract; the model continues to call `Memory_query` (verb=search) with the same arg shape.
 
 ### When to use `provides:` + `implements:` vs plain `tools:`
 
@@ -197,25 +198,23 @@ The script runs with `$SKILL_DIR` set to the skill's directory. It should be **i
 
 All paths converge on the same `run_install_script()` function.
 
-### Example: memory skill
+### Example: ling-mem skill
 
 ```yaml
-name: memory
-install: scripts/install.sh
+name: ling-mem
+install: install.sh
 ```
 
 ```bash
 #!/usr/bin/env bash
-# install.sh — Bootstrap memory files and mission
+# install.sh — Bootstrap memory files and the dream mission
 MEMORY_DIR="$HOME/.linggen/memory"
 mkdir -p "$MEMORY_DIR"
-for f in "$SKILL_DIR/assets/"*.md; do
-  target="$MEMORY_DIR/$(basename "$f")"
-  [ -f "$target" ] || cp "$f" "$target"
-done
+[ -f "$MEMORY_DIR/identity.md" ] || : > "$MEMORY_DIR/identity.md"
+[ -f "$MEMORY_DIR/style.md" ]    || : > "$MEMORY_DIR/style.md"
 
-MISSION_DIR="$HOME/.linggen/missions/memory"
-if [ ! -d "$MISSION_DIR" ]; then
+MISSION_DIR="$HOME/.linggen/missions/dream"
+if [ ! -f "$MISSION_DIR/mission.md" ]; then
   mkdir -p "$MISSION_DIR"
   cp "$SKILL_DIR/assets/mission.md" "$MISSION_DIR/mission.md"
 fi

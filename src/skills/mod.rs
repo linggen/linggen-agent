@@ -288,7 +288,7 @@ pub struct AppConfig {
 /// to probe for health.
 ///
 /// One `CapabilityImpl` per capability in the skill's `implements:`
-/// block. Example (`skills/memory/SKILL.md`):
+/// block. Example (`skills/ling-mem/SKILL.md`):
 ///
 /// ```yaml
 /// provides: [memory]
@@ -298,10 +298,17 @@ pub struct AppConfig {
 ///     autostart: "ling-mem start"
 ///     healthcheck: /api/health
 ///     tools:
-///       Memory_add:    /api/memory/add
-///       Memory_search: /api/memory/search
-///       ...
+///       Memory_query.get:    /api/memory/get
+///       Memory_query.search: /api/memory/search
+///       Memory_query.list:   /api/memory/list
+///       Memory_write.add:    /api/memory/add
+///       Memory_write.update: /api/memory/update
+///       Memory_write.delete: /api/memory/delete
 /// ```
+///
+/// Verb-dispatched tools (`Memory_query` / `Memory_write`) key entries
+/// as `<tool>.<verb>` — the engine reads the verb from the call args,
+/// looks up the corresponding URL, strips the verb, and POSTs.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct CapabilityImpl {
     /// Root of the skill's HTTP surface. Engine concatenates this with
@@ -317,9 +324,9 @@ pub struct CapabilityImpl {
     /// the engine's future liveness probe; not consumed today.
     #[serde(default = "default_capability_healthcheck")]
     pub healthcheck: String,
-    /// Map from capability tool name (as defined by the engine's
-    /// capability contract) → path on the daemon. E.g.
-    /// `Memory_search: /api/memory/search`.
+    /// Map from capability tool name → path on the daemon. For
+    /// verb-dispatched tools (e.g. `Memory_query`, `Memory_write`),
+    /// keys are `<tool>.<verb>` (e.g. `Memory_query.search`).
     #[serde(default)]
     pub tools: std::collections::HashMap<String, String>,
 }
@@ -755,8 +762,8 @@ implements:
     autostart: "ling-mem start"
     healthcheck: /api/health
     tools:
-      Memory_add:    /api/memory/add
-      Memory_search: /api/memory/search
+      Memory_query.search: /api/memory/search
+      Memory_write.add:    /api/memory/add
 ---
 Body."#;
         let skill = mgr.parse_skill(text, SkillSource::Global).unwrap();
@@ -765,8 +772,8 @@ Body."#;
         assert_eq!(mem.base_url, "http://127.0.0.1:9888");
         assert_eq!(mem.autostart.as_deref(), Some("ling-mem start"));
         assert_eq!(mem.healthcheck, "/api/health");
-        assert_eq!(mem.tools.get("Memory_add").map(String::as_str), Some("/api/memory/add"));
-        assert_eq!(mem.tools.get("Memory_search").map(String::as_str), Some("/api/memory/search"));
+        assert_eq!(mem.tools.get("Memory_query.search").map(String::as_str), Some("/api/memory/search"));
+        assert_eq!(mem.tools.get("Memory_write.add").map(String::as_str), Some("/api/memory/add"));
     }
 
     #[test]

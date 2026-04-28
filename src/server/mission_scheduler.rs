@@ -227,7 +227,11 @@ pub fn create_mission_session(mission: &Mission) -> Option<String> {
             std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string())
         }),
         mission_id: Some(mission.id.clone()),
-        model_id: None,
+        // Pin the mission's configured model onto the session so the UI header
+        // shows the right model and follow-up chat turns (which go through
+        // chat_api with the session's model_id) don't reset back to the global
+        // default.
+        model_id: mission.model.clone(),
         user_id: None,
     };
     match store.add_session(&meta) {
@@ -491,6 +495,27 @@ async fn dispatch_mission_prompt(
     engine.set_parent_agent(None);
     engine.set_run_id(Some(run_id.clone()));
 
+    // Apply the mission's configured model (frontmatter `model:` field) so
+    // missions run on the model the user chose in mission settings. Without
+    // this, the engine keeps whatever model_id it was last set to — usually
+    // the global default (e.g. gpt-5.5) — ignoring the per-mission choice.
+    // Falls back to default when the configured id isn't registered.
+    match mission.model.as_deref() {
+        Some(mid) if engine.model_manager.has_model(mid) => {
+            engine.model_id = mid.to_string();
+        }
+        Some(mid) => {
+            warn!(
+                "Mission '{}' requested model '{}' which is not configured — falling back to default '{}'",
+                mission.id, mid, engine.default_model_id
+            );
+            engine.model_id = engine.default_model_id.clone();
+        }
+        None => {
+            engine.model_id = engine.default_model_id.clone();
+        }
+    }
+
     // Inject the mission body into the system prompt so the agent reads it as
     // instructions (not as a user turn). Matches how skill bodies are injected
     // via active_skill — see engine/prompt.rs.
@@ -633,11 +658,41 @@ async fn dispatch_mission_prompt(
         }
         Err(err) => {
             let msg = err.to_string();
-            let run_status = if msg.to_lowercase().contains("cancel") {
+            let cancelled = msg.to_lowercase().contains("cancel");
+            let run_status = if cancelled {
                 crate::project_store::AgentRunStatus::Cancelled
             } else {
+                warn!(
+                    "Mission '{}' agent loop failed (run_id={}, session={}): {}",
+                    mission.id,
+                    mission_run_id,
+                    session_id.as_deref().unwrap_or("-"),
+                    msg
+                );
                 crate::project_store::AgentRunStatus::Failed
             };
+            // Surface the engine error inside the session transcript so the
+            // user sees *why* the mission failed — not just a red toast. The
+            // "Error:" prefix triggers the UI's isError rendering path
+            // (chatStore.ts detects it on both live and persisted messages).
+            if !cancelled {
+                if let Some(ref sid) = session_id {
+                    let _ = state.manager.global_sessions.add_chat_message(
+                        sid,
+                        &crate::state_fs::sessions::ChatMsg {
+                            agent_id: agent_id.to_string(),
+                            from_id: agent_id.to_string(),
+                            to_id: "user".to_string(),
+                            content: format!("Error: {}", msg),
+                            timestamp: crate::util::now_ts_secs(),
+                            is_observation: false,
+                        },
+                    );
+                    // Ping the UI so it reloads persisted messages immediately
+                    // instead of waiting for the next 5s poll.
+                    let _ = state.events_tx.send(ServerEvent::StateUpdated);
+                }
+            }
             let _ = manager
                 .finish_agent_run(&run_id, run_status, Some(msg))
                 .await;

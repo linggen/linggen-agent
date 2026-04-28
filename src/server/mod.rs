@@ -736,24 +736,11 @@ pub(crate) fn map_server_event_to_ui_message(event: ServerEvent, seq: u64) -> Op
             project_root: None,
             data: Some(json!({ "plan": plan })),
         }),
-        ServerEvent::MissionTriggered {
-            mission_id,
-            agent_id,
-            project_root,
-            session_id,
-        } => Some(UiEvent {
-            id: format!("mission-trigger-{mission_id}-{seq}"),
-            seq,
-            rev: seq,
-            ts_ms,
-            kind: UI_KIND_ACTIVITY.to_string(),
-            phase: Some(UI_PHASE_DOING.to_string()),
-            text: Some("Mission triggered".to_string()),
-            agent_id: Some(agent_id),
-            session_id,
-            project_root: Some(project_root),
-            data: Some(json!({ "status": "mission_triggered", "mission_id": mission_id })),
-        }),
+        // MissionTriggered is a lifecycle signal, not a chat activity.
+        // SessionCreated + AgentStatus(Working) already convey the visible start
+        // to the UI; routing this as activity caused a stray "Mission triggered"
+        // line inside the session transcript.
+        ServerEvent::MissionTriggered { .. } => None,
         ServerEvent::SessionCreated {
             ref session_id,
             ref title,
@@ -1528,7 +1515,7 @@ async fn capability_dispatch(
     };
 
     // Scope: a skill's webpage can only invoke its own tools. Prevents the
-    // discord skill's page from invoking Memory_delete via this route.
+    // discord skill's page from invoking Memory_write via this route.
     let provides = skill
         .provides
         .as_ref()

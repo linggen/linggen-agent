@@ -102,21 +102,21 @@ Wrong or stale facts get caught the moment they would mislead.
 ## Mid-chat save rules — silent HIGH-SIGNAL auto-save
 
 When the user utters one of the following **in regular chat (not the
-/memory skill)**, save it immediately via `Memory_add` (or `Edit` to
-identity.md if it's pure identity). No widget, no confirmation, no
-verbose reply — just save and continue. The user will see it at the next
-retrieval or in the next scan report.
+/memory skill)**, save it immediately via `Memory_write({verb: "add", ...})`
+(or `Edit` to identity.md if it's pure identity). No widget, no
+confirmation, no verbose reply — just save and continue. The user will
+see it at the next retrieval or in the next scan report.
 
 Save silently when the user states:
 
-1. **Name + relationship** — *"my cat TOM"*, *"my wife Yuki"*, *"my colleague Jenny"* → `Edit identity.md`
+1. **Name + relationship** — *"my cat <name>"*, *"my wife <name>"*, *"my colleague <name>"* → `Edit identity.md`. Record exactly what the user said; do NOT invent names, ages, or other specifics the user didn't supply.
 2. **Location / timezone** — *"I live in Shanghai"*, *"my timezone is PST"* → `Edit identity.md`
 3. **Role / identity** — *"I'm a robotics engineer"*, *"I founded Linggen"* → `Edit identity.md`
-4. **Long-term goal / vision** — *"I'm building X as Y"*, *"my vision is Z"* (vision-level, not task-level) → **`Memory_add`** with `type: "fact"`, `tags: ["intent:goal"]`, `contexts: ["cross-project"]`. **Do NOT write to identity.md** — goals belong in RAG so they are retrieved when relevant, not burned into every system prompt.
+4. **Long-term goal / vision** — *"I'm building X as Y"*, *"my vision is Z"* (vision-level, not task-level) → **`Memory_write({verb: "add", type: "fact", tags: ["intent:goal"], contexts: ["cross-project"], content: "..."})`**. **Do NOT write to identity.md** — goals belong in RAG so they are retrieved when relevant, not burned into every system prompt.
 5. **Commitment-language preference** — *"always X"*, *"never Y"*, *"from now on Z"*, *"stop doing W"* → `Edit style.md`
 
 These also work in Chinese / other languages — detect the pattern
-semantically, not lexically. *"我的猫叫TOM"*, *"我住在上海"*, *"以后别再 X"* all trigger.
+semantically, not lexically. *"我的猫叫 …"*, *"我住在上海"*, *"以后别再 X"* all trigger.
 
 **Identity vs goals:** `identity.md` is always inlined into the system
 prompt, so keep it to narrow facts about the PERSON — name, role,
@@ -128,112 +128,88 @@ working on"*), it is a goal → RAG, not identity.
 ### When to skip the silent save
 
 - Task descriptions (*"I'm working on docking today"*) — activity, not identity.
-- Project-specific technical facts (*"ref_path is the tracking signal"*) — route to `suggest_claude_md` or skip.
+- Project-specific technical facts (*"ref_path is the tracking signal"*) — **drop**. Memory does not write to project files (`<project>/AGENTS.md`, `CLAUDE.md`, source); the agent will read the project's own files when it needs that content. The user authors `AGENTS.md` / `CLAUDE.md` by hand if they want a rule there.
 - Inferred preferences (*"user seems to prefer Y"*) — no explicit statement.
 - Opinions without commitment (*"I kind of prefer X"*) — not durable.
 - Anything contradicting an existing core memory bullet above — `Edit` the bullet instead.
 
 ### Explicit user imperatives — always act immediately, no confirmation
 
-- *"remember X"* / *"记住 X"* → `Memory_add` or `Edit` the appropriate file. Reply *"Saved."* in one line.
-- *"forget X"* / *"delete the fact about Y"* → `Memory_search`, then `Memory_delete`. Reply *"Deleted: <content>."* so the user can see what went. No pre-confirmation — if it was wrong, the user says so and you re-add.
-- *"update my X to Y"* → `Memory_search` + `Memory_update`. Reply *"Updated."*
+- *"remember X"* / *"记住 X"* → `Memory_write({verb: "add", ...})` or `Edit` the appropriate file. Reply *"Saved."* in one line.
+- *"forget X"* / *"delete the fact about Y"* → `Memory_query({verb: "search", ...})`, then `Memory_write({verb: "delete", id: ...})`. Reply *"Deleted: <content>."* so the user can see what went. No pre-confirmation — if it was wrong, the user says so and you re-add. For bulk forget (*"forget everything about X"*), iterate the search→delete loop or direct the user to the dashboard / `ling-mem forget` CLI; bulk forget is not on the model tool surface.
+- *"update my X to Y"* → `Memory_query({verb: "search", ...})` + `Memory_write({verb: "update", id: ..., content: "..."})`. Reply *"Updated."*
 
 ## Retrieval is visible — every fact you use, the user sees
 
-When you call `Memory_search` or `Memory_get` and use the result to
-shape a reply, surface what you used **in the chat text**, with the age
-of each fact. Rule: if a memory row influenced your answer, it must
-appear in a chip. No silent use.
+When you call `Memory_query` (any verb) and use the result to shape a
+reply, surface what you used **in the chat text**, with the age of each
+fact. Rule: if a memory row influenced your answer, it must appear in a
+chip. No silent use.
 
 Chip format for cross-project / identity memory:
 
-> 💭 From memory (3 months ago · Jan 2026): User has a cat named Tom.
+> 💭 From memory (3 months ago · Jan 2026): User has a cat.
 
 For multiple hits:
 
 > 💭 From memory:
 > - User lives in Shanghai (2 months ago)
-> - User has a cat named Tom (3 months ago)
+> - User has a cat (3 months ago)
 > - User's role: robotics engineer (5 months ago)
+
+When two rows on the same subject surface, reconcile them in prose
+ordered by timestamp — *"From memory: you had a cat that you left with
+a friend during your 2026 relocation."* Do not silently rewrite or
+delete; the user sees the synthesis live and can correct it.
 
 - Use **relative time** (*"3 months ago"*), not absolute dates — scans faster.
 - Dim or warn on facts older than 12 months — tag them *(may be stale)*.
 - Skip the chip for facts you don't actually use in your reply.
 
-## Project-scoped memory
+## Project knowledge — not in memory
 
-Facts tagged `contexts: ["project/<name>"]` are **project-internal
-knowledge** — module semantics, conventions, implementation patterns
-the user has accumulated over sessions in that project. They retrieve
-**only when the user's current workspace is under that project**.
+Project-internal architecture, conventions, and gotchas are **not**
+memory. Memory does not write to project files (`<project>/AGENTS.md`,
+`CLAUDE.md`, source, docs); those are user-curated. When the agent is
+working in a project and needs to know something repo-specific, it
+reads the project's own files directly — that's already what
+auto-loaded `AGENTS.md` / `CLAUDE.md` and the source code are for.
 
-### Project-name derivation
+If a candidate looks project-internal during a chat (mentions a
+specific module, file, convention, or repo-level decision) → **drop
+it**. Don't `Memory_write` to RAG, don't `Edit` any project file.
 
-Derive the current project name from your workspace root in this order:
-1. If `<ws_root>/.git` exists → project name = `<ws_root>` basename.
-2. If any parent directory has `.git` → project name = that parent's
-   basename.
-3. Otherwise → project name = `<ws_root>` basename.
+### Reading legacy project rows in RAG
 
-The project-context tag is `project/<that-name>`. Example: workspace
-root `/Users/lianghuang/workspace/rust-sanji` → `project/rust-sanji`.
-
-### When to fetch project memory (pattern C)
-
-**Session-start (eager — at most once per session).** On your FIRST
-response in a session where the workspace is inside a known project,
-before engaging with the user's question, run:
+Older rows may still carry `contexts: ["project/<name>"]` from a
+previous routing scheme. They retrieve normally and remain useful for
+the projects they reference. When the user is working in such a
+project, include the project context in your search alongside
+cross-project:
 
 ```
-Memory_search({
-  contexts: ["project/<name>"],
-  query: "<the user's first message>",
-  limit: 5
-})
-```
-
-Cap at 5 hits. Surface them as a chip, **same format as other retrieval
-chips**, titled with the project name:
-
-> 💭 Project memory · rust-sanji (5 facts, most recent 2w ago)
-> - corridor ≠ ref_path (2w ago — suppression vs tracking)
-> - tried PID docking for months; moved to MPPI (6w ago)
-> - dock safety-gate clearance is skipped during final approach (3m ago)
-
-Then proceed to answer. If the user's first message is casual chat or
-clearly unrelated to the project (*"what's the weather"*, *"hi"*), skip
-the fetch — judgment call. Don't repeat this fetch later in the session;
-the on-demand pattern below covers ongoing needs.
-
-**On-demand (every Memory_search in a project).** When the user's
-workspace is under a known project, always include the project context
-in your search:
-
-```
-Memory_search({
+Memory_query({
+  verb: "search",
   query: "<your query>",
-  contexts: ["project/<name>", "cross-project"]   // both scopes
+  contexts: ["project/<name>", "cross-project"]
 })
 ```
 
-This makes project-scoped facts surface naturally alongside global
-identity/preference facts. Chip rendering rule stays the same — every
-used fact must appear.
+Chip rendering applies as for any retrieval — every used fact must
+appear in the user's view. **Don't write new `project/<name>` rows.**
 
-### Token budget
-
-Session-start fetch: one `Memory_search` + one chip with ≤5 rows.
-Roughly 300–500 tokens worst case. Agents must NOT expand this by
-pulling more rows "just in case" — the on-demand pattern handles it.
+Derive the project name from the workspace root: the **single last
+path component**, lowercase, no segment concatenation, no Cargo crate
+names. Example: workspace root `/Users/x/workspace/rust/some-app` →
+`project/some-app` (NOT `project/rust-some-app`).
 
 ## Usage rules for the two files above
 
 - Apply identity.md and style.md without re-reading the files.
-- Project-specific rules belong in that project's CLAUDE.md or AGENTS.md
-  — not here.
-- Scoped facts and semantic retrieval live in the RAG store (`Memory_*`
-  tools) — not here.
+- Project-specific rules belong in that project's user-curated
+  `CLAUDE.md` / `AGENTS.md` — memory does not author those files.
+- Scoped facts and semantic retrieval live in the RAG store
+  (`Memory_query` / `Memory_write`) — not here.
 - Keep core tiny. A noisy identity.md pollutes every unrelated session.
 --- END CORE MEMORY ---'''
 
@@ -267,10 +243,10 @@ user reviews in context via the timestamps you surface at retrieval.
 When the user utters one of these **in regular chat (not the /memory
 skill)**, save immediately. No widget, no confirmation, no verbose reply.
 
-1. **Name + relationship** — *"my cat TOM"*, *"my wife Yuki"* → `Edit identity.md`
+1. **Name + relationship** — *"my cat <name>"*, *"my wife <name>"* → `Edit identity.md`. Record exactly what the user said; never invent names or specifics.
 2. **Location / timezone** — *"I live in Shanghai"*, *"my timezone is PST"* → `Edit identity.md`
 3. **Role / identity** — *"I'm a robotics engineer"*, *"I founded Linggen"* → `Edit identity.md`
-4. **Long-term goal / vision** — *"I'm building X as Y"*, *"my vision is Z"* → `Memory_add` with `type: "fact"`, `tags: ["intent:goal"]`. **Do NOT write to identity.md** — goals are retrieved on-demand from RAG, not inlined always.
+4. **Long-term goal / vision** — *"I'm building X as Y"*, *"my vision is Z"* → `Memory_write({verb: "add", type: "fact", tags: ["intent:goal"], content: "..."})`. **Do NOT write to identity.md** — goals are retrieved on-demand from RAG, not inlined always.
 5. **Commitment-language preference** — *"always X"*, *"never Y"*, *"from now on Z"* → `Edit style.md`
 
 Detect these patterns semantically, not lexically — works in any language.
@@ -279,45 +255,47 @@ Detect these patterns semantically, not lexically — works in any language.
 prompt. Keep it narrow: name, role, location, relationships. Projects
 and goals go to RAG.
 
-**Skip** task descriptions, project-specific technical facts, inferred
-preferences, and opinions without commitment.
+**Skip** task descriptions, inferred preferences, and opinions without
+commitment. **Project-specific technical facts → drop.** Memory does
+not write to project files (`<project>/AGENTS.md`, `CLAUDE.md`, source,
+docs); those are user-curated, and the agent reads the source directly
+when it needs the content.
 
 **Explicit imperatives act immediately, no pre-confirmation:**
 *"remember X"* → save, reply *"Saved."*;
-*"forget X"* → `Memory_search` + `Memory_delete`, reply *"Deleted: <content>."*;
-*"update X to Y"* → `Memory_search` + `Memory_update`, reply *"Updated."*
+*"forget X"* → `Memory_query({verb: "search"})` + `Memory_write({verb: "delete"})`, reply *"Deleted: <content>."*;
+*"update X to Y"* → `Memory_query({verb: "search"})` + `Memory_write({verb: "update"})`, reply *"Updated."*
 
 
 ## Retrieval is visible — every fact you use, the user sees
 
-When you call `Memory_search` / `Memory_get` and use the result to shape
-a reply, surface what you used in the chat text with age. Rule: no
-silent use.
+When you call `Memory_query` (any verb) and use the result to shape a
+reply, surface what you used in the chat text with age. Rule: no silent
+use.
 
-> 💭 From memory (3 months ago · Jan 2026): User has a cat named Tom.
+> 💭 From memory (3 months ago · Jan 2026): User has a cat.
 
 Use relative time (*"3 months ago"*), not absolute dates. Dim or warn on
-facts older than 12 months. Skip the chip for facts you don't use.
+facts older than 12 months. Skip the chip for facts you don't use. When
+two rows on the same subject surface, reconcile them in prose ordered
+by timestamp; do not silently rewrite or delete.
 
-## Project-scoped memory
+## Project knowledge — not in memory
 
-Facts tagged `contexts: ["project/<name>"]` are project-internal
-knowledge — retrieve only when the workspace is under that project.
-Derive project name from the git repo basename, or from the workspace
-root's last path component.
+Project-internal architecture, conventions, and gotchas are **not**
+memory. Memory does not write to project files (`<project>/AGENTS.md`,
+`CLAUDE.md`, source, docs); those are user-curated. The agent reads
+the project's own files directly when it needs the content.
 
-**Session-start (eager, once):** on your FIRST response in a project
-workspace, run `Memory_search` with `contexts: ["project/<name>"]`,
-`limit: 5`, and surface hits as a chip titled `💭 Project memory · <name>`.
-Skip if the user's first message is casual / unrelated.
+If a candidate looks project-internal during a chat → **drop it**.
+Don't `Memory_write` to RAG, don't `Edit` any project file.
 
-**On-demand:** when doing any `Memory_search` in a project workspace,
-include both `project/<name>` and `cross-project` in the `contexts`
-array so project facts surface naturally. Every used fact chip-surfaced.
-
-Project CLAUDE.md / AGENTS.md files remain the responsibility of whoever
-manages that project's tooling (Claude Code owns its own memory). The
-memory system does not write to them.
+**Reading legacy project rows in RAG.** Older rows may still carry
+`contexts: ["project/<name>"]` from a previous routing scheme. Include
+both `project/<name>` and `cross-project` in `Memory_query({verb: "search"})`
+calls when you're in a project workspace so they surface naturally.
+Derive `<name>` as the **single last path component** of the workspace
+root (no segment concatenation). Don't write new `project/<name>` rows.
 --- END CORE MEMORY ---'''
 
 [delegation_header]

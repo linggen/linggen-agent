@@ -34,10 +34,28 @@
   }
 }
 
+/* Tab count bumps and flashes green when a new session is added */
+@keyframes count-bump {
+  0%   { transform: scale(1);   color: inherit; }
+  30%  { transform: scale(1.45); color: rgb(16, 185, 129); }
+  60%  { transform: scale(1);    color: rgb(16, 185, 129); }
+  100% { transform: scale(1);    color: inherit; }
+}
+
+/* "+1" badge floats up and fades out */
+@keyframes plus-one-fly {
+  0%   { opacity: 0; transform: translate(-50%, 0) scale(0.7); }
+  15%  { opacity: 1; transform: translate(-50%, -6px) scale(1.25); }
+  70%  { opacity: 1; transform: translate(-50%, -28px) scale(1.15); }
+  100% { opacity: 0; transform: translate(-50%, -44px) scale(1); }
+}
+
 @theme {
   --animate-thinking-bounce: thinking-bounce 1.4s ease-in-out infinite;
   --animate-slide-in: slide-in 0.25s ease-out;
   --animate-slide-in-right: slide-in-right 0.25s ease-out;
+  --animate-count-bump: count-bump 0.9s ease-out;
+  --animate-plus-one-fly: plus-one-fly 2.2s ease-out forwards;
 }
 
 :root {

@@ -9,7 +9,7 @@ import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react'
 import {
   MessageSquare, Bot, Sparkles, Plus, Search, X, Trash2,
   Play, Pause, ChevronDown, ChevronRight, Settings, RefreshCw,
-  CheckSquare,
+  CheckSquare, Loader2,
 } from 'lucide-react';
 import { cn } from '../lib/cn';
 import type { SessionInfo, CronMission } from '../types';
@@ -121,10 +121,18 @@ export const SessionList: React.FC<{
     }).catch(() => {});
   }, []);
 
-  // Track new sessions for animation
+  // Track new sessions for animation. Re-baseline silently on the first
+  // populated load (page_state event after mount) so every row doesn't
+  // slide in on refresh.
   const prevIdsRef = useRef<Set<string>>(new Set());
+  const didInitIdsRef = useRef(false);
   useEffect(() => {
     const currentIds = new Set(allSessions.map((s) => s.id));
+    if (!didInitIdsRef.current) {
+      if (currentIds.size > 0) didInitIdsRef.current = true;
+      prevIdsRef.current = currentIds;
+      return;
+    }
     const added = new Set<string>();
     for (const id of currentIds) {
       if (!prevIdsRef.current.has(id)) added.add(id);
@@ -147,6 +155,36 @@ export const SessionList: React.FC<{
     }
     return { user, mission, skill, all: allSessions.length };
   }, [allSessions]);
+
+  // Animate the tab count (e.g. "Mission (3)") with a +1 badge when it grows.
+  // bumpKey is a counter that re-mounts the animation node so consecutive
+  // increments still trigger fresh keyframes.
+  const [bumpKey, setBumpKey] = useState<Record<CreatorFilter, number>>({ all: 0, user: 0, mission: 0, skill: 0 });
+  const prevCountsRef = useRef(counts);
+  // Sessions load asynchronously after mount via the page_state event. The first
+  // populated update would otherwise look like growth on every tab. Re-baseline
+  // silently until we've observed real data at least once.
+  const didInitCountsRef = useRef(false);
+  useEffect(() => {
+    if (!didInitCountsRef.current) {
+      if (counts.all > 0) didInitCountsRef.current = true;
+      prevCountsRef.current = counts;
+      return;
+    }
+    const prev = prevCountsRef.current;
+    const grew: CreatorFilter[] = [];
+    (['user', 'mission', 'skill', 'all'] as CreatorFilter[]).forEach((k) => {
+      if (counts[k] > prev[k]) grew.push(k);
+    });
+    if (grew.length > 0) {
+      setBumpKey((b) => {
+        const next = { ...b };
+        for (const k of grew) next[k] = b[k] + 1;
+        return next;
+      });
+    }
+    prevCountsRef.current = counts;
+  }, [counts]);
 
   // Filter and search
   const filtered = useMemo(() => {
@@ -296,15 +334,29 @@ export const SessionList: React.FC<{
 
       {/* Filter tabs */}
       <div className="flex items-center gap-0.5 px-2 py-1.5 border-b border-slate-100 dark:border-white/[0.03]">
-        {(['user', 'mission', 'skill', 'all'] as const).map((f) => (
-          <button key={f} onClick={() => setFilter(f)}
-            className={cn('px-2 py-0.5 text-[11px] font-semibold rounded-full transition-colors capitalize',
-              filter === f
-                ? 'bg-blue-100 dark:bg-blue-500/15 text-blue-600 dark:text-blue-400'
-                : 'text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5')}>
-            {`${f === 'all' ? 'All' : f} (${counts[f]})`}
-          </button>
-        ))}
+        {(['user', 'mission', 'skill', 'all'] as const).map((f) => {
+          const k = bumpKey[f];
+          return (
+            <button key={f} onClick={() => setFilter(f)}
+              className={cn('relative px-2 py-0.5 text-[11px] font-semibold rounded-full transition-colors capitalize whitespace-nowrap',
+                filter === f
+                  ? 'bg-blue-100 dark:bg-blue-500/15 text-blue-600 dark:text-blue-400'
+                  : 'text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-100 dark:hover:bg-white/5')}>
+              {f === 'all' ? 'All' : f}
+              {' ('}
+              <span key={k} className={cn('inline-block tabular-nums', k > 0 && 'animate-count-bump')}>
+                {counts[f]}
+              </span>
+              {')'}
+              {k > 0 && (
+                <span key={`plus-${k}`}
+                  className="absolute left-1/2 -top-2 text-[16px] font-extrabold text-emerald-500 drop-shadow-[0_1px_2px_rgba(16,185,129,0.45)] pointer-events-none animate-plus-one-fly">
+                  +1
+                </span>
+              )}
+            </button>
+          );
+        })}
       </div>
 
       {/* Select-mode action bar */}
@@ -475,9 +527,16 @@ export const SessionList: React.FC<{
                 <span className="text-[10px] text-slate-400">{m.schedule}</span>
               </div>
               <button onClick={() => handleTriggerMission(m.id)} disabled={triggeringMission === m.id}
-                className="p-0.5 rounded hover:bg-green-100 dark:hover:bg-green-500/10 text-slate-400 hover:text-green-600 transition-colors disabled:opacity-40"
+                className={cn(
+                  'p-0.5 rounded transition-colors',
+                  triggeringMission === m.id
+                    ? 'text-green-600 bg-green-100 dark:bg-green-500/15'
+                    : 'text-slate-400 hover:text-green-600 hover:bg-green-100 dark:hover:bg-green-500/10',
+                )}
                 title="Trigger now">
-                <Play size={11} className={triggeringMission === m.id ? 'animate-spin' : ''} />
+                {triggeringMission === m.id
+                  ? <Loader2 size={11} className="animate-spin" />
+                  : <Play size={11} />}
               </button>
             </div>
           ))}
