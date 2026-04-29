@@ -183,7 +183,7 @@ export interface OllamaPsResponse {
 export interface AppConfig {
   models: ModelConfigUI[];
   server: { port: number; host: string };
-  agent: { max_iters: number; write_safety_mode: string; tool_permission_mode: string; prompt_loop_breaker?: string | null; default_policy?: string | null };
+  agent: { max_iters: number; write_safety_mode: string; tool_permission_mode: string; prompt_loop_breaker?: string | null };
   logging: { level?: string | null; directory?: string | null; retention_days?: number | null };
   agents: { id: string; spec_path: string; model?: string | null }[];
   routing?: { default_models?: string[]; default_policy?: string | null; auto_fallback?: boolean };
@@ -343,8 +343,6 @@ export interface CronMission {
   /** Optional pre-agent script (path relative to mission dir, or inline bash). */
   entry?: string | null;
 
-  /** Autonomy policy: "interactive" | "strict" | "trusted" | "sandbox". Default "strict". */
-  policy: string;
   /** Whitelist for Skill tool. Empty → Skill tool absent. ["*"] → any skill. */
   allow_skills?: string[];
   /** Capability names required — validated at load. */

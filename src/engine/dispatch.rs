@@ -81,6 +81,7 @@ impl AgentEngine {
             session_id: Option<String>,
             policy: Option<crate::engine::session_policy::SessionPolicy>,
             path_modes: Vec<crate::engine::permission::PathMode>,
+            interactive: bool,
         }
         let mut spawns: Vec<DelegationSpawn> = Vec::new();
 
@@ -99,6 +100,7 @@ impl AgentEngine {
                         session_id: self.tools.builtins.session_id.clone(),
                         policy: self.tools.builtins.session_policy.clone(),
                         path_modes: self.session_permissions.path_modes.clone(),
+                        interactive: self.session_permissions.interactive,
                     });
                 }
                 Err(e) => {
@@ -149,6 +151,7 @@ impl AgentEngine {
                         spawn.manager, ws, spawn.caller_id, spawn.target_agent_id,
                         spawn.task, spawn.parent_run_id, spawn.depth, spawn.max_depth,
                         bridge, spawn.session_id, spawn.policy, spawn.path_modes,
+                        spawn.interactive,
                     )
                     .await
                 });

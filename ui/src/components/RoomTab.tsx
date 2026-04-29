@@ -171,6 +171,14 @@ export const RoomTab: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [savedTick, setSavedTick] = useState(0);
+  const flashSaved = () => setSavedTick(t => t + 1);
+
+  useEffect(() => {
+    if (!savedTick) return;
+    const id = setTimeout(() => setSavedTick(0), 1800);
+    return () => clearTimeout(id);
+  }, [savedTick]);
 
   // Models (filter proxy models for sharing)
   const [allModels, setAllModels] = useState<{ id: string; model: string; provider?: string }[]>([]);
@@ -308,11 +316,12 @@ export const RoomTab: React.FC = () => {
 
   const saveRoomConfig = async (updates: Partial<{ shared_models: string[]; allowed_tools: string[]; allowed_skills: string[] }>) => {
     try {
-      await fetch('/api/room-config', {
+      const resp = await fetch('/api/room-config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updates),
       });
+      if (resp.ok) flashSaved();
     } catch { /* ignore */ }
   };
 
@@ -383,7 +392,7 @@ export const RoomTab: React.FC = () => {
     try {
       const meResp = await fetch('/api/rooms/mine');
       if (meResp.status === 401) { setLoggedIn(false); return; }
-      const resp = await fetch('/api/rooms/', {
+      const resp = await fetch('/api/rooms', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -402,8 +411,17 @@ export const RoomTab: React.FC = () => {
 
   const updateRoom = async (updates: Record<string, unknown>) => {
     setSaving(true); setError(null);
+    // Optimistic update so the controlled <select> reflects the new value
+    // immediately instead of snapping back to the old value during the
+    // network round-trip.
+    const prev = room;
+    if (room) setRoom({ ...room, ...(updates as Partial<RoomData>) });
     try {
-      const resp = await fetch('/api/rooms/', {
+      // Note: NO trailing slash. linggen.dev routes use exact path match
+      // (`path === '/rooms'`), so `/api/rooms/` silently misses every handler
+      // and returns a default 200 with null body — looks like success but
+      // nothing actually updates.
+      const resp = await fetch('/api/rooms', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updates),
@@ -411,17 +429,25 @@ export const RoomTab: React.FC = () => {
       if (!resp.ok) {
         const data = await resp.json();
         setError(data.error || 'Update failed');
+        if (prev) setRoom(prev);
         return;
       }
+      flashSaved();
       fetchRoom();
-    } catch (e: any) { setError(e.message); } finally { setSaving(false); }
+      // Room visibility may have flipped — refresh the public list so the
+      // user sees their own room appear/disappear under "Yours".
+      if ('room_type' in updates) fetchPublicRooms();
+    } catch (e: any) {
+      setError(e.message);
+      if (prev) setRoom(prev);
+    } finally { setSaving(false); }
   };
 
   const deleteRoom = async () => {
     if (!confirm('Delete your room? All members will be removed.')) return;
     setSaving(true);
     try {
-      await fetch('/api/rooms/', { method: 'DELETE' });
+      await fetch('/api/rooms', { method: 'DELETE' });
       setRoom(null); setMembers([]);
     } catch { /* ignore */ } finally { setSaving(false); }
   };
@@ -510,6 +536,10 @@ export const RoomTab: React.FC = () => {
   };
 
   const joinPublicRoom = async (roomId: string) => {
+    if (!loggedIn) {
+      setError('Sign in to linggen.dev to join a public room. Click the avatar in the top bar.');
+      return;
+    }
     if (!confirm('Privacy Notice: The room owner can see your messages. Don\'t share sensitive information.\n\nJoin this room?')) return;
     setJoining(true); setError(null);
     try {
@@ -536,6 +566,10 @@ export const RoomTab: React.FC = () => {
   const joinByInvite = async () => {
     const input = inviteInput.trim();
     if (!input) return;
+    if (!loggedIn) {
+      setError('Sign in to linggen.dev to join a room. Click the avatar in the top bar.');
+      return;
+    }
     // Extract token from URL or use as-is
     const match = input.match(/\/join\/([a-z0-9_]+)/i);
     const token = match ? match[1] : input;
@@ -581,17 +615,17 @@ export const RoomTab: React.FC = () => {
     return <div className="text-center py-12 text-slate-400">Loading...</div>;
   }
 
-  if (!loggedIn) {
-    return (
-      <div className="text-center py-12 space-y-3">
-        <p className="text-slate-500">Sign in to linggen.dev to manage rooms.</p>
-        <p className="text-xs text-slate-400">Click the avatar in the top bar to sign in.</p>
-      </div>
-    );
-  }
-
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 relative">
+
+      {savedTick > 0 && (
+        <div
+          key={savedTick}
+          className="fixed top-4 right-4 z-50 flex items-center gap-1.5 px-3 py-1.5 bg-green-500/15 border border-green-500/30 text-green-600 dark:text-green-400 text-xs font-bold rounded-lg shadow-lg pointer-events-none"
+        >
+          <Check size={12} /> Saved
+        </div>
+      )}
 
       {error && (
         <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg">
@@ -611,8 +645,17 @@ export const RoomTab: React.FC = () => {
         <div className="lg:w-1/2 lg:shrink-0 space-y-3">
           <h3 className={labelCls}>My Room</h3>
 
+          {/* Not logged in — show prompt instead of owner UI */}
+          {!loggedIn && (
+            <div className={`${sectionCls} !space-y-2 text-center`}>
+              <Users size={18} className="mx-auto text-slate-400" />
+              <p className="text-[10px] text-slate-500">Sign in to linggen.dev to create or manage your room.</p>
+              <p className="text-[10px] text-slate-400">Click the avatar in the top bar to sign in.</p>
+            </div>
+          )}
+
           {/* No room — compact CTA */}
-          {!room && !creating && (
+          {loggedIn && !room && !creating && (
             <div className={`${sectionCls} !space-y-2 text-center`}>
               <Users size={18} className="mx-auto text-slate-400" />
               <p className="text-[10px] text-slate-500">Share your models with others.</p>
@@ -621,7 +664,7 @@ export const RoomTab: React.FC = () => {
           )}
 
           {/* Create form */}
-          {creating && !room && (
+          {loggedIn && creating && !room && (
             <div className={sectionCls}>
               <div className="space-y-3">
                 <div>
@@ -660,7 +703,7 @@ export const RoomTab: React.FC = () => {
           )}
 
           {/* Room exists — settings card */}
-          {room && (
+          {loggedIn && room && (
             <div className="space-y-3">
 
               {/* Room header card */}
@@ -708,7 +751,7 @@ export const RoomTab: React.FC = () => {
                           method: 'POST',
                           headers: { 'Content-Type': 'application/json' },
                           body: JSON.stringify({ token_budget_room_daily: val }),
-                        }).then(() => fetchRoom());
+                        }).then(r => { if (r.ok) flashSaved(); fetchRoom(); });
                       }}
                       className="w-full px-2 py-1.5 bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded text-xs outline-none"
                     />
@@ -748,7 +791,7 @@ export const RoomTab: React.FC = () => {
               <div className={sectionCls}>
                 <div className="flex items-center justify-between">
                   <h4 className={labelCls}>Shared Models</h4>
-                  <span className="text-[10px] text-slate-500">{sharedModels.length}/{ownModels.length}</span>
+                  <span className="text-[10px] text-slate-500">{sharedModels.filter(id => ownModels.some(m => m.id === id)).length}/{ownModels.length}</span>
                 </div>
                 {ownModels.length === 0 ? (
                   <p className="text-[10px] text-slate-400">No models configured.</p>

@@ -539,7 +539,7 @@ async fn dispatch_mission_prompt(
     //   cwd + declared paths, and (b) if a skill is bound to the session,
     //   the skill's declared permission.paths.
     {
-        use crate::engine::permission::{PermissionMode, PermissionPolicy};
+        use crate::engine::permission::PermissionMode;
         let tier_mode = match mission
             .permission
             .as_ref()
@@ -550,18 +550,13 @@ async fn dispatch_mission_prompt(
             "edit" => PermissionMode::Edit,
             _ => PermissionMode::Admin,
         };
-        let policy = match mission.policy.as_str() {
-            "strict" => PermissionPolicy::strict(),
-            "interactive" => PermissionPolicy::interactive(),
-            "sandbox" => PermissionPolicy::sandbox(),
-            _ => PermissionPolicy::trusted(),
-        };
         let cwd = mission
             .cwd
             .clone()
             .or_else(|| mission.project.clone())
             .unwrap_or_else(|| "~/".to_string());
-        engine.session_permissions.set_policy(policy);
+        // Missions never prompt — they pause/fail on permission-needed.
+        engine.session_permissions.interactive = false;
         engine.session_permissions.set_path_mode(&cwd, tier_mode);
 
         // Apply extra narrow grants declared in permission.paths.

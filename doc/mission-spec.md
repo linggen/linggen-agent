@@ -16,7 +16,7 @@ A project or global config can have **multiple active missions** — like a cron
 
 - `skill-spec.md`: skill format — missions mirror this shape.
 - `agent-spec.md`: agent types, lifecycle, delegation.
-- `permission-spec.md`: modes, policies, rule evaluation.
+- `permission-spec.md`: path-scoped modes and rule evaluation.
 - `product-spec.md`: mission system overview, OS analogy.
 - `storage-spec.md`: mission JSON format, filesystem layout.
 
@@ -62,7 +62,6 @@ model: <optional override>
 entry: scripts/collect.sh          # optional pre-agent script (relative to mission dir)
 
 # Autonomy
-policy: strict                     # interactive | strict | trusted | sandbox
 allow-skills: []                   # whitelist for Skill tool — empty means mission calls no skill directly
 requires: [memory]                 # optional — capabilities that must be registered at load
 
@@ -97,7 +96,6 @@ permission:
 | `cwd` | yes | Working directory for entry script + agent |
 | `model` | no | Model override |
 | `entry` | no | Pre-agent script — path relative to mission dir, or inline `bash -c "..."` |
-| `policy` | no | `interactive` / `strict` / `trusted` / `sandbox` — default `strict` for missions |
 | `allow-skills` | no | Whitelist of skill names callable via `Skill`. Empty/omitted → `Skill` tool absent. `"*"` → any installed skill |
 | `requires` | no | Capability names that must be resolvable at load time — else mission disabled with reason |
 | `allowed-tools` | yes | Explicit tool list. `AskUser` / `EnterPlanMode` always stripped |
@@ -182,10 +180,11 @@ No seconds field. No `@reboot` or non-standard extensions.
 
 ## Permission model
 
-Missions run without a human in the loop. Two orthogonal levers govern what the agent can do and how out-of-scope actions are handled:
+Missions run without a human in the loop. Their permission model is the same path-mode model used by user sessions:
 
-- **`permission.mode`** — sets the capability ceiling (path-mode) on the mission cwd + declared paths.
-- **`policy`** — decides what happens when an action exceeds the ceiling or matches an ask-rule.
+- **`permission.mode`** sets the capability ceiling on the mission `cwd` and every path in `permission.paths`.
+- If the mission changes cwd, the effective mode is recomputed from those grants.
+- If a mission needs more permission than its grants allow, it records a permission-needed failure/pause. It does not prompt the user during scheduled execution and does not silently widen access.
 
 See `permission-spec.md` for the full model.
 
@@ -199,20 +198,9 @@ See `permission-spec.md` for the full model.
 
 The mode applies to `cwd` plus every path under `permission.paths`. Skill grants loaded via `Skill` invocation compose via longest-path-match — a mission with `admin` on `~/.linggen` can safely invoke a skill that declares narrower `admin` on `~/.linggen/memory` without widening anything.
 
-### Autonomy policy
+### Hardcoded deny floor
 
-| Policy | `on_exceed` | `on_ask_rule` | Fit for missions |
-|:-------|:-----------:|:-------------:|:-----------------|
-| **interactive** | ask | ask | **Discouraged** — queues prompts nobody clicks |
-| **strict** | deny | deny | **Default for missions.** Safely bounded — model must course-correct within grants |
-| **trusted** | allow | deny | Legacy locked-session behavior. Out-of-scope passes; `ask:` rules still deny |
-| **sandbox** | allow | allow | Containerized/Docker runs where the OS is the guardrail |
-
-`interactive` remains available for parity with session policy, but the scheduler logs a warning when a mission loads with it.
-
-### Config deny rules
-
-`linggen.toml` deny rules (`Bash(rm -rf *)`, `Bash(sudo *)`, etc.) are hard floors that no policy can bypass. They apply to missions exactly as they apply to interactive sessions.
+The engine's hardcoded deny floor (`sudo`, `rm -rf /`, forkbomb, etc.) applies to missions exactly as it applies to interactive sessions. There is no `linggen.toml` permission rule layer to inherit from. See `permission-spec.md`.
 
 ## Capability resolution
 
@@ -236,7 +224,7 @@ Separate from capability tools, a mission can delegate a whole sub-task to anoth
 
 For the `dream` mission: `allow-skills: []`. It uses `Memory_*` tools directly, no skill invocation.
 
-Invoked skills (when `allow-skills` is non-empty) inherit the **mission's** permission bubble (mode + policy + paths), not the skill's own defaults. A `strict`-policy mission that does invoke a skill runs that skill under `strict` — the skill can't widen the mission's autonomy by being called.
+Invoked skills (when `allow-skills` is non-empty) inherit the **mission's** permission grants (mode + paths), not the skill's own defaults. A skill can't widen the mission's access by being called.
 
 ## Skill-bundled missions
 
@@ -310,9 +298,9 @@ Skipped triggers (busy / daily cap) are logged with `skipped: true` and no `sess
 | Max triggers per mission | 100 per day | Caps runaway cost |
 | Max concurrent missions | No hard limit | Busy-skip throttles naturally |
 | `max_iters` | Per agent config | Bounds each triggered run |
-| Default policy | `strict` | Safe by default; authors opt into `trusted`/`sandbox` explicitly |
+| Path-mode grants | Required | Missions only run within their configured `cwd` and `permission.paths` |
 | No interactive tools | — | `AskUser`/`EnterPlanMode` stripped regardless of `allowed-tools` |
-| Config deny rules | Enforced | Hard-block commands at all policies |
+| Hardcoded deny floor | Enforced | Engine-baked deny patterns block dangerous commands in every mode |
 | Entry script failure | Skips agent | Prevents garbage-in agent work |
 
 ## Lifecycle
@@ -332,7 +320,7 @@ create → enabled → (triggers run on schedule, each run creates a session) �
 
 - **List** — all missions with status, schedule, last run, next run.
 - **Editor** — edit frontmatter fields + body. Body shown as markdown with step headings.
-- **Permissions panel** — mode + policy + allow-skills + requires. Warnings from `permission.warning` surfaced before enable.
+- **Permissions panel** — mode + paths + allow-skills + requires. Warnings from `permission.warning` surfaced before enable.
 - **Agent tab** — read-only view of the mission body (prompt).
 - **Run history** — list of `MissionRunEntry`; clicking a row opens the session read-only.
 - **Manual trigger** — "Run now" button. Same permission bubble as scheduled runs.
@@ -379,7 +367,7 @@ Both subsystems are first-class — engine boot treats them symmetrically.
 | `project_store/missions.rs` | Mission CRUD on disk, frontmatter parse/serialize, run history |
 | `server/mission_scheduler.rs` | Cron evaluation, tick loop, entry execution, session creation, agent dispatch |
 | `server/missions_api.rs` | HTTP endpoints for management and manual trigger |
-| `engine/permission.rs` | Policy + path-mode enforcement shared with interactive sessions |
+| `engine/permission.rs` | Path-mode enforcement shared with interactive sessions |
 | `skills/` | Capability registration — mission resolves tools through the same registry |
 
 ## Migration from old format

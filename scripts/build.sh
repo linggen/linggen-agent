@@ -2,20 +2,24 @@
 set -euo pipefail
 
 # Master build orchestrator script for Linggen Agent
-# Usage: ./scripts/build.sh <version> [--skip-linux]
+# Usage: ./scripts/build.sh <version> [--platform mac|linux]
+#
+# Default platform is the current host (no cross-build):
+#   - macOS host  → mac
+#   - Linux host  → linux
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 source "$ROOT_DIR/scripts/lib-common.sh"
 
 VERSION=""
-SKIP_LINUX=false
+PLATFORM=""
 
-# Parse arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --skip-linux)
-      SKIP_LINUX=true
-      shift ;;
+    --platform)
+      PLATFORM="${2:-}"; shift 2 ;;
+    --platform=*)
+      PLATFORM="${1#--platform=}"; shift ;;
     *)
       if [ -z "$VERSION" ]; then
         VERSION="$1"
@@ -25,13 +29,24 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$VERSION" ]; then
-  echo "Usage: $0 <version> [--skip-linux]" >&2
+  echo "Usage: $0 <version> [--platform mac|linux]" >&2
   exit 1
 fi
 
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+HOST_PLATFORM="$([ "$OS" = "darwin" ] && echo mac || echo linux)"
+PLATFORM="${PLATFORM:-$HOST_PLATFORM}"
+
+case "$PLATFORM" in
+  mac|linux) ;;
+  *)
+    echo "Error: --platform must be 'mac' or 'linux' (got '$PLATFORM')" >&2
+    exit 1 ;;
+esac
+
 VERSION_NUM="${VERSION#v}"
 
-echo "🏗️  Building Linggen ${VERSION}"
+echo "🏗️  Building Linggen ${VERSION} (platform: ${PLATFORM})"
 echo "=============================="
 
 # 0. Sync version to all project files
@@ -43,29 +58,21 @@ echo "🧹 Cleaning dist/..."
 rm -rf "$ROOT_DIR/dist"
 mkdir -p "$ROOT_DIR/dist"
 
-# 1. Build local platform artifacts
-OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
-if [ "$OS" = "darwin" ]; then
-  echo "📦 Step 1: Building macOS artifacts..."
+# 1. Build artifacts for the selected platform
+if [ "$PLATFORM" = "mac" ]; then
+  if [ "$OS" != "darwin" ]; then
+    echo "Error: --platform mac requires a macOS host" >&2
+    exit 1
+  fi
+  echo "📦 Building macOS artifacts..."
   "$ROOT_DIR/scripts/build-mac.sh" "$VERSION"
 else
-  echo "📦 Step 1: Building local Linux artifact..."
-  cd "$ROOT_DIR" && cargo clean -p linggen && cargo build --release
-fi
-
-# 2. Build multi-arch Linux artifacts (requires Docker)
-if [ "$SKIP_LINUX" = "true" ]; then
-  echo ""
-  echo "⏩ Step 2: Skipping multi-arch Linux build."
-else
-  if command -v docker >/dev/null && docker buildx version >/dev/null 2>&1; then
-    echo ""
-    echo "🐳 Step 2: Building multi-arch Linux packages via Docker..."
-    "$ROOT_DIR/scripts/build-linux.sh" "$VERSION"
-  else
-    echo ""
-    echo "⚠️  Docker or Buildx not found. Skipping multi-arch Linux build."
+  if ! (command -v docker >/dev/null && docker buildx version >/dev/null 2>&1); then
+    echo "Error: --platform linux requires Docker + buildx" >&2
+    exit 1
   fi
+  echo "🐳 Building multi-arch Linux packages via Docker..."
+  "$ROOT_DIR/scripts/build-linux.sh" "$VERSION"
 fi
 
 echo ""

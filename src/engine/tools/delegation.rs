@@ -76,6 +76,7 @@ impl Tools {
         let ask_bridge = self.ask_user_bridge.clone();
         let policy = self.session_policy.clone();
         let parent_path_modes = self.parent_path_modes.clone();
+        let parent_interactive = self.parent_interactive;
         block_on_async(run_delegation(
             manager,
             ws_root,
@@ -89,6 +90,7 @@ impl Tools {
             session_id,
             policy,
             parent_path_modes,
+            parent_interactive,
         ))
     }
 
@@ -254,6 +256,7 @@ pub(crate) async fn run_delegation(
     session_id: Option<String>,
     parent_policy: Option<crate::engine::session_policy::SessionPolicy>,
     parent_path_modes: Vec<crate::engine::permission::PathMode>,
+    parent_interactive: bool,
 ) -> Result<ToolResult> {
     let run_id = manager
         .begin_agent_run(
@@ -316,10 +319,16 @@ pub(crate) async fn run_delegation(
     // `~/.claude` for the memory skill) don't re-prompt inside delegated runs. The
     // parent is the authority: subagents cannot see anything the parent couldn't.
     for pm in &parent_path_modes {
-        engine.session_permissions.set_path_mode(&pm.path, pm.mode.clone());
+        engine.session_permissions.set_path_mode(&pm.path, pm.mode);
     }
     // Also propagate so that *further* nested delegations keep the grants.
     engine.tools.builtins.parent_path_modes = parent_path_modes;
+    engine.tools.builtins.parent_interactive = parent_interactive;
+    // A non-interactive parent (mission, proxy consumer) means the subagent
+    // also cannot prompt — surfacing a prompt with no human attached deadlocks.
+    if !parent_interactive {
+        engine.session_permissions.interactive = false;
+    }
 
     // Wire AskUser bridge so the subagent can prompt for permissions and user questions.
     if let Some(bridge) = ask_user_bridge {

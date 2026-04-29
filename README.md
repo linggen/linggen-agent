@@ -43,6 +43,7 @@ That's it. Opens a web UI at `localhost:9898`.
 | **Runs locally** | Yes | Yes | No (cloud) | Cloud-only |
 | **Any model** | Ollama, Claude, GPT, Gemini, DeepSeek, Groq, OpenRouter | Claude only | Multi-model | GPT only |
 | **Remote access** | P2P WebRTC — your machine, any device | Cloud-hosted web app | No | Cloud-only |
+| **Share models with others** | Yes — proxy rooms over P2P | No | No | No |
 | **Open source** | MIT | No | No | CLI only |
 | **Skills/extensions** | Drop-in SKILL.md files ([Agent Skills](https://agentskills.io) standard) | Custom slash commands | Plugins | No |
 | **Web UI** | Full web interface with streaming | Terminal + web app | IDE-embedded | Web (cloud) |
@@ -65,6 +66,21 @@ Then open `linggen.dev/app` from any browser, anywhere.
 
 Use local models via Ollama, or cloud APIs — Claude, GPT, Gemini, DeepSeek, Groq, OpenRouter. Switch models mid-conversation. Configure fallback chains so work never stops.
 
+### Proxy Rooms — Share Your Models
+
+Open a private or public room and let friends, teammates, or the community talk to your models — over the same P2P WebRTC link, no cloud middleman. Pick which models are shared, which tools and skills consumers can use, and set daily token budgets per room and per consumer. Disable the room and everyone is kicked instantly.
+
+```bash
+# Owner: enable a room in Settings → Sharing
+# Consumer: open linggen.dev/app and connect to the room name
+```
+
+Room config lives at `~/.linggen/room_config.toml`; persistent token usage at `~/.linggen/token_usage.json` (auto-resets at midnight UTC).
+
+### Semantic Memory
+
+The `ling-mem` skill gives the agent a LanceDB-backed semantic memory: typed facts (preference / decision / learned / fact), 384-dim embeddings, filter-and-search, first-class forgetting. It remembers across sessions, projects, and tools — and works the same from Linggen, Claude Code, or any agent that can shell out.
+
 ### Skills, Not Plugins
 
 Drop a `SKILL.md` into your project and the agent gains new capabilities instantly. Skills follow the open [Agent Skills](https://agentskills.io) standard, compatible with Claude Code and Codex.
@@ -85,7 +101,7 @@ For complex tasks, the agent proposes a plan before acting. Review, edit, or app
 
 ### Mission System
 
-Schedule recurring tasks with cron expressions. Code reviews, dependency updates, monitoring — agents self-initiate work on your schedule.
+Schedule recurring tasks with cron expressions. Three run modes — `agent` (full agent loop), `app` (open a URL), or `script` (run a shell command) — so missions cover everything from code reviews and dependency updates to dashboards and one-shot scripts. Each mission carries its own permission scope, allowed tools, and allowed skills.
 
 ## Quick Start
 

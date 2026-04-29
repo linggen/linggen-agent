@@ -28,8 +28,12 @@ For vision, landscape, and roadmap, see [`insight.md`](insight.md).
 | Shell/scripting | Bash tool — model runs shell commands |
 | Signal | Cancel, pause — delivered via message queue |
 | IPC | Event bus + delegation for inter-agent communication |
-| Cron job | Mission — cron-scheduled agent task (multiple per project) |
+| Cron job | Mission — scheduled agent / app / script (multiple per project) |
 | Driver | Model provider — Ollama, OpenAI, Claude, Bedrock |
+| Filesystem | Memory store — core markdown + LanceDB RAG via `ling-mem` |
+| Process privilege | Permission modes (chat / read / edit / admin) + path scoping |
+| User account | `UserContext` — every peer has `user_id`; state filtered per-user |
+| Network share | Rooms — share models with peers over P2P WebRTC |
 
 ### Related docs
 
@@ -37,11 +41,19 @@ For vision, landscape, and roadmap, see [`insight.md`](insight.md).
 |:----|:---------|
 | `agentic-loop.md` | Kernel — loop, interrupts, cancellation |
 | `agent-spec.md` | Process management — lifecycle, delegation, scheduling |
-| `skill-spec.md` | Dynamic extensions — format, discovery, triggers |
-| `tool-spec.md` | Syscall interface — built-in tools, safety |
-| `chat-spec.md` | Chat system — events, message model, rendering, APIs |
 | `session-spec.md` | Session/context — creators, effective tools, prompt assembly |
+| `skill-spec.md` | Dynamic extensions — format, discovery, triggers, install hooks |
+| `mission-spec.md` | Cron jobs — agent / app / script, scope, scheduling |
+| `tool-spec.md` | Syscall interface — built-in tools, safety |
+| `permission-spec.md` | Privilege model — modes, layers, deny floor, remote trust |
+| `chat-spec.md` | Chat system — events, message model, rendering, APIs |
+| `plan-spec.md` | Plan mode — research-then-execute |
+| `memory-spec.md` | Memory — extraction, storage, two-tier loading |
 | `models.md` | Hardware abstraction — providers, routing |
+| `webrtc-spec.md` | Transport — P2P, signaling, data channels |
+| `room-spec.md` | Sharing — rooms, shared models, token budgets |
+| `storage-spec.md` | Filesystem layout — `~/.linggen/` |
+| `log-spec.md` | Logging levels, throttling, output targets |
 | `cli.md` | Shell — CLI reference |
 | `insight.md` | Vision, landscape, roadmap |
 
@@ -87,6 +99,14 @@ Users configure multiple providers (Ollama, OpenAI, Claude, Bedrock). Named rout
 - Skills written for Linggen work in Claude Code and Codex (shared Agent Skills standard).
 - Users manage all agents, skills, and models from one place.
 
+### 7. Durable memory
+
+The agent remembers who the user is and how to work with them across sessions. Shipped as a skill (`ling-mem`) so the same store is reachable from any AI tool. See `memory-spec.md`.
+
+### 8. Sharing without the cloud
+
+Owners can open rooms to share their models with others. Inference flows P2P over WebRTC — no cloud middleman. See `room-spec.md`.
+
 ---
 
 ## Product Goals
@@ -98,30 +118,30 @@ Users configure multiple providers (Ollama, OpenAI, Claude, Bedrock). Named rout
 - **Unified CLI** — `ling` starts the server and opens the Web UI.
 - **Multi-model routing** — named policies (local-first, cloud-first, custom).
 - **Cross-tool compatibility** — Agent Skills standard.
+- **Durable memory** — persistent identity, preferences, and trajectory across sessions.
+- **Own-your-models sharing** — proxy rooms over P2P WebRTC, no cloud middleman.
 
 ## Mission System
 
-Cron-based scheduled agent work — like a crontab with multiple entries.
+Schedule-driven work — a crontab with multiple entries. Each mission runs as an agent, an app launch, or a shell script, with its own permission scope and tool/skill allowlist. See [`mission-spec.md`](mission-spec.md).
 
-- **No missions** → agents are purely reactive (human-in-the-loop).
-- **Active missions** → agents triggered on cron schedules, each with its own prompt.
+## Rooms
 
-A project can have **multiple active missions**. Each mission defines a cron schedule, target agent, prompt, and optional model override. Missions are independent — enable, disable, or edit them individually. See [`mission-spec.md`](doc/mission-spec.md) for full details.
+Owners open private or public rooms to share their models with others. Inference flows over the same P2P WebRTC link as remote access — the relay never sees request bodies. Per-room and per-consumer daily token budgets. See [`room-spec.md`](room-spec.md).
 
 ## UX Surface
 
 - **CLI**: `ling` starts backend server + opens Web UI.
-- **Web UI**: agent/skill management, session chat, agent tab views, mission page, settings, memory.
-- **Agent switching**: `/agent <name>` or tab views.
-- **Remote access**: built-in WebRTC transport for access from anywhere. `linggen.dev` provides signaling relay and bootstrap — the full UI is loaded from the linggen server via data channel. See `webrtc-spec.md`.
+- **Web UI**: agent/skill management, session chat, missions, room sharing, settings, memory.
+- **Remote access**: P2P WebRTC from anywhere via `linggen.dev`. See `webrtc-spec.md`.
+- **Sharing**: open a room; friends connect from `linggen.dev/app`. See `room-spec.md`.
 
 ## Safety Requirements
 
 - Workspace-scoped file operations.
-- Allowlisted command execution.
-- Persisted chat/run records.
-- Cancellation cascades through run trees.
-- See `tool-spec.md` for details.
+- Permission modes (chat / read / edit / admin) with path scoping and a hardcoded deny floor. See `permission-spec.md`.
+- Per-user filtering on remote peers.
+- Persisted chat/run records; cancellation cascades through run trees.
 
 ## Non-goals (early stage)
 

@@ -18,9 +18,6 @@ pub struct Config {
     /// Default working folder for new sessions. Defaults to `~` if not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_path: Option<String>,
-    /// Permission rules (deny/ask). See permission-spec.md.
-    #[serde(default)]
-    pub permissions: PermissionsConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -127,12 +124,6 @@ pub struct AgentConfig {
     pub prompt_loop_breaker: Option<String>,
     #[serde(default = "default_max_delegation_depth")]
     pub max_delegation_depth: usize,
-    /// Default session policy preset for user-initiated chats:
-    /// "interactive" | "strict" | "trusted" | "sandbox".
-    /// Defaults to "interactive" (per-action prompts on out-of-scope).
-    /// See `permission-spec.md` → Session policy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_policy: Option<String>,
     /// Every N user messages, inject a hidden memory self-review nudge into
     /// the turn. `0` disables. Default 6. See `memory-spec.md`.
     #[serde(default = "default_memory_nudge_interval")]
@@ -191,17 +182,6 @@ impl Default for ToolPermissionMode {
     fn default() -> Self {
         ToolPermissionMode::Ask
     }
-}
-
-/// Permission rules from `[permissions]` in linggen.toml. See permission-spec.md.
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
-pub struct PermissionsConfig {
-    /// Hard-block rules — always denied, no prompt. E.g. `["Bash(sudo *)"]`
-    #[serde(default)]
-    pub deny: Vec<String>,
-    /// Force-prompt rules — always prompted even within mode ceiling. E.g. `["Bash(git push *)"]`
-    #[serde(default)]
-    pub ask: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -397,7 +377,6 @@ impl Default for Config {
                 default_permission_mode: None,
                 prompt_loop_breaker: None,
                 max_delegation_depth: default_max_delegation_depth(),
-                default_policy: None,
                 memory_nudge_interval: default_memory_nudge_interval(),
             },
             logging: LoggingConfig {
@@ -408,7 +387,6 @@ impl Default for Config {
             agents: Vec::new(),
             routing: RoutingConfig::default(),
             home_path: None,
-            permissions: PermissionsConfig::default(),
         }
     }
 }

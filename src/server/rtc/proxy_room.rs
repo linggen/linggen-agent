@@ -99,6 +99,14 @@ impl ProxyRoomConnections {
 
 /// Rebuild the ModelManager from current local models + all tracked proxy rooms.
 /// This preserves the health tracker from the old manager.
+///
+/// Public so callers that replace `state.manager.models` (e.g. config reload
+/// in `update_config`) can restore the dynamically-registered proxy entries
+/// they would otherwise drop.
+pub async fn reapply_proxy_models(state: &ServerState) {
+    rebuild_model_manager(state).await;
+}
+
 async fn rebuild_model_manager(state: &ServerState) {
     let mut model_lock = state.manager.models.write().await;
     let old_mm = Arc::clone(&model_lock);

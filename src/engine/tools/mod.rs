@@ -188,6 +188,10 @@ pub struct Tools {
     /// granted paths (e.g. `~/.linggen`) don't require re-prompting inside a
     /// delegated run.
     pub(crate) parent_path_modes: Vec<super::permission::PathMode>,
+    /// Parent engine's `interactive` flag. Propagated to subagents so that a
+    /// non-interactive parent (mission, proxy consumer) yields a non-interactive
+    /// child — prompts in unattended runs deadlock.
+    pub(crate) parent_interactive: bool,
 }
 
 impl Tools {
@@ -207,6 +211,7 @@ impl Tools {
             session_id: None,
             session_policy: None,
             parent_path_modes: Vec::new(),
+            parent_interactive: true,
         })
     }
 

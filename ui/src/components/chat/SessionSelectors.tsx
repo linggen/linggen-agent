@@ -38,8 +38,15 @@ export const SessionModelSelector: React.FC = () => {
   const setSessionModel = useUiStore((s) => s.setSessionModel);
   const sessionId = useSessionStore((s) => s.activeSessionId);
   const selectedProjectRoot = useSessionStore((s) => s.selectedProjectRoot);
+  const userType = useUserStore((s) => s.userType);
 
-  const defaultLabel = defaultModels.length > 0 ? defaultModels[0] : 'default';
+  // Consumers (proxy room) only see models the owner has shared. There's no
+  // "owner default" available to them — the server picks the first shared
+  // model when no override is sent. Use that as the Default label.
+  const isConsumer = userType === 'consumer';
+  const defaultLabel = isConsumer
+    ? (models[0]?.id ?? 'shared')
+    : (defaultModels.length > 0 ? defaultModels[0] : 'default');
 
   const handleChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const value = e.target.value || null;
@@ -87,18 +94,17 @@ export const SessionModelSelector: React.FC = () => {
 export const SessionModeSelector: React.FC = () => {
   const sessionMode = useUiStore((s) => s.sessionMode);
   const setSessionMode = useUiStore((s) => s.setSessionMode);
-  const sessionZone = useUiStore((s) => s.sessionZone);
   const userPermission = useUserStore((s) => s.userPermission);
   const userType = useUserStore((s) => s.userType);
   const sessionId = useSessionStore((s) => s.activeSessionId);
 
+  // Four modes. `chat` means no path-mode grant covers cwd → no tools.
   const modes = [
+    { value: 'chat', label: 'chat', color: 'text-slate-500 dark:text-slate-400' },
     { value: 'read', label: 'read', color: 'text-emerald-600 dark:text-emerald-400' },
     { value: 'edit', label: 'edit', color: 'text-blue-600 dark:text-blue-400' },
     { value: 'admin', label: 'admin', color: 'text-amber-600 dark:text-amber-400' },
   ];
-
-  const isSystemZone = sessionZone === 'system';
 
   // Consumers: show permission as read-only badge (room settings control permissions)
   if (userType === 'consumer') {
@@ -128,31 +134,16 @@ export const SessionModeSelector: React.FC = () => {
     }
   };
 
-  const current = modes.find((m) => m.value === (sessionMode || 'read'));
-
-  if (isSystemZone) {
-    // In a system zone, mode is not user-switchable. If a skill (or other
-    // mechanism) has elevated the effective mode above "read", reflect that
-    // so the user sees the real permission instead of a misleading "read".
-    const effective = sessionMode && sessionMode !== 'read' ? sessionMode : 'read';
-    const effectiveColor = modes.find((m) => m.value === effective)?.color || 'text-slate-400';
-    return (
-      <span
-        className={`text-[11px] border border-slate-200 dark:border-white/10 rounded px-1.5 py-0.5 font-semibold bg-slate-50 dark:bg-black/30 ${effectiveColor}`}
-        title="System path — mode granted by skill or setup, not user-switchable"
-      >
-        {effective} (system)
-      </span>
-    );
-  }
+  const effective = sessionMode || 'chat';
+  const current = modes.find((m) => m.value === effective);
 
   return (
     <select
-      value={sessionMode || 'read'}
+      value={effective}
       onChange={handleChange}
       onClick={(e) => e.stopPropagation()}
       className={`text-[11px] border border-slate-200 dark:border-white/10 rounded px-1.5 py-0.5 outline-none font-semibold bg-white dark:bg-black/30 ${current?.color || ''}`}
-      title="Session permission mode"
+      title="Permission mode for this folder"
     >
       {modes.map((m) => (
         <option key={m.value} value={m.value}>{m.label}</option>

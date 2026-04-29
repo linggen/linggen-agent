@@ -44,16 +44,5 @@ fi
 tar -C target/release -czf "$DIST_DIR/ling-${SLUG}.tar.gz" ling
 echo "✅ ling built: dist/ling-${SLUG}.tar.gz"
 
-# Step 3: Signing
-echo ""
-echo "3️⃣  Signing Artifacts..."
-
-TARBALL="$DIST_DIR/ling-${SLUG}.tar.gz"
-SIG=$(sign_file "$TARBALL" "$ROOT_DIR") || true
-if [ -n "$SIG" ]; then
-  echo "$SIG" > "${TARBALL}.sig.txt"
-  echo "  ✅ Tarball signed"
-fi
-
 echo ""
 echo "✅ macOS build complete! Artifacts are in $DIST_DIR"

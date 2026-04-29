@@ -12,9 +12,6 @@ use std::sync::Arc;
 /// Accepted values for permission.mode.
 const VALID_MODES: &[&str] = &["read", "edit", "admin"];
 
-/// Accepted values for the autonomy policy.
-const VALID_POLICIES: &[&str] = &["interactive", "strict", "trusted", "sandbox"];
-
 fn validate_mode(mode: &str) -> Result<(), String> {
     if VALID_MODES.contains(&mode) {
         Ok(())
@@ -23,18 +20,6 @@ fn validate_mode(mode: &str) -> Result<(), String> {
             "Invalid permission.mode '{}'. Allowed: {}",
             mode,
             VALID_MODES.join(", ")
-        ))
-    }
-}
-
-fn validate_policy(policy: &str) -> Result<(), String> {
-    if VALID_POLICIES.contains(&policy) {
-        Ok(())
-    } else {
-        Err(format!(
-            "Invalid policy '{}'. Allowed: {}",
-            policy,
-            VALID_POLICIES.join(", ")
         ))
     }
 }
@@ -85,9 +70,6 @@ pub(crate) struct CreateMissionRequest {
     mode: Option<String>,
     #[serde(default)]
     entry: Option<String>,
-    /// Autonomy policy.
-    #[serde(default)]
-    policy: Option<String>,
     #[serde(default)]
     allow_skills: Option<Vec<String>>,
     #[serde(default)]
@@ -112,11 +94,6 @@ pub(crate) async fn create_mission(
 ) -> impl IntoResponse {
     if let Err(e) = missions::validate_cron(&req.schedule) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-    }
-    if let Some(ref p) = req.policy {
-        if let Err(e) = validate_policy(p) {
-            return (StatusCode::BAD_REQUEST, e).into_response();
-        }
     }
     if let Some(ref m) = req.permission_mode {
         if let Err(e) = validate_mode(m) {
@@ -180,7 +157,6 @@ pub(crate) async fn create_mission(
         cwd: Some(req.cwd.clone()),
         model: Some(req.model),
         entry: Some(entry),
-        policy: req.policy,
         allow_skills: req.allow_skills,
         requires: req.requires,
         allowed_tools: req.allowed_tools,
@@ -246,8 +222,6 @@ pub(crate) struct UpdateMissionRequest {
     #[serde(default)]
     entry: Option<Option<String>>,
     #[serde(default)]
-    policy: Option<String>,
-    #[serde(default)]
     allow_skills: Option<Vec<String>>,
     #[serde(default)]
     requires: Option<Vec<String>>,
@@ -264,11 +238,6 @@ pub(crate) async fn update_mission(
     if let Some(ref s) = req.schedule {
         if let Err(e) = missions::validate_cron(s) {
             return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-        }
-    }
-    if let Some(ref p) = req.policy {
-        if let Err(e) = validate_policy(p) {
-            return (StatusCode::BAD_REQUEST, e).into_response();
         }
     }
     if let Some(ref m) = req.permission_mode {
@@ -318,7 +287,6 @@ pub(crate) async fn update_mission(
         cwd: cwd_pair.clone(),
         model: req.model,
         entry: req.entry,
-        policy: req.policy,
         allow_skills: req.allow_skills,
         requires: req.requires,
         allowed_tools: req.allowed_tools,

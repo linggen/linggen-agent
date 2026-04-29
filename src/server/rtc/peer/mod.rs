@@ -438,6 +438,11 @@ async fn run_peer(
                                             .and_then(|v| v.as_str())
                                             .map(|s| s.to_string())
                                             .or_else(|| user_ctx.avatar_url.clone());
+                                        tracing::info!(
+                                            "[room_chat] inbound on inference channel from user_id={} text_len={}",
+                                            user_ctx.user_id,
+                                            chat_text.len()
+                                        );
                                         let _ = state.events_tx.send(
                                             crate::server::ServerEvent::RoomChat {
                                                 sender_id: user_ctx.user_id.clone(),

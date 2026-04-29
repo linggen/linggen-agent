@@ -106,6 +106,11 @@ pub(super) fn handle_control_message(
                 .chars()
                 .take(64)
                 .collect();
+            tracing::info!(
+                "[room_chat] inbound on control channel from user_id={} text_len={}",
+                user_ctx.user_id,
+                text.len()
+            );
             let _ = state.events_tx.send(crate::server::ServerEvent::RoomChat {
                 sender_id: user_ctx.user_id.clone(),
                 sender_name,

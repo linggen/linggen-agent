@@ -78,29 +78,18 @@ impl AgentEngine {
             let sdir = crate::paths::global_sessions_dir().join(sid);
             self.session_permissions = permission::SessionPermissions::load(&sdir);
 
-            // Consumer/mission sessions must keep their non-interactive policy
-            // even after reload from disk. SessionPolicy::apply() set the
-            // policy before the loop starts, but SessionPermissions::load()
-            // just overwrote it. Re-apply Trusted (no prompts, ask-rules
-            // denied) if consumer/mission restrictions are active.
+            // Mission and proxy-consumer sessions are non-interactive — they
+            // pause/fail instead of prompting. Re-apply after load, since
+            // permission.json may have been written before this flag was set.
             if self.cfg.consumer_allowed_tools.is_some() || self.cfg.mission_allowed_tools.is_some() {
-                self.session_permissions
-                    .set_policy(permission::PermissionPolicy::trusted());
-            } else if self.session_permissions.policy == permission::PermissionPolicy::default() {
-                // First-time load (permission.json absent or at defaults) —
-                // apply the user's configured default policy from
-                // `[agent] default_policy`. Skill/mission/consumer sessions
-                // already picked their own policy above, so this only affects
-                // fresh user chats.
-                if let Some(ref name) = self.cfg.default_policy {
-                    self.session_permissions
-                        .set_policy(permission::PermissionPolicy::from_preset(name));
-                }
+                self.session_permissions.interactive = false;
             }
 
-            // Initialize default path_modes if empty (new session = read on cwd).
+            // Initialize default path_modes if empty (new user session →
+            // configured default mode on starting cwd). Mission/consumer
+            // sessions get their grants from frontmatter; skip the default.
             if self.session_permissions.path_modes.is_empty()
-                && !self.session_permissions.policy.is_locked()
+                && self.session_permissions.interactive
             {
                 let actual_cwd = self.tools.builtins.cwd();
                 let cwd_str = if let Some(home) = dirs::home_dir() {

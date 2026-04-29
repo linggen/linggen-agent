@@ -6,9 +6,9 @@ guide: |
   Avoid implementation details like function signatures, variable types, or code snippets.
 ---
 
-# Proxy Rooms
+# Rooms
 
-Community model sharing — users with API keys (proxies) share spare capacity with other users (consumers) through rooms. Consumers get free AI access; proxies earn credits. Built on linggen's existing WebRTC infrastructure.
+Community model sharing. An owner opens a **room** to share their models with other users (consumers); the owner's linggen acts as the proxy that calls the AI provider on the consumer's behalf. Consumers get AI access without setting up keys; owners earn credits. Built on linggen's existing WebRTC infrastructure.
 
 ## Related docs
 
@@ -271,11 +271,11 @@ A dedicated consumer chat page shows the consumer-relevant UI: chat widget, sess
 
 #### Permission enforcement
 
-Consumer sessions are **locked** — the agent never asks the consumer for additional permissions. All enforcement is server-side:
+Consumer sessions cannot ask the consumer for additional permissions. All enforcement is server-side:
 
 1. **Room config is the ceiling**: `room_config.toml` defines `allowed_tools` and `allowed_skills`. These are the hard limits regardless of the consumer's permission level.
-2. **Permission level operates within the ceiling**: the consumer's permission (chat/read/edit) determines what the agent can do, but only within what the room config allows. Even a consumer with edit permission cannot use tools the owner hasn't shared.
-3. **No prompts**: locked sessions never show permission prompts (AskUser for tool access, mode upgrades, path grants). If an action isn't already allowed, it's blocked silently.
+2. **Permission level is a path-mode grant**: the consumer's permission (chat/read/edit) determines what the agent can do in the consumer session scope, but only within what the room config allows. Even a consumer with edit permission cannot use tools the owner hasn't shared.
+3. **No consumer prompts**: consumer sessions never show permission prompts for tool access, mode upgrades, or path grants. If an action needs more permission, it is blocked or returned as permission-needed to the owner-side runtime.
 4. **System prompt filtering**: the agent's tool list and skill list only include what the room config allows. The agent never sees blocked tools, so it won't attempt to call them.
 5. **Execution gate**: defense-in-depth — if the agent hallucinates a blocked tool or skill call, the engine blocks it at execution time.
 6. **Skill trigger enforcement**: consumers cannot bypass skill restrictions by typing `/skill-name` directly. Both button-click and trigger-command paths check the allowlist.
@@ -404,7 +404,7 @@ Layer 3: ENGINE (per-request)
 - linggen.dev frontend: dashboard room sections, join page, public rooms browser.
 - linggen local UI: Settings > Sharing tab (room management, shared models, member list).
 - Browser consumer mode: tunnel owner's UI via WebRTC, consumer_mode message on control channel, server-side permission loading.
-- Consumer permission enforcement: SessionPolicy loads room_config for consumer sessions (allowed_tools, allowed_skills, locked=true). System prompt filters skills. Execution gate blocks disallowed tool/skill calls. Locked sessions skip path-based prompts.
+- Consumer permission enforcement: SessionPolicy loads room_config for consumer sessions (allowed_tools, allowed_skills, consumer path-mode ceiling). System prompt filters skills. Execution gate blocks disallowed tool/skill calls. Consumer sessions cannot approve new path grants.
 
 ### Phase 6b: Linggen server proxy mode — DONE
 

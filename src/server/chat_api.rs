@@ -576,8 +576,9 @@ async fn run_skill_dispatch(
     }
 
     // Skill permission approval — prompt user if skill declares permission requirements.
-    // Consumer sessions are locked — skills run with the permissions already set by SessionPolicy.
-    if !engine.session_permissions.policy.is_locked() {
+    // Non-interactive sessions (mission/consumer) skip the prompt — skills run
+    // with whatever grants the session already has.
+    if engine.session_permissions.interactive {
         if let Some(ref skill) = engine.active_skill {
             if let Some(ref perm) = skill.permission {
                 use crate::engine::permission::PermissionMode;
@@ -620,25 +621,12 @@ async fn run_skill_dispatch(
 
                 match engine.ask_permission_raw(&skill.name, question).await {
                     Some(crate::engine::permission::PermissionAction::AllowOnce) => {
-                        // "Approve" — grant the requested permissions and lock
-                        // the session to `strict` policy. The skill declared
-                        // the paths it needs; anything outside that scope
-                        // should be silently denied (so the model sees an
-                        // error and adapts) rather than prompting the user on
-                        // every speculative Glob/Grep. Spec: permission-spec.md
-                        // → "A policy where either lever is not `ask` is
-                        // locked — the agent never prompts the user".
+                        // "Approve" — write the skill's declared grants into
+                        // the session's path_modes. The skill runs within the
+                        // session's normal interactive flow.
                         for path in &perm.paths {
-                            engine.session_permissions.set_path_mode(path, mode.clone());
+                            engine.session_permissions.set_path_mode(path, mode);
                         }
-                        // Skill may declare a policy (SKILL.md frontmatter
-                        // `permission.policy`); default to `strict` so the
-                        // skill's scope is enforced without user prompts.
-                        engine.session_permissions.policy = perm
-                            .policy
-                            .as_deref()
-                            .map(crate::engine::permission::PermissionPolicy::from_preset)
-                            .unwrap_or_else(crate::engine::permission::PermissionPolicy::strict);
                         if let Some(ref sdir) = engine.session_dir {
                             engine.session_permissions.save(sdir);
                         }
@@ -1460,6 +1448,15 @@ pub(crate) async fn chat_handler(
 
             tokio::spawn(async move {
                 let mut engine = agent.lock().await;
+
+                // Refresh the engine's model_manager from the live state so it
+                // sees models registered after engine creation — most notably
+                // proxy models added when the user joins a room mid-session.
+                // Without this, picking a freshly-registered proxy model
+                // appears valid in the UI but `has_model` returns false here,
+                // and we fall back to the local default model.
+                engine.model_manager = state.manager.models.read().await.clone();
+
                 if let Some(queued_id) = queued_item_id.as_deref() {
                     let key = queue_key(
                         &project_root_for_queue,
@@ -1496,12 +1493,27 @@ pub(crate) async fn chat_handler(
                     .await;
                 }
 
-                // Apply session-level model override if provided.
-                // When no override is sent (user selected "Default"), reset
-                // model_id to the configured default so fallback state from a
-                // previous turn doesn't persist.
+                // Resolve the effective model. Consumers (proxy room) MUST be
+                // restricted to the room's shared_models — never fall back to
+                // the owner's default model, which would leak access to a
+                // model the consumer isn't allowed to use.
+                let is_consumer = req_user_type == "consumer";
+                let shared_models = if is_consumer {
+                    crate::server::rtc::room_config::load_room_config().shared_models
+                } else {
+                    Vec::new()
+                };
+                let consumer_default = || -> Option<String> {
+                    shared_models
+                        .iter()
+                        .find(|id| engine.model_manager.has_model(id))
+                        .cloned()
+                };
+
                 if let Some(ref mid) = req_model_id {
-                    if engine.model_manager.has_model(mid) {
+                    let ok = engine.model_manager.has_model(mid)
+                        && (!is_consumer || shared_models.contains(mid));
+                    if ok {
                         engine.model_id = mid.clone();
                         // Persist model choice to session metadata
                         if let Some(ref sid) = session_id {
@@ -1513,18 +1525,23 @@ pub(crate) async fn chat_handler(
                             }
                         }
                     } else {
-                        // The UI asked for a model that's no longer in config
-                        // (renamed / removed / not yet reloaded). Fall back to
-                        // the default instead of silently running on stale
-                        // `engine.model_id`, and clear the stale pinning so the
-                        // session stops requesting the dead id.
+                        // Requested model is unavailable or not shared with this
+                        // consumer. Fall back to a shared model (consumer) or
+                        // the configured default (owner), and clear the stale
+                        // pinning so the session stops requesting the dead id.
+                        let fallback = if is_consumer {
+                            consumer_default().unwrap_or_else(|| engine.default_model_id.clone())
+                        } else {
+                            engine.default_model_id.clone()
+                        };
                         tracing::warn!(
-                            "Session '{}' requested model '{}' which is not configured — falling back to default '{}'",
+                            "Session '{}' requested model '{}' which is unavailable for {} — falling back to '{}'",
                             session_id.as_deref().unwrap_or("?"),
                             mid,
-                            engine.default_model_id
+                            if is_consumer { "consumer" } else { "owner" },
+                            fallback
                         );
-                        engine.model_id = engine.default_model_id.clone();
+                        engine.model_id = fallback;
                         if let Some(ref sid) = session_id {
                             if let Ok(Some(mut meta)) = state.manager.global_sessions.get_session_meta(sid) {
                                 if meta.model_id.is_some() {
@@ -1534,6 +1551,10 @@ pub(crate) async fn chat_handler(
                             }
                         }
                     }
+                } else if is_consumer {
+                    // Consumer chose "Default" — pick a shared model, never the
+                    // owner's default.
+                    engine.model_id = consumer_default().unwrap_or_else(|| engine.default_model_id.clone());
                 } else {
                     engine.model_id = engine.default_model_id.clone();
                 }
@@ -1654,7 +1675,7 @@ pub(crate) async fn chat_handler(
                                     // is implicit approval of its declared permissions — without
                                     // this, the skill runs at the session's default mode and its
                                     // SKILL.md permission block has no effect.
-                                    if !engine.session_permissions.policy.is_locked() {
+                                    if engine.session_permissions.interactive {
                                         if let Some(ref perm) = skill.permission {
                                             use crate::engine::permission::PermissionMode;
                                             let mode = match perm.mode.as_str() {
@@ -1668,65 +1689,30 @@ pub(crate) async fn chat_handler(
                                                     &engine.session_permissions.path_modes,
                                                     std::path::Path::new(path),
                                                 );
-                                                if current.as_ref() != Some(&mode) {
-                                                    engine.session_permissions.set_path_mode(path, mode.clone());
+                                                if current != Some(mode) {
+                                                    engine.session_permissions.set_path_mode(path, mode);
                                                     changed = true;
                                                 }
                                             }
                                             // Also grant the skill's mode on the session's own cwd
-                                            // so the page_state's `effective_mode` lookup (which
-                                            // queries against the session cwd, not the skill's
-                                            // declared paths) reflects the skill's ceiling. Without
-                                            // this, the UI dropdown shows "read" even when the
-                                            // skill has admin grants on its own paths — confusing
-                                            // because the skill *is* operating at admin tier.
-                                            // Mirrors what mission_scheduler does at line 565 for
-                                            // mission cwd.
+                                            // so the UI's mode badge reflects the skill's ceiling.
                                             let cwd_str = engine.cfg.ws_root.display().to_string();
                                             if !cwd_str.is_empty() {
                                                 let current_cwd = crate::engine::permission::effective_mode_for_path(
                                                     &engine.session_permissions.path_modes,
                                                     &engine.cfg.ws_root,
                                                 );
-                                                if current_cwd.as_ref() != Some(&mode) {
-                                                    engine.session_permissions.set_path_mode(&cwd_str, mode.clone());
+                                                if current_cwd != Some(mode) {
+                                                    engine.session_permissions.set_path_mode(&cwd_str, mode);
                                                     changed = true;
                                                 }
-                                            }
-                                            // Apply the skill's declared policy (or `strict` by
-                                            // default) so out-of-scope actions deny silently
-                                            // instead of prompting. See permission-spec.md §
-                                            // Session policy.
-                                            let want = perm
-                                                .policy
-                                                .as_deref()
-                                                .map(crate::engine::permission::PermissionPolicy::from_preset)
-                                                .unwrap_or_else(crate::engine::permission::PermissionPolicy::strict);
-                                            if engine.session_permissions.policy != want {
-                                                engine.session_permissions.policy = want;
-                                                changed = true;
                                             }
                                             if changed {
                                                 if let Some(ref sdir) = engine.session_dir {
                                                     engine.session_permissions.save(sdir);
                                                 }
-                                                // Tell page_state to rebuild on the next 2s tick
-                                                // so the UI's mode pill reflects the skill grant
-                                                // immediately, instead of waiting for the chat
-                                                // task to finish (which is what currently emits
-                                                // the next StateUpdated).
                                                 let _ = ctx.events_tx.send(ServerEvent::StateUpdated);
                                             }
-
-                                            // NOTE: we intentionally do NOT seed session cwd to
-                                            // perm.paths[0]. Earlier versions did this to make
-                                            // Bash permission checks resolve to the granted path,
-                                            // but that broke relative-path tools (Edit, Write)
-                                            // because the model's mental model of cwd stays at
-                                            // the workspace root. Bash permission is now handled
-                                            // by `check_permission`'s 4c rule (scans the command
-                                            // string for granted paths), which works regardless
-                                            // of cwd. See permission-spec.md.
                                         }
                                     }
                                     engine.active_skill = Some(skill);

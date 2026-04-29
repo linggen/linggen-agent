@@ -214,6 +214,11 @@ async fn run_proxy_client_loop(
                                             let chat_text = chat_data.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                             if !chat_text.is_empty() {
                                                 if let Some(ref etx) = events_broadcast_tx {
+                                                    tracing::info!(
+                                                        "[room_chat] proxy_client received from owner; broadcasting locally; sender_id={} text_len={}",
+                                                        sender_id,
+                                                        chat_text.len()
+                                                    );
                                                     let _ = etx.send(crate::server::ServerEvent::RoomChat {
                                                         sender_id, sender_name, avatar_url, text: chat_text,
                                                     });

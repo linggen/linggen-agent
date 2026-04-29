@@ -66,8 +66,6 @@ struct MissionFrontmatter {
     entry: Option<String>,
 
     // Autonomy
-    #[serde(default = "default_policy", skip_serializing_if = "is_default_policy")]
-    policy: String,
     #[serde(
         rename = "allow-skills",
         default,
@@ -92,14 +90,6 @@ struct MissionFrontmatter {
     project: Option<String>,
     #[serde(default, skip_serializing_if = "is_zero")]
     created_at: u64,
-}
-
-fn default_policy() -> String {
-    "strict".to_string()
-}
-
-fn is_default_policy(s: &str) -> bool {
-    s == "strict"
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -130,6 +120,7 @@ struct LegacyFrontmatter {
     /// Legacy: "readonly" | "standard" | "full". Maps to permission.mode.
     #[serde(default)]
     permission_tier: Option<String>,
+    /// Legacy autonomy policy preset — read but ignored (no longer used).
     #[serde(default)]
     policy: Option<String>,
     #[serde(default)]
@@ -159,7 +150,6 @@ pub struct Mission {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
 
-    pub policy: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -220,7 +210,6 @@ pub struct MissionDraft {
     pub cwd: Option<Option<String>>,
     pub model: Option<Option<String>>,
     pub entry: Option<Option<String>>,
-    pub policy: Option<String>,
     pub allow_skills: Option<Vec<String>>,
     pub requires: Option<Vec<String>>,
     pub allowed_tools: Option<Vec<String>>,
@@ -353,7 +342,6 @@ fn parse_mission_md(id: &str, content: &str) -> Result<Mission> {
         cwd: fm.cwd,
         model: fm.model,
         entry: fm.entry,
-        policy: fm.policy,
         allow_skills: fm.allow_skills,
         requires: fm.requires,
         allowed_tools: fm.allowed_tools,
@@ -375,7 +363,6 @@ fn default_mission(id: String, prompt: String) -> Mission {
         cwd: None,
         model: None,
         entry: None,
-        policy: default_policy(),
         allow_skills: Vec::new(),
         requires: Vec::new(),
         allowed_tools: Vec::new(),
@@ -424,7 +411,6 @@ fn parse_legacy(id: &str, yaml: &str, body: String) -> Result<Mission> {
         cwd: fm.project.clone(),
         model: fm.model,
         entry: fm.entry,
-        policy: fm.policy.unwrap_or_else(default_policy),
         allow_skills: Vec::new(),
         requires: Vec::new(),
         allowed_tools: Vec::new(),
@@ -446,7 +432,6 @@ fn mission_to_md(mission: &Mission) -> String {
         cwd: mission.cwd.clone(),
         model: mission.model.clone(),
         entry: mission.entry.clone(),
-        policy: mission.policy.clone(),
         allow_skills: mission.allow_skills.clone(),
         requires: mission.requires.clone(),
         allowed_tools: mission.allowed_tools.clone(),
@@ -599,7 +584,6 @@ impl MissionStore {
             cwd: draft.cwd.clone().flatten(),
             model: draft.model.clone().flatten(),
             entry,
-            policy: draft.policy.clone().unwrap_or_else(default_policy),
             allow_skills: draft.allow_skills.clone().unwrap_or_default(),
             requires: draft.requires.clone().unwrap_or_default(),
             allowed_tools: draft.allowed_tools.clone().unwrap_or_default(),
@@ -654,9 +638,6 @@ impl MissionStore {
         }
         if let Some(e) = draft.entry {
             mission.entry = e;
-        }
-        if let Some(p) = draft.policy {
-            mission.policy = p;
         }
         if let Some(s) = draft.allow_skills {
             mission.allow_skills = s;
@@ -872,7 +853,6 @@ mod tests {
             .unwrap();
         assert_eq!(m1.id, "check-status");
         assert!(m1.enabled);
-        assert_eq!(m1.policy, "strict");
         assert_eq!(m1.agent_id, MISSION_AGENT_ID);
 
         let m2 = store
@@ -893,7 +873,6 @@ mod tests {
             prompt: Some("Clean up old files\n\nRemove build artifacts.".into()),
             model: Some(Some("gpt-4".into())),
             cwd: Some(Some("/tmp/proj".into())),
-            policy: Some("strict".into()),
             allow_skills: Some(vec!["memory".into()]),
             requires: Some(vec!["memory".into()]),
             allowed_tools: Some(vec!["Read".into(), "Bash".into()]),
@@ -997,7 +976,6 @@ mod tests {
         let m = parse_mission_md("nightly", content).unwrap();
         assert_eq!(m.schedule, "0 23 * * *");
         assert!(m.enabled);
-        assert_eq!(m.policy, "strict");
         assert_eq!(m.permission.as_ref().unwrap().mode, "edit"); // standard → edit
         assert_eq!(m.prompt, "Do the nightly scan.");
         assert_eq!(m.created_at, 123);

@@ -50,7 +50,6 @@ interface CreateMissionArgs {
   model?: string;
   cwd?: string;
   entry?: string;
-  policy?: string;
   permission_mode?: string;
   permission_paths?: string[];
   permission_warning?: string;
@@ -71,7 +70,6 @@ async function createMission(args: CreateMissionArgs): Promise<CronMission | nul
       model: args.model || null,
       cwd: args.cwd || null,
       entry: args.entry || null,
-      policy: args.policy || 'strict',
       permission_mode: args.permission_mode || 'admin',
       permission_paths: args.permission_paths || [],
       permission_warning: args.permission_warning || null,
@@ -236,13 +234,6 @@ export const PERMISSION_MODES = [
   { value: 'admin', label: 'Admin', desc: 'Full access, no restrictions. Use with caution.', color: 'amber' },
 ] as const;
 
-export const POLICY_OPTIONS = [
-  { value: 'strict',      label: 'Strict',      desc: 'Silently deny anything outside the grant. Safest default for headless runs.',  color: 'green' },
-  { value: 'trusted',     label: 'Trusted',     desc: 'Silently allow out-of-scope. Ask-rules (git push, etc.) still deny.',           color: 'blue' },
-  { value: 'sandbox',     label: 'Sandbox',     desc: 'Allow everything. For Docker/VM runs where the OS is the guardrail.',          color: 'amber' },
-  { value: 'interactive', label: 'Interactive', desc: 'Prompt for out-of-scope. Discouraged for missions — prompts queue unseen.',    color: 'red'   },
-] as const;
-
 export const MissionEditor: React.FC<{
   editing: CronMission | null;
   workingFolders: string[];
@@ -258,9 +249,6 @@ export const MissionEditor: React.FC<{
   const [selectedCwd, setSelectedCwd] = useState(editing?.cwd || editing?.project || '');
   const [entry, setEntry] = useState(editing?.entry || '');
 
-  const [policy, setPolicy] = useState<'strict' | 'trusted' | 'sandbox' | 'interactive'>(
-    ((editing?.policy as 'strict' | 'trusted' | 'sandbox' | 'interactive') || 'strict'),
-  );
   const [permissionMode, setPermissionMode] = useState<'read' | 'edit' | 'admin'>(
     (editing?.permission?.mode as 'read' | 'edit' | 'admin') || 'admin',
   );
@@ -304,7 +292,6 @@ export const MissionEditor: React.FC<{
         model: model || undefined,
         cwd: selectedCwd || undefined,
         entry: entry || undefined,
-        policy,
         permission_mode: permissionMode,
         permission_paths: permPaths,
         permission_warning: permissionWarning || undefined,
@@ -380,41 +367,6 @@ export const MissionEditor: React.FC<{
             className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-slate-200 dark:border-white/10 bg-white dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-blue-500/30" />
           <div className="text-[11px] text-slate-400 mt-1.5">
             Relative paths resolve against the mission directory. Entry receives <code>MISSION_ID</code>, <code>MISSION_DIR</code>, <code>MISSION_CWD</code>, <code>MISSION_OUTPUT_DIR</code>, <code>MISSION_LAST_RUN_AT</code>, <code>MISSION_RUN_ID</code>.
-          </div>
-        </div>
-
-        <div>
-          <label className="text-[12px] font-medium text-slate-600 dark:text-slate-400 mb-1.5 block">
-            Autonomy policy
-          </label>
-          <div className="space-y-2">
-            {POLICY_OPTIONS.map(opt => {
-              const selected = policy === opt.value;
-              const colorMap: Record<string, string> = {
-                blue: selected ? 'border-blue-500/40 bg-blue-500/10' : '',
-                green: selected ? 'border-green-500/40 bg-green-500/10' : '',
-                amber: selected ? 'border-amber-500/40 bg-amber-500/10' : '',
-                red: selected ? 'border-red-500/40 bg-red-500/10' : '',
-              };
-              const dotMap: Record<string, string> = {
-                blue: 'bg-blue-500', green: 'bg-green-500',
-                amber: 'bg-amber-500', red: 'bg-red-500',
-              };
-              return (
-                <button key={opt.value} type="button" onClick={() => setPolicy(opt.value as any)}
-                  className={cn(
-                    'w-full flex items-start gap-3 px-3 py-2.5 rounded-lg border text-left transition-colors',
-                    selected ? colorMap[opt.color] : 'border-slate-200 dark:border-white/10 hover:bg-slate-50 dark:hover:bg-white/5',
-                  )}>
-                  <div className={cn('w-3 h-3 rounded-full mt-0.5 shrink-0 border-2',
-                    selected ? dotMap[opt.color] + ' border-transparent' : 'border-slate-300 dark:border-white/20')} />
-                  <div className="min-w-0">
-                    <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">{opt.label}</div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">{opt.desc}</div>
-                  </div>
-                </button>
-              );
-            })}
           </div>
         </div>
 

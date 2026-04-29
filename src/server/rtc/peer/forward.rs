@@ -110,10 +110,24 @@ pub(super) fn forward_event_to_channels(
     // events via its sess-{id} channel and never need activity from other
     // sessions — suppress cross-session events entirely (skill iframe must not
     // observe activity, ask_user, or session_created from unrelated sessions).
-    // Room chat is user-level and still reaches the peer.
+    //
+    // Room chat used to be allowed through to embed peers as "user-level",
+    // but embed iframes (skill apps) don't render a RoomChatPanel — and when
+    // the user has both a main view AND an embed view connected at the same
+    // time (typical: a skill page is open in the dashboard), the embed peer's
+    // forward duplicated every room_chat message in the visible panel. Drop
+    // it for embed peers; the main-view peer is the only one that displays
+    // room chat.
+    if filter.view == Some("embed") && ui_msg.kind == "room_chat" {
+        tracing::trace!(
+            "[fwd] DROP(embed-no-room-chat) user={} pinned={}",
+            dbg_user, dbg_pinned
+        );
+        return;
+    }
     if let (Some("embed"), Some(pinned)) = (filter.view, filter.pinned_session_id) {
         if let Some(sid) = ui_msg.session_id.as_deref() {
-            let is_user_level = matches!(ui_msg.kind.as_str(), "room_chat") || sid == "global";
+            let is_user_level = sid == "global";
             if !is_user_level && sid != pinned {
                 // TRACE not DEBUG — this branch fires per-event for every
                 // background session the embed peer ignores. A single
@@ -164,6 +178,12 @@ pub(super) fn forward_event_to_channels(
         Some("global") | None => {
             if let Some(cid) = control_channel_id {
                 if pending_dc_writes.len() < MAX_DC_WRITE_QUEUE {
+                    if ui_msg.kind == "room_chat" {
+                        tracing::info!(
+                            "[room_chat] forward → control DC user={} channel={:?}",
+                            dbg_user, cid
+                        );
+                    }
                     pending_dc_writes.push_back((cid, json.clone()));
                 }
             }
@@ -238,6 +258,10 @@ pub(super) fn forward_event_to_channels(
                 "data": ui_msg.data,
             });
             if pending_dc_writes.len() < MAX_DC_WRITE_QUEUE {
+                tracing::info!(
+                    "[room_chat] forward → inference DC user={} channel={:?}",
+                    dbg_user, cid
+                );
                 pending_dc_writes.push_back((cid, chat_msg.to_string()));
             }
         }

@@ -28,8 +28,9 @@ if [ -f "$ROOT_DIR/Cargo.toml" ]; then
   fi
   echo "  ✅ Updated Cargo.toml"
 
-  # Update Cargo.lock
-  (cd "$ROOT_DIR" && cargo fetch 2>/dev/null || true)
+  # Update Cargo.lock — required so the built binary's `--version` matches.
+  # Don't swallow failures here: a broken lockfile means a broken release.
+  (cd "$ROOT_DIR" && cargo fetch)
   echo "  ✅ Updated Cargo.lock"
 fi
 

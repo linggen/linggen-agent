@@ -1419,6 +1419,8 @@ async fn prepare_server(
         .route("/api/auth/login", get(auth_login))
         .route("/api/auth/callback", get(auth_callback))
         .route("/api/auth/logout", post(auth_logout))
+        .route("/api/rooms", axum::routing::any(proxy_rooms))
+        .route("/api/rooms/", axum::routing::any(proxy_rooms))
         .route("/api/rooms/{*path}", axum::routing::any(proxy_rooms))
         .route("/api/proxy/connect", post(connect_proxy_room_api))
         .route("/api/proxy/disconnect", post(disconnect_proxy_room_api))

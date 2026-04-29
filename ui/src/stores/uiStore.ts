@@ -49,9 +49,8 @@ interface UiState {
   // Session-level model override (not persisted — resets on session change)
   sessionModel: string | null;
 
-  // Session permission mode (read/edit/admin — pushed by server page_state)
+  // Session permission mode (chat/read/edit/admin — pushed by server page_state)
   sessionMode: string | null;
-  sessionZone: string; // 'home' | 'temp' | 'system'
 
   // Chat UI
   verboseMode: boolean;
@@ -75,7 +74,6 @@ interface UiState {
   setModelPickerOpen: (open: boolean) => void;
   setSessionModel: (model: string | null) => void;
   setSessionMode: (mode: string | null) => void;
-  setSessionZone: (zone: string) => void;
   setShowAgentSpecEditor: (show: boolean) => void;
   setOpenApp: (app: AppPanelState | null) => void;
 
@@ -99,7 +97,6 @@ export const useUiStore = create<UiState>((set) => ({
   modelPickerOpen: false,
   sessionModel: null,
   sessionMode: null,
-  sessionZone: 'home',
   showAgentSpecEditor: false,
   openApp: null,
   selectedFileContent: null,
@@ -131,7 +128,6 @@ export const useUiStore = create<UiState>((set) => ({
   setModelPickerOpen: (open) => set({ modelPickerOpen: open }),
   setSessionModel: (model) => set({ sessionModel: model }),
   setSessionMode: (mode: string | null) => set({ sessionMode: mode }),
-  setSessionZone: (zone) => set({ sessionZone: zone }),
   setShowAgentSpecEditor: (show) => set({ showAgentSpecEditor: show }),
   setOpenApp: (app) => set({ openApp: app }),
 

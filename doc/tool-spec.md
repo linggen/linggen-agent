@@ -97,15 +97,15 @@ Dispatch order in `ToolRegistry.execute()`:
 
 ## Access control
 
-Session permission mode controls which tools are available. See `permission-spec.md` for the full model.
+The session's effective permission mode for the target path controls which tools are available. See `permission-spec.md` for the full model.
 
-- **Four modes**: chat (no tools), read, edit, admin — each a ceiling on what the agent can do.
-- **Path-scoped**: permissions are tied to directory trees, aligned with OS ownership (home vs system).
+- **Four modes**: chat (no tools), read, edit, admin — each a ceiling on what the agent can do for a path.
+- **Path-scoped**: permissions are stored as `(path, mode)` grants and recomputed when cwd changes.
 - **Deny/ask rules**: configured in `linggen.toml` to hard-block or force-prompt specific commands.
 - Write-safety mode: checks that file was Read before Write/Edit.
 - Redundancy detection: cache + loop-breaker for repeated calls.
 
-**Flow**: permission gate in `handle_tool_action()` → classify action tier → check deny/ask rules → check path zone + mode ceiling → emit `AskUser` event if needed → proceed or block.
+**Flow**: permission gate in `handle_tool_action()` → classify action tier → check deny/ask rules → resolve target path → compare action tier to effective path mode → emit `AskUser` event if interactive, otherwise return permission-needed.
 
 **Implementation**: `engine/permission.rs`, `engine/tool_exec.rs`, `ui/src/components/ToolPermissionCard.tsx`.
 

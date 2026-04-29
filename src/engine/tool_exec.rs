@@ -101,7 +101,12 @@ impl AgentEngine {
                         Some(permission::PermissionAction::AllowSession)
                     }
                     other => {
-                        if other.starts_with("Switch to ") || other.starts_with("Allow read on ") {
+                        // Match both the current "Switch this folder to {mode}"
+                        // wording from build_exceeds_ceiling_question and the
+                        // legacy "Switch to {mode} mode" / "Allow read on …"
+                        // forms still in older prompts. Anything starting with
+                        // "Switch" is treated as a persistent grant approval.
+                        if other.starts_with("Switch ") || other.starts_with("Allow read on ") {
                             Some(permission::PermissionAction::AllowSession)
                         } else {
                             Some(permission::PermissionAction::Deny)
@@ -297,18 +302,6 @@ impl AgentEngine {
             Some(self.tools.builtins.cwd().to_string_lossy().to_string())
         };
 
-        // Auto-block retries of denied tool calls.
-        if self.session_permissions.denied_sigs.contains(&sig) {
-            let summary =
-                permission::permission_target_summary(&canonical_tool, &args, &self.tools.builtins.cwd());
-            let msg = self.prompt_store.render_or_fallback(
-                crate::prompts::keys::PERMISSION_DENIED,
-                &[("tool", &canonical_tool), ("summary", &summary)],
-            );
-            messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-            return PreExecOutcome::Blocked(LoopControl::Continue);
-        }
-
         // --- mission bash prefix restriction (legacy, kept for backward compat) ---
         if canonical_tool == "Bash" {
             if let Some(ref prefixes) = self.cfg.bash_allow_prefixes {
@@ -351,8 +344,6 @@ impl AgentEngine {
                 file_path_arg.as_deref(),
                 &self.tools.builtins.cwd(),
                 &self.session_permissions,
-                &self.cfg.deny_rules,
-                &self.cfg.ask_rules,
                 skill_tier_override,
             )
         };
@@ -374,155 +365,59 @@ impl AgentEngine {
                 let summary =
                     permission::permission_target_summary(&canonical_tool, &args, &self.tools.builtins.cwd());
 
-                match prompt_kind {
-                    permission::PromptKind::ExceedsCeiling { target_mode, path, tool_summary } => {
-                        let question = permission::build_exceeds_ceiling_question(
-                            &tool_summary, &target_mode, &path,
+                // Non-interactive sessions (mission, proxy consumer) cannot prompt —
+                // return permission-needed immediately.
+                if !self.session_permissions.interactive {
+                    let msg = self.prompt_store.render_or_fallback(
+                        crate::prompts::keys::PERMISSION_DENIED,
+                        &[("tool", &canonical_tool), ("summary", &summary)],
+                    );
+                    messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
+                    return PreExecOutcome::Blocked(LoopControl::Continue);
+                }
+
+                let permission::PromptKind::ExceedsCeiling { target_mode, path, tool_summary } = prompt_kind;
+                let question = permission::build_exceeds_ceiling_question(
+                    &tool_summary, &target_mode, &path,
+                );
+                match self.ask_permission_raw(&canonical_tool, question).await {
+                    Some(permission::PermissionAction::AllowOnce) => { /* proceed */ }
+                    Some(permission::PermissionAction::AllowSession) => {
+                        // Switch mode — update path_modes and save.
+                        self.session_permissions.set_path_mode(&path, target_mode);
+                        if let Some(ref sdir) = self.session_dir {
+                            self.session_permissions.save(sdir);
+                        }
+                        // Notify UI so the mode badge updates.
+                        if let Some(manager) = self.tools.get_manager() {
+                            manager.send_event(
+                                crate::agent_manager::AgentEvent::StateUpdated,
+                                self.session_id.clone(),
+                            ).await;
+                        }
+                    }
+                    Some(permission::PermissionAction::Deny) => {
+                        let msg = self.prompt_store.render_or_fallback(
+                            crate::prompts::keys::PERMISSION_DENIED,
+                            &[("tool", &canonical_tool), ("summary", &summary)],
                         );
-                        match self.ask_permission_raw(&canonical_tool, question).await {
-                            Some(permission::PermissionAction::AllowOnce) => { /* proceed */ }
-                            Some(permission::PermissionAction::AllowSession) => {
-                                // Switch mode — update path_modes and save.
-                                self.session_permissions.set_path_mode(&path, target_mode);
-                                if let Some(ref sdir) = self.session_dir {
-                                    self.session_permissions.save(sdir);
-                                }
-                                // Notify UI so the mode badge updates.
-                                if let Some(manager) = self.tools.get_manager() {
-                                    manager.send_event(
-                                        crate::agent_manager::AgentEvent::StateUpdated,
-                                        self.session_id.clone(),
-                                    );
-                                }
-                            }
-                            Some(permission::PermissionAction::Deny) => {
-                                self.session_permissions.denied_sigs.insert(sig.clone());
-                                if let Some(ref sdir) = self.session_dir {
-                                    self.session_permissions.save(sdir);
-                                }
-                                let msg = self.prompt_store.render_or_fallback(
-                                    crate::prompts::keys::PERMISSION_DENIED,
-                                    &[("tool", &canonical_tool), ("summary", &summary)],
-                                );
-                                messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                                return PreExecOutcome::Blocked(LoopControl::Continue);
-                            }
-                            Some(permission::PermissionAction::DenyWithMessage(user_msg)) => {
-                                self.session_permissions.denied_sigs.insert(sig.clone());
-                                if let Some(ref sdir) = self.session_dir {
-                                    self.session_permissions.save(sdir);
-                                }
-                                let msg = format!(
-                                    "Permission denied by user for {} '{}'. User says: {}",
-                                    canonical_tool, summary, user_msg
-                                );
-                                messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                                return PreExecOutcome::Blocked(LoopControl::Continue);
-                            }
-                            None => {
-                                let msg = self.prompt_store.render_or_fallback(
-                                    crate::prompts::keys::PERMISSION_TIMEOUT, &[],
-                                );
-                                let _ = self.persist_assistant_message(&msg, session_id).await;
-                                return PreExecOutcome::Blocked(LoopControl::Return(AgentOutcome::None));
-                            }
-                        }
+                        messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
+                        return PreExecOutcome::Blocked(LoopControl::Continue);
                     }
-                    permission::PromptKind::SystemZoneWrite { tool_summary } => {
-                        let question = permission::build_system_zone_question(&tool_summary);
-                        match self.ask_permission_raw(&canonical_tool, question).await {
-                            Some(permission::PermissionAction::AllowOnce) => { /* proceed */ }
-                            None => {
-                                let msg = self.prompt_store.render_or_fallback(
-                                    crate::prompts::keys::PERMISSION_TIMEOUT, &[],
-                                );
-                                let _ = self.persist_assistant_message(&msg, session_id).await;
-                                return PreExecOutcome::Blocked(LoopControl::Return(AgentOutcome::None));
-                            }
-                            Some(permission::PermissionAction::Deny)
-                            | Some(permission::PermissionAction::DenyWithMessage(_)) => {
-                                self.session_permissions.denied_sigs.insert(sig.clone());
-                                if let Some(ref sdir) = self.session_dir {
-                                    self.session_permissions.save(sdir);
-                                }
-                                let msg = self.prompt_store.render_or_fallback(
-                                    crate::prompts::keys::PERMISSION_DENIED,
-                                    &[("tool", &canonical_tool), ("summary", &summary)],
-                                );
-                                messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                                return PreExecOutcome::Blocked(LoopControl::Continue);
-                            }
-                            _ => { /* unexpected response — allow once as fallback */ }
-                        }
+                    Some(permission::PermissionAction::DenyWithMessage(user_msg)) => {
+                        let msg = format!(
+                            "Permission denied by user for {} '{}'. User says: {}",
+                            canonical_tool, summary, user_msg
+                        );
+                        messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
+                        return PreExecOutcome::Blocked(LoopControl::Continue);
                     }
-                    permission::PromptKind::AskRuleOverride { rule, tool_summary } => {
-                        let question = permission::build_ask_rule_question(&tool_summary, &rule);
-                        match self.ask_permission_raw(&canonical_tool, question).await {
-                            Some(permission::PermissionAction::AllowOnce) => { /* proceed */ }
-                            Some(permission::PermissionAction::AllowSession) => {
-                                // Store the matched rule as override key so suppression
-                                // covers all commands matching the pattern.
-                                self.session_permissions.allows.insert(rule.clone());
-                                if let Some(ref sdir) = self.session_dir {
-                                    self.session_permissions.save(sdir);
-                                }
-                            }
-                            Some(permission::PermissionAction::Deny) => {
-                                self.session_permissions.denied_sigs.insert(sig.clone());
-                                if let Some(ref sdir) = self.session_dir {
-                                    self.session_permissions.save(sdir);
-                                }
-                                let msg = self.prompt_store.render_or_fallback(
-                                    crate::prompts::keys::PERMISSION_DENIED,
-                                    &[("tool", &canonical_tool), ("summary", &summary)],
-                                );
-                                messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                                return PreExecOutcome::Blocked(LoopControl::Continue);
-                            }
-                            None => {
-                                let msg = self.prompt_store.render_or_fallback(
-                                    crate::prompts::keys::PERMISSION_TIMEOUT, &[],
-                                );
-                                let _ = self.persist_assistant_message(&msg, session_id).await;
-                                return PreExecOutcome::Blocked(LoopControl::Return(AgentOutcome::None));
-                            }
-                            _ => {}
-                        }
-                    }
-                    permission::PromptKind::ReadOutsidePath { dir, tool_summary } => {
-                        let question = permission::build_read_outside_path_question(&tool_summary, &dir);
-                        match self.ask_permission_raw(&canonical_tool, question).await {
-                            Some(permission::PermissionAction::AllowOnce) => { /* proceed */ }
-                            Some(permission::PermissionAction::AllowSession) => {
-                                // Grant read on the directory.
-                                self.session_permissions.set_path_mode(
-                                    &dir, permission::PermissionMode::Read,
-                                );
-                                if let Some(ref sdir) = self.session_dir {
-                                    self.session_permissions.save(sdir);
-                                }
-                            }
-                            Some(permission::PermissionAction::Deny) => {
-                                self.session_permissions.denied_sigs.insert(sig.clone());
-                                if let Some(ref sdir) = self.session_dir {
-                                    self.session_permissions.save(sdir);
-                                }
-                                let msg = self.prompt_store.render_or_fallback(
-                                    crate::prompts::keys::PERMISSION_DENIED,
-                                    &[("tool", &canonical_tool), ("summary", &summary)],
-                                );
-                                messages.push(self.tool_result_msg_for(msg, &tool_call_id, &canonical_tool));
-                                return PreExecOutcome::Blocked(LoopControl::Continue);
-                            }
-                            None => {
-                                let msg = self.prompt_store.render_or_fallback(
-                                    crate::prompts::keys::PERMISSION_TIMEOUT, &[],
-                                );
-                                let _ = self.persist_assistant_message(&msg, session_id).await;
-                                return PreExecOutcome::Blocked(LoopControl::Return(AgentOutcome::None));
-                            }
-                            _ => {}
-                        }
+                    None => {
+                        let msg = self.prompt_store.render_or_fallback(
+                            crate::prompts::keys::PERMISSION_TIMEOUT, &[],
+                        );
+                        let _ = self.persist_assistant_message(&msg, session_id).await;
+                        return PreExecOutcome::Blocked(LoopControl::Return(AgentOutcome::None));
                     }
                 }
             }
@@ -1012,6 +907,7 @@ impl AgentEngine {
                 // change during a run (user approves mid-turn), so re-sync here
                 // rather than at engine construction time.
                 self.tools.builtins.parent_path_modes = self.session_permissions.path_modes.clone();
+                self.tools.builtins.parent_interactive = self.session_permissions.interactive;
                 let tools_clone = self.tools.clone();
                 let mut handle = tokio::task::spawn_blocking(move || tools_clone.execute(call));
                 let result = loop {

@@ -854,19 +854,6 @@ pub(crate) async fn get_session_permission(
             serde_json::Value::String(mode.to_string()),
         ));
     }
-    // Include zone so UI can disable mode switching for system paths.
-    if let Some(cwd) = params.get("cwd") {
-        let zone = crate::engine::permission::path_zone(std::path::Path::new(cwd));
-        let zone_str = match zone {
-            crate::engine::permission::PathZone::Home => "home",
-            crate::engine::permission::PathZone::Temp => "temp",
-            crate::engine::permission::PathZone::System => "system",
-        };
-        resp.as_object_mut().map(|m| m.insert(
-            "zone".to_string(),
-            serde_json::Value::String(zone_str.to_string()),
-        ));
-    }
     match serde_json::to_string(&resp) {
         Ok(json) => (StatusCode::OK, json).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -895,21 +882,6 @@ pub(crate) async fn update_session_permission(
         "admin" => PermissionMode::Admin,
         _ => return StatusCode::BAD_REQUEST,
     };
-
-    // Block edit/admin mode on system zone paths (per permission-spec.md).
-    if mode > PermissionMode::Read {
-        let expanded = if req.path.starts_with("~/") {
-            dirs::home_dir()
-                .map(|h| h.join(&req.path[2..]))
-                .unwrap_or_else(|| PathBuf::from(&req.path))
-        } else {
-            PathBuf::from(&req.path)
-        };
-        let zone = crate::engine::permission::path_zone(&expanded);
-        if zone == crate::engine::permission::PathZone::System {
-            return StatusCode::FORBIDDEN;
-        }
-    }
 
     let session_dir = crate::paths::global_sessions_dir().join(&req.session_id);
     let mut perms = SessionPermissions::load(&session_dir);
@@ -1390,18 +1362,44 @@ pub(crate) async fn token_usage_api(
 }
 
 /// Proxy linggen.dev room APIs — forwards GET/POST/PATCH/DELETE to /api/rooms/*.
-/// Uses the API token from remote.toml for auth.
+/// Uses the API token from remote.toml for auth. Public endpoints
+/// (`GET /api/rooms/public`, `GET /api/rooms/preview/...`) are reachable
+/// without login by falling back to the default relay URL.
 pub(crate) async fn proxy_rooms(
     method: axum::http::Method,
-    axum::extract::Path(path): axum::extract::Path<String>,
+    uri: axum::http::Uri,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let config = match crate::cli::login::load_remote_config() {
-        Some(c) => c,
-        None => return (StatusCode::UNAUTHORIZED, "Not logged in to linggen.dev").into_response(),
-    };
+    let room_path = uri
+        .path()
+        .strip_prefix("/api/rooms")
+        .unwrap_or_default()
+        .trim_start_matches('/');
 
-    let url = format!("{}/api/rooms/{}", config.relay_url, path);
+    // Endpoints that linggen.dev serves without auth — reachable even when
+    // the user hasn't run `ling login`.
+    let is_public_endpoint = method == axum::http::Method::GET
+        && (room_path == "public" || room_path.starts_with("preview/"));
+
+    let config = crate::cli::login::load_remote_config();
+    if config.is_none() && !is_public_endpoint {
+        return (StatusCode::UNAUTHORIZED, "Not logged in to linggen.dev").into_response();
+    }
+
+    // Pick the relay URL: prefer the logged-in config; otherwise fall back
+    // to the default so public endpoints still work.
+    let relay_url = config
+        .as_ref()
+        .map(|c| c.relay_url.clone())
+        .unwrap_or_else(|| "https://linggen.dev".to_string());
+
+    // linggen.dev routes match `/api/rooms` exactly for room create/update/delete.
+    // Normalize both local `/api/rooms` and `/api/rooms/` to the same upstream URL.
+    let url = if room_path.is_empty() {
+        format!("{}/api/rooms", relay_url)
+    } else {
+        format!("{}/api/rooms/{}", relay_url, room_path)
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -1415,12 +1413,16 @@ pub(crate) async fn proxy_rooms(
         _ => return (StatusCode::METHOD_NOT_ALLOWED, "Method not allowed").into_response(),
     };
 
-    req = req.bearer_auth(&config.api_token);
+    if let Some(cfg) = &config {
+        req = req.bearer_auth(&cfg.api_token);
+    }
     if !body.is_empty() {
         // Auto-inject instance_id for room creation/update if not already present
         if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body) {
             if json.get("instance_id").is_none() || json["instance_id"].is_null() {
-                json["instance_id"] = serde_json::Value::String(config.instance_id.clone());
+                if let Some(cfg) = &config {
+                    json["instance_id"] = serde_json::Value::String(cfg.instance_id.clone());
+                }
             }
             req = req.header("Content-Type", "application/json").json(&json);
         } else {
@@ -1431,11 +1433,24 @@ pub(crate) async fn proxy_rooms(
     match req.send().await {
         Ok(resp) => {
             let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            match resp.json::<serde_json::Value>().await {
+            let body_text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                tracing::warn!(
+                    "rooms proxy {} {} → {} body={}",
+                    method,
+                    url,
+                    status.as_u16(),
+                    body_text.chars().take(300).collect::<String>()
+                );
+            }
+            match serde_json::from_str::<serde_json::Value>(&body_text) {
                 Ok(body) => (status, Json(body)).into_response(),
-                Err(_) => (status, "{}").into_response(),
+                Err(_) => (status, body_text).into_response(),
             }
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("Relay error: {}", e)).into_response(),
+        Err(e) => {
+            tracing::warn!("rooms proxy {} {} reqwest error: {}", method, url, e);
+            (StatusCode::BAD_GATEWAY, format!("Relay error: {}", e)).into_response()
+        }
     }
 }

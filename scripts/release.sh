@@ -2,7 +2,11 @@
 set -euo pipefail
 
 # Release orchestrator script for Linggen Agent
-# Usage: ./scripts/release.sh <version> [--draft] [--skip-linux]
+# Usage: ./scripts/release.sh <version> [--draft] [--platform mac|linux]
+#
+# Default platform is the current host (no cross-build):
+#   - macOS host  → mac
+#   - Linux host  → linux (multi-arch: x86_64 + aarch64)
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 source "$ROOT_DIR/scripts/lib-common.sh"
@@ -10,6 +14,7 @@ source "$ROOT_DIR/scripts/lib-common.sh"
 REPO="linggen/linggen"
 VERSION=""
 KEEP_DRAFT=false
+PLATFORM=""
 PASS_ARGS=()
 
 # Parse arguments
@@ -18,8 +23,13 @@ while [[ $# -gt 0 ]]; do
     --draft)
       KEEP_DRAFT=true
       shift ;;
-    --skip-linux)
-      PASS_ARGS+=("--skip-linux")
+    --platform)
+      PLATFORM="${2:-}"
+      PASS_ARGS+=("--platform" "$PLATFORM")
+      shift 2 ;;
+    --platform=*)
+      PLATFORM="${1#--platform=}"
+      PASS_ARGS+=("$1")
       shift ;;
     *)
       if [ -z "$VERSION" ]; then
@@ -30,9 +40,20 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$VERSION" ]; then
-  echo "Usage: $0 <version> [--draft] [--skip-linux]" >&2
+  echo "Usage: $0 <version> [--draft] [--platform mac|linux]" >&2
   exit 1
 fi
+
+OS_LOWER="$(uname -s | tr '[:upper:]' '[:lower:]')"
+HOST_PLATFORM="$([ "$OS_LOWER" = "darwin" ] && echo mac || echo linux)"
+PLATFORM="${PLATFORM:-$HOST_PLATFORM}"
+
+case "$PLATFORM" in
+  mac|linux) ;;
+  *)
+    echo "Error: --platform must be 'mac' or 'linux' (got '$PLATFORM')" >&2
+    exit 1 ;;
+esac
 
 VERSION_NUM="${VERSION#v}"
 DIST_DIR="$ROOT_DIR/dist"
@@ -42,7 +63,6 @@ echo "📦 Step 1: Building all artifacts..."
 "$ROOT_DIR/scripts/build.sh" "$VERSION" ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
 
 SLUG=$(detect_platform)
-OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 
 # Step 2: Create GitHub Release
 echo ""
@@ -67,16 +87,27 @@ delete_asset() {
   gh release delete-asset "$VERSION" "$name" --repo "$REPO" --yes 2>/dev/null || true
 }
 
-# ling binary tarball (local platform)
 TARBALL="$DIST_DIR/ling-${SLUG}.tar.gz"
-if [ -f "$TARBALL" ]; then
+HAS_MAC_TARBALL=false
+HAS_LINUX_DIR=false
+[ "$PLATFORM" = "mac" ] && [ -f "$TARBALL" ] && HAS_MAC_TARBALL=true
+[ -d "$DIST_DIR/linux" ] && HAS_LINUX_DIR=true
+
+if [ "$HAS_MAC_TARBALL" = "false" ] && [ "$HAS_LINUX_DIR" = "false" ]; then
+  echo "Error: no artifacts to upload — did the build step produce anything?" >&2
+  echo "Looked for: $TARBALL and $DIST_DIR/linux/" >&2
+  exit 1
+fi
+
+# ling binary tarball (mac platform only — linux artifacts live under dist/linux/)
+if [ "$HAS_MAC_TARBALL" = "true" ]; then
   echo "  Uploading: $(basename "$TARBALL")"
   delete_asset "$(basename "$TARBALL")"
   gh release upload "$VERSION" "$TARBALL" --repo "$REPO"
 fi
 
 # Linux Artifacts (multi-arch from Docker)
-if [ -d "$DIST_DIR/linux" ]; then
+if [ "$HAS_LINUX_DIR" = "true" ]; then
   echo "  Uploading Linux artifacts..."
   for file in "$DIST_DIR/linux"/*; do
     if [ -f "$file" ]; then
@@ -92,29 +123,16 @@ echo ""
 echo "📄 Step 4: Generating and uploading manifest..."
 BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
 
-# Build assets array for the manifest
-ASSETS="[]"
-
-# Add current host artifact
-if [ -f "$DIST_DIR/ling-${SLUG}.tar.gz" ]; then
-  ASSETS=$(echo "$ASSETS" | jq \
-    --arg name "ling-${SLUG}" \
-    --arg url "${BASE_URL}/ling-${SLUG}.tar.gz" \
-    '. + [{"name": $name, "url": $url}]')
-fi
-
-# Add Linux artifacts if they exist
-if [ -d "$DIST_DIR/linux" ]; then
-  for arch in x86_64 aarch64; do
-    TAR="ling-linux-${arch}.tar.gz"
-    if [ -f "$DIST_DIR/linux/$TAR" ]; then
-      ASSETS=$(echo "$ASSETS" | jq \
-        --arg name "ling-linux-${arch}" \
-        --arg url "${BASE_URL}/$TAR" \
-        '. + [{"name": $name, "url": $url}]')
-    fi
-  done
-fi
+# Build assets array from the release's actual asset list, not just local dist/.
+# This makes split-host workflows additive: running with --platform mac on a Mac
+# and later --platform linux on a Linux box keeps both sets of entries in the
+# manifest, instead of the second run overwriting the first.
+ASSETS=$(gh release view "$VERSION" --repo "$REPO" --json assets \
+  | jq --arg base "$BASE_URL" \
+      '[.assets[]
+         | select(.name | test("^ling-.*\\.tar\\.gz$"))
+         | {name: (.name | sub("\\.tar\\.gz$"; "")),
+            url: ($base + "/" + .name)}]')
 
 MANIFEST_JSON=$(jq -n \
   --arg version "${VERSION_NUM}" \

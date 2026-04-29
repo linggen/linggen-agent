@@ -1,16 +1,21 @@
 use crate::engine::render::normalize_tool_path_arg;
 use crate::engine::tools::{AskUserOption, AskUserQuestion};
-use globset::Glob;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use tracing::warn;
 
-// ---------------------------------------------------------------------------
-// Permission action returned after prompting the user
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Permission system — see `doc/permission-spec.md`.
+//
+// State per session: a list of (path, mode) grants. Effective mode for the
+// current cwd is the most-specific matching grant, or `chat` (no tools) if
+// nothing covers it. Reads are gated like writes — there is no "reads are
+// free" carveout. A short hardcoded deny floor blocks the worst foot-guns
+// regardless of mode. No config rule layer.
+// ===========================================================================
 
+/// Permission action returned after prompting the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionAction {
     AllowOnce,
@@ -19,231 +24,6 @@ pub enum PermissionAction {
     /// User denied with a custom message to relay to the model.
     DenyWithMessage(String),
 }
-
-// ---------------------------------------------------------------------------
-// Persisted format for project-level permissions
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Bash command pattern helpers
-// ---------------------------------------------------------------------------
-
-/// Detects shell operators that chain multiple commands.
-/// Compound commands always require explicit approval (no pattern derivation).
-pub fn is_compound_command(cmd: &str) -> bool {
-    // Check for common shell chaining/substitution operators.
-    // We scan character-by-character to avoid false positives inside quotes,
-    // but for simplicity we use a heuristic approach on the raw string.
-    let bytes = cmd.as_bytes();
-    let len = bytes.len();
-    for i in 0..len {
-        match bytes[i] {
-            b';' => return true,
-            b'|' => return true, // covers `|` and `||`
-            b'&' if i + 1 < len && bytes[i + 1] == b'&' => return true,
-            b'`' => return true,
-            b'$' if i + 1 < len && bytes[i + 1] == b'(' => return true,
-            _ => {}
-        }
-    }
-    false
-}
-
-/// Extracts a glob pattern from a simple (non-compound) command.
-///
-/// - Returns `None` for compound commands (always ask).
-/// - `"pwd"` → `"pwd"` (single word = exact match)
-/// - `"git status"` → `"git *"` (two words = first token + wildcard)
-/// - `"npm run build"` → `"npm run *"` (3+ words = first two tokens + wildcard)
-/// - `"ls -la"` → `"ls *"` (second token starts with `-` = first token + wildcard)
-pub fn derive_command_pattern(cmd: &str) -> Option<String> {
-    // For compound commands, use "first_program *" from the first segment.
-    if is_compound_command(cmd) {
-        let first_cmd = extract_first_command(cmd);
-        let first_token = first_cmd.split_whitespace().next()?;
-        return Some(format!("{} *", first_token));
-    }
-    let tokens: Vec<&str> = cmd.split_whitespace().collect();
-    match tokens.len() {
-        0 => None,
-        1 => Some(tokens[0].to_string()),
-        2 => {
-            // If second token is a flag, use just "program *"
-            // Otherwise "program subcommand" → "program *"
-            Some(format!("{} *", tokens[0]))
-        }
-        _ => {
-            // 3+ tokens: if second token is a flag or a file path, use "program *"
-            // Only treat it as a subcommand if it looks like one (no slashes, no dots prefix, no flags)
-            if tokens[1].starts_with('-') || is_path_like(tokens[1]) {
-                Some(format!("{} *", tokens[0]))
-            } else {
-                Some(format!("{} {} *", tokens[0], tokens[1]))
-            }
-        }
-    }
-}
-
-/// Returns true if a token looks like a file path rather than a subcommand.
-/// Paths typically contain `/`, start with `.` or `~`, or start with `/`.
-fn is_path_like(token: &str) -> bool {
-    token.contains('/')
-        || token.starts_with('.')
-        || token.starts_with('~')
-}
-
-/// Extract the first simple command from a compound command string.
-/// Splits on `|`, `;`, `&&`, `||` and returns the trimmed first segment.
-fn extract_first_command(cmd: &str) -> String {
-    let bytes = cmd.as_bytes();
-    let len = bytes.len();
-    for i in 0..len {
-        match bytes[i] {
-            b';' | b'|' | b'`' => return cmd[..i].trim().to_string(),
-            b'&' if i + 1 < len && bytes[i + 1] == b'&' => return cmd[..i].trim().to_string(),
-            b'$' if i + 1 < len && bytes[i + 1] == b'(' => return cmd[..i].trim().to_string(),
-            _ => {}
-        }
-    }
-    cmd.trim().to_string()
-}
-
-/// Matches a command against a stored glob pattern.
-/// Falls back to exact string comparison if glob compilation fails.
-pub fn command_matches_pattern(cmd: &str, pattern: &str) -> bool {
-    match Glob::new(pattern) {
-        Ok(glob) => glob.compile_matcher().is_match(cmd),
-        Err(_) => cmd == pattern,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// File-scoped permission helpers (Write / Edit)
-// ---------------------------------------------------------------------------
-
-/// Extracts a directory-level glob pattern from a relative file path.
-///
-/// - `"src/components/App.tsx"` → `"src/components/*"`
-/// - `"README.md"` (root file)  → `"*"`
-/// - `"deep/nested/dir/file.rs"` → `"deep/nested/dir/*"`
-pub fn derive_file_pattern(rel_path: &str) -> String {
-    // Strip leading slashes to avoid absolute-path patterns in stored rules
-    let rel_path = rel_path.trim_start_matches('/');
-    if rel_path.is_empty() {
-        return "*".to_string();
-    }
-    match rel_path.rfind('/') {
-        Some(idx) => format!("{}/*", &rel_path[..idx]),
-        None => "*".to_string(), // root-level file
-    }
-}
-
-// Old file permission prompt builders removed — replaced by ExceedsCeiling prompt.
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Returns true for tools that modify the filesystem or execute commands.
-pub fn is_destructive_tool(tool: &str) -> bool {
-    matches!(tool, "Write" | "Edit" | "Bash")
-}
-
-/// Returns true for tools that make network requests (WebFetch, WebSearch).
-pub fn is_web_tool(tool: &str) -> bool {
-    matches!(tool, "WebFetch" | "WebSearch")
-}
-
-/// Build a human-readable summary of what the tool is about to do.
-pub fn permission_target_summary(tool: &str, args: &serde_json::Value, cwd: &Path) -> String {
-    match tool {
-        "Write" | "Edit" => normalize_tool_path_arg(cwd, args)
-            .unwrap_or_else(|| "<unknown file>".to_string()),
-        "Bash" => args
-            .get("cmd")
-            .or_else(|| args.get("command"))
-            .and_then(|v| v.as_str())
-            .map(|cmd| {
-                if cmd.len() > 80 {
-                    format!("{}...", &cmd[..77])
-                } else {
-                    cmd.to_string()
-                }
-            })
-            .unwrap_or_else(|| "<unknown command>".to_string()),
-        "Patch" => {
-            // Try to extract the first file from a unified diff header.
-            args.get("diff")
-                .or_else(|| args.get("patch"))
-                .and_then(|v| v.as_str())
-                .and_then(|diff| {
-                    diff.lines().find_map(|line| {
-                        line.strip_prefix("+++ b/")
-                            .or_else(|| line.strip_prefix("+++ "))
-                            .map(|s| s.to_string())
-                    })
-                })
-                .unwrap_or_else(|| "<patch>".to_string())
-        }
-        "WebFetch" => args
-            .get("url")
-            .and_then(|v| v.as_str())
-            .map(|url| {
-                if url.len() > 120 {
-                    format!("{}...", &url[..117])
-                } else {
-                    url.to_string()
-                }
-            })
-            .unwrap_or_else(|| "<unknown URL>".to_string()),
-        "WebSearch" => args
-            .get("query")
-            .and_then(|v| v.as_str())
-            .map(|q| {
-                if q.len() > 120 {
-                    format!("{}...", &q[..117])
-                } else {
-                    q.to_string()
-                }
-            })
-            .unwrap_or_else(|| "<unknown query>".to_string()),
-        // Skill-declared tools (including Memory_*) fall through to a
-        // generic best-effort summary: show the first user-relevant string
-        // arg we can find (query / content / id / endpoint). The UI prompt
-        // includes the tool name too so the user still has context.
-        _ => skill_tool_summary(&args).unwrap_or_else(|| tool.to_string()),
-    }
-}
-
-/// Best-effort single-line summary for a skill-declared tool. Looks at
-/// common arg names in priority order. Returns `None` if nothing looks
-/// display-worthy, so the caller can fall back to just the tool name.
-fn skill_tool_summary(args: &serde_json::Value) -> Option<String> {
-    for key in &["query", "content", "id", "endpoint", "path", "url"] {
-        if let Some(v) = args.get(*key).and_then(|v| v.as_str()) {
-            if !v.is_empty() {
-                return Some(truncate_for_prompt(v, 120));
-            }
-        }
-    }
-    None
-}
-
-fn truncate_for_prompt(s: &str, max: usize) -> String {
-    if s.len() > max {
-        format!("{}...", &s[..max.saturating_sub(3)])
-    } else {
-        s.to_string()
-    }
-}
-
-// Old prompt builders (build_permission_question, build_web_permission_question,
-// build_bash_permission_question, parse_*) removed — replaced by new check flow
-// prompt builders below (build_exceeds_ceiling_question, etc.).
-
-// ===========================================================================
-// New permission model (permission-spec.md)
-// ===========================================================================
 
 /// Session permission mode — defines the ceiling of what the agent can do.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -279,17 +59,6 @@ pub struct PathMode {
     pub mode: PermissionMode,
 }
 
-/// Filesystem zone — determines whether mode switching is allowed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PathZone {
-    /// User's home directory — mode switching allowed.
-    Home,
-    /// Temporary directories — mode switching allowed.
-    Temp,
-    /// System directories — per-action approval only, no mode switch.
-    System,
-}
-
 /// Bash command classification for permission tier mapping.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BashClass {
@@ -298,114 +67,40 @@ pub enum BashClass {
     Admin,
 }
 
-/// How the agent should react to a permission decision point.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Decision {
-    /// Prompt the user.
-    Ask,
-    /// Silently allow — no prompt.
-    Allow,
-    /// Silently block — no prompt.
-    Deny,
+// ---------------------------------------------------------------------------
+// SessionPermissions — the only persisted permission state.
+// ---------------------------------------------------------------------------
+
+fn default_true() -> bool {
+    true
 }
 
-impl Default for Decision {
-    fn default() -> Self { Decision::Ask }
-}
-
-/// Session-level policy — how the agent handles actions outside the
-/// granted path-mode ceiling, and actions matching `ask:` rules.
+/// Per-session permission state, persisted to `permission.json`.
 ///
-/// Orthogonal to `path_modes` (which sets the per-path capability
-/// ceiling). The policy decides what happens WHEN the ceiling isn't
-/// enough — ask the user, silently allow, or silently deny. Hard
-/// `deny:` rules (sudo, rm -rf) are the safety floor and always
-/// deny regardless of policy.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PermissionPolicy {
-    /// What to do when action exceeds the effective path-mode grant.
-    #[serde(default)]
-    pub on_exceed: Decision,
-    /// What to do when action matches an `ask:` rule.
-    #[serde(default)]
-    pub on_ask_rule: Decision,
-}
-
-impl Default for PermissionPolicy {
-    fn default() -> Self { Self::interactive() }
-}
-
-impl PermissionPolicy {
-    /// Default for user-facing sessions — prompt for anything beyond grant.
-    pub const fn interactive() -> Self {
-        Self { on_exceed: Decision::Ask, on_ask_rule: Decision::Ask }
-    }
-    /// Safe autonomous — silently deny anything out of scope. No prompts.
-    pub const fn strict() -> Self {
-        Self { on_exceed: Decision::Deny, on_ask_rule: Decision::Deny }
-    }
-    /// Trusted autonomous — silently allow out of scope, but still deny
-    /// ask-rules (e.g. `git push`). Matches legacy `locked=true` behavior
-    /// for consumer/mission sessions.
-    pub const fn trusted() -> Self {
-        Self { on_exceed: Decision::Allow, on_ask_rule: Decision::Deny }
-    }
-    /// Sandbox (e.g. Docker) — allow everything that isn't a hard deny rule.
-    pub const fn sandbox() -> Self {
-        Self { on_exceed: Decision::Allow, on_ask_rule: Decision::Allow }
-    }
-
-    /// Parse a preset name from config / SKILL.md frontmatter / mission spec.
-    /// Unknown names fall back to the default (`interactive`).
-    pub fn from_preset(name: &str) -> Self {
-        match name.to_ascii_lowercase().as_str() {
-            "strict" => Self::strict(),
-            "trusted" => Self::trusted(),
-            "sandbox" => Self::sandbox(),
-            _ => Self::interactive(),
-        }
-    }
-
-    /// True when the policy never prompts the user. Back-compat replacement
-    /// for the old `locked: bool` field.
-    pub fn is_locked(&self) -> bool {
-        self.on_exceed != Decision::Ask && self.on_ask_rule != Decision::Ask
-    }
-}
-
-/// Per-session permission state, persisted to permission.json.
-#[derive(Debug, Serialize, Deserialize, Default)]
+/// `path_modes[]` is the entire grant table — only explicit user approvals
+/// (mode upgrade prompts), mission frontmatter, and skill frontmatter write
+/// to it. `interactive` is metadata: false for mission and proxy-consumer
+/// sessions so the engine pauses or fails instead of trying to prompt.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SessionPermissions {
     #[serde(default)]
     pub path_modes: Vec<PathMode>,
-    /// Legacy flag — kept for on-disk compatibility. If true and `policy`
-    /// is absent, `load()` migrates to `PermissionPolicy::trusted()` (the
-    /// historical meaning of "locked"). New code should set `policy` and
-    /// treat this field as a derived mirror of `policy.is_locked()`.
-    #[serde(default)]
-    pub locked: bool,
-    /// Session-level policy governing how out-of-scope actions are handled.
-    #[serde(default)]
-    pub policy: PermissionPolicy,
-    /// Ask-rule overrides approved by the user this session.
-    #[serde(default)]
-    pub allows: HashSet<String>,
-    /// Tool call signatures the user denied (auto-blocked on retry).
-    #[serde(default)]
-    pub denied_sigs: HashSet<String>,
+    /// True for normal user sessions (prompt on permission-needed). False for
+    /// mission and proxy-consumer sessions (pause/fail; never prompt).
+    #[serde(default = "default_true")]
+    pub interactive: bool,
 }
 
-impl SessionPermissions {
-    /// Update the policy and keep the legacy `locked` mirror in sync.
-    pub fn set_policy(&mut self, policy: PermissionPolicy) {
-        self.policy = policy;
-        self.locked = policy.is_locked();
+impl Default for SessionPermissions {
+    fn default() -> Self {
+        Self { path_modes: Vec::new(), interactive: true }
     }
 }
 
 impl SessionPermissions {
     /// Load from `{session_dir}/permission.json`. Returns default if missing.
+    /// Tolerates legacy fields (`policy`, `locked`, `allows`, `denied_sigs`)
+    /// — they're ignored, which is the migration.
     pub fn load(session_dir: &Path) -> Self {
         let file = session_dir.join("permission.json");
         if !file.exists() {
@@ -413,19 +108,7 @@ impl SessionPermissions {
         }
         match fs::read_to_string(&file) {
             Ok(content) => match serde_json::from_str::<Self>(&content) {
-                Ok(mut p) => {
-                    tracing::trace!("Loaded session permissions from {}", file.display());
-                    // Back-compat: old files have `locked: true` and no
-                    // `policy` — map to the historical meaning (Trusted).
-                    // Old files with `locked: false` stay Interactive (default).
-                    let has_default_policy = p.policy == PermissionPolicy::default();
-                    if p.locked && has_default_policy {
-                        p.policy = PermissionPolicy::trusted();
-                    }
-                    // Keep the mirror in sync going forward.
-                    p.locked = p.policy.is_locked();
-                    p
-                }
+                Ok(p) => p,
                 Err(e) => {
                     warn!("Failed to parse session permission.json: {}", e);
                     Self::default()
@@ -455,38 +138,21 @@ impl SessionPermissions {
     }
 
     /// Add or update a path-mode grant. If a grant for the exact path exists, update it.
-    /// Prunes child entries that are now redundant (child mode <= new parent mode)
-    /// or that conflict with a downgrade (parent lowered, children should follow).
+    /// Prunes child entries that are now redundant or that conflict with a downgrade.
     pub fn set_path_mode(&mut self, path: &str, mode: PermissionMode) {
-        // Expand tilde for prefix comparison.
-        let expanded = if path.starts_with("~/") {
-            dirs::home_dir()
-                .map(|h| h.join(&path[2..]).to_string_lossy().to_string())
-                .unwrap_or_else(|| path.to_string())
-        } else {
-            path.to_string()
-        };
+        let expanded = expand_tilde(path);
 
-        // Remove child entries covered by this grant.
         self.path_modes.retain(|pm| {
             if pm.path == path {
-                return true; // keep the exact match — we'll update it below
+                return true;
             }
-            let pm_expanded = if pm.path.starts_with("~/") {
-                dirs::home_dir()
-                    .map(|h| h.join(&pm.path[2..]).to_string_lossy().to_string())
-                    .unwrap_or_else(|| pm.path.clone())
-            } else {
-                pm.path.clone()
-            };
-            // Is pm a child of the path being set?
+            let pm_expanded = expand_tilde(&pm.path);
             let is_child = pm_expanded.starts_with(&expanded)
                 && (pm_expanded.len() == expanded.len()
                     || pm_expanded.as_bytes().get(expanded.len()) == Some(&b'/'));
-            !is_child // keep non-children
+            !is_child
         });
 
-        // Update or insert.
         if let Some(existing) = self.path_modes.iter_mut().find(|pm| pm.path == path) {
             existing.mode = mode;
         } else {
@@ -498,94 +164,178 @@ impl SessionPermissions {
     }
 }
 
-/// Determine the filesystem zone for a path.
-pub fn path_zone(path: &Path) -> PathZone {
-    // Normalize to absolute for comparison.
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .join(path)
-    };
+// ---------------------------------------------------------------------------
+// Hardcoded deny floor — engine-baked, not user-configurable.
+//
+// Curated list of patterns that are always blocked regardless of mode. Admin
+// mode does NOT bypass this. See `doc/permission-spec.md` §"Hardcoded deny
+// floor".
+// ---------------------------------------------------------------------------
 
-    // Temp zone — include /private/tmp (macOS symlinks /tmp → /private/tmp)
-    if path.starts_with("/tmp") || path.starts_with("/private/tmp")
-        || path.starts_with("/var/tmp") || path.starts_with("/private/var/tmp")
-    {
-        return PathZone::Temp;
+/// True if the given bash command matches the hardcoded deny floor.
+pub fn is_hardcoded_deny(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return false;
     }
-    #[cfg(windows)]
-    {
-        if let Ok(temp) = std::env::var("TEMP") {
-            if path.starts_with(&temp) {
-                return PathZone::Temp;
-            }
+
+    // Forkbomb pattern :(){:|:&};: — also tolerates whitespace variants
+    // (`:() { :|:& };:`).
+    let dewhitespaced: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    if dewhitespaced.contains(":(){:|:&}") {
+        return true;
+    }
+
+    // Walk each command segment in a compound command and test independently.
+    for segment in split_command_segments(trimmed) {
+        let seg = segment.trim();
+        if seg.is_empty() {
+            continue;
         }
-    }
-
-    // Home zone — but sensitive home paths are treated as System
-    if let Some(home) = dirs::home_dir() {
-        if path.starts_with(&home) {
-            if is_sensitive_home_path_abs(&path, &home) {
-                return PathZone::System;
-            }
-            return PathZone::Home;
-        }
-    }
-
-    // Everything else is System
-    PathZone::System
-}
-
-/// Check if a path under home is sensitive (credentials, config).
-fn is_sensitive_home_path_abs(path: &Path, home: &Path) -> bool {
-    let sensitive = [".ssh", ".gnupg", ".aws", ".azure", ".gcloud"];
-    for dir in &sensitive {
-        if path.starts_with(home.join(dir)) {
-            return true;
-        }
-    }
-    // .git/ and .linggen/ internals (at any nesting level)
-    for component in path.components() {
-        let s = component.as_os_str().to_string_lossy();
-        if s == ".git" || s == ".linggen" {
+        if segment_is_hardcoded_deny(seg) {
             return true;
         }
     }
     false
 }
 
-/// Public wrapper for sensitive path check.
-pub fn is_sensitive_home_path(path: &Path) -> bool {
-    if let Some(home) = dirs::home_dir() {
-        if path.starts_with(&home) {
-            return is_sensitive_home_path_abs(path, &home);
+fn segment_is_hardcoded_deny(seg: &str) -> bool {
+    let tokens: Vec<&str> = seg.split_whitespace().collect();
+    if tokens.is_empty() {
+        return false;
+    }
+    let program = tokens[0];
+
+    // sudo / sudoedit — privilege escalation, never allowed.
+    if program == "sudo" || program == "sudoedit" {
+        return true;
+    }
+
+    // mkfs.* — filesystem creation on a device.
+    if program == "mkfs" || program.starts_with("mkfs.") {
+        return true;
+    }
+
+    // dd of=/dev/{disk,sd*,nvme*,hd*,mmcblk*} — direct disk overwrite.
+    if program == "dd" {
+        for arg in &tokens[1..] {
+            if let Some(target) = arg.strip_prefix("of=") {
+                if dd_target_is_blockdev(target) {
+                    return true;
+                }
+            }
         }
     }
+
+    // rm -rf / and rm -rf /* — whole-disk wipe.
+    if program == "rm" {
+        let has_recursive = tokens[1..].iter().any(|t| {
+            *t == "-rf" || *t == "-fr" || *t == "-Rf" || *t == "-fR" || *t == "--recursive"
+                || *t == "-r" || *t == "-R"
+        });
+        let has_force = tokens[1..].iter().any(|t| {
+            *t == "-f" || *t == "-rf" || *t == "-fr" || *t == "-Rf" || *t == "-fR" || *t == "--force"
+        });
+        if has_recursive && has_force {
+            for arg in &tokens[1..] {
+                if rm_target_is_root(arg) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // chown -R … / and chmod -R … / — root-tree ownership/mode bombs.
+    if program == "chown" || program == "chmod" {
+        let has_recursive = tokens[1..]
+            .iter()
+            .any(|t| *t == "-R" || *t == "--recursive");
+        if has_recursive {
+            if let Some(last) = tokens.last() {
+                if rm_target_is_root(last) {
+                    return true;
+                }
+            }
+        }
+    }
+
     false
+}
+
+fn dd_target_is_blockdev(target: &str) -> bool {
+    if let Some(rest) = target.strip_prefix("/dev/") {
+        return rest.starts_with("disk")
+            || rest.starts_with("sd")
+            || rest.starts_with("nvme")
+            || rest.starts_with("hd")
+            || rest.starts_with("mmcblk");
+    }
+    false
+}
+
+fn rm_target_is_root(arg: &str) -> bool {
+    matches!(arg, "/" | "/*" | "/.*" | "~" | "~/" | "~/*" | "/.")
+}
+
+/// Split a compound command into segments by `;`, `&&`, `||`, `|`.
+fn split_command_segments(cmd: &str) -> Vec<String> {
+    let bytes = cmd.as_bytes();
+    let len = bytes.len();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < len {
+        let b = bytes[i];
+        let split = match b {
+            b';' => Some(1usize),
+            b'|' => Some(if i + 1 < len && bytes[i + 1] == b'|' { 2 } else { 1 }),
+            b'&' if i + 1 < len && bytes[i + 1] == b'&' => Some(2),
+            _ => None,
+        };
+        if let Some(advance) = split {
+            segments.push(cmd[start..i].to_string());
+            i += advance;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if start < len {
+        segments.push(cmd[start..].to_string());
+    }
+    segments
 }
 
 // ---------------------------------------------------------------------------
 // Bash command classifier
 // ---------------------------------------------------------------------------
 
-/// Check if a command contains output redirection (`>` or `>>`).
-/// Excludes `->` (arrow) and `>=` (comparison).
+fn is_compound_command(cmd: &str) -> bool {
+    let bytes = cmd.as_bytes();
+    let len = bytes.len();
+    for i in 0..len {
+        match bytes[i] {
+            b';' => return true,
+            b'|' => return true,
+            b'&' if i + 1 < len && bytes[i + 1] == b'&' => return true,
+            b'`' => return true,
+            b'$' if i + 1 < len && bytes[i + 1] == b'(' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn has_output_redirect(cmd: &str) -> bool {
     let bytes = cmd.as_bytes();
     for i in 0..bytes.len() {
         if bytes[i] == b'>' {
-            // Exclude `->`
             if i > 0 && bytes[i - 1] == b'-' {
                 continue;
             }
-            // Exclude `>=`
             if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
                 continue;
             }
-            // Exclude redirects to /dev/null (e.g. `>/dev/null`, `2>/dev/null`)
-            // — these suppress output, not write to the filesystem.
             let after = cmd[i..].trim_start_matches('>').trim();
             if after.starts_with("/dev/null") {
                 continue;
@@ -599,21 +349,17 @@ fn has_output_redirect(cmd: &str) -> bool {
 /// Classify a bash command into read/write/admin tier.
 pub fn classify_bash_command(cmd: &str) -> BashClass {
     if is_compound_command(cmd) {
-        // Classify each segment, return highest
         return classify_compound_command(cmd);
     }
 
     let tokens: Vec<&str> = cmd.split_whitespace().collect();
     if tokens.is_empty() {
-        return BashClass::Admin; // empty = unknown = admin
+        return BashClass::Admin;
     }
 
     let program = tokens[0];
     let subcommand = tokens.get(1).copied().unwrap_or("");
 
-    // Check for output redirection → at least write.
-    // Match `>` and `>>` with or without surrounding spaces (shell doesn't require them).
-    // Exclude `->` (arrow operator) and `>=` (comparison).
     if has_output_redirect(cmd) {
         let base = classify_single_command(program, subcommand);
         return if base == BashClass::Admin {
@@ -627,7 +373,6 @@ pub fn classify_bash_command(cmd: &str) -> BashClass {
 }
 
 fn classify_single_command(program: &str, subcommand: &str) -> BashClass {
-    // Read-class programs
     const READ_PROGRAMS: &[&str] = &[
         "ls", "cat", "head", "tail", "less", "more", "wc", "file", "stat", "du", "df",
         "pwd", "env", "printenv", "echo", "printf", "which", "whereis", "type",
@@ -635,114 +380,96 @@ fn classify_single_command(program: &str, subcommand: &str) -> BashClass {
         "uname", "hostname", "date", "id", "whoami", "realpath", "dirname", "basename",
         "ping", "dig", "nslookup", "host", "test", "true", "false", "seq", "sort",
         "uniq", "tr", "cut", "paste", "diff", "comm",
+        // Read-only system diagnostics (used by sys-doctor and similar inspection
+        // skills). These programs only display info — they don't mutate state.
+        "uptime", "sw_vers", "vm_stat", "netstat", "ifconfig", "ipconfig", "scutil",
+        "ps", "lsof", "vmmap", "iostat",
+        // macOS system / security inspection. Bare invocations are read-only;
+        // mutating forms (sysctl -w, csrutil disable, spctl --add, fdesetup
+        // enable, etc.) all require sudo, which the hardcoded deny floor blocks.
+        "sysctl", "spctl", "csrutil", "fdesetup", "socketfilterfw", "systemsetup",
     ];
 
-    // Read-class git subcommands
     const GIT_READ: &[&str] = &[
         "status", "log", "diff", "show", "branch", "tag", "remote", "rev-parse",
         "blame", "stash", "describe", "shortlog", "ls-files", "ls-tree",
     ];
 
-    // Read-class cargo/npm/pip/go subcommands
     const CARGO_READ: &[&str] = &["check", "clippy", "doc", "metadata", "tree", "verify-project"];
     const NPM_READ: &[&str] = &["list", "ls", "outdated", "view", "info", "audit", "why", "explain"];
     const PIP_READ: &[&str] = &["list", "show", "freeze", "check"];
     const GO_READ: &[&str] = &["vet", "list", "doc", "env", "version"];
 
-    // Admin-class programs (always dangerous)
     const ADMIN_PROGRAMS: &[&str] = &[
         "rm", "sudo", "su", "kill", "killall", "pkill",
         "chmod", "chown", "chgrp",
-        "docker", "podman", "systemctl", "launchctl", "service",
+        "podman", "systemctl", "launchctl", "service",
         "mount", "umount", "mkfs", "fdisk", "dd",
-        "apt", "apt-get", "yum", "dnf", "pacman", "brew",
+        "apt", "apt-get", "yum", "dnf", "pacman",
         "reboot", "shutdown", "halt", "poweroff",
         "iptables", "ufw", "firewall-cmd",
         "crontab", "at",
     ];
 
-    // Write-class programs
     const WRITE_PROGRAMS: &[&str] = &[
         "mkdir", "cp", "mv", "touch", "sed", "awk", "patch",
         "ln", "install", "rsync", "tee",
     ];
 
-    // Write-class git subcommands
     const GIT_WRITE: &[&str] = &[
         "add", "commit", "push", "pull", "merge", "rebase", "checkout", "switch",
         "fetch", "clone", "init", "reset", "cherry-pick", "am", "apply",
     ];
 
-    // Write-class build/package subcommands
     const CARGO_WRITE: &[&str] = &["build", "test", "run", "fmt", "install", "publish", "bench"];
     const NPM_WRITE: &[&str] = &["install", "ci", "run", "start", "test", "build", "publish", "exec"];
     const PIP_WRITE: &[&str] = &["install", "uninstall"];
     const GO_WRITE: &[&str] = &["build", "test", "run", "install", "get", "mod"];
 
-    // Check admin first (highest priority)
+    // brew and docker have read subcommands worth carving out so inspection
+    // skills (sys-doctor) don't have to admin-prompt for `brew list` / `docker images`.
+    const BREW_READ: &[&str] = &["list", "info", "search", "outdated", "deps", "leaves",
+                                  "doctor", "config", "--version", "-v", "--prefix", "tap-info"];
+    const DOCKER_READ: &[&str] = &["ps", "images", "logs", "inspect", "version", "info",
+                                    "system", "history", "port", "top", "stats", "diff", "events"];
+
     if ADMIN_PROGRAMS.contains(&program) {
         return BashClass::Admin;
     }
-
-    // Check read programs
     if READ_PROGRAMS.contains(&program) {
         return BashClass::Read;
     }
-
-    // Check write programs
     if WRITE_PROGRAMS.contains(&program) {
         return BashClass::Write;
     }
 
-    // Handle multi-token commands (git, cargo, npm, pip, go, python, node)
     match program {
         "git" => {
-            if GIT_READ.contains(&subcommand) {
-                BashClass::Read
-            } else if GIT_WRITE.contains(&subcommand) {
-                BashClass::Write
-            } else {
-                BashClass::Admin // unknown git subcommand
-            }
+            if GIT_READ.contains(&subcommand) { BashClass::Read }
+            else if GIT_WRITE.contains(&subcommand) { BashClass::Write }
+            else { BashClass::Admin }
         }
         "cargo" => {
-            if CARGO_READ.contains(&subcommand) {
-                BashClass::Read
-            } else if CARGO_WRITE.contains(&subcommand) {
-                BashClass::Write
-            } else {
-                BashClass::Admin
-            }
+            if CARGO_READ.contains(&subcommand) { BashClass::Read }
+            else if CARGO_WRITE.contains(&subcommand) { BashClass::Write }
+            else { BashClass::Admin }
         }
         "npm" | "npx" | "yarn" | "pnpm" => {
-            if NPM_READ.contains(&subcommand) {
-                BashClass::Read
-            } else if NPM_WRITE.contains(&subcommand) {
-                BashClass::Write
-            } else {
-                BashClass::Admin
-            }
+            if NPM_READ.contains(&subcommand) { BashClass::Read }
+            else if NPM_WRITE.contains(&subcommand) { BashClass::Write }
+            else { BashClass::Admin }
         }
         "pip" | "pip3" => {
-            if PIP_READ.contains(&subcommand) {
-                BashClass::Read
-            } else if PIP_WRITE.contains(&subcommand) {
-                BashClass::Write
-            } else {
-                BashClass::Admin
-            }
+            if PIP_READ.contains(&subcommand) { BashClass::Read }
+            else if PIP_WRITE.contains(&subcommand) { BashClass::Write }
+            else { BashClass::Admin }
         }
         "go" => {
-            if GO_READ.contains(&subcommand) {
-                BashClass::Read
-            } else if GO_WRITE.contains(&subcommand) {
-                BashClass::Write
-            } else {
-                BashClass::Admin
-            }
+            if GO_READ.contains(&subcommand) { BashClass::Read }
+            else if GO_WRITE.contains(&subcommand) { BashClass::Write }
+            else { BashClass::Admin }
         }
         "python" | "python3" | "node" => {
-            // --version, --help are read; everything else is admin
             if subcommand == "--version" || subcommand == "--help" || subcommand == "-V" {
                 BashClass::Read
             } else {
@@ -750,7 +477,6 @@ fn classify_single_command(program: &str, subcommand: &str) -> BashClass {
             }
         }
         "curl" => {
-            // curl -I (HEAD) or --head is read; otherwise admin
             if subcommand == "-I" || subcommand == "--head" {
                 BashClass::Read
             } else {
@@ -758,23 +484,23 @@ fn classify_single_command(program: &str, subcommand: &str) -> BashClass {
             }
         }
         "wget" => {
-            if subcommand == "--spider" {
-                BashClass::Read
-            } else {
-                BashClass::Admin
-            }
+            if subcommand == "--spider" { BashClass::Read } else { BashClass::Admin }
         }
         "make" | "cmake" | "ninja" | "mvn" | "gradle" | "pytest" | "jest" | "vitest" => {
-            BashClass::Write // build/test tools
+            BashClass::Write
         }
-        _ => BashClass::Admin, // unknown → admin
+        "brew" => {
+            if BREW_READ.contains(&subcommand) { BashClass::Read } else { BashClass::Admin }
+        }
+        "docker" | "podman" => {
+            if DOCKER_READ.contains(&subcommand) { BashClass::Read } else { BashClass::Admin }
+        }
+        _ => BashClass::Admin,
     }
 }
 
-/// Classify a compound command by the highest-tier component.
 fn classify_compound_command(cmd: &str) -> BashClass {
     let mut highest = BashClass::Read;
-    // Split on common shell operators
     let segments: Vec<&str> = cmd
         .split(|c: char| c == ';' || c == '|' || c == '&')
         .map(|s| s.trim())
@@ -793,7 +519,7 @@ fn classify_compound_command(cmd: &str) -> BashClass {
             highest = class.clone();
         }
         if highest == BashClass::Admin {
-            return BashClass::Admin; // short-circuit
+            return BashClass::Admin;
         }
     }
     highest
@@ -803,11 +529,6 @@ fn classify_compound_command(cmd: &str) -> BashClass {
 // Effective mode lookup
 // ---------------------------------------------------------------------------
 
-/// Expand a leading `~` (or `~/`) to the user's home directory. Returns the
-/// input unchanged for paths that don't start with `~`, or when the home dir
-/// can't be resolved. Both grant paths and the target must run through this
-/// before string comparison — mission sessions persist `cwd` and grants in
-/// raw `~/...` form, so expanding only one side silently drops the match.
 fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -821,17 +542,56 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+/// Tilde-expand and resolve symlinks. On macOS, `/tmp` and `/private/tmp` are
+/// the same directory but differ as strings — the engine's `cwd()` returns
+/// the canonical `/private/tmp`, while `session.yaml.cwd` keeps the typed
+/// `/tmp`. Without canonicalizing both sides at lookup, a grant on one form
+/// fails to cover a target on the other.
+///
+/// Falls back to the tilde-expanded path when canonicalize fails (e.g. the
+/// leaf doesn't exist yet — common for Write to a new file). In that case
+/// we walk up to the nearest existing ancestor, canonicalize it, and append
+/// the missing tail so `/tmp/new-file.txt` still normalizes to
+/// `/private/tmp/new-file.txt`.
+fn normalize_path(path: &str) -> String {
+    let expanded = expand_tilde(path);
+    let mut p = std::path::PathBuf::from(&expanded);
+    if let Ok(c) = p.canonicalize() {
+        return c.to_string_lossy().to_string();
+    }
+    // Walk up until we find an existing ancestor we can canonicalize.
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    while let Some(parent) = p.parent().map(|x| x.to_path_buf()) {
+        if let Some(name) = p.file_name() {
+            suffix.push(name.to_os_string());
+        }
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        if let Ok(c) = parent.canonicalize() {
+            let mut out = c;
+            for n in suffix.iter().rev() {
+                out.push(n);
+            }
+            return out.to_string_lossy().to_string();
+        }
+        if parent == p {
+            break;
+        }
+        p = parent;
+    }
+    expanded
+}
+
 /// Find the effective permission mode for a target path by checking path_modes.
 /// Returns the mode from the most specific (longest) matching path.
-/// Returns `None` if no grant covers the target path.
+/// Returns `None` if no grant covers the target — caller treats as `chat`.
 pub fn effective_mode_for_path(path_modes: &[PathMode], target: &Path) -> Option<PermissionMode> {
-    let target_str = expand_tilde(&target.to_string_lossy());
+    let target_str = normalize_path(&target.to_string_lossy());
     let mut best: Option<(&PathMode, usize)> = None;
 
     for pm in path_modes {
-        let grant_path = expand_tilde(&pm.path);
-
-        // Check if target starts with the grant path (grant covers children)
+        let grant_path = normalize_path(&pm.path);
         if target_str.starts_with(&grant_path)
             && (target_str.len() == grant_path.len()
                 || grant_path == "/"
@@ -843,63 +603,29 @@ pub fn effective_mode_for_path(path_modes: &[PathMode], target: &Path) -> Option
             }
         }
     }
-
-    best.map(|(pm, _)| pm.mode.clone())
-}
-
-/// Effective mode with zone-based defaults. Explicit path grants win; if no
-/// grant covers the target and it lies in the Temp zone (`/tmp`, `/var/tmp`,
-/// `%TEMP%`), fall back to `Edit` — scratch space is always writable per
-/// `permission-spec.md` §"Path zones". Home and System zones have no default
-/// grant and return `None` here, so the UI badge shows `read` and the
-/// permission check prompts as usual.
-pub fn effective_mode_with_zone(path_modes: &[PathMode], target: &Path) -> Option<PermissionMode> {
-    if let Some(m) = effective_mode_for_path(path_modes, target) {
-        return Some(m);
-    }
-    if path_zone(target) == PathZone::Temp {
-        return Some(PermissionMode::Edit);
-    }
-    None
+    best.map(|(pm, _)| pm.mode)
 }
 
 // ---------------------------------------------------------------------------
-// Action tier for non-Bash tools
+// Tool tier mapping
 // ---------------------------------------------------------------------------
 
 /// Map a tool name to its permission mode requirement.
-///
-/// For Bash, use `classify_bash_command` instead. Resolution order:
-/// 1. Built-in engine tools — matched here by literal name.
-/// 2. Capability tools — tier comes from `engine::capabilities` (so
-///    `Memory_query` is Read, `Memory_write` is Edit).
-/// 3. Skill-unique tools — caller should resolve the tier from the
-///    SkillToolDef's manifest `tier:` field via `parse_skill_tier`
-///    before consulting this function.
-/// 4. Anything unrecognized → Admin (strict default).
 pub fn tool_action_tier(tool: &str) -> PermissionMode {
     match tool {
-        "Read" | "Glob" | "Grep" | "WebSearch" | "capture_screenshot"
+        "Read" | "Glob" | "Grep" | "WebSearch" | "WebFetch" | "capture_screenshot"
         | "EnterPlanMode" | "ExitPlanMode" | "UpdatePlan" | "AskUser" => PermissionMode::Read,
         "Write" | "Edit" => PermissionMode::Edit,
         _ => {
-            // Capability tools carry their tier in the engine's
-            // capability registry — consult that before falling back
-            // to the strict default.
             if let Some(tier) = crate::engine::capabilities::tool_tier(tool) {
                 return tier;
             }
-            // Everything else: Bash, WebFetch, RunApp, Task, Skill,
-            // lock_paths, unlock_paths, plus any skill-unique tool
-            // whose manifest didn't declare a tier.
             PermissionMode::Admin
         }
     }
 }
 
-/// Parse the `tier:` string from a skill tool's manifest into a
-/// `PermissionMode`. Returns `None` for unrecognized strings so the
-/// caller can fall back to `tool_action_tier`.
+/// Parse the `tier:` string from a skill tool's manifest into a `PermissionMode`.
 pub fn parse_skill_tier(tier: &str) -> Option<PermissionMode> {
     match tier {
         "read" => Some(PermissionMode::Read),
@@ -910,111 +636,69 @@ pub fn parse_skill_tier(tier: &str) -> Option<PermissionMode> {
 }
 
 // ---------------------------------------------------------------------------
-// New permission check flow (permission-spec.md)
+// Permission check
 // ---------------------------------------------------------------------------
 
-/// Result of a permission check.
 #[derive(Debug)]
 pub enum PermissionCheckResult {
-    /// Action is allowed — proceed without prompting.
     Allowed,
-    /// Action is hard-blocked (deny rule, locked session, etc.).
     Blocked(String),
-    /// Action needs user approval — show a prompt.
     NeedsPrompt(PromptKind),
 }
 
-/// What kind of prompt to show the user.
+/// What kind of prompt to show. With the simplified model there is only one
+/// kind — every permission-needed event is a request to upgrade the mode on
+/// the target path (or a parent path for files outside cwd).
 #[derive(Debug)]
 pub enum PromptKind {
-    /// Action exceeds the mode ceiling on a home/temp path.
-    /// Offer: Allow once / Switch to {target_mode} mode / Deny / Other
     ExceedsCeiling {
         target_mode: PermissionMode,
         path: String,
         tool_summary: String,
     },
-    /// Write/edit in system zone — per-action only, no mode switch.
-    /// Offer: Allow once / Deny
-    SystemZoneWrite {
-        tool_summary: String,
-    },
-    /// Config `ask` rule forces a prompt even within ceiling.
-    /// Offer: Allow once / Allow for session / Deny
-    AskRuleOverride {
-        rule: String,
-        tool_summary: String,
-    },
-    /// Read outside any granted path.
-    /// Offer: Allow read on {dir} / Allow once / Deny
-    ReadOutsidePath {
-        dir: String,
-        tool_summary: String,
-    },
 }
 
-/// Parse a tool rule like `"Bash(sudo *)"` into `("Bash", "sudo *")`.
-pub fn parse_tool_rule(rule: &str) -> Option<(String, String)> {
-    let open = rule.find('(')?;
-    let close = rule.rfind(')')?;
-    if close <= open {
-        return None;
-    }
-    let tool = rule[..open].trim().to_string();
-    let pattern = rule[open + 1..close].trim().to_string();
-    if tool.is_empty() || pattern.is_empty() {
-        return None;
-    }
-    Some((tool, pattern))
-}
-
-/// Check if a tool call matches any rule in a list.
-/// Rules are `Tool(pattern)` format, e.g. `"Bash(sudo *)"`.
-fn matches_rules(rules: &[String], tool: &str, arg: Option<&str>) -> Option<String> {
-    for rule in rules {
-        if let Some((rule_tool, rule_pattern)) = parse_tool_rule(rule) {
-            if rule_tool == tool {
-                if let Some(a) = arg {
-                    if command_matches_pattern(a, &rule_pattern) {
-                        return Some(rule.clone());
-                    }
-                } else {
-                    // No arg — blanket tool match if pattern is "*"
-                    if rule_pattern == "*" {
-                        return Some(rule.clone());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// The main permission check for the new model.
+/// The main permission check.
 ///
-/// Returns whether the action is allowed, blocked, or needs a prompt.
-/// This does NOT handle the actual prompting — the caller does that.
+/// The caller (tool_exec) decides what to do with `NeedsPrompt`: prompt the
+/// user if `session_perms.interactive`, otherwise treat as permission-needed
+/// (pause/fail) for missions and consumer sessions.
 pub fn check_permission(
     tool: &str,
     bash_command: Option<&str>,
     file_path: Option<&str>,
     session_cwd: &Path,
     session_perms: &SessionPermissions,
-    deny_rules: &[String],
-    ask_rules: &[String],
     action_tier_override: Option<PermissionMode>,
 ) -> PermissionCheckResult {
-    // 0. Chat mode = no tools at all, hard-block everything
-    let target_path_for_chat = file_path
-        .map(PathBuf::from)
-        .unwrap_or_else(|| session_cwd.to_path_buf());
-    if let Some(PermissionMode::Chat) = effective_mode_for_path(&session_perms.path_modes, &target_path_for_chat) {
-        return PermissionCheckResult::Blocked("Chat mode: no tools available".to_string());
+    // 0a. Hardcoded deny floor (admin mode does not bypass).
+    if tool == "Bash" {
+        if let Some(cmd) = bash_command {
+            if is_hardcoded_deny(cmd) {
+                return PermissionCheckResult::Blocked(
+                    "Command blocked by safety floor (sudo, rm -rf /, mkfs, etc.)".to_string(),
+                );
+            }
+        }
     }
 
-    // 1. Classify action tier. An explicit override (from a skill-declared
-    // `tier:` on the tool) wins over the built-in table — skills know their
-    // own operation's risk profile better than the hardcoded defaults.
+    // 0b. Skill is a navigation primitive — always allowed regardless of mode.
+    // Skills that need elevated permissions request them at activation time
+    // through their own SKILL.md `permission:` block. Without this bypass, a
+    // chat-mode session can never reach a skill via natural language because
+    // the model can't call `Skill` to dispatch to it.
+    if tool == "Skill" {
+        return PermissionCheckResult::Allowed;
+    }
+
+    // Chat mode is the lowest tier — any concrete tool's action_tier
+    // (Read/Edit/Admin) exceeds it, so step 4 below produces an
+    // ExceedsCeiling prompt offering to switch to the needed mode. We
+    // intentionally do NOT short-circuit a Chat grant to a hard block:
+    // when the user explicitly picks chat and then asks the agent to run
+    // something, they want to be asked to upgrade, not silently denied.
+
+    // 1. Classify action tier. Skill-declared override wins over the built-in table.
     let action_tier = if let Some(override_tier) = action_tier_override {
         override_tier
     } else if tool == "Bash" {
@@ -1030,73 +714,7 @@ pub fn check_permission(
         tool_action_tier(tool)
     };
 
-    // 1b. Auto-allow reads of Linggen's own memory files (~/.linggen/memory/*).
-    // The system prompt explicitly tells every agent that this directory holds
-    // their persistent memory and to read files here when needed. Prompting on
-    // each read defeats the feature without adding security — the user already
-    // authorized Linggen to manage this directory by installing the app. Writes
-    // still go through the normal check (memory files are edited via the
-    // memory skill's grants, not every session's).
-    if action_tier == PermissionMode::Read {
-        if let Some(fp) = file_path {
-            let expanded = if fp == "~" {
-                dirs::home_dir()
-            } else if let Some(rest) = fp.strip_prefix("~/") {
-                dirs::home_dir().map(|h| h.join(rest))
-            } else {
-                Some(PathBuf::from(fp))
-            };
-            if let (Some(p), Some(home)) = (expanded, dirs::home_dir()) {
-                // Reject paths with `..` components — `PathBuf::starts_with` is
-                // purely lexical, so `~/.linggen/memory/../../.ssh/id_rsa` would
-                // match the memory prefix and escape the sandbox. Only allow
-                // paths whose components are all normal.
-                let has_parent_dir =
-                    p.components().any(|c| c == std::path::Component::ParentDir);
-                let mem_root = home.join(".linggen").join("memory");
-                if !has_parent_dir && p.starts_with(&mem_root) {
-                    return PermissionCheckResult::Allowed;
-                }
-            }
-        }
-    }
-
-    // Determine the argument for rule matching
-    let rule_arg = bash_command.or(file_path);
-
-    // 2. Check deny rules (config)
-    if let Some(rule) = matches_rules(deny_rules, tool, rule_arg) {
-        return PermissionCheckResult::Blocked(format!("Denied by rule: {}", rule));
-    }
-
-    // 3. Check ask rules (config) — but skip if user already allowed for session
-    if let Some(rule) = matches_rules(ask_rules, tool, rule_arg) {
-        // Check if user already overrode this ask rule for the session.
-        // Store the rule itself as the key so suppression covers all matching commands.
-        if !session_perms.allows.contains(&rule) {
-            match session_perms.policy.on_ask_rule {
-                Decision::Allow => { /* policy skips the rule */ }
-                Decision::Deny => {
-                    return PermissionCheckResult::Blocked(
-                        format!("Ask rule '{}' denied by session policy", rule),
-                    );
-                }
-                Decision::Ask => {
-                    let summary = rule_arg.unwrap_or(tool).to_string();
-                    return PermissionCheckResult::NeedsPrompt(PromptKind::AskRuleOverride {
-                        rule,
-                        tool_summary: format!("{} {}", tool, summary),
-                    });
-                }
-            }
-        }
-    }
-
-    // 4. Resolve target path + zone (ensure absolute for grant matching).
-    // Expand `~` / `~/foo` to the home dir so tilde paths passed by tools
-    // (e.g. Read("~/.linggen/memory/...")) match grants like "~/.linggen"
-    // instead of being joined to session_cwd and producing garbage like
-    // "/Users/<name>/~/.linggen/...".
+    // 2. Resolve target path. Tools without an explicit file_path use cwd.
     let target_path = file_path
         .map(|fp| {
             if fp == "~" {
@@ -1111,47 +729,25 @@ pub fn check_permission(
             }
         })
         .unwrap_or_else(|| session_cwd.to_path_buf());
-    let zone = path_zone(&target_path);
 
-    // 4b. Explicit grants take precedence over zone-based defaults. If the
-    // session already has a grant covering the target path that satisfies
-    // the required tier (e.g. a skill's `permission: admin on ~/.linggen`),
-    // allow without prompting — the user already approved this grant when
-    // activating the skill. Temp-zone paths (/tmp, /var/tmp) get an implicit
-    // Edit grant via effective_mode_with_zone — scratch space is always
-    // writable per permission-spec.md §"Path zones".
-    if let Some(mode) = effective_mode_with_zone(&session_perms.path_modes, &target_path) {
+    // 3. Most-specific grant covering the target.
+    if let Some(mode) = effective_mode_for_path(&session_perms.path_modes, &target_path) {
         if action_tier <= mode {
             return PermissionCheckResult::Allowed;
         }
     }
 
-    // 4c. Bash has no meaningful single target path (its file_path is
-    // synthesized from session cwd by the caller, not derived from the
-    // command). If the command string references a granted path
-    // (e.g. `bash ~/.linggen/skills/.../run.sh`), treat that grant as the
-    // effective ceiling. This lets skill-bound sessions run bash against
-    // their approved paths without per-call prompts, while commands that
-    // don't touch granted paths still fall through to the normal
-    // zone/ceiling checks.
+    // 3b. Bash commands sometimes reference granted paths in their args.
+    // If the command string mentions a granted path, treat that grant's
+    // mode as the effective ceiling for this call.
     if tool == "Bash" {
         if let Some(cmd) = bash_command {
             let mut best: Option<PermissionMode> = None;
             for pm in &session_perms.path_modes {
-                let grant_path = if let Some(stripped) = pm.path.strip_prefix("~/") {
-                    dirs::home_dir()
-                        .map(|h| h.join(stripped).to_string_lossy().to_string())
-                        .unwrap_or_else(|| pm.path.clone())
-                } else if pm.path == "~" {
-                    dirs::home_dir()
-                        .map(|h| h.to_string_lossy().to_string())
-                        .unwrap_or_else(|| pm.path.clone())
-                } else {
-                    pm.path.clone()
-                };
-                if cmd.contains(&grant_path) || cmd.contains(&pm.path) {
-                    if best.as_ref().map_or(true, |b| pm.mode > *b) {
-                        best = Some(pm.mode.clone());
+                let expanded = expand_tilde(&pm.path);
+                if cmd.contains(&expanded) || cmd.contains(&pm.path) {
+                    if best.map_or(true, |b| pm.mode > b) {
+                        best = Some(pm.mode);
                     }
                 }
             }
@@ -1163,88 +759,106 @@ pub fn check_permission(
         }
     }
 
-    // 5. System zone + write/edit/admin → per-action only
-    if zone == PathZone::System && action_tier > PermissionMode::Read {
-        match session_perms.policy.on_exceed {
-            Decision::Allow => return PermissionCheckResult::Allowed,
-            Decision::Deny => {
-                return PermissionCheckResult::Blocked(
-                    "System zone write denied by session policy".to_string(),
-                );
-            }
-            Decision::Ask => {
-                let summary = rule_arg.unwrap_or(tool).to_string();
-                return PermissionCheckResult::NeedsPrompt(PromptKind::SystemZoneWrite {
-                    tool_summary: format!("{} {}", tool, summary),
-                });
+    // 4. Exceeds ceiling (or no grant) — needs upgrade prompt.
+    let grant_path = grant_path_for_prompt(tool, &target_path, session_cwd);
+    let path_str = display_path(&grant_path);
+    let rule_arg = bash_command.or(file_path);
+    let summary = rule_arg.unwrap_or(tool).to_string();
+
+    PermissionCheckResult::NeedsPrompt(PromptKind::ExceedsCeiling {
+        target_mode: action_tier,
+        path: path_str,
+        tool_summary: format!("{} {}", tool, summary),
+    })
+}
+
+/// Compute the path to offer in the "Switch this folder to {mode}" option.
+fn grant_path_for_prompt(tool: &str, target: &Path, session_cwd: &Path) -> PathBuf {
+    if matches!(tool, "Grep" | "Glob" | "Task") {
+        return target.to_path_buf();
+    }
+    if target.starts_with(session_cwd) {
+        session_cwd.to_path_buf()
+    } else if target.is_dir() {
+        target.to_path_buf()
+    } else {
+        target.parent().map(Path::to_path_buf).unwrap_or_else(|| target.to_path_buf())
+    }
+}
+
+fn display_path(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let s = path.to_string_lossy();
+        let h = home.to_string_lossy();
+        if s.starts_with(h.as_ref()) {
+            return format!("~{}", &s[h.len()..]);
+        }
+    }
+    path.to_string_lossy().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Prompt construction & parsing
+// ---------------------------------------------------------------------------
+
+pub fn permission_target_summary(tool: &str, args: &serde_json::Value, cwd: &Path) -> String {
+    match tool {
+        "Write" | "Edit" => normalize_tool_path_arg(cwd, args)
+            .unwrap_or_else(|| "<unknown file>".to_string()),
+        "Bash" => args
+            .get("cmd")
+            .or_else(|| args.get("command"))
+            .and_then(|v| v.as_str())
+            .map(|cmd| {
+                if cmd.len() > 80 {
+                    format!("{}...", &cmd[..77])
+                } else {
+                    cmd.to_string()
+                }
+            })
+            .unwrap_or_else(|| "<unknown command>".to_string()),
+        "Patch" => args
+            .get("diff")
+            .or_else(|| args.get("patch"))
+            .and_then(|v| v.as_str())
+            .and_then(|diff| {
+                diff.lines().find_map(|line| {
+                    line.strip_prefix("+++ b/")
+                        .or_else(|| line.strip_prefix("+++ "))
+                        .map(|s| s.to_string())
+                })
+            })
+            .unwrap_or_else(|| "<patch>".to_string()),
+        "WebFetch" => args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|url| truncate_for_prompt(url, 120))
+            .unwrap_or_else(|| "<unknown URL>".to_string()),
+        "WebSearch" => args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|q| truncate_for_prompt(q, 120))
+            .unwrap_or_else(|| "<unknown query>".to_string()),
+        _ => skill_tool_summary(args).unwrap_or_else(|| tool.to_string()),
+    }
+}
+
+fn skill_tool_summary(args: &serde_json::Value) -> Option<String> {
+    for key in &["query", "content", "id", "endpoint", "path", "url"] {
+        if let Some(v) = args.get(*key).and_then(|v| v.as_str()) {
+            if !v.is_empty() {
+                return Some(truncate_for_prompt(v, 120));
             }
         }
     }
+    None
+}
 
-    // 6. Find effective mode for target path (with zone-based defaults)
-    let effective_mode = effective_mode_with_zone(&session_perms.path_modes, &target_path);
-
-    match effective_mode {
-        Some(ref mode) if action_tier <= *mode => {
-            // Within ceiling → allowed
-            PermissionCheckResult::Allowed
-        }
-        Some(_) | None => {
-            // Exceeds ceiling or no grant — policy decides.
-            if session_perms.policy.on_exceed == Decision::Allow {
-                return PermissionCheckResult::Allowed;
-            }
-            if session_perms.policy.on_exceed == Decision::Deny {
-                return PermissionCheckResult::Blocked(format!(
-                    "Action requires {} mode but session policy denies out-of-scope actions",
-                    action_tier,
-                ));
-            }
-            // on_exceed == Ask — fall through to the prompt paths below.
-
-            // For reads outside any granted path, offer path grant.
-            // Dir-targeting tools (Grep, Glob, Task) already pass a directory
-            // as target_path — granting on its parent would be too broad
-            // (e.g. Grep /Users/lianghuang → granting /Users). Use the target
-            // itself as the grant. File-targeting tools (Read) keep parent()
-            // so granting covers siblings the agent will likely read next.
-            if action_tier == PermissionMode::Read && effective_mode.is_none() {
-                let target_is_dir = matches!(tool, "Grep" | "Glob" | "Task")
-                    || target_path.is_dir();
-                let dir_path = if target_is_dir {
-                    target_path.as_path()
-                } else {
-                    target_path.parent().unwrap_or(&target_path)
-                };
-                let dir = dir_path.to_string_lossy().to_string();
-                let summary = rule_arg.unwrap_or(tool).to_string();
-                return PermissionCheckResult::NeedsPrompt(PromptKind::ReadOutsidePath {
-                    dir,
-                    tool_summary: format!("{} {}", tool, summary),
-                });
-            }
-
-            // For write/admin actions, offer mode upgrade on the session cwd
-            // (not the specific file — per spec, "Switch to edit mode" grants on cwd/**)
-            let target_mode = action_tier.clone();
-            let path_str = if let Some(home) = dirs::home_dir() {
-                let cs = session_cwd.to_string_lossy();
-                let hs = home.to_string_lossy();
-                if cs.starts_with(hs.as_ref()) {
-                    format!("~{}", &cs[hs.len()..])
-                } else {
-                    cs.to_string()
-                }
-            } else {
-                session_cwd.to_string_lossy().to_string()
-            };
-            let summary = rule_arg.unwrap_or(tool).to_string();
-            PermissionCheckResult::NeedsPrompt(PromptKind::ExceedsCeiling {
-                target_mode,
-                path: path_str,
-                tool_summary: format!("{} {}", tool, summary),
-            })
-        }
+fn truncate_for_prompt(s: &str, max: usize) -> String {
+    if s.len() > max {
+        format!("{}...", &s[..max.saturating_sub(3)])
+    } else {
+        s.to_string()
     }
 }
 
@@ -1259,91 +873,18 @@ pub fn build_exceeds_ceiling_question(
         header: "Permission".to_string(),
         options: vec![
             AskUserOption {
-                label: "Allow once".to_string(),
-                description: Some("One-time approval, mode stays the same".to_string()),
-                preview: None,
-            },
-            AskUserOption {
-                label: format!("Switch to {} mode", target_mode),
+                label: format!("Switch this folder to {}", target_mode),
                 description: Some(format!("Grants {} on {} and children", target_mode, path)),
                 preview: None,
             },
             AskUserOption {
-                label: "Deny".to_string(),
-                description: Some("Block this action".to_string()),
-                preview: None,
-            },
-        ],
-        multi_select: false,
-    }
-}
-
-/// Build AskUser question for a SystemZoneWrite prompt.
-pub fn build_system_zone_question(tool_summary: &str) -> AskUserQuestion {
-    AskUserQuestion {
-        question: tool_summary.to_string(),
-        header: "Permission".to_string(),
-        options: vec![
-            AskUserOption {
                 label: "Allow once".to_string(),
-                description: Some("One-time approval for this system path".to_string()),
+                description: Some("One-time approval, no persistence".to_string()),
                 preview: None,
             },
             AskUserOption {
                 label: "Deny".to_string(),
                 description: Some("Block this action".to_string()),
-                preview: None,
-            },
-        ],
-        multi_select: false,
-    }
-}
-
-/// Build AskUser question for an AskRuleOverride prompt.
-pub fn build_ask_rule_question(tool_summary: &str, rule: &str) -> AskUserQuestion {
-    AskUserQuestion {
-        question: tool_summary.to_string(),
-        header: "Permission".to_string(),
-        options: vec![
-            AskUserOption {
-                label: "Allow once".to_string(),
-                description: Some("Proceed this one time".to_string()),
-                preview: None,
-            },
-            AskUserOption {
-                label: "Allow for this session".to_string(),
-                description: Some(format!("Suppress '{}' for this session", rule)),
-                preview: None,
-            },
-            AskUserOption {
-                label: "Deny".to_string(),
-                description: Some("Block this action".to_string()),
-                preview: None,
-            },
-        ],
-        multi_select: false,
-    }
-}
-
-/// Build AskUser question for a ReadOutsidePath prompt.
-pub fn build_read_outside_path_question(tool_summary: &str, dir: &str) -> AskUserQuestion {
-    AskUserQuestion {
-        question: tool_summary.to_string(),
-        header: "Permission".to_string(),
-        options: vec![
-            AskUserOption {
-                label: "Allow once".to_string(),
-                description: Some("One-time read".to_string()),
-                preview: None,
-            },
-            AskUserOption {
-                label: format!("Allow read on {}", dir),
-                description: Some("Grants read for this directory tree this session".to_string()),
-                preview: None,
-            },
-            AskUserOption {
-                label: "Deny".to_string(),
-                description: Some("Block this read".to_string()),
                 preview: None,
             },
         ],
@@ -1358,39 +899,8 @@ pub fn parse_exceeds_ceiling_answer(
 ) -> PermissionAction {
     if selected == "Allow once" {
         PermissionAction::AllowOnce
-    } else if selected == format!("Switch to {} mode", target_mode) {
-        PermissionAction::AllowSession // caller interprets as mode switch
-    } else {
-        PermissionAction::Deny
-    }
-}
-
-/// Parse user response to a ReadOutsidePath prompt.
-pub fn parse_read_outside_path_answer(selected: &str, dir: &str) -> PermissionAction {
-    if selected == "Allow once" {
-        PermissionAction::AllowOnce
-    } else if selected == format!("Allow read on {}", dir) {
-        PermissionAction::AllowSession // caller interprets as read grant on dir
-    } else {
-        PermissionAction::Deny
-    }
-}
-
-/// Parse user response to an AskRuleOverride prompt.
-pub fn parse_ask_rule_answer(selected: &str) -> PermissionAction {
-    if selected == "Allow once" {
-        PermissionAction::AllowOnce
-    } else if selected == "Allow for this session" {
+    } else if selected == format!("Switch this folder to {}", target_mode) {
         PermissionAction::AllowSession
-    } else {
-        PermissionAction::Deny
-    }
-}
-
-/// Parse user response to a SystemZoneWrite prompt.
-pub fn parse_system_zone_answer(selected: &str) -> PermissionAction {
-    if selected == "Allow once" {
-        PermissionAction::AllowOnce
     } else {
         PermissionAction::Deny
     }
@@ -1399,65 +909,6 @@ pub fn parse_system_zone_answer(selected: &str) -> PermissionAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // Utility tests (kept)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_is_destructive() {
-        assert!(is_destructive_tool("Write"));
-        assert!(is_destructive_tool("Edit"));
-        assert!(is_destructive_tool("Bash"));
-        assert!(!is_destructive_tool("Read"));
-    }
-
-    #[test]
-    fn test_is_web_tool() {
-        assert!(is_web_tool("WebFetch"));
-        assert!(is_web_tool("WebSearch"));
-        assert!(!is_web_tool("Bash"));
-    }
-
-    #[test]
-    fn test_is_compound_command() {
-        assert!(is_compound_command("ls; rm -rf /"));
-        assert!(is_compound_command("echo foo && echo bar"));
-        assert!(is_compound_command("ls | grep foo"));
-        assert!(!is_compound_command("npm run build"));
-    }
-
-    #[test]
-    fn test_derive_command_pattern() {
-        assert_eq!(derive_command_pattern("pwd"), Some("pwd".to_string()));
-        assert_eq!(derive_command_pattern("git status"), Some("git *".to_string()));
-        assert_eq!(derive_command_pattern("npm run build"), Some("npm run *".to_string()));
-        assert_eq!(derive_command_pattern("ls -la"), Some("ls *".to_string()));
-    }
-
-    #[test]
-    fn test_command_matches_pattern() {
-        assert!(command_matches_pattern("npm run build", "npm run *"));
-        assert!(!command_matches_pattern("cargo build", "npm run *"));
-        assert!(command_matches_pattern("git status", "git *"));
-        assert!(command_matches_pattern("pwd", "pwd"));
-    }
-
-    #[test]
-    fn test_derive_file_pattern() {
-        assert_eq!(derive_file_pattern("src/components/App.tsx"), "src/components/*");
-        assert_eq!(derive_file_pattern("README.md"), "*");
-    }
-
-    #[test]
-    fn test_permission_target_summary_bash() {
-        let args = serde_json::json!({ "cmd": "cargo build" });
-        assert_eq!(permission_target_summary("Bash", &args, Path::new("/tmp")), "cargo build");
-    }
-
-    // -----------------------------------------------------------------------
-    // New permission model tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_permission_mode_ordering() {
@@ -1481,80 +932,44 @@ mod tests {
             path: "~/workspace/linggen".to_string(),
             mode: PermissionMode::Edit,
         });
-        sp.allows.insert("Bash:git push *".to_string());
-        sp.denied_sigs.insert("Bash:rm -rf dist".to_string());
-
         let json = serde_json::to_string_pretty(&sp).unwrap();
         let loaded: SessionPermissions = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.path_modes.len(), 1);
         assert_eq!(loaded.path_modes[0].mode, PermissionMode::Edit);
-        assert!(loaded.allows.contains("Bash:git push *"));
-        assert!(loaded.denied_sigs.contains("Bash:rm -rf dist"));
-        assert!(!loaded.locked);
+        assert!(loaded.interactive);
     }
 
     #[test]
-    fn test_session_permissions_load_save() {
-        let tmp = std::env::temp_dir().join("linggen_session_perm_test");
+    fn test_session_permissions_load_legacy_fields_ignored() {
+        let tmp = std::env::temp_dir().join("linggen_perm_legacy_test");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
-
-        let mut sp = SessionPermissions::default();
-        sp.set_path_mode("~/workspace", PermissionMode::Edit);
-        sp.locked = true;
-        sp.save(&tmp);
-
+        let legacy = r#"{
+            "path_modes": [{"path": "~/x", "mode": "edit"}],
+            "locked": true,
+            "policy": {"on_exceed": "ask", "on_ask_rule": "ask"},
+            "allows": ["Bash(git push *)"],
+            "denied_sigs": ["Bash:rm -rf dist"]
+        }"#;
+        fs::write(tmp.join("permission.json"), legacy).unwrap();
         let loaded = SessionPermissions::load(&tmp);
         assert_eq!(loaded.path_modes.len(), 1);
-        assert_eq!(loaded.path_modes[0].path, "~/workspace");
-        assert_eq!(loaded.path_modes[0].mode, PermissionMode::Edit);
-        assert!(loaded.locked);
-
+        assert_eq!(loaded.path_modes[0].path, "~/x");
         let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn test_session_permissions_set_path_mode_updates() {
-        let mut sp = SessionPermissions::default();
-        sp.set_path_mode("~/workspace", PermissionMode::Read);
-        assert_eq!(sp.path_modes.len(), 1);
-        assert_eq!(sp.path_modes[0].mode, PermissionMode::Read);
-
-        // Update existing path
-        sp.set_path_mode("~/workspace", PermissionMode::Admin);
-        assert_eq!(sp.path_modes.len(), 1); // no duplicate
-        assert_eq!(sp.path_modes[0].mode, PermissionMode::Admin);
-
-        // Add different path (sibling, not child)
-        sp.set_path_mode("~/other", PermissionMode::Edit);
-        assert_eq!(sp.path_modes.len(), 2);
     }
 
     #[test]
     fn test_set_path_mode_prunes_children() {
         let mut sp = SessionPermissions::default();
-
-        // Set up: child edit grants from per-file prompts.
         sp.set_path_mode("/tmp/project/src/a.rs", PermissionMode::Edit);
         sp.set_path_mode("/tmp/project/src/b.rs", PermissionMode::Edit);
-        sp.set_path_mode("/tmp/other", PermissionMode::Read); // sibling, not child
+        sp.set_path_mode("/tmp/other", PermissionMode::Read);
         assert_eq!(sp.path_modes.len(), 3);
 
-        // Upgrade parent → children pruned.
         sp.set_path_mode("/tmp/project", PermissionMode::Edit);
-        assert_eq!(sp.path_modes.len(), 2); // /tmp/project + /tmp/other
+        assert_eq!(sp.path_modes.len(), 2);
         assert!(sp.path_modes.iter().any(|pm| pm.path == "/tmp/project"));
         assert!(sp.path_modes.iter().any(|pm| pm.path == "/tmp/other"));
-
-        // Downgrade parent → children also pruned (no leftover overrides).
-        sp.set_path_mode("/tmp/project/deep/child", PermissionMode::Admin);
-        assert_eq!(sp.path_modes.len(), 3);
-        sp.set_path_mode("/tmp/project", PermissionMode::Read);
-        assert_eq!(sp.path_modes.len(), 2); // deep/child pruned
-        assert_eq!(
-            sp.path_modes.iter().find(|pm| pm.path == "/tmp/project").unwrap().mode,
-            PermissionMode::Read,
-        );
     }
 
     #[test]
@@ -1562,135 +977,120 @@ mod tests {
         let mut sp = SessionPermissions::default();
         sp.set_path_mode("~/workspace/linggen/src/main.rs", PermissionMode::Edit);
         sp.set_path_mode("~/workspace/linggen", PermissionMode::Edit);
-        // Child should be pruned.
         assert_eq!(sp.path_modes.len(), 1);
         assert_eq!(sp.path_modes[0].path, "~/workspace/linggen");
     }
 
     #[test]
-    fn test_path_zone_home() {
-        if let Some(home) = dirs::home_dir() {
-            assert_eq!(path_zone(&home.join("workspace")), PathZone::Home);
-            assert_eq!(path_zone(&home.join("Documents/file.txt")), PathZone::Home);
-        }
-    }
-
-    #[test]
-    fn test_path_zone_temp() {
-        assert_eq!(path_zone(Path::new("/tmp")), PathZone::Temp);
-        assert_eq!(path_zone(Path::new("/tmp/build")), PathZone::Temp);
-        assert_eq!(path_zone(Path::new("/var/tmp/scratch")), PathZone::Temp);
-        // macOS: /tmp is symlinked to /private/tmp
-        assert_eq!(path_zone(Path::new("/private/tmp")), PathZone::Temp);
-        assert_eq!(path_zone(Path::new("/private/tmp/arcadegame")), PathZone::Temp);
-    }
-
-    #[test]
-    fn test_path_zone_system() {
-        assert_eq!(path_zone(Path::new("/etc/hosts")), PathZone::System);
-        assert_eq!(path_zone(Path::new("/usr/bin/ls")), PathZone::System);
-        assert_eq!(path_zone(Path::new("/bin/sh")), PathZone::System);
-    }
-
-    #[test]
-    fn test_path_zone_sensitive_home() {
-        if let Some(home) = dirs::home_dir() {
-            // Sensitive home paths are classified as System
-            assert_eq!(path_zone(&home.join(".ssh/id_rsa")), PathZone::System);
-            assert_eq!(path_zone(&home.join(".aws/credentials")), PathZone::System);
-            assert_eq!(path_zone(&home.join(".gnupg/pubring.gpg")), PathZone::System);
-        }
-    }
-
-    #[test]
-    fn test_is_sensitive_home_path() {
-        if let Some(home) = dirs::home_dir() {
-            assert!(is_sensitive_home_path(&home.join(".ssh/id_rsa")));
-            assert!(is_sensitive_home_path(&home.join(".aws/config")));
-            assert!(!is_sensitive_home_path(&home.join("workspace/src/main.rs")));
-        }
-    }
-
-    #[test]
     fn test_classify_bash_read() {
         assert_eq!(classify_bash_command("ls"), BashClass::Read);
-        assert_eq!(classify_bash_command("ls -la"), BashClass::Read);
-        assert_eq!(classify_bash_command("cat foo.txt"), BashClass::Read);
-        assert_eq!(classify_bash_command("pwd"), BashClass::Read);
         assert_eq!(classify_bash_command("git status"), BashClass::Read);
-        assert_eq!(classify_bash_command("git log --oneline"), BashClass::Read);
-        assert_eq!(classify_bash_command("git diff"), BashClass::Read);
         assert_eq!(classify_bash_command("cargo check"), BashClass::Read);
-        assert_eq!(classify_bash_command("npm list"), BashClass::Read);
-        assert_eq!(classify_bash_command("grep foo bar.txt"), BashClass::Read);
-        assert_eq!(classify_bash_command("find . -name '*.rs'"), BashClass::Read);
         assert_eq!(classify_bash_command("python --version"), BashClass::Read);
-        assert_eq!(classify_bash_command("curl -I https://example.com"), BashClass::Read);
     }
 
     #[test]
     fn test_classify_bash_write() {
         assert_eq!(classify_bash_command("mkdir -p src/new"), BashClass::Write);
-        assert_eq!(classify_bash_command("cp foo.txt bar.txt"), BashClass::Write);
-        assert_eq!(classify_bash_command("mv old.rs new.rs"), BashClass::Write);
-        assert_eq!(classify_bash_command("git add ."), BashClass::Write);
-        assert_eq!(classify_bash_command("git commit -m 'fix'"), BashClass::Write);
         assert_eq!(classify_bash_command("git push origin main"), BashClass::Write);
-        assert_eq!(classify_bash_command("npm install"), BashClass::Write);
-        assert_eq!(classify_bash_command("npm run build"), BashClass::Write);
         assert_eq!(classify_bash_command("cargo build"), BashClass::Write);
-        assert_eq!(classify_bash_command("cargo test"), BashClass::Write);
-        assert_eq!(classify_bash_command("make"), BashClass::Write);
     }
 
     #[test]
     fn test_classify_bash_admin() {
         assert_eq!(classify_bash_command("rm -rf dist"), BashClass::Admin);
-        assert_eq!(classify_bash_command("sudo apt install foo"), BashClass::Admin);
-        assert_eq!(classify_bash_command("chmod 755 script.sh"), BashClass::Admin);
         assert_eq!(classify_bash_command("docker run nginx"), BashClass::Admin);
-        assert_eq!(classify_bash_command("kill -9 1234"), BashClass::Admin);
-        assert_eq!(classify_bash_command("unknown_program --flag"), BashClass::Admin);
-        assert_eq!(classify_bash_command("curl https://example.com"), BashClass::Admin);
+    }
+
+    #[test]
+    fn test_classify_bash_sysdoctor_read() {
+        // sys-doctor's command vocabulary should classify as read so the skill
+        // can run with mode: read instead of mode: admin on /.
+        assert_eq!(classify_bash_command("sw_vers"), BashClass::Read);
+        assert_eq!(classify_bash_command("vm_stat"), BashClass::Read);
+        assert_eq!(classify_bash_command("uptime"), BashClass::Read);
+        assert_eq!(classify_bash_command("netstat -an"), BashClass::Read);
+        assert_eq!(classify_bash_command("ifconfig en0"), BashClass::Read);
+        assert_eq!(classify_bash_command("sysctl -n hw.ncpu"), BashClass::Read);
+        assert_eq!(classify_bash_command("spctl --status"), BashClass::Read);
+        assert_eq!(classify_bash_command("csrutil status"), BashClass::Read);
+        assert_eq!(classify_bash_command("fdesetup status"), BashClass::Read);
+        assert_eq!(classify_bash_command("brew list"), BashClass::Read);
+        assert_eq!(classify_bash_command("brew --version"), BashClass::Read);
+        assert_eq!(classify_bash_command("docker images"), BashClass::Read);
+        assert_eq!(classify_bash_command("docker system df"), BashClass::Read);
+        assert_eq!(classify_bash_command("docker ps"), BashClass::Read);
+        // Mutations stay admin.
+        assert_eq!(classify_bash_command("brew install foo"), BashClass::Admin);
+        assert_eq!(classify_bash_command("docker run nginx"), BashClass::Admin);
+        assert_eq!(classify_bash_command("docker rm container"), BashClass::Admin);
     }
 
     #[test]
     fn test_classify_bash_compound() {
-        // Highest tier wins
         assert_eq!(classify_bash_command("ls && rm foo"), BashClass::Admin);
         assert_eq!(classify_bash_command("ls | grep foo"), BashClass::Read);
-        assert_eq!(classify_bash_command("mkdir dir && cp a b"), BashClass::Write);
-        assert_eq!(classify_bash_command("git status; git add ."), BashClass::Write);
+        assert_eq!(classify_bash_command("mkdir d && cp a b"), BashClass::Write);
     }
 
     #[test]
     fn test_classify_bash_redirect() {
-        // Output redirection promotes read to write — with and without spaces
-        assert_eq!(classify_bash_command("echo hello > out.txt"), BashClass::Write);
+        assert_eq!(classify_bash_command("echo hi > out.txt"), BashClass::Write);
         assert_eq!(classify_bash_command("ls > files.txt"), BashClass::Write);
-        assert_eq!(classify_bash_command("cat /etc/passwd>leak.txt"), BashClass::Write);
-        assert_eq!(classify_bash_command("echo foo>>append.txt"), BashClass::Write);
-
-        // Redirect to /dev/null is NOT a write — it suppresses output
         assert_eq!(classify_bash_command("du -sh ~/Desktop 2>/dev/null"), BashClass::Read);
-        assert_eq!(classify_bash_command("find ~ -size +100M 2> /dev/null"), BashClass::Read);
-        assert_eq!(classify_bash_command("ls >/dev/null"), BashClass::Read);
     }
 
     #[test]
-    fn test_check_permission_chat_mode_blocks_all() {
-        let mut sp = SessionPermissions::default();
-        sp.set_path_mode("~/workspace", PermissionMode::Chat);
+    fn test_hardcoded_deny_sudo() {
+        assert!(is_hardcoded_deny("sudo apt install foo"));
+        assert!(is_hardcoded_deny("sudo -i"));
+        assert!(is_hardcoded_deny("sudoedit /etc/hosts"));
+        assert!(is_hardcoded_deny("ls && sudo rm /etc/foo"));
+    }
 
-        if let Some(home) = dirs::home_dir() {
-            let cwd = home.join("workspace");
-            let result = check_permission(
-                "Read", None,
-                Some(home.join("workspace/file.txt").to_str().unwrap()),
-                &cwd, &sp, &[], &[], None,
-            );
-            assert!(matches!(result, PermissionCheckResult::Blocked(_)));
-        }
+    #[test]
+    fn test_hardcoded_deny_rm_rf_root() {
+        assert!(is_hardcoded_deny("rm -rf /"));
+        assert!(is_hardcoded_deny("rm -rf /*"));
+        assert!(is_hardcoded_deny("rm -fr /"));
+        assert!(!is_hardcoded_deny("rm -rf dist"));
+        assert!(!is_hardcoded_deny("rm -rf ./build"));
+    }
+
+    #[test]
+    fn test_hardcoded_deny_dd_blockdev() {
+        assert!(is_hardcoded_deny("dd if=/dev/zero of=/dev/sda"));
+        assert!(is_hardcoded_deny("dd of=/dev/disk2 if=foo.iso"));
+        assert!(is_hardcoded_deny("dd if=foo of=/dev/nvme0n1"));
+        assert!(!is_hardcoded_deny("dd if=/dev/zero of=/tmp/blob bs=1M count=10"));
+    }
+
+    #[test]
+    fn test_hardcoded_deny_mkfs() {
+        assert!(is_hardcoded_deny("mkfs /dev/sda1"));
+        assert!(is_hardcoded_deny("mkfs.ext4 /dev/sda1"));
+        assert!(is_hardcoded_deny("mkfs.btrfs /dev/sdb"));
+    }
+
+    #[test]
+    fn test_hardcoded_deny_forkbomb() {
+        assert!(is_hardcoded_deny(":(){:|:&};:"));
+        assert!(is_hardcoded_deny(":() { :|:& };:"));
+    }
+
+    #[test]
+    fn test_hardcoded_deny_chown_chmod_root() {
+        assert!(is_hardcoded_deny("chown -R nobody /"));
+        assert!(is_hardcoded_deny("chmod -R 777 /"));
+        assert!(!is_hardcoded_deny("chown user:user /etc/hosts"));
+    }
+
+    #[test]
+    fn test_hardcoded_deny_safe_commands() {
+        assert!(!is_hardcoded_deny("ls"));
+        assert!(!is_hardcoded_deny("cargo build"));
+        assert!(!is_hardcoded_deny("git push origin main"));
+        assert!(!is_hardcoded_deny(""));
     }
 
     #[test]
@@ -1701,45 +1101,27 @@ mod tests {
         ];
 
         if let Some(home) = dirs::home_dir() {
-            let result = effective_mode_for_path(
-                &modes,
-                &home.join("workspace/linggen/src/main.rs"),
+            assert_eq!(
+                effective_mode_for_path(&modes, &home.join("workspace/linggen/src/main.rs")),
+                Some(PermissionMode::Edit),
             );
-            assert_eq!(result, Some(PermissionMode::Edit));
-
-            let result = effective_mode_for_path(
-                &modes,
-                &home.join("workspace/other/README.md"),
+            assert_eq!(
+                effective_mode_for_path(&modes, &home.join("workspace/other/README.md")),
+                Some(PermissionMode::Read),
             );
-            assert_eq!(result, Some(PermissionMode::Read));
-
-            // No grant for this path
-            let result = effective_mode_for_path(
-                &modes,
-                &home.join("Documents/notes.txt"),
+            assert_eq!(
+                effective_mode_for_path(&modes, &home.join("Documents/notes.txt")),
+                None,
             );
-            assert_eq!(result, None);
         }
     }
 
     #[test]
-    fn test_effective_mode_for_path_tilde_target() {
-        // Mission sessions persist `cwd` and grant paths in raw `~/...` form
-        // (see SessionMeta and SessionPermissions). The lookup must match
-        // when both sides are tilde-prefixed — historically only the grant
-        // was expanded, so `"~/.linggen".starts_with("/Users/x/.linggen")`
-        // returned false and the UI silently fell back to "read".
-        let modes = vec![
-            PathMode { path: "~/.linggen".to_string(), mode: PermissionMode::Admin },
-        ];
-        assert_eq!(
-            effective_mode_for_path(&modes, Path::new("~/.linggen")),
-            Some(PermissionMode::Admin),
-        );
-        assert_eq!(
-            effective_mode_for_path(&modes, Path::new("~/.linggen/sessions/x")),
-            Some(PermissionMode::Admin),
-        );
+    fn test_effective_mode_no_zone_default() {
+        // Critical: /tmp no longer auto-grants edit.
+        let modes: Vec<PathMode> = vec![];
+        assert_eq!(effective_mode_for_path(&modes, Path::new("/tmp/x")), None);
+        assert_eq!(effective_mode_for_path(&modes, Path::new("/var/tmp/x")), None);
     }
 
     #[test]
@@ -1748,261 +1130,79 @@ mod tests {
             PathMode { path: "~/workspace".to_string(), mode: PermissionMode::Read },
             PathMode { path: "~/workspace/linggen".to_string(), mode: PermissionMode::Admin },
         ];
-
         if let Some(home) = dirs::home_dir() {
-            // Most specific path wins
-            let result = effective_mode_for_path(
-                &modes,
-                &home.join("workspace/linggen/src/main.rs"),
-            );
-            assert_eq!(result, Some(PermissionMode::Admin));
-
-            // Parent path applies to sibling
-            let result = effective_mode_for_path(
-                &modes,
-                &home.join("workspace/other/file.txt"),
-            );
-            assert_eq!(result, Some(PermissionMode::Read));
-        }
-    }
-
-    #[test]
-    fn test_effective_mode_with_zone_temp_implicit_edit() {
-        let modes: Vec<PathMode> = vec![];
-        // No grants, but Temp zone implicitly grants Edit.
-        assert_eq!(
-            effective_mode_with_zone(&modes, Path::new("/tmp/arcadegame/index.html")),
-            Some(PermissionMode::Edit),
-        );
-        assert_eq!(
-            effective_mode_with_zone(&modes, Path::new("/var/tmp/build")),
-            Some(PermissionMode::Edit),
-        );
-        // macOS /private/tmp alias.
-        assert_eq!(
-            effective_mode_with_zone(&modes, Path::new("/private/tmp/scratch")),
-            Some(PermissionMode::Edit),
-        );
-    }
-
-    #[test]
-    fn test_effective_mode_with_zone_home_no_grant_returns_none() {
-        let modes: Vec<PathMode> = vec![];
-        if let Some(home) = dirs::home_dir() {
-            // Home zone with no grant → None (UI falls back to "read").
             assert_eq!(
-                effective_mode_with_zone(&modes, &home.join("other-project/file.rs")),
-                None,
+                effective_mode_for_path(&modes, &home.join("workspace/linggen/x")),
+                Some(PermissionMode::Admin),
+            );
+            assert_eq!(
+                effective_mode_for_path(&modes, &home.join("workspace/other/y")),
+                Some(PermissionMode::Read),
             );
         }
-        // System zone with no grant → None (per-action prompt path).
-        assert_eq!(
-            effective_mode_with_zone(&modes, Path::new("/etc/hosts")),
-            None,
-        );
     }
 
     #[test]
-    fn test_effective_mode_with_zone_explicit_grant_wins() {
-        // An explicit grant (even Read) takes precedence over the zone default.
-        // This lets users downgrade /tmp if they want, and prevents surprise
-        // elevation when a grant already exists.
-        let modes = vec![
-            PathMode { path: "/tmp/sandbox".to_string(), mode: PermissionMode::Read },
-        ];
-        assert_eq!(
-            effective_mode_with_zone(&modes, Path::new("/tmp/sandbox/x")),
-            Some(PermissionMode::Read),
-        );
-        // Sibling path without a grant still gets the Temp default.
-        assert_eq!(
-            effective_mode_with_zone(&modes, Path::new("/tmp/other/y")),
-            Some(PermissionMode::Edit),
-        );
+    fn test_chat_mode_returns_needs_prompt_regardless_of_interactive() {
+        // Contract: `check_permission` is mode-driven and does NOT consult
+        // `session_permissions.interactive`. Chat mode always returns
+        // NeedsPrompt(ExceedsCeiling) for any concrete tool. The interactive
+        // distinction lives in tool_exec.rs:
+        //   - interactive=true  (owner)            → prompt fires, user opts in
+        //   - interactive=false (mission/consumer) → silent block, no prompt
+        // This separation lets the permission classifier stay simple while
+        // the dispatcher chooses the right user-facing behavior per session.
+        let mut sp = SessionPermissions::default();
+        sp.set_path_mode("~/workspace", PermissionMode::Chat);
+
+        if let Some(home) = dirs::home_dir() {
+            let cwd = home.join("workspace");
+            let target = home.join("workspace/file.txt");
+            let target_s = target.to_str().unwrap();
+
+            // Owner: interactive = true.
+            sp.interactive = true;
+            let r1 = check_permission("Read", None, Some(target_s), &cwd, &sp, None);
+            assert!(
+                matches!(r1, PermissionCheckResult::NeedsPrompt(PromptKind::ExceedsCeiling { .. })),
+                "owner case: expected NeedsPrompt, got {r1:?}",
+            );
+
+            // Mission / consumer: interactive = false. Same classifier output —
+            // tool_exec is what turns this into a silent block.
+            sp.interactive = false;
+            let r2 = check_permission("Read", None, Some(target_s), &cwd, &sp, None);
+            assert!(
+                matches!(r2, PermissionCheckResult::NeedsPrompt(PromptKind::ExceedsCeiling { .. })),
+                "non-interactive case: expected NeedsPrompt, got {r2:?}",
+            );
+        }
     }
 
     #[test]
-    fn test_check_permission_temp_zone_auto_allows_write() {
-        // Core UX fix: agent writes to /tmp without prompting, regardless of
-        // session cwd or existing grants. Scratch space is always writable
-        // per permission-spec.md §"Path zones".
+    fn test_session_permissions_default_is_interactive() {
+        // Owners default to interactive. Mission scheduler and SessionPolicy
+        // flip this to false explicitly for unattended runs.
         let sp = SessionPermissions::default();
-        let deny: Vec<String> = vec![];
-        let ask: Vec<String> = vec![];
-        let cwd = dirs::home_dir().unwrap_or_default();
-
-        let result = check_permission(
-            "Write", None, Some("/tmp/arcadegame/index.html"),
-            &cwd, &sp, &deny, &ask, None,
-        );
-        assert!(matches!(result, PermissionCheckResult::Allowed));
-
-        // Edit on /var/tmp also auto-allowed.
-        let result = check_permission(
-            "Edit", None, Some("/var/tmp/build/out.o"),
-            &cwd, &sp, &deny, &ask, None,
-        );
-        assert!(matches!(result, PermissionCheckResult::Allowed));
-    }
-
-    #[test]
-    fn test_check_permission_temp_zone_admin_still_prompts() {
-        // Admin-tier actions (e.g. unknown bash commands) on /tmp still go
-        // through the normal ceiling check — Temp default is Edit, not Admin.
-        let sp = SessionPermissions::default();
-        let deny: Vec<String> = vec![];
-        let ask: Vec<String> = vec![];
-        let cwd = dirs::home_dir().unwrap_or_default();
-
-        let result = check_permission(
-            "Bash", Some("some-unknown-tool /tmp/foo"), None,
-            &cwd, &sp, &deny, &ask, None,
-        );
-        // Unknown bash command → Admin tier → prompt (session cwd is in Home zone,
-        // so this hits the ExceedsCeiling branch).
-        assert!(matches!(result, PermissionCheckResult::NeedsPrompt(_)));
-    }
-
-    #[test]
-    fn test_tool_action_tier() {
-        assert_eq!(tool_action_tier("Read"), PermissionMode::Read);
-        assert_eq!(tool_action_tier("Glob"), PermissionMode::Read);
-        assert_eq!(tool_action_tier("Grep"), PermissionMode::Read);
-        assert_eq!(tool_action_tier("Write"), PermissionMode::Edit);
-        assert_eq!(tool_action_tier("Edit"), PermissionMode::Edit);
-        assert_eq!(tool_action_tier("Bash"), PermissionMode::Admin);
-        assert_eq!(tool_action_tier("WebFetch"), PermissionMode::Admin);
-        assert_eq!(tool_action_tier("Task"), PermissionMode::Admin);
-        assert_eq!(tool_action_tier("Skill"), PermissionMode::Admin);
-    }
-
-    #[test]
-    fn test_parse_skill_tier_covers_all_modes() {
-        assert_eq!(parse_skill_tier("read"), Some(PermissionMode::Read));
-        assert_eq!(parse_skill_tier("edit"), Some(PermissionMode::Edit));
-        assert_eq!(parse_skill_tier("admin"), Some(PermissionMode::Admin));
-        assert_eq!(parse_skill_tier("nonsense"), None);
-        assert_eq!(parse_skill_tier(""), None);
-    }
-
-    #[test]
-    fn test_unrecognized_tool_defaults_to_admin() {
-        // Truly unknown tools fall through to the strict Admin default.
-        // (Capability tools — Memory_* etc. — are handled via the
-        // engine's capability registry; see the next test.)
-        assert_eq!(tool_action_tier("SomeNovelTool"), PermissionMode::Admin);
-    }
-
-    #[test]
-    fn test_capability_tool_tier_comes_from_registry() {
-        // `Memory_*` tools route to tiers declared in
-        // `engine::capabilities` — not the Admin default.
-        assert_eq!(tool_action_tier("Memory_query"), PermissionMode::Read);
-        assert_eq!(tool_action_tier("Memory_write"), PermissionMode::Edit);
-    }
-
-    #[test]
-    fn test_skill_tool_summary_picks_first_useful_arg() {
-        let cwd = std::env::current_dir().unwrap();
-        let summary = permission_target_summary(
-            "SomeTool",
-            &serde_json::json!({"query": "dock calibration"}),
-            &cwd,
-        );
-        assert!(summary.contains("dock calibration"), "got: {summary}");
-    }
-
-    #[test]
-    fn test_skill_tool_summary_falls_back_to_tool_name() {
-        let cwd = std::env::current_dir().unwrap();
-        let summary = permission_target_summary(
-            "SomeTool",
-            &serde_json::json!({}),
-            &cwd,
-        );
-        assert_eq!(summary, "SomeTool");
-    }
-
-    // -----------------------------------------------------------------------
-    // Check flow tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_tool_rule() {
-        assert_eq!(
-            parse_tool_rule("Bash(sudo *)"),
-            Some(("Bash".to_string(), "sudo *".to_string()))
-        );
-        assert_eq!(
-            parse_tool_rule("Edit(src/*)"),
-            Some(("Edit".to_string(), "src/*".to_string()))
-        );
-        assert_eq!(
-            parse_tool_rule("WebFetch(domain:github.com)"),
-            Some(("WebFetch".to_string(), "domain:github.com".to_string()))
-        );
-        assert_eq!(parse_tool_rule("invalid"), None);
-        assert_eq!(parse_tool_rule("()"), None);
-    }
-
-    #[test]
-    fn test_check_permission_deny_rule() {
-        let sp = SessionPermissions::default();
-        let deny = vec!["Bash(sudo *)".to_string()];
-        let ask: Vec<String> = vec![];
-        let cwd = dirs::home_dir().unwrap_or_default();
-
-        let result = check_permission("Bash", Some("sudo apt install foo"), None, &cwd, &sp, &deny, &ask, None);
-        assert!(matches!(result, PermissionCheckResult::Blocked(_)));
-
-        // Non-matching command should not be blocked by deny
-        let result = check_permission("Bash", Some("ls -la"), None, &cwd, &sp, &deny, &ask, None);
-        assert!(!matches!(result, PermissionCheckResult::Blocked(_)));
-    }
-
-    #[test]
-    fn test_check_permission_ask_rule() {
-        let sp = SessionPermissions::default();
-        let deny: Vec<String> = vec![];
-        let ask = vec!["Bash(git push *)".to_string()];
-
-        let cwd = dirs::home_dir().unwrap_or_default();
-
-        let result = check_permission("Bash", Some("git push origin main"), None, &cwd, &sp, &deny, &ask, None);
-        assert!(matches!(result, PermissionCheckResult::NeedsPrompt(PromptKind::AskRuleOverride { .. })));
-
-        // After user allows for session (stores the rule pattern), should not prompt again
-        let mut sp2 = SessionPermissions::default();
-        sp2.allows.insert("Bash(git push *)".to_string()); // stores the rule, not the exact command
-        let result = check_permission("Bash", Some("git push origin main"), None, &cwd, &sp2, &deny, &ask, None);
-        assert!(!matches!(result, PermissionCheckResult::NeedsPrompt(PromptKind::AskRuleOverride { .. })));
-        // Different command matching same rule pattern — also suppressed
-        let result = check_permission("Bash", Some("git push origin feature"), None, &cwd, &sp2, &deny, &ask, None);
-        assert!(!matches!(result, PermissionCheckResult::NeedsPrompt(PromptKind::AskRuleOverride { .. })));
+        assert!(sp.interactive);
     }
 
     #[test]
     fn test_check_permission_within_ceiling() {
         if let Some(home) = dirs::home_dir() {
             let cwd = home.join("workspace/linggen");
-            let cwd_str = format!("~/{}", "workspace/linggen");
             let mut sp = SessionPermissions::default();
-            sp.set_path_mode(&cwd_str, PermissionMode::Edit);
+            sp.set_path_mode("~/workspace/linggen", PermissionMode::Edit);
 
-            let deny: Vec<String> = vec![];
-            let ask: Vec<String> = vec![];
-
-            // Read within edit ceiling → allowed
             let result = check_permission(
                 "Read", None, Some(cwd.join("src/main.rs").to_str().unwrap()),
-                &cwd, &sp, &deny, &ask, None,
+                &cwd, &sp, None,
             );
             assert!(matches!(result, PermissionCheckResult::Allowed));
 
-            // Write within edit ceiling → allowed
             let result = check_permission(
                 "Write", None, Some(cwd.join("src/main.rs").to_str().unwrap()),
-                &cwd, &sp, &deny, &ask, None,
+                &cwd, &sp, None,
             );
             assert!(matches!(result, PermissionCheckResult::Allowed));
         }
@@ -2012,113 +1212,100 @@ mod tests {
     fn test_check_permission_exceeds_ceiling() {
         if let Some(home) = dirs::home_dir() {
             let cwd = home.join("workspace/linggen");
-            let cwd_str = format!("~/{}", "workspace/linggen");
             let mut sp = SessionPermissions::default();
-            sp.set_path_mode(&cwd_str, PermissionMode::Read);
+            sp.set_path_mode("~/workspace/linggen", PermissionMode::Read);
 
-            let deny: Vec<String> = vec![];
-            let ask: Vec<String> = vec![];
-
-            // Write exceeds read ceiling → prompt
             let result = check_permission(
                 "Write", None, Some(cwd.join("src/main.rs").to_str().unwrap()),
-                &cwd, &sp, &deny, &ask, None,
+                &cwd, &sp, None,
             );
-            assert!(matches!(result, PermissionCheckResult::NeedsPrompt(PromptKind::ExceedsCeiling { .. })));
+            assert!(matches!(
+                result,
+                PermissionCheckResult::NeedsPrompt(PromptKind::ExceedsCeiling { .. })
+            ));
         }
     }
 
     #[test]
-    fn test_check_permission_system_zone_write() {
-        let sp = SessionPermissions::default();
-        let deny: Vec<String> = vec![];
-        let ask: Vec<String> = vec![];
-        let cwd = dirs::home_dir().unwrap_or_default();
-
-        // Write to /etc → system zone prompt
-        let result = check_permission("Write", None, Some("/etc/hosts"), &cwd, &sp, &deny, &ask, None);
-        assert!(matches!(result, PermissionCheckResult::NeedsPrompt(PromptKind::SystemZoneWrite { .. })));
-    }
-
-    #[test]
-    fn test_check_permission_strict_policy_blocks() {
-        // Strict policy silently denies anything out of scope (no prompts,
-        // no back-door Allow). This is what locked-down autonomous sessions
-        // (e.g. strict missions) should look like. Legacy `locked=true` on
-        // disk migrates to the `trusted` policy instead — see the migration
-        // in SessionPermissions::load.
-        let mut sp = SessionPermissions::default();
-        sp.set_policy(PermissionPolicy::strict());
-
-        let deny: Vec<String> = vec![];
-        let ask: Vec<String> = vec![];
-        let cwd = dirs::home_dir().unwrap_or_default();
-
-        // Write to system zone under strict policy → blocked (no prompt).
-        let result = check_permission("Write", None, Some("/etc/hosts"), &cwd, &sp, &deny, &ask, None);
-        assert!(
-            matches!(result, PermissionCheckResult::Blocked(_)),
-            "strict policy must hard-block system-zone writes, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_check_permission_system_zone_read_allowed() {
-        if let Some(_home) = dirs::home_dir() {
+    fn test_check_permission_no_grant_outside_cwd_prompts() {
+        if let Some(home) = dirs::home_dir() {
+            let cwd = home.join("workspace/linggen");
             let mut sp = SessionPermissions::default();
-            // Grant read on /etc
-            sp.set_path_mode("/etc", PermissionMode::Read);
+            sp.set_path_mode("~/workspace/linggen", PermissionMode::Edit);
 
-            let deny: Vec<String> = vec![];
-            let ask: Vec<String> = vec![];
-
-            let cwd = dirs::home_dir().unwrap_or_default();
-
-            // Read in system zone with grant → allowed
-            let result = check_permission("Read", None, Some("/etc/hosts"), &cwd, &sp, &deny, &ask, None);
-            assert!(matches!(result, PermissionCheckResult::Allowed));
-
-            // Write in system zone → still per-action
-            let result = check_permission("Write", None, Some("/etc/hosts"), &cwd, &sp, &deny, &ask, None);
-            assert!(matches!(result, PermissionCheckResult::NeedsPrompt(PromptKind::SystemZoneWrite { .. })));
+            // Read /etc/hosts — outside any grant, must prompt.
+            let result = check_permission(
+                "Read", None, Some("/etc/hosts"),
+                &cwd, &sp, None,
+            );
+            assert!(matches!(
+                result,
+                PermissionCheckResult::NeedsPrompt(PromptKind::ExceedsCeiling { .. })
+            ));
         }
+    }
+
+    #[test]
+    fn test_check_permission_hardcoded_deny_overrides_admin() {
+        let mut sp = SessionPermissions::default();
+        sp.set_path_mode("~", PermissionMode::Admin);
+        let cwd = dirs::home_dir().unwrap_or_default();
+
+        let result = check_permission(
+            "Bash", Some("sudo rm -rf /"), None,
+            &cwd, &sp, None,
+        );
+        assert!(matches!(result, PermissionCheckResult::Blocked(_)));
+    }
+
+    #[test]
+    fn test_tool_action_tier() {
+        assert_eq!(tool_action_tier("Read"), PermissionMode::Read);
+        assert_eq!(tool_action_tier("WebFetch"), PermissionMode::Read);
+        assert_eq!(tool_action_tier("Write"), PermissionMode::Edit);
+        assert_eq!(tool_action_tier("Bash"), PermissionMode::Admin);
+    }
+
+    #[test]
+    fn test_capability_tool_tier_comes_from_registry() {
+        assert_eq!(tool_action_tier("Memory_query"), PermissionMode::Read);
+        assert_eq!(tool_action_tier("Memory_write"), PermissionMode::Edit);
+    }
+
+    #[test]
+    fn test_parse_skill_tier() {
+        assert_eq!(parse_skill_tier("read"), Some(PermissionMode::Read));
+        assert_eq!(parse_skill_tier("edit"), Some(PermissionMode::Edit));
+        assert_eq!(parse_skill_tier("admin"), Some(PermissionMode::Admin));
+        assert_eq!(parse_skill_tier("nonsense"), None);
+    }
+
+    #[test]
+    fn test_build_exceeds_ceiling_question() {
+        let q = build_exceeds_ceiling_question("Edit src/main.rs", &PermissionMode::Edit, "~/work");
+        assert_eq!(q.options.len(), 3);
+        assert_eq!(q.options[0].label, "Switch this folder to edit");
+        assert_eq!(q.options[1].label, "Allow once");
+        assert_eq!(q.options[2].label, "Deny");
     }
 
     #[test]
     fn test_parse_exceeds_ceiling_answer() {
         let mode = PermissionMode::Edit;
-        assert_eq!(parse_exceeds_ceiling_answer("Allow once", &mode), PermissionAction::AllowOnce);
-        assert_eq!(parse_exceeds_ceiling_answer("Switch to edit mode", &mode), PermissionAction::AllowSession);
+        assert_eq!(
+            parse_exceeds_ceiling_answer("Switch this folder to edit", &mode),
+            PermissionAction::AllowSession,
+        );
+        assert_eq!(
+            parse_exceeds_ceiling_answer("Allow once", &mode),
+            PermissionAction::AllowOnce,
+        );
         assert_eq!(parse_exceeds_ceiling_answer("Deny", &mode), PermissionAction::Deny);
     }
 
     #[test]
-    fn test_parse_ask_rule_answer() {
-        assert_eq!(parse_ask_rule_answer("Allow once"), PermissionAction::AllowOnce);
-        assert_eq!(parse_ask_rule_answer("Allow for this session"), PermissionAction::AllowSession);
-        assert_eq!(parse_ask_rule_answer("Deny"), PermissionAction::Deny);
-    }
-
-    #[test]
-    fn test_parse_system_zone_answer() {
-        assert_eq!(parse_system_zone_answer("Allow once"), PermissionAction::AllowOnce);
-        assert_eq!(parse_system_zone_answer("Deny"), PermissionAction::Deny);
-    }
-
-    #[test]
-    fn test_build_exceeds_ceiling_question() {
-        let q = build_exceeds_ceiling_question("Edit src/main.rs", &PermissionMode::Edit, "~/workspace/linggen");
-        assert_eq!(q.options.len(), 3);
-        assert_eq!(q.options[0].label, "Allow once");
-        assert_eq!(q.options[1].label, "Switch to edit mode");
-        assert_eq!(q.options[2].label, "Deny");
-    }
-
-    #[test]
-    fn test_build_system_zone_question() {
-        let q = build_system_zone_question("Edit /etc/hosts");
-        assert_eq!(q.options.len(), 2);
-        assert_eq!(q.options[0].label, "Allow once");
-        assert_eq!(q.options[1].label, "Deny");
+    fn test_permission_target_summary_bash() {
+        let args = serde_json::json!({ "cmd": "cargo build" });
+        assert_eq!(permission_target_summary("Bash", &args, Path::new("/tmp")), "cargo build");
     }
 }

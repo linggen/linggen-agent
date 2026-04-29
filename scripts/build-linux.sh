@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build Linggen Agent (ling) for Linux (x86_64 and arm64) using Docker Buildx
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

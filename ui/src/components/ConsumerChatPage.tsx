@@ -72,8 +72,16 @@ export const ConsumerChatPage: React.FC = () => {
             <Menu size={18} />
           </button>
           <div className="flex items-center gap-2">
-            <img src="/linggen-icon.svg" alt="Linggen" className="w-5 h-5" onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }} />
-            <span className="text-sm font-bold text-slate-900 dark:text-white">Linggen</span>
+            <a
+              href="https://linggen.dev"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-2 hover:opacity-80 transition-opacity"
+              title="Open linggen.dev"
+            >
+              <img src="/linggen-icon.svg" alt="Linggen" className="w-5 h-5" onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }} />
+              <span className="text-sm font-bold text-slate-900 dark:text-white">Linggen</span>
+            </a>
             <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-500 font-medium">{userRoomName || 'Proxy Room'}</span>
           </div>
         </div>
@@ -94,7 +102,16 @@ export const ConsumerChatPage: React.FC = () => {
           <button
             onClick={() => {
               try { getTransport().disconnect(); } catch { /* already gone */ }
-              window.close();
+              // The consumer page is loaded over the WebRTC tunnel from
+              // linggen.dev/app/connect/... — go back to the dashboard.
+              // window.close() only works for script-opened popups, so
+              // navigate instead. Fall back to close if we're somehow
+              // not on linggen.dev (self-hosted instance).
+              if (window.location.hostname.endsWith('linggen.dev')) {
+                window.location.href = '/app';
+              } else {
+                window.close();
+              }
             }}
             className="flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium text-red-500 hover:bg-red-500/10 transition-colors"
             title="Leave this room"

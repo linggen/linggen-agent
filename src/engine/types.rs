@@ -105,10 +105,6 @@ pub struct EngineConfig {
     pub tool_permission_mode: crate::config::ToolPermissionMode,
     /// New permission mode (chat/read/edit/admin). See permission-spec.md.
     pub permission_mode: crate::engine::permission::PermissionMode,
-    /// Config deny rules from `[permissions]` in linggen.toml.
-    pub deny_rules: Vec<String>,
-    /// Config ask rules from `[permissions]` in linggen.toml.
-    pub ask_rules: Vec<String>,
     pub prompt_loop_breaker: Option<String>,
     pub interface_mode: InterfaceMode,
     /// When set, Bash commands must match one of these prefixes.
@@ -122,10 +118,6 @@ pub struct EngineConfig {
     pub consumer_allowed_tools: Option<std::collections::HashSet<String>>,
     /// When set, restricts available skills for proxy room consumers.
     pub consumer_allowed_skills: Option<std::collections::HashSet<String>>,
-    /// Default session policy preset for user sessions (`interactive` /
-    /// `strict` / `trusted` / `sandbox`). Set from `[agent] default_policy`
-    /// in linggen.toml. When unset, sessions default to `interactive`.
-    pub default_policy: Option<String>,
     /// Every N user messages, inject a hidden memory self-review nudge into
     /// the turn's message list. `0` disables. Default 6.
     pub memory_nudge_interval: usize,
@@ -268,7 +260,6 @@ pub struct AgentEngine {
     /// Required by Ollama native tool calling — Ollama expects tool results
     /// after an assistant message with tool_calls.
     pub(crate) native_tool_mode: bool,
-    // denied_tool_sigs moved to session_permissions.denied_sigs (persisted per session).
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -47,7 +47,13 @@ pub(crate) async fn update_config_api(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
     match state.manager.apply_config(new_config).await {
-        Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        Ok(()) => {
+            // apply_config rebuilt ModelManager from static config and dropped
+            // any dynamically-registered proxy models. Restore them so chats
+            // requesting `proxy:*` ids don't fall back to local defaults.
+            crate::server::rtc::proxy_room::reapply_proxy_models(&state).await;
+            Json(serde_json::json!({ "status": "ok" })).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -181,6 +187,8 @@ pub(crate) async fn start_codex_auth_login(
                 *manager.models.write().await = new_models;
                 // Clear all session engines so they use the new models
                 manager.session_engines.lock().await.clear();
+                // Restore proxy models that the rebuild above dropped.
+                crate::server::rtc::proxy_room::reapply_proxy_models(&state).await;
                 tracing::info!("Reloaded models after ChatGPT OAuth login");
             }
             Err(e) => tracing::warn!("ChatGPT OAuth login failed: {}", e),

@@ -45,9 +45,9 @@ The **home path** is the default working folder for new sessions. Defaults to `~
 | cwd | home path (default `~`) | anywhere within the git repo |
 | CLAUDE.md | not loaded from home path | loaded from git root + parents |
 | agents/ | global only (`~/.linggen/agents/`) | global + project (`{git_root}/agents/`) |
-| Permissions | `~/.linggen/permissions.json` | `{git_root}/.linggen/permissions.json` |
+| Permissions | session `permission.json` path grants | session `permission.json` path grants |
 | Git context | none | branch, status, recent commits |
-| Sandbox | unrestricted (home path scope) | unrestricted (no tightening on project entry) |
+| Sandbox | effective mode for cwd | effective mode for cwd |
 | Memory | global (`~/.linggen/memory/`) | project-scoped (`~/.linggen/projects/{encoded}/memory/`) |
 
 ### Session metadata tracks working folder
@@ -108,7 +108,7 @@ Each session carries:
 - **System prompt** — rebuilt each turn from current agent + skill + environment + project instructions
 - **Title** — can be renamed
 - **Working folder** — changes when agent or user runs `cd`. Triggers project detection.
-- **Project context** — loads/unloads CLAUDE.md, permissions, git info when entering/leaving a git repo.
+- **Project context** — loads/unloads CLAUDE.md and git info when entering/leaving a git repo. Permissions are still session-scoped and recomputed from path grants.
 
 ### What's fixed for the session lifetime
 
@@ -139,21 +139,24 @@ A zero-tool session (e.g., game-table skill with `allowed-tools: []`) gets layer
 
 ## Effective tools and permissions
 
-Session permission mode controls which tools are available. See `permission-spec.md` for the full model.
+The session's effective permission mode for the current working folder controls which tools are available. See `permission-spec.md` for the full model.
 
 - **Session is the single source of truth** for permissions. No tool lists in agent specs or skill frontmatter control access.
-- **Four modes** (chat/read/edit/admin) define the ceiling. Mode is path-scoped and persisted per-session.
+- **Four modes** (chat/read/edit/admin) define the ceiling. Mode is always path-scoped and persisted per-session as `(path, mode)`.
+- **Current cwd determines the visible mode**. After `cd`, the backend recomputes the effective mode by longest matching path grant. No matching grant means `chat`.
 - **Skills** that need elevated permissions declare a `permission` section in frontmatter — the user approves when invoking, and the grant is written to the session's `permission.json`.
-- **Missions** set mode + locked flag at creation time.
+- **Missions** set mode + paths at creation time. If a mission needs more permission than its grants allow, it records permission-needed instead of silently widening access.
 
-Available tools depend on the session's current mode for the current path:
+Available tools depend on the session's effective mode for the current path:
 
 | Mode | Available tools |
 |:-----|:---------------|
 | chat | None |
-| read | Read, Glob, Grep, WebSearch, capture_screenshot, plan tools, AskUser, read-class Bash |
-| edit | Everything in read + Write, Edit, write-class Bash |
-| admin | Everything |
+| read | Read, Glob, Grep, WebSearch, WebFetch, capture_screenshot, plan tools, AskUser, read-class Bash, Memory_query |
+| edit | Everything in read + Write, Edit, write-class Bash, Memory_write |
+| admin | Everything in edit + admin-class Bash |
+
+Reads are gated like writes — an unguarded path defaults to `chat` (no tools), so a `Read` outside any grant prompts the user just like an edit would. This is required for proxy-consumer safety (a consumer cannot reach `~/.ssh` from a session granted on `~/work`).
 
 ## Storage
 
@@ -186,8 +189,8 @@ The chat handler detects this by checking the session's current `creator` field.
 | Aspect | Before (mission) | After (user) |
 |:-------|:-----------------|:-------------|
 | `creator` field | `"mission"` | `"user"` |
-| Permission mode | Mission tier (locked) | Config default from `linggen.toml` (unlocked) |
-| Locked flag | `true` | `false` — interactive prompts resume |
+| Permission grants | Mission path grants | Existing grants preserved; user can change them |
+| Permission-needed behavior | Run records pause/failure | Interactive prompts resume |
 | System prompt | Rebuilt from `ling.md` | Same — but cache invalidated to pick up any config changes |
 | Chat history | Mission messages | Preserved — user sees full mission context |
 | Session files | Stay in place | No move |

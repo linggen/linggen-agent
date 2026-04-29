@@ -313,21 +313,12 @@ pub async fn build_page_state(
                 .or_else(|| ctx.project_root.clone().filter(|s| !s.is_empty()));
 
             if let Some(ref root) = effective_root {
-                // Mode at session root, with zone-based defaults: Temp zone
-                // (/tmp, /var/tmp) implicitly grants edit. If no grant covers
-                // the cwd and it's not Temp, returns None → UI falls back to
-                // "read", matching permission-spec.md §"Directory changes".
-                let mode = crate::engine::permission::effective_mode_with_zone(&perms.path_modes, std::path::Path::new(root));
+                // Effective mode at the session's working folder. If no grant
+                // covers it, the lookup returns None → UI shows "chat" (no tools).
+                let mode = crate::engine::permission::effective_mode_for_path(&perms.path_modes, std::path::Path::new(root));
                 if let Some(mode) = mode {
                     perm_val.as_object_mut().map(|m| m.insert("effective_mode".to_string(), serde_json::Value::String(mode.to_string())));
                 }
-                let zone = crate::engine::permission::path_zone(std::path::Path::new(root));
-                let zone_str = match zone {
-                    crate::engine::permission::PathZone::Home => "home",
-                    crate::engine::permission::PathZone::Temp => "temp",
-                    crate::engine::permission::PathZone::System => "system",
-                };
-                perm_val.as_object_mut().map(|m| m.insert("zone".to_string(), serde_json::Value::String(zone_str.to_string())));
             }
             ps.session_permission = Some(perm_val);
         }

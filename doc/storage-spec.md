@@ -97,16 +97,13 @@ Stored at `~/.linggen/credentials.json`. Keyed by model `id` from `linggen.toml`
 {
   "path_modes": [
     { "path": "~/workspace/linggen", "mode": "edit" }
-  ],
-  "locked": false,
-  "allows": ["Bash:git push *"],
-  "denied_sigs": []
+  ]
 }
 ```
 
-Stored at `~/.linggen/sessions/{session_id}/permission.json`. Per-session, cleared on session end. See `permission-spec.md` for the full model.
+Stored at `~/.linggen/sessions/{session_id}/permission.json`. Per-session, cleared on session end. `path_modes[]` is the only field — the entire permission state. Only explicit user approvals, mission frontmatter, and skill frontmatter write to it. See `permission-spec.md` for the full model.
 
-Global deny/ask rules are configured in `linggen.toml` under `[permissions]`, not in a separate file.
+There is no `[permissions]` block in `linggen.toml` and no project-level `permissions.json`. The engine's hardcoded deny floor is baked into the binary, not user-configurable.
 
 ### Session metadata (`session.yaml`)
 
@@ -145,7 +142,6 @@ description: Check CI/CD status every 30 minutes and report issues.
 schedule: '*/30 * * * *'
 enabled: true
 cwd: /path/to/project
-policy: strict
 entry: scripts/poll.sh            # optional pre-agent script
 allow-skills: []
 requires: []
@@ -160,7 +156,7 @@ created_at: 1700000000
 Check CI/CD status and report issues.
 ```
 
-Core frontmatter fields: `name`, `description`, `schedule` (5-field cron), `enabled`, `cwd`, `policy` (`strict` | `trusted` | `sandbox` | `interactive`), `entry` (optional script path or inline bash), `allow-skills`, `requires`, `allowed-tools`, `permission` (nested `mode` / `paths` / `warning`), `created_at`. Legacy `permission_tier` and top-level `mode: agent|script|app` are still read by the parser and rewritten to the new shape on next save; `mode: app` is unsupported.
+Core frontmatter fields: `name`, `description`, `schedule` (5-field cron), `enabled`, `cwd`, `entry` (optional script path or inline bash), `allow-skills`, `requires`, `allowed-tools`, `permission` (nested `mode` / `paths` / `warning`), `created_at`. Legacy `permission_tier`, mission `policy`, and top-level `mode: agent|script|app` are still read by the parser and rewritten to the new shape on next save; `mode: app` is unsupported.
 
 The markdown body is the mission prompt (step-by-step instructions for the agent). Multiple missions can be active simultaneously — each in its own directory.
 

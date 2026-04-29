@@ -8,138 +8,119 @@ guide: |
 
 # Permission System
 
-Controls what agents can do, who can grant access, and how trust flows across local, remote, and proxy contexts.
+Controls what agents can do, where they can do it, and how access changes as the working folder changes.
 
 ## Related docs
 
-- `tool-spec.md`, `session-spec.md`, `agent-spec.md`, `mission-spec.md`, `webrtc-spec.md`, `proxy-spec.md`.
+- `tool-spec.md`, `session-spec.md`, `agent-spec.md`, `mission-spec.md`, `webrtc-spec.md`, `room-spec.md`.
 
 ## Core principle
 
-**Session is the single source of truth for permissions. Every permission must be preset or approved by the user.** No tool permissions in agent specs, skill frontmatter defines requests not grants. The agent cannot gain capabilities without explicit human consent.
+**A permission is always `(path, mode)`.** The session keeps a list of grants. The effective mode for the current working folder is the most-specific matching grant — or `chat` (no tools) if no grant covers it. If the agent needs a tier higher than the effective mode, interactive sessions prompt; non-interactive runs (missions, proxy consumers) pause or fail.
 
-## Design principles
+There is no separate config rule layer, no per-tool ask/deny patterns, and no "reads are free" carveout. Every action — read, write, bash, anything — gates on the same `(path, mode)` lookup.
 
-1. **Nothing auto-allowed.** All tool access requires explicit user consent — preset via config or approved at runtime.
-2. **Deny wins.** A deny rule blocks regardless of allows elsewhere.
-3. **Inner layer can only tighten.** Subagents restrict, never expand.
-4. **Prompt only when someone can answer.** Missions and proxy sessions use pre-configured permissions only.
-5. **Classify the action, not the tool.** `Bash("ls")` is a read; `Bash("rm -rf /")` is admin. Permission reflects what the command *does*.
-6. **Session is the permission boundary.** Each session has its own permission state. No project-level persistence.
-7. **Align with OS filesystem ownership.** Home directory is user space — mode switching allowed. System directories require per-action approval — no persistent write grants. This mirrors Unix (`~/` vs `/etc`) and Windows (`%USERPROFILE%` vs `C:\Windows`).
+### What's gated, and what isn't
+
+**The permission system gates the agent. The user is never gated.**
+
+| Actor | Path | Permission check |
+|:---|:---|:---|
+| Agent's in-process tools (`Bash`, `Read`, `Write`, `Edit`, capability tools) | Through `check_permission` | Yes — path-mode + hardcoded deny floor |
+| User-typed `!`-shortcut in chat | `POST /api/bash` | No |
+| Skill iframe JS calling backend (e.g. dashboard widgets) | `POST /api/bash` etc. | No |
+
+Rationale: the user is the authority on their own machine. The permission system exists because the model is unpredictable and prompt-injectable — those failure modes don't apply to commands the user typed or to deterministic skill-bundled code the user already approved at skill activation. The hardcoded deny floor is an *agent-only* safety net, not a universal block.
 
 ## Modes and tools
 
-Session mode controls which tools are available. No tool permissions in agent specs, skill frontmatter, or elsewhere — **session is the single source of truth**.
-
 | Mode | What's available |
 |:-----|:-----------------|
-| **chat** | No tools |
-| **read** | `Read`, `Glob`, `Grep`, `WebSearch`, `capture_screenshot`, plan tools, `AskUser`, read-class Bash, `Memory_query` |
+| **chat** | `Skill` only (navigation primitive — always allowed). Any other tool the agent attempts triggers an upgrade prompt offering to switch the folder to the needed tier. The user can Allow once, Switch persistently, or Deny. |
+| **read** | `Skill` + `Read`, `Glob`, `Grep`, `WebSearch`, `WebFetch`, `capture_screenshot`, plan tools, `AskUser`, read-class Bash, `Memory_query` |
 | **edit** | Everything in read + `Write`, `Edit`, write-class Bash, `Memory_write` |
-| **admin** | Everything. (No Linggen-defined capability tool currently requires admin tier — the deprecated `Memory_forget` was removed from the model surface; bulk-forget runs via the dashboard or `ling-mem forget` CLI under explicit user invocation.) |
+| **admin** | Everything in edit + admin-class Bash |
+
+`Skill` always bypasses the path-mode check — without it, a chat-mode session could never invoke a skill via natural language. The activated skill then runs through its own permission flow (its `permission:` block, if declared).
+
+Chat mode is *not* a hard wall. It is the lowest tier — every concrete action exceeds it, so the user gets a per-action upgrade prompt. Chat is "default-deny but ask"; pick it when you want explicit approval for every tool the agent uses.
 
 ### Bash classification
 
-Bash is the only tool whose mode depends on the command. Each command is classified:
+Bash is the only tool whose tier depends on the command. Each command is classified:
 
 | Class | Examples |
 |:------|:---------|
 | **read** | `ls`, `cat`, `pwd`, `find`, `grep`, `git status/log/diff/show/branch`, `cargo check`, `npm list` |
 | **write** | `mkdir`, `cp`, `mv`, `git add/commit/push`, `npm install/run`, `cargo build/test` |
-| **admin** | `rm`, `sudo`, `kill`, `chmod`, `docker`, `systemctl`, unknown commands |
+| **admin** | `kill`, `chmod`, `docker`, `systemctl`, unknown commands |
 
-Compound commands: classified by highest component. Unknown: admin-class.
+Compound commands: classified by the highest component. Unknown commands: admin-class.
 
-## Path zones
+## Path grants
 
-The filesystem is divided into zones, aligned with OS ownership:
-
-| Zone | Unix/macOS | Windows | Mode switch | Writes |
-|:-----|:-----------|:--------|:-----------|:-------|
-| **Home** | `~/` | `%USERPROFILE%` | Yes | Within mode ceiling |
-| **Temp** | `/tmp`, `/var/tmp` | `%TEMP%` | Yes | Within mode ceiling |
-| **System** | Everything else | `C:\Windows`, `C:\Program Files` | **No** | **Per-action only** |
-
-**Sensitive home paths** (`~/.ssh`, `~/.gnupg`, `~/.aws`, `.git/`, `.linggen/`) behave like system zone — per-action approval for writes, no mode switch.
-
-## Permission modes
-
-Four modes. Each defines a ceiling — the max tier the agent can access on a given path.
-
-| Mode | Ceiling | What the agent can do |
-|:-----|:--------|:---------------------|
-| **chat** | chat | Converse only. No tools. |
-| **read** | read | Read, search, inspect. |
-| **edit** | edit | Read + write/edit files. |
-| **admin** | admin | Everything including Bash, web, system ops. |
-
-**Default: read**, scoped to the session's starting directory.
-
-### Modes are path-scoped
-
-A mode grant is always `(path, mode)`. The grant covers the path and all children. Each session stores a list of grants in `permission.json`:
+A grant is `(path, mode)`. The grant covers the path and all children. Each session stores grants in `permission.json`:
 
 ```json
 {
   "path_modes": [
-    { "path": "~/workspace/linggen", "mode": "edit" },
-    { "path": "/etc/nginx", "mode": "read" }
+    { "path": "~/workspace/linggen", "mode": "edit" }
   ]
 }
 ```
 
-Most specific matching path wins.
+That is the entire permission state. No config rules, no session ask-overrides, no denied-call list.
+
+### Effective mode lookup
+
+For the current working folder (or any tool target path):
+
+1. Find the most-specific grant in `path_modes[]` whose `path` is an ancestor of (or equal to) the target. Use that mode.
+2. No match → effective mode is **chat**.
+
+That is the entire algorithm. No zones, no `/tmp` special case, no sensitive-path carveouts — every path is treated identically, defaulting to `chat`.
+
+### Session creation
+
+A new user session is given one grant on its starting working folder using the configured default mode (`tool_permission_mode` in `linggen.toml`, default **read**). Anywhere else has no grant — mode is `chat` until upgraded.
+
+### Directory changes
+
+When the agent or user runs `cd`, the engine updates the session cwd, recomputes the effective mode from `path_modes[]`, and emits a mode-change event. The chat header badge updates immediately. The grant list itself does not change.
+
+This contains permission to the granted folder. Edit on project A does not leak to project B; `cd /tmp` lands in `chat` until the user grants `edit` (or higher) there.
 
 ### Mode upgrades
 
-When the agent exceeds the current path's ceiling (home/temp zone), the prompt for that specific tool call includes a mode switch option:
+When the agent needs a tier higher than the effective mode, interactive sessions prompt:
 
 ```
 Agent wants to edit src/main.rs
 
-  [Switch to edit mode]     ← grants edit on ~/workspace/linggen/**
-  [Allow once]              ← one-time, mode stays the same
+  [Switch this folder to edit]   ← persists (current_cwd, edit) in path_modes
+  [Allow once]                   ← one-time approval, no persistence
   [Deny]
 ```
 
-"Switch to edit mode" persists in `permission.json`. Future edits and write-class Bash within that tree pass without prompting. This applies to all tool types — Edit, Write, and write-class Bash all show the mode switch option when they exceed the ceiling.
+"Switch this folder to {mode}" is the persistent, always-approve-on-this-path option. After switching, all actions within the new ceiling pass without prompting. This is the only persistence path: **only explicit user approvals, mission frontmatter, and skill frontmatter write to `path_modes[]`**. Allow-once never persists.
 
-### Directory changes
+### Reads are gated, too
 
-When the working directory changes (`! cd ~/other-project`):
-
-- If the new path has an existing grant → that mode applies.
-- If no grant covers it → effective mode resets to **read**.
-
-Edit mode on project A does not leak to project B.
-
-### Reading outside granted paths
-
-If the agent reads a file not covered by any grant:
+A `Read` of a file outside any grant triggers the same prompt:
 
 ```
 Agent wants to read /etc/nginx/nginx.conf
 
-  [Allow read on /etc/nginx]    ← grants read for the session
+  [Switch /etc/nginx to read]
   [Allow once]
   [Deny]
 ```
 
-### System zone writes
-
-No mode switch offered. Always per-action:
-
-```
-Agent wants to edit /etc/hosts
-
-  [Allow once]
-  [Deny]
-```
+Treating reads like writes is required for consumer safety. A remote consumer with a grant on `~/work` cannot reach into `~/.ssh`, because no grant covers it. There is no exception for "reads are cheap."
 
 ### Mode in chat widget
 
-Current effective mode shown in chat header, updates on directory change:
+The chat header shows the effective mode for the current working folder and updates after `cd`:
 
 ```
 ┌──────────────────────────────────────────┐
@@ -147,223 +128,122 @@ Current effective mode shown in chat header, updates on directory change:
 │  ~/workspace/linggen                     │
 ```
 
-Clicking the badge opens a dropdown to switch modes for the current path.
+Clicking the badge changes the grant for the current working folder only. It does not change grants for unrelated folders.
 
-### Locked flag
+## Hardcoded deny floor
 
-Not a mode — a flag. When locked, prompts are skipped; actions that would need prompting are blocked instead. Used for missions, CI, remote-different-user sessions.
+A short, curated list of commands is denied at the engine level regardless of mode. Admin mode does not bypass it; the user cannot extend or relax it via config; the floor is baked into the binary.
+
+| Pattern | Why |
+|:--------|:----|
+| `sudo …` | Privilege escalation — never authorized for an agent |
+| `rm -rf /`, `rm -rf /*` | Whole-disk wipe |
+| `dd of=/dev/{disk,sd*,nvme*,hd*}` | Direct disk overwrite |
+| `mkfs.*` | Filesystem creation on a device |
+| `:(){:\|:&};:` | Classic forkbomb |
+| `chown -R … /`, `chmod -R … /` | Root-tree ownership/mode bombs |
+
+This is a defense-in-depth floor against the most common foot-guns. Everything else is gated by mode. Users who want stricter control keep the session in `read` mode.
 
 ## Permission layers
 
 ```
 ┌─────────────────────────────────────┐
-│  1. Config (linggen.toml)           │  Deny/ask rules, default mode
+│  1. Hardcoded deny floor            │  Engine-baked, cannot be overridden
 ├─────────────────────────────────────┤
-│  2. Session (permission.json)       │  Path modes, policy, session allows, denied sigs
+│  2. Session permission.json         │  path_modes[] — the only persisted state
 └─────────────────────────────────────┘
 ```
 
-Config sets guardrails. Session holds runtime state. That's it.
-
-## Session policy
-
-Mode sets the *capability ceiling* on each path. **Policy** decides what happens when an action exceeds the ceiling or hits an ask-rule. The two concepts are orthogonal and compose: mode = what the agent is allowed to do, policy = behavior when it wants more.
-
-Two independent levers:
-
-| Lever | When it applies | Choices |
-|:------|:----------------|:--------|
-| **on_exceed** | Action exceeds effective path-mode grant | `ask` / `allow` / `deny` |
-| **on_ask_rule** | Action matches an `ask:` rule | `ask` / `allow` / `deny` |
-
-Deny rules always deny — policy cannot override the safety floor.
-
-Named presets:
-
-| Preset | `on_exceed` | `on_ask_rule` | When to use |
-|:-------|:-----------:|:-------------:|:------------|
-| **interactive** | ask | ask | Default for user-facing sessions |
-| **strict** | deny | deny | Autonomous runs where safety matters more than coverage |
-| **trusted** | allow | deny | Autonomous runs you trust — legacy locked-session behavior |
-| **sandbox** | allow | allow | Containerized/Docker runs where the OS is the guardrail |
-
-Policy applies to the *whole session*. It's set by:
-
-- Interactive user sessions → `interactive` (default)
-- Consumer (proxy-room) sessions → `trusted` (no prompts, still denies `ask:` rules like `git push`)
-- Mission sessions → declared in the mission's `policy:` field, defaults to `strict`. `trusted` / `sandbox` are opt-in for missions that need out-of-scope actions to pass. `interactive` is discouraged — prompts queue unseen.
-
-A policy where either lever is not `ask` is *locked* — the agent never prompts the user in that session.
-
-## Permission rules (deny / ask)
-
-Two types in config. Deny takes priority over ask.
-
-| Type | Effect |
-|:-----|:-------|
-| **deny** | Block immediately, no prompt, no override |
-| **ask** | Always prompt, even if mode would allow. User can override per-session. |
-
-Rules are always scoped: `Tool(pattern)`.
-
-```toml
-[permissions]
-deny = ["Bash(sudo *)", "Bash(rm -rf *)"]
-ask = ["Bash(git push *)", "Bash(docker *)"]
-```
-
-No config `allow` rules — within-ceiling actions are already allowed by the mode. Use `ask` to add friction for specific commands; use `deny` to hard-block.
+No `[permissions]` block in `linggen.toml`. No project-level `permissions.json`. One persistent source per session.
 
 ## Check flow
 
 ```
- 1. Tool in agent's effective set? NO → blocked
+ 1. Tool in agent's effective set?              NO → blocked
  2. Classify action tier (read / edit / admin)
- 3. Check deny rules → blocked (hard floor, not overridable)
- 4. Check ask rules (config + not in session allows):
-      policy.on_ask_rule = ask   → prompt
-      policy.on_ask_rule = allow → skip the rule
-      policy.on_ask_rule = deny  → blocked
- 5. Resolve target path + zone
- 6. If an explicit path grant covers the target and satisfies the tier → allowed
-    (skill-declared grants short-circuit zone and ceiling checks)
- 7. System zone + write/admin?
-      policy.on_exceed = ask   → per-action prompt
-      policy.on_exceed = allow → allowed
-      policy.on_exceed = deny  → blocked
- 8. Find effective mode for path:
-      Within ceiling            → allowed
-      Exceeds / no grant, and
-        policy.on_exceed = ask   → prompt
-        policy.on_exceed = allow → allowed
-        policy.on_exceed = deny  → blocked
+ 3. Resolve target path (cwd if tool has none)
+ 4. Hardcoded deny floor matches command?       YES → blocked, no override
+ 5. Most-specific (path, mode) grant for target:
+      effective mode tier ≥ action tier         → allowed
+      otherwise (or no grant)                   → prompt if interactive,
+                                                  pause/fail if unattended
 ```
 
-## Prompt options
-
-**Actions within the mode ceiling on a granted path never prompt.** Three cases trigger prompts:
-
-### Exceeds mode ceiling (home/temp zone)
-
-1. Allow once
-2. Switch to {mode} mode — persists `(current_path, mode)` in `permission.json`
-3. Deny
-4. Other...
-
-After switching, all actions within the new ceiling pass without prompting.
-
-### System zone writes
-
-No mode switch. Always per-action:
-
-1. Allow once
-2. Deny
-
-### Ask-rule override
-
-Config `ask` rules force a prompt even within the ceiling. Example: `ask = ["Bash(git push *)"]` prompts in admin mode.
-
-1. Allow once
-2. Allow for this session — suppresses the ask rule for this session
-3. Deny
-
-## Session persistence
-
-`~/.linggen/sessions/{session_id}/permission.json`:
-
-```json
-{
-  "path_modes": [
-    { "path": "~/workspace/linggen", "mode": "edit" }
-  ],
-  "locked": false,
-  "allows": ["Bash:git push *"],
-  "denied_sigs": ["Bash:rm -rf dist"]
-}
-```
-
-`allows` stores ask-rule overrides — commands the user approved to suppress config `ask` rules for this session. `denied_sigs` stores tool calls the user denied (auto-blocked on retry).
-
-No project-level `permissions.json`. Two persistent sources: `linggen.toml` (global) and session `permission.json` (per-session, cleared on session end).
+Tools without a path target (e.g., `WebSearch`) check the effective mode for the session's current cwd.
 
 ## Session creators
 
-Three ways to create a session, each with different initial permissions:
+Three ways to create a session, each with different initial grants.
 
 ### User session
 
-- Starts in **read** mode on the current directory.
-- User upgrades mode interactively as needed.
+- One grant auto-added on the starting cwd at the configured default mode (`tool_permission_mode`, default `read`).
+- User upgrades interactively as needed.
 - This is the default.
 
 ### Mission session
 
-- Mode (`read` / `edit` / `admin`) and paths set in the mission's `permission:` block.
-- Policy (`strict` / `trusted` / `sandbox` / `interactive`) defaults to `strict`; see mission-spec.md.
-- Always **locked** — no prompts, pre-configured permissions only (`interactive` is discouraged).
-- Config deny rules still apply.
-- Session promotion (user sends message) clears locked flag, resets to interactive.
+- Grants come from the mission's `permission:` block (`mode` + `paths`). The mission's `cwd` also receives the mode.
+- No prompts during scheduled execution. If a mission needs more than its grants allow, the run records a permission-needed failure/pause.
+- Hardcoded deny floor still applies.
+- Session promotion (user sends a message): grants are preserved; future permission-needed events become interactive prompts.
 
 ### Skill invocation (within a user session)
 
-Skills don't create sessions — they run inside the current user session. Skills that need elevated permissions declare it in frontmatter. Example from the `sys-doctor` skill:
+Skills don't create sessions — they run inside the current user session. Skills that need elevated permissions declare it in frontmatter:
 
 ```yaml
 ---
 name: sys-doctor
-description: System health analyst — scans disk, apps, caches, and system info
 permission:
   mode: admin
   paths: ["/"]
-  warning: "Sys Doctor runs diagnostic commands (df, du, sysctl, uname) and the AI may suggest cleanup commands."
+  warning: "Sys Doctor runs diagnostic commands and may suggest cleanup."
 ---
 ```
 
-When the user invokes the skill (click card, `/sys-doctor`, etc.):
+When the user invokes the skill:
 
 ```
 Skill "sys-doctor" requests:
   admin mode on /
-  ⚠️ Sys Doctor runs diagnostic commands (df, du, sysctl, uname)
-    and the AI may suggest cleanup commands.
+  ⚠️ Sys Doctor runs diagnostic commands and may suggest cleanup.
 
-  [Approve]           ← grants (/, admin) in session permission.json
-  [Run in read mode]  ← skill runs with current permissions, may fail
+  [Approve]              ← writes (/, admin) into session permission.json
+  [Run in current mode]  ← skill runs with existing grants, may fail
   [Cancel]
 ```
 
-If approved, the grants are added to the **current session's** `permission.json`. The skill runs within the session with those grants. The grants persist in the session — user can revoke via the mode dropdown.
+Approved grants are added to the current session's `permission.json` and persist for the session. The user can revoke by changing the mode for that path.
 
-Skills without a `permission` section run with whatever the session already has.
+Skills without a `permission` section run with whatever grants the session already has.
 
 ## Remote access
 
-| Context | Mode cap | Locked | Prompts |
-|:--------|:---------|:-------|:--------|
-| Local browser (owner) | Any | No | Yes |
-| Remote same-user (owner) | Any | No | Yes |
-| Remote different-user (guest) | Owner-set (default: read) | Yes | No |
-| Proxy consumer (browser) | Room config ceiling | Yes | No |
+| Context | Path grants | Permission-needed behavior |
+|:--------|:------------|:---------------------------|
+| Local browser (owner) | User-controlled | Prompt |
+| Remote same-user (owner) | User-controlled | Prompt |
+| Remote different-user (guest) | Owner-set | Pause/fail; no guest prompt |
+| Proxy consumer (browser) | Owner room config + consumer mode | Block/pause; no consumer prompt |
 
-Guest and consumer sessions are always locked — no prompts, actions within ceiling + allow rules proceed, everything else blocked. For proxy consumers, the room config (`allowed_tools`, `allowed_skills`) is the hard ceiling — the consumer's permission level operates within it.
-
+For proxy consumers, the room config (`allowed_tools`, `allowed_skills`) is the hard ceiling. The consumer's grants live within that ceiling. Consumers cannot upgrade or grant new paths — they have no UI for it, and no prompts ever surface in their session.
 
 ## Subagents
 
-- Inherit parent's session permission state (mode, path grants, session allows).
-- Can only tighten. Cannot upgrade mode (no AskUser).
-- Locked if parent is locked.
+- Inherit the parent session's grants (a snapshot at spawn time).
+- Can only tighten — cannot upgrade mode (no `AskUser`).
+- If a subagent needs more permission, it returns permission-needed to the parent.
 
 ## Configuration
 
 ```toml
 [agent]
-tool_permission_mode = "read"    # Default mode for new sessions
-
-[permissions]
-deny = ["Bash(sudo *)", "Bash(rm -rf *)"]
-ask = ["Bash(git push *)", "Bash(docker *)"]
+tool_permission_mode = "read"    # Default mode for new user sessions
 ```
+
+That is the only permission-related config. No `[permissions]` block. No deny/ask rule tables. The engine's hardcoded deny floor is fixed and not user-configurable.
 
 ## Future
 
