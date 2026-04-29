@@ -1,5 +1,6 @@
 ---
 type: spec
+reader: Coding agent and users
 guide: |
   Product specification — describe what the system should do and why.
   Keep it brief. Aim to guide design and implementation, not document code.
@@ -30,6 +31,8 @@ Every session has a **working folder** (cwd) — the directory the agent operate
 ### Home path
 
 The **home path** is the default working folder for new sessions. Defaults to `~`. Users can change it in settings (e.g. `~/workspace`, `~/projects`). Stored in `linggen.toml` as `home_path`.
+
+**Skill-bound sessions** can override this. If the bound skill declares `cwd:` in its frontmatter (e.g. `cwd: ~/.linggen` for `ling-mem`), the session boots there instead of the home path. Resolution order at `POST /api/sessions`: skill's `cwd:` → request's `project_root` → `home_path`. Mirrors the `cwd:` field in mission frontmatter.
 
 ### How it works
 

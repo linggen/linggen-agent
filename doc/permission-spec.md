@@ -1,5 +1,6 @@
 ---
 type: spec
+reader: Coding agent and users
 guide: |
   Product specification — describe what the system should do and why.
   Keep it brief. Aim to guide design and implementation, not document code.
@@ -56,6 +57,33 @@ Bash is the only tool whose tier depends on the command. Each command is classif
 | **admin** | `kill`, `chmod`, `docker`, `systemctl`, unknown commands |
 
 Compound commands: classified by the highest component. Unknown commands: admin-class.
+
+### Bash path-arg gating
+
+Bash gates on **the paths the command actually touches**, not just the session cwd. Absolute (`/foo`) and tilde (`~/foo`) tokens in the command are extracted; each must be covered by a grant at the command's tier.
+
+- `ls` (no path args) → cwd's tier must cover read.
+- `ls /tmp/foo` → `/tmp` must have read; cwd's tier is irrelevant.
+- `cat /etc/hosts > /tmp/x` → both `/etc/hosts` (read) and `/tmp/x` (write) checked.
+- `bash ~/scripts/foo.sh` → admin tier required on `~/scripts/foo.sh` (or its parent grant).
+
+This prevents `read on /A, cwd /A` from leaking into `bash ls /B` — `/B` would prompt for upgrade. Best-effort extraction: doesn't parse `--flag=/path` forms or quoted paths with spaces. Compound commands (`a; b`, `a && b`) are split and each path checked.
+
+### Per-tool path-gate matrix
+
+What "target path" each tool gates on:
+
+| Tool | Target path | Notes |
+|:---|:---|:---|
+| `Read`, `Write`, `Edit` | the tool's `path` arg | The actual file being read/written. `Read("/B/x")` is checked against `/B`'s grant, not cwd. |
+| `Bash` | each `/`-prefixed and `~/`-prefixed token in `cmd`; falls back to cwd if none | Covered above. |
+| `Glob`, `Grep` | cwd | Inherently scoped — the walker descends from cwd; absolute paths in `globs[]` patterns don't actually escape because the walker is cwd-rooted. |
+| `Task` | inherits parent's `path_modes` | Subagent runs with parent's grants snapshot at spawn. |
+| `WebFetch`, `WebSearch` | cwd | Network ops, but tier-gated on cwd by current design (gate them through chat→read upgrade if you want them to require explicit approval). |
+| `AskUser`, plan tools | cwd | Conversational primitives; cwd-tier check applies. |
+| `Skill` | none — always allowed | Navigation primitive; the activated skill goes through its own permission flow. |
+| `Memory_query`, `Memory_write` | cwd | Routes to a local HTTP daemon; gated by cwd's tier (Read for query, Edit for write per capability registry). |
+| `capture_screenshot` | cwd | Network op (URL → image), cwd-tier check applies. |
 
 ## Path grants
 

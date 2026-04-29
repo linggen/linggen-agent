@@ -714,7 +714,39 @@ pub fn check_permission(
         tool_action_tier(tool)
     };
 
-    // 2. Resolve target path. Tools without an explicit file_path use cwd.
+    // 2. Bash-specific path gating: if the command contains explicit absolute
+    // or tilde-prefixed path args, each must be covered at action_tier.
+    // Without this, `bash ls /B` from a session with read-on-/A would pass
+    // because step 3 only consulted cwd's tier — but the command's actual
+    // reach is /B, not /A. cwd is just where the shell starts; we gate on
+    // what the command actually touches.
+    if tool == "Bash" {
+        if let Some(cmd) = bash_command {
+            let path_args = extract_command_paths(cmd);
+            if !path_args.is_empty() {
+                for path_arg in &path_args {
+                    let arg_path = expand_path_arg(path_arg);
+                    let mode = effective_mode_for_path(&session_perms.path_modes, &arg_path);
+                    if mode.map_or(true, |m| action_tier > m) {
+                        let grant_path = grant_path_for_prompt(tool, &arg_path, session_cwd);
+                        let path_str = display_path(&grant_path);
+                        return PermissionCheckResult::NeedsPrompt(PromptKind::ExceedsCeiling {
+                            target_mode: action_tier,
+                            path: path_str,
+                            tool_summary: format!("{} {}", tool, cmd),
+                        });
+                    }
+                }
+                // Every explicit path arg is covered at action_tier — allowed.
+                return PermissionCheckResult::Allowed;
+            }
+            // No path args: fall through to the cwd check below — `ls`,
+            // `cargo build`, etc. operate in cwd, so cwd's tier is the gate.
+        }
+    }
+
+    // 3. Resolve target path for non-Bash tools (or Bash without path args).
+    // Tools without an explicit file_path use cwd.
     let target_path = file_path
         .map(|fp| {
             if fp == "~" {
@@ -730,36 +762,14 @@ pub fn check_permission(
         })
         .unwrap_or_else(|| session_cwd.to_path_buf());
 
-    // 3. Most-specific grant covering the target.
+    // 4. Most-specific grant covering the target.
     if let Some(mode) = effective_mode_for_path(&session_perms.path_modes, &target_path) {
         if action_tier <= mode {
             return PermissionCheckResult::Allowed;
         }
     }
 
-    // 3b. Bash commands sometimes reference granted paths in their args.
-    // If the command string mentions a granted path, treat that grant's
-    // mode as the effective ceiling for this call.
-    if tool == "Bash" {
-        if let Some(cmd) = bash_command {
-            let mut best: Option<PermissionMode> = None;
-            for pm in &session_perms.path_modes {
-                let expanded = expand_tilde(&pm.path);
-                if cmd.contains(&expanded) || cmd.contains(&pm.path) {
-                    if best.map_or(true, |b| pm.mode > b) {
-                        best = Some(pm.mode);
-                    }
-                }
-            }
-            if let Some(mode) = best {
-                if action_tier <= mode {
-                    return PermissionCheckResult::Allowed;
-                }
-            }
-        }
-    }
-
-    // 4. Exceeds ceiling (or no grant) — needs upgrade prompt.
+    // 5. Exceeds ceiling (or no grant) — needs upgrade prompt.
     let grant_path = grant_path_for_prompt(tool, &target_path, session_cwd);
     let path_str = display_path(&grant_path);
     let rule_arg = bash_command.or(file_path);
@@ -770,6 +780,34 @@ pub fn check_permission(
         path: path_str,
         tool_summary: format!("{} {}", tool, summary),
     })
+}
+
+/// Extract absolute (`/foo/bar`) and tilde-prefixed (`~`, `~/foo`) tokens from
+/// a bash command. Used to gate Bash by the paths it actually touches, not
+/// just the session cwd's tier. Best-effort: doesn't handle quoted paths with
+/// spaces, embedded `--flag=/path` forms, or command substitution. Catches the
+/// common `cmd /path` and `cmd ~/path` forms.
+fn extract_command_paths(cmd: &str) -> Vec<String> {
+    cmd.split_whitespace()
+        .filter(|t| t.starts_with('/') || t.starts_with("~/") || *t == "~")
+        // Strip trailing punctuation introduced by compound shell syntax
+        // (`cmd1; cmd2`, `cmd1 && cmd2`, redirects).
+        .map(|t| t.trim_end_matches(';').trim_end_matches('&').trim_end_matches('|').to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Expand `~`, `~/...`, or absolute paths to a `PathBuf`.
+fn expand_path_arg(p: &str) -> PathBuf {
+    if p == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(p))
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        dirs::home_dir()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(p))
+    } else {
+        PathBuf::from(p)
+    }
 }
 
 /// Compute the path to offer in the "Switch this folder to {mode}" option.
@@ -1243,6 +1281,95 @@ mod tests {
                 PermissionCheckResult::NeedsPrompt(PromptKind::ExceedsCeiling { .. })
             ));
         }
+    }
+
+    #[test]
+    fn test_check_permission_bash_args_gate_by_arg_path_not_cwd() {
+        // The headline bug this gate fixes: a session with read on /A and cwd
+        // /A could previously run `bash ls /B` because the gate only checked
+        // cwd's tier. Now the path arg is checked — if /B isn't covered, the
+        // call prompts to upgrade /B.
+        if let Some(home) = dirs::home_dir() {
+            let cwd = home.join("a");
+            let mut sp = SessionPermissions::default();
+            sp.set_path_mode(&cwd.to_string_lossy(), PermissionMode::Read);
+
+            // Read /B — /B has no grant — should prompt for /B's parent.
+            let result = check_permission(
+                "Bash", Some("ls /tmp/foo"), None,
+                &cwd, &sp, None,
+            );
+            assert!(
+                matches!(result, PermissionCheckResult::NeedsPrompt(PromptKind::ExceedsCeiling { .. })),
+                "ls /tmp/foo from cwd {} should prompt — /tmp/foo not covered. got {result:?}",
+                cwd.display(),
+            );
+
+            // Now grant read on /tmp — should pass.
+            sp.set_path_mode("/tmp", PermissionMode::Read);
+            let result = check_permission(
+                "Bash", Some("ls /tmp/foo"), None,
+                &cwd, &sp, None,
+            );
+            assert!(matches!(result, PermissionCheckResult::Allowed),
+                "ls /tmp/foo with read on /tmp should be allowed. got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_check_permission_bash_no_args_uses_cwd() {
+        // Bash without absolute path args (e.g. `cargo build`, `ls .`) operates
+        // in cwd — the cwd's tier is what gates it.
+        if let Some(home) = dirs::home_dir() {
+            let cwd = home.join("project");
+            let mut sp = SessionPermissions::default();
+            sp.set_path_mode(&cwd.to_string_lossy(), PermissionMode::Edit);
+
+            // `cargo build` is write-class (edit tier), no path args → cwd check.
+            let result = check_permission(
+                "Bash", Some("cargo build"), None,
+                &cwd, &sp, None,
+            );
+            assert!(matches!(result, PermissionCheckResult::Allowed),
+                "cargo build in edit-mode cwd should be allowed. got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_check_permission_bash_arg_already_granted_passes() {
+        // Skill activation grants admin on ~/.linggen/skills. A bash command
+        // that only references that granted path (e.g. `bash ~/.linggen/skills/foo/run.sh`)
+        // should pass without re-prompting, even if cwd has a lower tier.
+        if let Some(home) = dirs::home_dir() {
+            let cwd = home.join("project");
+            let mut sp = SessionPermissions::default();
+            sp.set_path_mode(&cwd.to_string_lossy(), PermissionMode::Read);
+            sp.set_path_mode("~/.linggen/skills", PermissionMode::Admin);
+
+            let result = check_permission(
+                "Bash", Some("bash ~/.linggen/skills/foo/run.sh"), None,
+                &cwd, &sp, None,
+            );
+            assert!(matches!(result, PermissionCheckResult::Allowed),
+                "bash on a granted path should be allowed even if cwd is lower-tier. got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_extract_command_paths() {
+        assert_eq!(extract_command_paths("ls"), Vec::<String>::new());
+        assert_eq!(extract_command_paths("ls /tmp"), vec!["/tmp"]);
+        assert_eq!(extract_command_paths("cat /etc/hosts"), vec!["/etc/hosts"]);
+        assert_eq!(extract_command_paths("ls /a /b"), vec!["/a", "/b"]);
+        assert_eq!(extract_command_paths("ls ~/Desktop"), vec!["~/Desktop"]);
+        // Compound — both parts.
+        assert_eq!(extract_command_paths("ls /a; ls /b"), vec!["/a", "/b"]);
+        assert_eq!(extract_command_paths("ls /a && ls /b"), vec!["/a", "/b"]);
+        // Flag with embedded path (false negative — acceptable trade-off).
+        assert_eq!(extract_command_paths("cargo install --root=/usr/local"),
+                   Vec::<String>::new());
+        // Relative paths aren't extracted — fall back to cwd check.
+        assert_eq!(extract_command_paths("cat ./local.txt"), Vec::<String>::new());
     }
 
     #[test]

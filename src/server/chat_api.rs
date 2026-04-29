@@ -1694,19 +1694,15 @@ pub(crate) async fn chat_handler(
                                                     changed = true;
                                                 }
                                             }
-                                            // Also grant the skill's mode on the session's own cwd
-                                            // so the UI's mode badge reflects the skill's ceiling.
-                                            let cwd_str = engine.cfg.ws_root.display().to_string();
-                                            if !cwd_str.is_empty() {
-                                                let current_cwd = crate::engine::permission::effective_mode_for_path(
-                                                    &engine.session_permissions.path_modes,
-                                                    &engine.cfg.ws_root,
-                                                );
-                                                if current_cwd != Some(mode) {
-                                                    engine.session_permissions.set_path_mode(&cwd_str, mode);
-                                                    changed = true;
-                                                }
-                                            }
+                                            // Note: we intentionally do NOT also grant the skill's mode
+                                            // on the session's cwd. The skill gets exactly what its
+                                            // SKILL.md declared in `permission.paths` and nothing more.
+                                            // Auto-broadening to cwd was previously done so the badge
+                                            // would reflect the skill's tier, but it silently inflated
+                                            // grants when cwd was a parent of the declared paths
+                                            // (e.g. cwd=~ + paths=[~/.linggen] → admin on whole home).
+                                            // The badge will read "chat" outside declared paths; that
+                                            // is honest — the agent has no permission there.
                                             if changed {
                                                 if let Some(ref sdir) = engine.session_dir {
                                                     engine.session_permissions.save(sdir);

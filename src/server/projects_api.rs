@@ -597,7 +597,20 @@ pub(crate) async fn create_session(
         crate::util::now_ts_secs(),
         &uuid::Uuid::new_v4().to_string()[..8]
     );
-    let cwd = req.project_root.as_deref()
+    // cwd resolution: skill's declared `cwd:` (if any) wins, otherwise the
+    // iframe's project_root, otherwise the configured home_path. Mirrors how
+    // mission frontmatter sets cwd; lets ling-mem boot at ~/.linggen instead
+    // of the user's home dir.
+    let mut cwd_str: Option<String> = None;
+    if let Some(ref skill_name) = req.skill {
+        if let Some(skill) = state.manager.skill_manager.get_skill(skill_name).await {
+            if let Some(ref c) = skill.cwd {
+                cwd_str = Some(c.clone());
+            }
+        }
+    }
+    let cwd_str = cwd_str.or_else(|| req.project_root.clone());
+    let cwd = cwd_str.as_deref()
         .map(|p| canonical_project_root(p).to_string_lossy().to_string());
     let meta = crate::state_fs::sessions::SessionMeta {
         id: id.clone(),

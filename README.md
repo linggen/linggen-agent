@@ -5,7 +5,7 @@
 <h1 align="center">Linggen</h1>
 
 <p align="center">
-  <strong>Local AI coding agent you can access from anywhere.</strong><br>
+  <strong>A local AI app engine — and your general-purpose personal assistant.</strong><br>
   Open-source. Any model. WebRTC remote access. Skills you can share.
 </p>
 
@@ -27,7 +27,7 @@
 
 ## What is Linggen?
 
-Linggen is an AI coding agent that runs on your machine — and lets you access it from any device via WebRTC. Start a task on your desktop, check on it from your phone. No cloud hosting, no subscriptions, your models and your data.
+Linggen is a local AI app engine. Out of the box, it's a general-purpose personal assistant that chats and acts. Install skills and the same runtime hosts them as full AI apps — coding, system diagnostics, semantic memory, model sharing, anything you want to drop in. Runs on your machine; access it from any device via WebRTC. No cloud hosting, no subscriptions, your models and your data.
 
 ```bash
 curl -fsSL https://linggen.dev/install.sh | bash

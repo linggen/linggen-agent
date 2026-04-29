@@ -1,5 +1,6 @@
 ---
 type: spec
+reader: Coding agent and users
 guide: |
   Product specification — describe what the system should do and why.
   Keep it brief. Aim to guide design and implementation, not document code.
@@ -52,9 +53,12 @@ When a skill sets `allowed-tools: []`, tool-related prompt sections (schemas, us
 | `ling` | The only agent — adapts to any context via skills | `["*"]` |
 
 Ling is the universal agent. Specialized behavior comes from skills:
-- **Mission skill** — bound to cron sessions, sets autonomous execution mode with safety guardrails
 - **Game-table skill** — bound to game sessions, zero tools, pure conversation
 - **Linggen-guide skill** — documentation lookup and Q&A
+- **Sys-doctor skill** — system health analyst with web dashboard
+- **Ling-mem skill** — semantic memory store with typed `Memory_*` tools
+
+Missions are a sibling subsystem to skills (cron-scheduled), not a skill type. See `mission-spec.md`.
 
 ### Dynamic system prompt
 

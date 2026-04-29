@@ -390,6 +390,11 @@ pub struct Skill {
     /// Permission request — if set, user is prompted to approve before skill runs.
     #[serde(default)]
     pub permission: Option<SkillPermission>,
+    /// Optional starting cwd for sessions invoking this skill. Tilde-expandable
+    /// (`~/.linggen`). When omitted, sessions inherit the user's `home_path`.
+    /// Mirrors the `cwd:` field in mission frontmatter.
+    #[serde(default)]
+    pub cwd: Option<String>,
     /// Install script path relative to skill directory. Run once on install.
     #[serde(default)]
     pub install: Option<String>,
@@ -469,6 +474,14 @@ struct SkillFrontmatter {
     app: Option<AppConfig>,
     #[serde(default)]
     permission: Option<SkillPermission>,
+    /// Optional starting cwd for sessions invoking this skill. Tilde-expandable
+    /// (e.g. `~/.linggen`). When set, sessions created by this skill's app
+    /// launcher (or the slash-command activation path) start at this folder
+    /// instead of the user's home_path. Mirrors the `cwd:` field in mission
+    /// frontmatter. When omitted, defaults to the user's `home_path` (or
+    /// whatever the iframe's session-create call passes).
+    #[serde(default)]
+    cwd: Option<String>,
     #[serde(default)]
     install: Option<String>,
     #[serde(default)]
@@ -621,6 +634,7 @@ impl SkillManager {
             trigger: frontmatter.trigger,
             app: frontmatter.app,
             permission: frontmatter.permission,
+            cwd: frontmatter.cwd,
             install: frontmatter.install,
             provides: frontmatter.provides,
             implements: frontmatter.implements,

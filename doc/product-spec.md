@@ -1,5 +1,6 @@
 ---
 type: spec
+reader: Coding agent and users
 guide: |
   Product specification — describe what the system should do and why.
   Keep it brief. Aim to guide design and implementation, not document code.
@@ -10,11 +11,11 @@ guide: |
 
 ## Vision
 
-Linggen is **the root system for AI agents**. The core runtime manages agent processes, communication, and execution — everything else grows on top as skills and agents.
+Linggen is **a local AI app engine — and your general-purpose personal assistant**. Two faces of the same runtime: out of the box, the assistant chats and acts; install skills and the same runtime hosts them as full apps.
 
-Users manage agents, skills, and models through the Web UI. Each agent has its own context, skill set, and mission — from a social chat skill to a coding agent to a scheduled architecture guardian. Skills follow the [Agent Skills](https://agentskills.io) open standard (aligned with Claude Code) and work across AI tools.
+Architecturally, Linggen is **the root system for AI agents** — the core runtime manages agent processes, communication, and execution; everything else (skills, agents, missions) grows on top as files. Skills follow the [Agent Skills](https://agentskills.io) open standard (aligned with Claude Code) and work across AI tools.
 
-For vision, landscape, and roadmap, see [`insight.md`](insight.md).
+For background on why an AI app engine is needed, plus landscape and roadmap, see [`insight.md`](insight.md).
 
 ### OS analogy
 
