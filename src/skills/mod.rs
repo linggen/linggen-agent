@@ -55,13 +55,31 @@ fn page_update_tool_def() -> SkillToolDef {
             items: None,
         },
     );
+    args.insert(
+        "body_patch".to_string(),
+        SkillParamDef {
+            param_type: "array".to_string(),
+            required: false,
+            default: None,
+            description:
+                "In-place body updates that swap individual widgets without rebuilding \
+                 the rest. Each entry: {\"match\":{\"type\":\"...\",\"title\":\"...\"},\
+                 \"widget\":{...}}. Match is by type+title (case-insensitive); if no \
+                 existing widget matches, the patch is appended. Use this for rescans / \
+                 partial refreshes — preserves all other widgets."
+                    .to_string(),
+            items: None,
+        },
+    );
     SkillToolDef {
         name: "PageUpdate".to_string(),
         description:
-            "Refresh the skill's dashboard UI. Pass `top_bar`, `body`, and/or `footer` \
-             as top-level arguments — omit any section you don't want to change \
-             (previous values persist). At least one of the three must be provided \
-             and non-empty. See the skill's SKILL.md for widget shapes."
+            "Refresh the skill's dashboard UI. Pass `top_bar`, `body`, `footer`, \
+             and/or `body_patch` as top-level arguments — omit any section you don't \
+             want to change (previous values persist). At least one must be provided \
+             and non-empty. Use `body_patch` for single-widget refreshes (rescan, etc.) \
+             so other widgets stay intact; use `body` only when replacing the full layout. \
+             See the skill's SKILL.md for widget shapes."
                 .to_string(),
         cmd: String::new(),
         endpoint: None,

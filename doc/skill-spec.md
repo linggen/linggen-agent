@@ -117,11 +117,51 @@ Three groups of fields. Standard fields work across tools; the others are extens
 | :---- | :------ |
 | `trigger` | Custom prefix, e.g. `"!!"` |
 | `app` | Makes the skill a runnable app with its own UI |
+| `tools` | Custom tools the skill exposes to the agent (see "Custom tools") |
 | `permission` | Permission request, prompted at activation |
 | `cwd` | Starting cwd for sessions invoking this skill |
 | `install` | Script that runs once on installation |
 | `provides` / `implements` | Marks the skill as a service backend for an engine-defined capability |
 | `requires` | External dependencies to resolve at install |
+
+## Custom tools
+
+A skill can declare its own tools in the `tools:` frontmatter list. Each tool surfaces to the agent under the skill's namespace and dispatches according to which fields are populated:
+
+| Kind | Trigger | What happens when the agent calls it |
+| :--- | :------ | :----------------------------------- |
+| **Shell** | `cmd: "..."` is set | Engine runs the command, stdout returns to the model. `$SKILL_DIR` and `{{argname}}` placeholders are expanded. |
+| **HTTP** | `endpoint: "..."` is set (requires `daemon:` block) | Engine POSTs args as JSON to `http://127.0.0.1:<daemon.port>{endpoint}`; response body returns to the model. |
+| **Data** | Neither `cmd` nor `endpoint` | No backend execution. Args surface as a `content_block` event to the app's iframe. Used for app UI signals like `PageUpdate`. |
+
+### Schema
+
+```yaml
+tools:
+  - name: ScanDisk                          # Required. Tool name the agent calls.
+    description: "Run a fresh disk scan."   # Required. Tells the agent when to use it.
+    cmd: "$SKILL_DIR/scripts/scan-disk.sh"  # Shell tool
+    tier: read                              # read | edit | admin (default: admin)
+    timeout_ms: 30000                       # default: 30000
+    args:
+      target:
+        type: string                        # string | object | array | number | boolean
+        required: true
+        default: "~"
+        description: "Path to scan"
+        items: { type: object }             # for arrays only
+    returns: "Sectioned text output."       # Optional, hint for the model
+```
+
+### Permission tier
+
+Shell and HTTP tools obey the skill's `permission.mode`. A `tier: read` tool runs ungated when the skill is in read mode; `tier: edit` or `tier: admin` prompts the user. Data tools have no side effect to gate, so `tier` is ignored. Omitting `tier` defaults to `admin` (the strict default).
+
+### Reuse across kinds
+
+App skills automatically receive a built-in `PageUpdate` data tool — you do not declare it. Service-backend skills (those with `implements:` for an engine-defined capability like `memory`) inherit the engine's tool names and schemas; their declared `tools:` are private extensions on top of the capability's contract.
+
+Tool definitions are parsed once at skill-load time. Editing `tools:` requires a server restart to register; editing scripts pointed to by `cmd:` does not.
 
 ## Service skills
 

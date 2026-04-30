@@ -112,6 +112,7 @@ body {
   background: rgba(15, 23, 42, 0.08);
   border-radius: 0.35rem;
   padding: 0.08rem 0.35rem;
+  overflow-wrap: anywhere;
 }
 
 .markdown-body pre {

@@ -190,16 +190,13 @@ fn cron_matches_now(schedule: &str, now: &chrono::DateTime<Local>) -> bool {
     }
 }
 
-/// Create a session title from the mission prompt.
+/// Mission session title — `{name} session`, mirroring skill sessions.
+/// Falls back to the mission id when no friendly name is set. The mission
+/// badge in the UI already labels these as missions, and the list shows
+/// relative time, so the title stays short.
 fn mission_session_title(mission: &Mission) -> String {
-    let prompt_preview: String = mission.prompt.chars().take(50).collect();
-    let suffix = if mission.prompt.chars().count() > 50 {
-        "..."
-    } else {
-        ""
-    };
-    let time = Local::now().format("%Y-%m-%d %H:%M");
-    format!("Mission: {}{} — {}", prompt_preview, suffix, time)
+    let label = mission.name.as_deref().unwrap_or(&mission.id);
+    format!("{} session", label)
 }
 
 /// Create a new session for a mission run in the global session store.
