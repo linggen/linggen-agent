@@ -586,10 +586,23 @@ async fn run_peer(
                 match result {
                     Ok((n, source)) => {
                         let contents: &[u8] = &buf[..n];
+                        // Pick the local candidate destination that matches the
+                        // packet's source. A packet from 127.0.0.1 must have been
+                        // sent to 127.0.0.1; one from a LAN address went to the
+                        // LAN candidate. Without this, str0m can't pair STUN
+                        // checks and consent-freshness fails ~15s after Connected.
+                        let destination = if source.ip().is_loopback() {
+                            std::net::SocketAddr::new(
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                                local_candidate_addr.port(),
+                            )
+                        } else {
+                            local_candidate_addr
+                        };
                         let receive = Receive {
                             proto: Protocol::Udp,
                             source,
-                            destination: local_candidate_addr,
+                            destination,
                             contents: contents.try_into()?,
                         };
                         rtc.handle_input(Input::Receive(Instant::now(), receive))?;
