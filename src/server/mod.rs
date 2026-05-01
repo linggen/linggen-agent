@@ -1634,9 +1634,15 @@ async fn serve_app_file(
     match tokio::fs::read(&canonical_full).await {
         Ok(content) => {
             let mime = mime_guess::from_path(&full_path).first_or_octet_stream();
+            // No-store on skill assets: skills are user-iterated, often
+            // edited mid-session, and ES-module URL caching makes a stale
+            // scan.js indistinguishable from a missing feature. Forcing
+            // revalidation costs nothing on localhost and removes a sharp
+            // edge from the development loop.
             Response::builder()
                 .header("Content-Type", mime.as_ref())
                 .header("X-Frame-Options", "ALLOWALL")
+                .header("Cache-Control", "no-store")
                 .body(axum::body::Body::from(content))
                 .unwrap_or_else(|_| Response::new(axum::body::Body::from("internal server error")))
         }

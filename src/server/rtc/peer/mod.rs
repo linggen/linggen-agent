@@ -74,14 +74,25 @@ async fn create_peer_inner(
     // ICE-lite makes us passive; the browser drives connectivity checks.
     let mut rtc = RtcConfig::new().set_ice_lite(true).build(Instant::now());
 
-    // Add local candidate with the real LAN IP (not 127.0.0.1)
-    // so WebRTC works both via localhost and via LAN IP.
+    // Advertise both the LAN IP and 127.0.0.1 as host candidates. The LAN
+    // IP makes WebRTC work for browser-to-daemon over the local network;
+    // 127.0.0.1 is required for in-process webviews (Tauri, etc.) where
+    // the LAN-IP path passes ICE Checking but fails consent-freshness
+    // ~15s later, dropping the data channel.
+    let port = local_addr.port();
     let local_ip = get_local_ip().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-    let candidate_addr = std::net::SocketAddr::new(local_ip, local_addr.port());
-    let candidate =
-        Candidate::host(candidate_addr, "udp").context("Failed to create host candidate")?;
-    rtc.add_local_candidate(candidate)
-        .context("Failed to add local candidate")?;
+    let candidate_addr = std::net::SocketAddr::new(local_ip, port);
+    let mut host_ips: Vec<std::net::IpAddr> = vec![local_ip];
+    let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    if !host_ips.contains(&loopback) {
+        host_ips.push(loopback);
+    }
+    for ip in host_ips {
+        let candidate = Candidate::host(std::net::SocketAddr::new(ip, port), "udp")
+            .context("Failed to create host candidate")?;
+        rtc.add_local_candidate(candidate)
+            .context("Failed to add local candidate")?;
+    }
 
     // Accept the offer and generate answer
     let answer = rtc
