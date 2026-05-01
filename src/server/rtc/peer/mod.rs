@@ -97,12 +97,18 @@ async fn create_peer_inner(
     tracing::debug!("SDP answer: {sdp_summary}");
     tracing::trace!("SDP answer full:\n{answer_sdp}");
 
-    // Spawn the peer event loop
+    // Spawn the peer event loop. Track peer lifetime in active_peer_count
+    // so the idle-shutdown watcher knows when no clients remain.
     let events_rx = state.events_tx.subscribe();
+    state
+        .active_peer_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let counter = state.active_peer_count.clone();
     tokio::spawn(async move {
         if let Err(e) = run_peer(rtc, socket, candidate_addr, state, events_rx, user_ctx).await {
             tracing::warn!("WebRTC peer exited: {e:#}");
         }
+        counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     });
 
     Ok(answer_sdp)

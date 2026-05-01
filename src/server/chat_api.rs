@@ -18,6 +18,24 @@ use tokio::sync::broadcast;
 
 fn default_user_type() -> String { "owner".to_string() }
 
+/// Scope the agent's reachable-skill list to the active skill app's
+/// `allow-skills` declaration. Mirrors the mission scoping path so skill
+/// app sessions don't see every installed skill in the daemon — important
+/// in the shared-daemon model where one ling serves many branded apps.
+///
+/// Default when `allow-skills` is unset: only the active skill itself.
+/// `["*"]` opts out of scoping.
+fn apply_skill_app_scope(engine: &mut crate::engine::AgentEngine, skill: &crate::skills::Skill) {
+    use std::collections::HashSet;
+    let allow = skill.allow_skills.as_deref().unwrap_or(&[]);
+    if allow.iter().any(|s| s == "*") {
+        return;
+    }
+    let mut scoped: HashSet<String> = allow.iter().cloned().collect();
+    scoped.insert(skill.name.clone());
+    engine.cfg.consumer_allowed_skills = Some(scoped);
+}
+
 #[derive(Deserialize)]
 pub(crate) struct ChatRequest {
     project_root: String,
@@ -239,6 +257,7 @@ pub(crate) async fn get_system_prompt_api(
     if let Ok(Some(meta)) = state.manager.global_sessions.get_session_meta(sid) {
         if let Some(ref skill_name) = meta.skill {
             if let Some(skill) = state.manager.skill_manager.get_skill(skill_name).await {
+                apply_skill_app_scope(&mut engine, &skill);
                 engine.active_skill = Some(skill);
             }
         }
@@ -1711,6 +1730,7 @@ pub(crate) async fn chat_handler(
                                             }
                                         }
                                     }
+                                    apply_skill_app_scope(&mut engine, &skill);
                                     engine.active_skill = Some(skill);
                                 }
                             } else {

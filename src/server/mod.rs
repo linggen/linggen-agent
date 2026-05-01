@@ -66,6 +66,9 @@ pub struct ServerState {
     pub manager: Arc<AgentManager>,
     pub dev_mode: bool,
     pub port: u16,
+    /// Connected WebRTC peer count. Drives the idle-shutdown watcher when
+    /// `idle_shutdown_secs` is set. Bumped in `rtc::peer::create_peer_inner`.
+    pub active_peer_count: Arc<std::sync::atomic::AtomicUsize>,
     pub events_tx: broadcast::Sender<ServerEvent>,
     pub skill_manager: Arc<crate::skills::SkillManager>,
     pub prompt_store: Arc<crate::prompts::PromptStore>,
@@ -1233,6 +1236,7 @@ async fn prepare_server(
     host: &str,
     port: u16,
     dev_mode: bool,
+    idle_shutdown_secs: Option<u64>,
     mut agent_events_rx: mpsc::UnboundedReceiver<(crate::agent_manager::AgentEvent, Option<String>)>,
 ) -> anyhow::Result<ServerHandle> {
     info!("linggen server starting on {}:{}...", host, port);
@@ -1248,6 +1252,7 @@ async fn prepare_server(
         manager,
         dev_mode,
         port,
+        active_peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         events_tx,
         skill_manager,
         prompt_store,
@@ -1272,6 +1277,37 @@ async fn prepare_server(
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 usage.lock().await.flush();
+            }
+        });
+    }
+
+    // Idle-shutdown watcher: when --idle-shutdown-secs is set, exit the
+    // process after that many seconds with zero connected WebRTC peers.
+    // Used by bundled apps so the daemon doesn't outlive its last client.
+    if let Some(timeout) = idle_shutdown_secs.filter(|t| *t > 0) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let peers = state.active_peer_count.clone();
+        let idle_since = Arc::new(AtomicU64::new(0));
+        info!("idle-shutdown enabled: exit after {timeout}s with no peers");
+        tokio::spawn(async move {
+            let check_interval = std::time::Duration::from_secs(15);
+            loop {
+                tokio::time::sleep(check_interval).await;
+                if peers.load(Ordering::Relaxed) > 0 {
+                    idle_since.store(0, Ordering::Relaxed);
+                    continue;
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let prev = idle_since.load(Ordering::Relaxed);
+                if prev == 0 {
+                    idle_since.store(now, Ordering::Relaxed);
+                } else if now.saturating_sub(prev) >= timeout {
+                    info!("idle-shutdown: no peers for {timeout}s, exiting");
+                    std::process::exit(0);
+                }
             }
         });
     }
@@ -1482,9 +1518,10 @@ pub async fn start_server(
     host: &str,
     port: u16,
     dev_mode: bool,
+    idle_shutdown_secs: Option<u64>,
     agent_events_rx: mpsc::UnboundedReceiver<(crate::agent_manager::AgentEvent, Option<String>)>,
 ) -> anyhow::Result<()> {
-    let handle = prepare_server(manager, skill_manager, host, port, dev_mode, agent_events_rx).await?;
+    let handle = prepare_server(manager, skill_manager, host, port, dev_mode, idle_shutdown_secs, agent_events_rx).await?;
     handle.task.await??;
     Ok(())
 }

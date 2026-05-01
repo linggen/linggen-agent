@@ -395,6 +395,15 @@ pub struct Skill {
     pub user_invocable: bool,
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
+    /// Skills that the agent may invoke via the `Skill` tool while this skill
+    /// is active in a session. Mirrors the mission-frontmatter field of the
+    /// same name. Semantics:
+    /// - omitted → default to `[<this skill's name>]` (only the skill itself)
+    /// - `["*"]` → no whitelist (any installed skill reachable)
+    /// - `["a", "b", …]` → exactly those skills (the active skill is
+    ///   automatically included)
+    #[serde(default)]
+    pub allow_skills: Option<Vec<String>>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -480,6 +489,8 @@ struct SkillFrontmatter {
     user_invocable: bool,
     #[serde(default, rename = "allowed-tools", deserialize_with = "deserialize_string_or_vec")]
     allowed_tools: Option<Vec<String>>,
+    #[serde(default, rename = "allow-skills", deserialize_with = "deserialize_string_or_vec")]
+    allow_skills: Option<Vec<String>>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -646,6 +657,7 @@ impl SkillManager {
             disable_model_invocation: frontmatter.disable_model_invocation,
             user_invocable: frontmatter.user_invocable,
             allowed_tools: frontmatter.allowed_tools,
+            allow_skills: frontmatter.allow_skills,
             model: frontmatter.model,
             context: frontmatter.context,
             agent: frontmatter.agent,

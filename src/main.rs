@@ -47,6 +47,11 @@ struct Cli {
     #[arg(long, global = true)]
     skills_dir: Option<std::path::PathBuf>,
 
+    /// Auto-exit after N seconds with zero connected WebRTC peers. 0 = disabled.
+    /// Used by bundled apps so the daemon doesn't outlive the last client.
+    #[arg(long, global = true)]
+    idle_shutdown_secs: Option<u64>,
+
     /// Web UI foreground (no daemon). For dev/debugging.
     #[arg(long, default_value_t = false, hide = true)]
     web: bool,
@@ -417,7 +422,7 @@ async fn main() -> Result<()> {
                 }
                 tracing::info!("------------------------------");
 
-                server::start_server(manager, skill_manager, &host, port, cli.dev, rx).await?;
+                server::start_server(manager, skill_manager, &host, port, cli.dev, cli.idle_shutdown_secs, rx).await?;
             }
         }
 
