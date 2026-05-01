@@ -43,6 +43,10 @@ struct Cli {
     #[arg(long, global = true)]
     port: Option<u16>,
 
+    /// Override skill discovery dir (default: ~/.linggen/skills/). Used by bundled apps.
+    #[arg(long, global = true)]
+    skills_dir: Option<std::path::PathBuf>,
+
     /// Web UI foreground (no daemon). For dev/debugging.
     #[arg(long, default_value_t = false, hide = true)]
     web: bool,
@@ -180,6 +184,10 @@ async fn main() -> Result<()> {
     let global_root = cli.root;
     let global_host = cli.host;
     let global_port = cli.port;
+
+    if let Some(dir) = cli.skills_dir.clone() {
+        crate::paths::set_skills_dir_override(dir);
+    }
 
     // Lightweight subcommands — no tracing/AgentManager needed.
     match &cli.cmd {

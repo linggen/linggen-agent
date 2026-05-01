@@ -34,8 +34,20 @@ pub fn global_agents_dir() -> PathBuf {
     linggen_home().join("agents")
 }
 
-/// `~/.linggen/skills/`
+/// Process-wide override for the skill discovery directory. Set once at
+/// startup by the `--skills-dir` CLI flag; bundled apps point at their
+/// sealed `Resources/skills/` so they don't load the user's global skills.
+static SKILLS_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_skills_dir_override(path: PathBuf) {
+    let _ = SKILLS_DIR_OVERRIDE.set(path);
+}
+
+/// `~/.linggen/skills/` (or the `--skills-dir` override if set).
 pub fn global_skills_dir() -> PathBuf {
+    if let Some(p) = SKILLS_DIR_OVERRIDE.get() {
+        return p.clone();
+    }
     linggen_home().join("skills")
 }
 
