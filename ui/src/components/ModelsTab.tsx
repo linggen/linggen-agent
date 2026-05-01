@@ -178,7 +178,7 @@ export const ModelsTab: React.FC<{
     return () => clearInterval(timer);
   }, [fetchOllamaStatus, fetchHealth, fetchCredentials, fetchCodexAuthStatus, fetchClaudeAuthStatus]);
 
-  const updateModel = (index: number, field: keyof ModelConfigUI, value: string | null) => {
+  const updateModel = (index: number, field: keyof ModelConfigUI, value: string | number | null) => {
     const models = [...config.models];
     const oldId = models[index]?.id;
     const updated = { ...models[index], [field]: value };
@@ -194,7 +194,7 @@ export const ModelsTab: React.FC<{
     models[index] = updated;
     // When model ID is renamed, update default_models to keep it in sync
     let routing = config.routing;
-    if (field === 'id' && oldId && value && oldId !== value && defaultModels.includes(oldId)) {
+    if (field === 'id' && oldId && typeof value === 'string' && value && oldId !== value && defaultModels.includes(oldId)) {
       const newDefaults = defaultModels.map((id) => id === oldId ? value : id);
       routing = { ...routing, default_models: newDefaults };
     }

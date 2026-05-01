@@ -3,6 +3,7 @@
  */
 import { create } from 'zustand';
 import type { SessionInfo } from '../types';
+import { sessions as sessionsApi } from '../lib/api';
 
 const SELECTED_PROJECT_STORAGE_KEY = 'linggen:selected-project';
 const ACTIVE_SESSION_STORAGE_KEY = 'linggen:active-session';
@@ -80,13 +81,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     const now = new Date();
     const title = `Chat ${now.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}, ${now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`;
     try {
-      const resp = await fetch('/api/sessions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title }),
-      });
-      const data = await resp.json();
-      // Optimistically add to local state
+      const data = await sessionsApi.create({ title });
       const newSession = { id: data.id, repo_path: '', title, created_at: Math.floor(Date.now() / 1000) };
       set((s) => ({
         activeSessionId: data.id,
@@ -101,18 +96,13 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   removeSession: async (id) => {
     const { allSessions } = get();
     if (!confirm('Remove this session?')) return;
-    // Find session metadata to route the delete to the correct store
     const session = allSessions.find(s => s.id === id);
     try {
-      await fetch('/api/sessions/all', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id: id,
-          project: session?.project || null,
-          mission_id: session?.mission_id || null,
-          skill: session?.skill || null,
-        }),
+      await sessionsApi.remove({
+        session_id: id,
+        project: session?.project || null,
+        mission_id: session?.mission_id || null,
+        skill: session?.skill || null,
       });
       // Optimistically remove from local state (no refetch needed — page_state will confirm)
       set((s) => {
@@ -142,15 +132,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     const idSet = new Set(ids);
     const targets = allSessions.filter(s => idSet.has(s.id));
     await Promise.allSettled(targets.map(session =>
-      fetch('/api/sessions/all', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id: session.id,
-          project: session.project || null,
-          mission_id: session.mission_id || null,
-          skill: session.skill || null,
-        }),
+      sessionsApi.remove({
+        session_id: session.id,
+        project: session.project || null,
+        mission_id: session.mission_id || null,
+        skill: session.skill || null,
       }),
     ));
     set((s) => {
@@ -173,12 +159,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     const { selectedProjectRoot } = get();
     if (!selectedProjectRoot) return;
     try {
-      await fetch('/api/sessions', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_root: selectedProjectRoot, session_id: id, title }),
-      });
-      // Optimistically update title in local state
+      await sessionsApi.rename({ project_root: selectedProjectRoot, session_id: id, title });
       set((s) => ({
         allSessions: s.allSessions.map(sess => sess.id === id ? { ...sess, title } : sess),
         sessions: s.sessions.map(sess => sess.id === id ? { ...sess, title } : sess),

@@ -29,7 +29,7 @@ export const ModelsCard: React.FC<{
   defaultModels?: string[];
   onToggleDefault?: (modelId: string) => void;
   onChangeReasoningEffort?: (modelId: string, effort: string | null) => void;
-}> = ({ models, agents, ollamaStatus, activeModelId, defaultModels = [], onToggleDefault, onChangeReasoningEffort }) => {
+}> = ({ models, ollamaStatus, activeModelId, defaultModels = [], onToggleDefault, onChangeReasoningEffort }) => {
   const scrollContainerRef = React.useRef<HTMLDivElement>(null);
 
   // Scroll to the default (starred) model on mount

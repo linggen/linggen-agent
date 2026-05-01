@@ -28,7 +28,6 @@ export const AgentMessage: React.FC<{
   const phase = getMessagePhase(msg);
   const contentBlocks = msg.content || [];
   const hasToolBlocks = contentBlocks.some(b => b.type === 'tool_use');
-  const _hasRunningTools = contentBlocks.some(b => b.type === 'tool_use' && b.status === 'running');
   const isStreamingText = !!msg.liveText;
 
   const hasAnyActivity = hasToolBlocks ||

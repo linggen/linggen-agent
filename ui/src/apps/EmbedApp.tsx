@@ -18,7 +18,6 @@ import { useChatStore } from '../stores/chatStore';
 import { useUserStore } from '../stores/userStore';
 import { useChatActions } from '../hooks/useChatActions';
 import { useRunInfo } from '../hooks/useRunInfo';
-import { useTransport } from '../hooks/useTransport';
 
 const params = new URLSearchParams(window.location.search);
 const pinnedSession = params.get('session') || '';
@@ -32,8 +31,6 @@ const isRemoteMode = typeof document !== 'undefined' && !!document.querySelector
 export const EmbedApp: React.FC = () => {
   const projectStore = useSessionStore();
   const agentStore = useServerStore();
-
-  useTransport({ sessionId: projectStore.activeSessionId });
 
   const { sessions, activeSessionId } = projectStore;
   const { agents, selectedAgent } = agentStore;

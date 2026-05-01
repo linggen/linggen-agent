@@ -12,16 +12,10 @@ export const PlanBlock: React.FC<{
   onRejectPlan?: () => void;
   onEditPlan?: (text: string) => void;
   inputRef?: React.RefObject<HTMLTextAreaElement | null>;
-}> = ({ plan, statusColor, pendingPlanAgentId, agentContext, onApprovePlan, onRejectPlan, onEditPlan, inputRef }) => {
+}> = ({ plan, statusColor, onApprovePlan, onRejectPlan, onEditPlan }) => {
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState('');
   const editRef = useRef<HTMLTextAreaElement | null>(null);
-
-  const startEditing = () => {
-    setEditText(plan.plan_text || '');
-    setEditing(true);
-    setTimeout(() => editRef.current?.focus(), 50);
-  };
 
   const saveEdit = () => {
     if (onEditPlan && editText.trim()) {

@@ -11,15 +11,13 @@ import { useUserStore } from '../stores/userStore';
 import { useChatStore } from '../stores/chatStore';
 import { useInteractionStore } from '../stores/interactionStore';
 import { useServerStore } from '../stores/serverStore';
-import { useTransport, sendViewContext } from '../hooks/useTransport';
+import { sendViewContext } from '../hooks/useTransport';
 
 /** Detect remote/tunnel mode (blob iframe with injected instance meta tag). */
 const isRemoteMode = typeof document !== 'undefined' && !!document.querySelector('meta[name="linggen-instance"]');
 
 export const ConsumerApp: React.FC = () => {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
-
-  useTransport({ sessionId: activeSessionId });
 
   // Re-subscribe the chat widget when the user picks a session in the sidebar.
   // Without this, setActiveSessionId updates the store but the chat widget

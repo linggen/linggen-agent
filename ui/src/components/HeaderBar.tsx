@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { LogIn, Menu, Settings, Sparkles } from 'lucide-react';
 import { cn } from '../lib/cn';
-import { useUiStore } from '../stores/uiStore';
 import { useUserStore } from '../stores/userStore';
+import { useOpenSettings } from '../hooks/useOpenSettings';
 import logoUrl from '../assets/logo.svg';
 
 /** Cached user profile from linggen.dev (fetched once on mount). */
@@ -120,8 +120,8 @@ export const HeaderBar: React.FC<{
   const userRoomName = useUserStore((s) => s.userRoomName);
   const userType = useUserStore((s) => s.userType);
   const roomEnabled = useUserStore((s) => s.roomEnabled);
-  const roomRole = useUserStore((s) => s.roomRole);
   const proxyRoomName = useUserStore((s) => s.proxyRoomName);
+  const openSettings = useOpenSettings();
 
   // Fetch room name for owner — room_enabled comes from page_state, but
   // room_name requires an HTTP call since it's stored on linggen.dev.
@@ -184,7 +184,7 @@ export const HeaderBar: React.FC<{
         {userRoomName && (
           <button
             onClick={() => {
-              useUiStore.getState().openSettings('room');
+              openSettings('room');
             }}
             className={`flex items-center gap-1.5 text-[10px] px-1.5 py-0.5 rounded font-medium transition-colors ${
               roomEnabled
@@ -201,7 +201,7 @@ export const HeaderBar: React.FC<{
         {!userRoomName && proxyRoomName && (
           <button
             onClick={() => {
-              useUiStore.getState().openSettings('room');
+              openSettings('room');
             }}
             className="flex items-center gap-1.5 text-[10px] px-1.5 py-0.5 rounded font-medium transition-colors bg-blue-500/10 text-blue-600 hover:bg-blue-500/20"
             title="Proxy room"

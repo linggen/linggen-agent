@@ -146,13 +146,6 @@ const sectionCls = 'bg-white dark:bg-white/[0.02] border border-slate-200 dark:b
 const labelCls = 'text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400';
 const inputCls = 'w-full bg-white dark:bg-[#0a0a0a] border border-slate-200 dark:border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-blue-500/50';
 const btnPrimary = 'px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg transition-colors disabled:opacity-50';
-const btnDanger = 'px-3 py-1.5 text-xs text-red-500 hover:text-red-600 font-medium';
-
-const permBadge: Record<string, string> = {
-  read: 'bg-blue-500/10 text-blue-500 dark:text-blue-400',
-  edit: 'bg-amber-500/10 text-amber-500 dark:text-amber-400',
-  admin: 'bg-red-500/10 text-red-500 dark:text-red-400',
-};
 
 const statusDot = (online: boolean, status?: string) =>
   `w-1.5 h-1.5 rounded-full ${status === 'disabled' ? 'bg-amber-500' : online ? 'bg-green-500' : 'bg-slate-400'}`;
@@ -198,7 +191,6 @@ export const RoomTab: React.FC = () => {
 
   // Room connect state
   const [roomEnabled, setRoomEnabled] = useState(true);
-  const [autoConnect, setAutoConnect] = useState(true);
   const [connectingInstance, setConnectingInstance] = useState<string | null>(null);
 
   // --- Consumer state (new) ---
@@ -295,7 +287,6 @@ export const RoomTab: React.FC = () => {
           setAllowedSkills(data.allowed_skills || []);
           const enabled = data.room_enabled ?? true;
           setRoomEnabled(enabled);
-          setAutoConnect(data.auto_connect ?? true);
           // Sync to global store so HeaderBar shows correct status
           useUserStore.getState().setRoomEnabled(enabled);
         }
@@ -367,12 +358,6 @@ export const RoomTab: React.FC = () => {
     // Sync to global store so HeaderBar updates immediately
     useUserStore.getState().setRoomEnabled(next);
     saveRoomConfig({ room_enabled: next } as any);
-  };
-
-  const toggleAutoConnect = () => {
-    const next = !autoConnect;
-    setAutoConnect(next);
-    saveRoomConfig({ auto_connect: next } as any);
   };
 
   const toggleSkill = (name: string) => {

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertTriangle, ArrowUpRight, Book, Check, ChevronRight, Download, ExternalLink, FilePlus2, Package, Pencil, RefreshCw, Save, Search, Shield, ShieldAlert, Sparkles, Trash2, Wrench, X, Zap } from 'lucide-react';
+import { ArrowUpRight, Book, Check, ChevronRight, Download, ExternalLink, FilePlus2, Package, Pencil, RefreshCw, Save, Search, ShieldAlert, Sparkles, Trash2, Wrench, X, Zap } from 'lucide-react';
 import type { BuiltInSkillInfo, MarketplaceSkill, SkillInfoFull, SkillFileInfo } from '../types';
 import { CM6Editor } from './CM6Editor';
 
@@ -366,29 +366,6 @@ export const SkillsTab: React.FC<{
       await Promise.all([fetchSkills(), fetchSkillFiles()]);
       const data = await resp.json();
       if (data.path) loadSkillFile(data.path);
-    } catch (e) {
-      setError(String(e));
-    }
-  };
-
-  const _deleteSkillFile = async (path: string) => {
-    if (!confirm(`Delete skill file ${path}?`)) return;
-    try {
-      const resp = await fetch('/api/skill-file', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_root: projectRoot, path }),
-      });
-      if (!resp.ok) {
-        setError(await resp.text());
-        return;
-      }
-      if (editingSkill === path) {
-        setEditingSkill(null);
-        setEditContent('');
-        setSavedEditContent('');
-      }
-      await Promise.all([fetchSkills(), fetchSkillFiles()]);
     } catch (e) {
       setError(String(e));
     }

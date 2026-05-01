@@ -15,7 +15,7 @@ import { cn } from '../lib/cn';
 import type { SessionInfo, CronMission } from '../types';
 import { useSessionStore } from '../stores/sessionStore';
 import { useServerStore } from '../stores/serverStore';
-import { useUiStore } from '../stores/uiStore';
+import { useOpenMissionEditor } from '../hooks/useOpenMissionEditor';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -100,6 +100,7 @@ export const SessionList: React.FC<{
   const storeSessions = useSessionStore((s) => s.allSessions);
   const allSessions = filterSessions ?? storeSessions;
   const agentStatus = useServerStore((s) => s.agentStatus);
+  const openMissionEditor = useOpenMissionEditor();
   const [filter, setFilter] = useState<CreatorFilter>('user');
   const [search, setSearch] = useState('');
   const [showSearch, setShowSearch] = useState(false);
@@ -395,7 +396,7 @@ export const SessionList: React.FC<{
           <div className="flex flex-col items-center justify-center py-12 text-slate-400">
             <MessageSquare size={24} className="mb-2 opacity-30" />
             <p className="text-xs">No sessions yet</p>
-            <button onClick={() => setShowNewChat(true)} className="mt-2 text-xs text-blue-500 hover:underline">
+            <button onClick={onCreateSession} className="mt-2 text-xs text-blue-500 hover:underline">
               Start a new chat
             </button>
           </div>
@@ -512,7 +513,7 @@ export const SessionList: React.FC<{
         <div className="border-t border-slate-100 dark:border-white/[0.03]">
           {missions.length === 0 && (
             <div className="px-3 py-3 text-xs text-slate-400 text-center">
-              No missions. <button onClick={() => useUiStore.getState().openMissionEditor(null)} className="text-blue-500 hover:underline">Create one</button>
+              No missions. <button onClick={() => openMissionEditor(null)} className="text-blue-500 hover:underline">Create one</button>
             </div>
           )}
           {missions.map((m) => (

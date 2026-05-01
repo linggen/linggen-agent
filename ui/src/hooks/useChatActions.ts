@@ -152,7 +152,7 @@ export function useChatActions(
         if (!resp.ok) {
           const errText = await resp.text().catch(() => `HTTP ${resp.status}`);
           chat.addMessage({
-            role: 'assistant', from: 'system', to: 'user',
+            role: 'agent', from: 'system', to: 'user',
             text: `Error: ${errText}`, isError: true,
             timestamp: resultTs.toLocaleTimeString(), timestampMs: resultTs.getTime(), isGenerating: false,
           });
@@ -161,7 +161,7 @@ export function useChatActions(
           const output = [data.stdout, data.stderr].filter(Boolean).join('\n').trim();
           const exitInfo = data.exit_code !== 0 ? `\n\n(exit code ${data.exit_code})` : '';
           chat.addMessage({
-            role: 'assistant', from: 'system', to: 'user',
+            role: 'agent', from: 'system', to: 'user',
             text: output ? `\`\`\`\n${output}\n\`\`\`${exitInfo}` : `(no output)${exitInfo}`,
             timestamp: resultTs.toLocaleTimeString(), timestampMs: resultTs.getTime(), isGenerating: false,
           });
@@ -171,7 +171,7 @@ export function useChatActions(
         console.error('Bash error:', e);
         const errTs = new Date();
         chat.addMessage({
-          role: 'assistant', from: 'system', to: 'user',
+          role: 'agent', from: 'system', to: 'user',
           text: `Error: ${e instanceof Error ? e.message : String(e)}`, isError: true,
           timestamp: errTs.toLocaleTimeString(), timestampMs: errTs.getTime(), isGenerating: false,
         });
@@ -204,14 +204,14 @@ export function useChatActions(
             : '';
           const ts = new Date();
           useChatStore.getState().addMessage({
-            role: 'assistant', from: 'system', to: 'user',
+            role: 'agent', from: 'system', to: 'user',
             text: `Conversation compacted.${refsText}`,
             timestamp: ts.toLocaleTimeString(), timestampMs: ts.getTime(), isGenerating: false,
           });
         } else {
           const ts = new Date();
           useChatStore.getState().addMessage({
-            role: 'assistant', from: agentToUse, to: 'user', text: 'Nothing to compact.',
+            role: 'agent', from: agentToUse, to: 'user', text: 'Nothing to compact.',
             timestamp: ts.toLocaleTimeString(), timestampMs: ts.getTime(), isGenerating: false,
           });
         }
@@ -236,6 +236,7 @@ export function useChatActions(
 
     try {
       const { isMissionSession, activeMissionId, isSkillSession, activeSkillName } = useSessionStore.getState();
+      const sessionModel = useUiStore.getState().sessionModel;
       const data = await getTransport().sendChat({
         project_root: root,
         agent_id: agentToUse,
@@ -243,7 +244,7 @@ export function useChatActions(
         session_id: sid,
         ...(isMissionSession && activeMissionId ? { mission_id: activeMissionId } : {}),
         ...(isSkillSession && activeSkillName ? { skill_name: activeSkillName } : {}),
-        ...(useUiStore.getState().sessionModel ? { model_id: useUiStore.getState().sessionModel } : {}),
+        ...(sessionModel ? { model_id: sessionModel } : {}),
         ...(images && images.length > 0 ? { images } : {}),
       }) as any;
       if (data?.session_id && !sid) {

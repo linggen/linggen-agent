@@ -111,6 +111,8 @@ export interface SessionState {
   user_stories: [any, string] | null;
   tasks: [any, string][];
   messages: [any, string][];
+  agent_status?: string;
+  plan_status?: string;
 }
 
 export interface AgentTreeItem {

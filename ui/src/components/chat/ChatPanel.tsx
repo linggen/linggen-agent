@@ -4,7 +4,6 @@ import 'highlight.js/styles/github.css';
 import { cn } from '../../lib/cn';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useServerStore } from '../../stores/serverStore';
-import { useUiStore } from '../../stores/uiStore';
 import { useUserStore } from '../../stores/userStore';
 import { AskUserCard } from '../AskUserCard';
 import { ToolPermissionCard } from '../ToolPermissionCard';
@@ -347,7 +346,6 @@ export const ChatPanel: React.FC<{
   const agentStatusText = useServerStore((s) => s.agentStatusText);
   const currentStatus = agentStatus?.[sessionId || ''];
   const isAgentActive = !!currentStatus && currentStatus !== 'idle';
-  const _isThinking = currentStatus === 'thinking' || currentStatus === 'model_loading';
   const [spinnerVerb, setSpinnerVerb] = useState('');
   const [lastRunSummary, setLastRunSummary] = useState<{ verb: string; elapsed: number } | null>(null);
   useEffect(() => {
@@ -414,7 +412,6 @@ export const ChatPanel: React.FC<{
   );
   const selectedAgentKey = normalizeAgentKey(selectedAgent);
   const selectedMainRunningRunId = runningMainRunIds?.[selectedAgentKey];
-  const selectedSubagentKey = selectedSubagent ? normalizeAgentKey(selectedSubagent.id) : '';
   const subagentMessages = useMemo(() => {
     if (!selectedSubagent) return [];
     const id = normalizeAgentKey(selectedSubagent.id);

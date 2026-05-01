@@ -2,6 +2,9 @@
 name = "linggen"
 version = "0.10.0"
 edition = "2021"
+license = "Apache-2.0"
+description = "Linggen — the root system for AI agents. A local-first runtime for AI apps."
+repository = "https://github.com/linggen/linggen"
 
 [[bin]]
 name = "ling"

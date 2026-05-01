@@ -1,22 +1,37 @@
 /**
- * Single UI entry — routes between MainApp / EmbedApp / ConsumerApp based on:
- *   URL path /embed          → EmbedApp
- *   URL ?mode=compact (shim) → EmbedApp
- *   currentPage === 'consumer' (from user_info) → ConsumerApp
- *   otherwise                → MainApp
+ * Single UI entry. Two layers of dispatch:
  *
- * The `view` signal (main/embed/consumer) is computed here and pushed to the
- * server whenever it changes — each App only needs to notify on session /
- * project changes within its own view.
+ * 1. View (top-level user-type discriminator):
+ *      URL path /embed | ?mode=compact → EmbedApp
+ *      currentPage === 'consumer' (from user_info) → ConsumerApp
+ *      otherwise → main view (MainApp + react-router routes)
+ *
+ * 2. Routes (within the main view, via react-router-dom):
+ *      /settings           → SettingsHome (chromed, overlays MainApp)
+ *      /settings/:section  → BareSection (iframe target, no MainApp)
+ *      /missions/edit      → MissionEditorPage (overlays MainApp)
+ *      /chat | /sessions | /info-panel → bare iframe targets
+ *      everything else     → MainApp shell only
+ *
+ * The `view` signal is pushed to the server whenever it changes; each App
+ * notifies on session/project changes within its own view.
  */
 import React, { useEffect } from 'react';
 import ReactDOM from 'react-dom/client';
+import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom';
 import { MainApp } from '../apps/MainApp';
 import { EmbedApp } from '../apps/EmbedApp';
 import { ConsumerApp } from '../apps/ConsumerApp';
+import { SettingsHome } from '../pages/Settings/SettingsHome';
+import { BareSection } from '../pages/Settings/BareSection';
+import { MissionEditorPage } from '../pages/Mission/MissionEditorPage';
+import { BareChat } from '../pages/Bare/BareChat';
+import { BareSessions } from '../pages/Bare/BareSessions';
+import { BareInfoPanel } from '../pages/Bare/BareInfoPanel';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import { useUiStore } from '../stores/uiStore';
-import { sendViewContext } from '../hooks/useTransport';
+import { useSessionStore } from '../stores/sessionStore';
+import { useTransport, sendViewContext } from '../hooks/useTransport';
 import '../index.css';
 import { installFetchProxy } from '../lib/fetchProxy';
 
@@ -31,6 +46,14 @@ type View = 'main' | 'embed' | 'consumer';
 
 const Root: React.FC = () => {
   const currentPage = useUiStore((s) => s.currentPage);
+  const sessionId = useSessionStore((s) => s.activeSessionId);
+  const location = useLocation();
+
+  // Hoist transport to Root so the WebRTC singleton outlives every route
+  // transition. Children (MainApp, EmbedApp, ConsumerApp, bare pages) no
+  // longer call useTransport themselves — their unmount on navigation would
+  // otherwise tear down the connection.
+  useTransport({ sessionId });
 
   const view: View = isEmbedPath
     ? 'embed'
@@ -38,10 +61,6 @@ const Root: React.FC = () => {
       ? 'consumer'
       : 'main';
 
-  // Keep the global in sync, then push the view to the server whenever it
-  // changes (e.g. main → consumer once user_info arrives). sendViewContext
-  // is a no-op if the transport isn't connected yet; onReconnect will send
-  // the initial value once it is.
   useEffect(() => {
     (window as { __LINGGEN_VIEW__?: View }).__LINGGEN_VIEW__ = view;
     sendViewContext();
@@ -49,13 +68,38 @@ const Root: React.FC = () => {
 
   if (view === 'embed') return <EmbedApp />;
   if (view === 'consumer') return <ConsumerApp />;
-  return <MainApp />;
+
+  // Bare iframe targets: skills load these directly to compose their own
+  // frame pages. No main shell — just the bare component. See
+  // doc/ui-router-migration.md.
+  const isBareRoute =
+    location.pathname.startsWith('/settings/') ||
+    BARE_PATHS.has(location.pathname);
+
+  return (
+    <>
+      {!isBareRoute && <MainApp />}
+      <Routes>
+        <Route path="/settings" element={<SettingsHome />} />
+        <Route path="/settings/:section" element={<BareSection />} />
+        <Route path="/missions/edit" element={<MissionEditorPage />} />
+        <Route path="/chat" element={<BareChat />} />
+        <Route path="/sessions" element={<BareSessions />} />
+        <Route path="/info-panel" element={<BareInfoPanel />} />
+        <Route path="*" element={null} />
+      </Routes>
+    </>
+  );
 };
+
+const BARE_PATHS: ReadonlySet<string> = new Set(['/chat', '/sessions', '/info-panel']);
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ErrorBoundary>
-      <Root />
+      <BrowserRouter>
+        <Root />
+      </BrowserRouter>
     </ErrorBoundary>
   </React.StrictMode>
 );

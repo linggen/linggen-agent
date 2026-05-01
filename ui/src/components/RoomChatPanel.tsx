@@ -11,7 +11,7 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { MessageCircle, Send, ChevronDown, ChevronRight, Settings } from 'lucide-react';
 import { useRoomChatStore } from '../stores/roomChatStore';
 import { useUserStore } from '../stores/userStore';
-import { useUiStore } from '../stores/uiStore';
+import { useOpenSettings } from '../hooks/useOpenSettings';
 import { getTransport } from '../lib/transport';
 
 // ---------------------------------------------------------------------------
@@ -53,6 +53,7 @@ export const RoomChatPanel: React.FC = () => {
   const proxyRoomName = useUserStore((s) => s.proxyRoomName);
   const roomEnabled = useUserStore((s) => s.roomEnabled);
   const roomName = ownerRoomName || proxyRoomName;
+  const openSettings = useOpenSettings();
 
   const [input, setInput] = useState('');
   const listRef = useRef<HTMLDivElement>(null);
@@ -123,7 +124,7 @@ export const RoomChatPanel: React.FC = () => {
             <ChevronRight size={10} className="text-slate-400" />
             <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Room Chat</span>
             <div className="ml-auto flex items-center gap-1">
-              <button onClick={(e) => { e.stopPropagation(); useUiStore.getState().openSettings('room'); }}
+              <button onClick={(e) => { e.stopPropagation(); openSettings('room'); }}
                 className="p-0.5 rounded hover:bg-slate-200 dark:hover:bg-white/10 text-slate-400 hover:text-blue-500 transition-colors" title="Room settings">
                 <Settings size={11} />
               </button>
@@ -155,7 +156,7 @@ export const RoomChatPanel: React.FC = () => {
         <ChevronDown size={10} className="text-slate-400" />
         <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Room Chat</span>
         <div className="ml-auto flex items-center gap-1.5">
-          <button onClick={(e) => { e.stopPropagation(); useUiStore.getState().openSettings('room'); }}
+          <button onClick={(e) => { e.stopPropagation(); openSettings('room'); }}
             className="p-0.5 rounded hover:bg-slate-200 dark:hover:bg-white/10 text-slate-400 hover:text-blue-500 transition-colors" title="Room settings">
             <Settings size={11} />
           </button>

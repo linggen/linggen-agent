@@ -69,7 +69,7 @@ function relayToSkillIframe(item: UiEvent): void {
 
   if (item.kind === 'turn_complete') {
     const msgs = useChatStore.getState().messages;
-    const lastMsg = [...msgs].reverse().find((m) => m.role === 'assistant' || (m as any).role === 'agent');
+    const lastMsg = [...msgs].reverse().find((m) => m.role === 'agent');
     window.parent.postMessage({
       type: 'linggen-skill-event',
       event: 'stream_end',

@@ -69,7 +69,6 @@ function SkillRow({ skill, projectName, onClick }: {
     : sourceType === 'Global' ? 'Linggen' : (projectName || 'Project');
   const displayName = `/${skill.name}`;
   const trigger = skill.trigger && skill.trigger !== `/${skill.name}` ? skill.trigger : null;
-  const argHint = skill.argument_hint ? ` ${skill.argument_hint}` : '';
   const isApp = !!skill.app;
 
   return (

@@ -2,9 +2,12 @@
  * UI navigation, overlays, and transient chrome state.
  */
 import { create } from 'zustand';
-import type { CronMission, ManagementTab } from '../types';
+import type { CronMission } from '../types';
 
-export type Page = 'main' | 'settings' | 'mission-editor' | 'consumer';
+/** Top-level view discriminator. Drives MainApp vs ConsumerApp selection
+ *  in the entry router; page navigation within the main view is now handled
+ *  by react-router-dom routes. */
+export type Page = 'main' | 'consumer';
 export type SidebarTab = 'projects' | 'missions';
 
 export interface Toast {
@@ -30,7 +33,6 @@ interface UiState {
   // Page navigation
   currentPage: Page;
   sidebarTab: SidebarTab;
-  initialSettingsTab: ManagementTab | undefined;
 
   // Mission editor
   editingMission: CronMission | null;
@@ -64,8 +66,6 @@ interface UiState {
   // Actions
   setCurrentPage: (page: Page) => void;
   setSidebarTab: (tab: SidebarTab) => void;
-  setInitialSettingsTab: (tab: ManagementTab | undefined) => void;
-  openSettings: (tab?: ManagementTab) => void;
   openMissionEditor: (mission: CronMission | null) => void;
   closeMissionEditor: () => void;
   bumpMissionRefreshKey: () => void;
@@ -90,7 +90,6 @@ const VERBOSE_MODE_STORAGE_KEY = 'linggen:verbose-mode';
 export const useUiStore = create<UiState>((set) => ({
   currentPage: 'main',
   sidebarTab: 'projects',
-  initialSettingsTab: undefined,
   editingMission: null,
   missionRefreshKey: 0,
   overlay: null,
@@ -118,10 +117,8 @@ export const useUiStore = create<UiState>((set) => ({
 
   setCurrentPage: (page) => set({ currentPage: page }),
   setSidebarTab: (tab) => set({ sidebarTab: tab }),
-  setInitialSettingsTab: (tab) => set({ initialSettingsTab: tab }),
-  openSettings: (tab) => set({ currentPage: 'settings', initialSettingsTab: tab }),
-  openMissionEditor: (mission) => set({ editingMission: mission, currentPage: 'mission-editor' }),
-  closeMissionEditor: () => set({ editingMission: null, currentPage: 'main' }),
+  openMissionEditor: (mission) => set({ editingMission: mission }),
+  closeMissionEditor: () => set({ editingMission: null }),
   bumpMissionRefreshKey: () => set((s) => ({ missionRefreshKey: s.missionRefreshKey + 1 })),
 
   setOverlay: (overlay) => set({ overlay }),

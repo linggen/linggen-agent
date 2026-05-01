@@ -8,8 +8,6 @@ import { SessionList } from '../components/SessionList';
 import { FilePreview } from '../components/FilePreview';
 import { ChatWidget } from '../components/chat';
 import { HeaderBar } from '../components/HeaderBar';
-import { SettingsPage } from '../components/SettingsPage';
-import { MissionEditor } from '../components/MissionPage';
 import { AgentSpecEditorModal } from '../components/AgentSpecEditorModal';
 import { ToastContainer } from '../components/ToastContainer';
 import { AppPanel } from '../components/AppPanel';
@@ -25,7 +23,9 @@ import { useUserStore } from '../stores/userStore';
 import { useInteractionStore } from '../stores/interactionStore';
 import { useRunInfo } from '../hooks/useRunInfo';
 import { useChatActions } from '../hooks/useChatActions';
-import { useTransport, sendViewContext } from '../hooks/useTransport';
+import { sendViewContext } from '../hooks/useTransport';
+import { useOpenSettings } from '../hooks/useOpenSettings';
+import { useLocation } from 'react-router-dom';
 
 const urlParams = new URLSearchParams(window.location.search);
 const isMobileParam = urlParams.get('mode') === 'mobile';
@@ -55,8 +55,15 @@ export const MainApp: React.FC = () => {
   const chatStore = useChatStore();
   const uiStore = useUiStore();
 
-  // Initialize transport — must run before connection gate to establish WebRTC.
-  useTransport({ sessionId: projectStore.activeSessionId });
+  const openSettings = useOpenSettings();
+
+  // Hide the main shell when an overlay route (Settings, Mission editor) is
+  // active. We keep MainApp mounted so WebRTC stays alive — only the visual
+  // shell is hidden so the routed overlay component is the only thing on
+  // screen.
+  const location = useLocation();
+  const isOverlayRoute = location.pathname === '/settings'
+    || location.pathname === '/missions/edit';
 
   const isMobile = useIsMobile();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -66,7 +73,7 @@ export const MainApp: React.FC = () => {
   const { selectedProjectRoot, sessions, allSessions, activeSessionId, isMissionSession } = projectStore;
   const { agents, models, skills, selectedAgent, agentStatus, agentStatusText, defaultModels, ollamaStatus, reloadingSkills, agentTreesByProject } = agentStore;
   const { messages: chatMessages } = chatStore;
-  const { currentPage, editingMission, showAgentSpecEditor, openApp, selectedFileContent, selectedFilePath } = uiStore;
+  const { showAgentSpecEditor, openApp, selectedFileContent, selectedFilePath } = uiStore;
 
   const isRunning = agentStore.isRunning();
   const mainAgents = agents;
@@ -188,18 +195,6 @@ export const MainApp: React.FC = () => {
     }
   }, [isMobile]);
 
-  // --- Sidebar callbacks ---
-  const readFile = useCallback(async (path: string, projectRootOverride?: string) => {
-    const root = projectRootOverride || useSessionStore.getState().selectedProjectRoot;
-    if (!root) return;
-    try {
-      const resp = await fetch(`/api/file?project_root=${encodeURIComponent(root)}&path=${encodeURIComponent(path)}`);
-      const data = await resp.json();
-      useUiStore.getState().setSelectedFileContent(data.content);
-      useUiStore.getState().setSelectedFilePath(path);
-    } catch (e) { console.error('Error reading file:', e); }
-  }, []);
-
   // --- Info panel props (shared between desktop sidebar and mobile drawer) ---
   const handleClickSkill = useCallback((skill: any) => {
     recordSkillUsage(skill.name);
@@ -228,7 +223,7 @@ export const MainApp: React.FC = () => {
     onToggleDefault: agentStore.toggleDefaultModel,
     onChangeReasoningEffort: agentStore.setReasoningEffort,
     onReloadSkills: () => agentStore.reloadSkills(),
-    onOpenSettings: (tab: string) => uiStore.openSettings(tab),
+    onOpenSettings: (tab: string) => openSettings(tab as any),
     onClickSkill: handleClickSkill,
   };
 
@@ -265,35 +260,11 @@ export const MainApp: React.FC = () => {
   return (
     <>
       <ToastContainer />
-      {currentPage === 'mission-editor' && (
-        <div className="flex flex-col h-screen bg-slate-100/70 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200 font-sans overflow-hidden">
-          <MissionEditor
-            editing={editingMission}
-            onSave={() => { uiStore.bumpMissionRefreshKey(); uiStore.closeMissionEditor(); }}
-            onCancel={() => uiStore.closeMissionEditor()}
-            onViewAgent={() => {}}
-          />
-        </div>
-      )}
-      {currentPage === 'settings' && (
-        <SettingsPage
-          onBack={() => {
-            uiStore.setCurrentPage('main');
-            uiStore.setInitialSettingsTab(undefined);
-            agentStore.fetchModels();
-            agentStore.fetchDefaultModels();
-            agentStore.fetchOllamaStatus();
-          }}
-          projectRoot={selectedProjectRoot}
-          initialTab={uiStore.initialSettingsTab}
-          missionAgents={agents}
-        />
-      )}
-      <div className={`flex flex-col h-screen bg-slate-100/70 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200 font-sans overflow-hidden${currentPage !== 'main' ? ' hidden' : ''}`}>
+      <div className={`flex flex-col h-screen bg-slate-100/70 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200 font-sans overflow-hidden${isOverlayRoute ? ' hidden' : ''}`}>
         {/* Header */}
         <HeaderBar
           isRunning={isRunning}
-          onOpenSettings={() => uiStore.setCurrentPage('settings')}
+          onOpenSettings={() => openSettings()}
           onToggleMobileMenu={() => setMobileMenuOpen(!mobileMenuOpen)}
           onToggleInfoPanel={isMobile ? () => setMobileInfoOpen(!mobileInfoOpen) : undefined}
         />
@@ -311,7 +282,7 @@ export const MainApp: React.FC = () => {
                   onSelectSession={(session) => selectSession(session, () => setMobileMenuOpen(false))}
                   onCreateSession={() => { projectStore.createSession(); setMobileMenuOpen(false); }}
                   onDeleteSession={(id) => projectStore.removeSession(id)}
-                  onOpenSettings={(tab) => { uiStore.openSettings(tab as any); setMobileMenuOpen(false); }}
+                  onOpenSettings={(tab) => { openSettings(tab as any); setMobileMenuOpen(false); }}
                 />
               </div>
             </>
@@ -324,7 +295,7 @@ export const MainApp: React.FC = () => {
               onSelectSession={(session) => selectSession(session)}
               onCreateSession={() => projectStore.createSession()}
               onDeleteSession={(id) => projectStore.removeSession(id)}
-              onOpenSettings={(tab) => uiStore.openSettings(tab as any)}
+              onOpenSettings={(tab) => openSettings(tab as any)}
             />
             <RoomChatPanel />
           </div>

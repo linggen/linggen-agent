@@ -1,14 +1,18 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowLeft } from 'lucide-react';
-import type { AgentInfo, AppConfig, ManagementTab } from '../types';
-import { ModelsTab } from './ModelsTab';
-import { AgentsTab } from './AgentsTab';
-import { SkillsTab } from './SkillsTab';
-import { ToolsTab } from './ToolsTab';
-import { GeneralTab } from './GeneralTab';
-import { MissionPage } from './MissionPage';
-import { StoragePage } from './StoragePage';
-import { RoomTab } from './RoomTab';
+import { useNavigate, useLocation } from 'react-router-dom';
+import type { AppConfig, ManagementTab } from '../../types';
+import { ModelsTab } from '../../components/ModelsTab';
+import { AgentsTab } from '../../components/AgentsTab';
+import { SkillsTab } from '../../components/SkillsTab';
+import { ToolsTab } from '../../components/ToolsTab';
+import { GeneralTab } from '../../components/GeneralTab';
+import { MissionPage } from '../../components/MissionPage';
+import { StoragePage } from '../../components/StoragePage';
+import { RoomTab } from '../../components/RoomTab';
+import { useSessionStore } from '../../stores/sessionStore';
+import { useServerStore } from '../../stores/serverStore';
+import type { SettingsLocationState } from '../../hooks/useOpenSettings';
 
 const tabs: { key: ManagementTab; label: string }[] = [
   { key: 'models', label: 'Models' },
@@ -21,13 +25,17 @@ const tabs: { key: ManagementTab; label: string }[] = [
   { key: 'room', label: 'Room' },
 ];
 
-export const SettingsPage: React.FC<{
-  onBack: () => void;
-  projectRoot?: string;
-  initialTab?: ManagementTab;
-  missionAgents?: AgentInfo[];
-}> = ({ onBack, projectRoot = '', initialTab, missionAgents }) => {
-  const [activeTab, setActiveTab] = useState<ManagementTab>(initialTab || 'models');
+export const SettingsHome: React.FC = () => {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const projectRoot = useSessionStore((s) => s.selectedProjectRoot);
+  const missionAgents = useServerStore((s) => s.agents);
+
+  // Tab to pre-select. Comes from route state set by useOpenSettings(tab).
+  // Reads on every render so a navigate() to the same URL with a new tab
+  // still updates the active tab.
+  const requestedTab = (location.state as SettingsLocationState | null)?.tab;
+  const [activeTab, setActiveTab] = useState<ManagementTab>(requestedTab || 'models');
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [originalConfig, setOriginalConfig] = useState<AppConfig | null>(null);
   const [saving, setSaving] = useState(false);
@@ -37,8 +45,8 @@ export const SettingsPage: React.FC<{
   const saveCredsRef = useRef<(() => Promise<void>) | null>(null);
 
   useEffect(() => {
-    if (initialTab) setActiveTab(initialTab);
-  }, [initialTab]);
+    if (requestedTab) setActiveTab(requestedTab);
+  }, [requestedTab]);
 
   const configDirty = config !== null && originalConfig !== null && JSON.stringify(config) !== JSON.stringify(originalConfig);
   const dirty = configDirty || credsDirty;
@@ -80,7 +88,6 @@ export const SettingsPage: React.FC<{
         }
         setOriginalConfig(config);
       }
-      // Also save credentials if dirty
       if (credsDirty && saveCredsRef.current) {
         await saveCredsRef.current();
       }
@@ -93,7 +100,14 @@ export const SettingsPage: React.FC<{
     }
   };
 
-  // Config-based tabs (Models, General) need save button; Agents/Skills manage their own saving
+  const onBack = () => {
+    const server = useServerStore.getState();
+    server.fetchModels();
+    server.fetchDefaultModels();
+    server.fetchOllamaStatus();
+    navigate('/');
+  };
+
   const showSaveButton = activeTab === 'models' || activeTab === 'general';
 
   if (!config) {
@@ -106,7 +120,6 @@ export const SettingsPage: React.FC<{
 
   return (
     <div className="flex flex-col h-screen bg-slate-100/70 dark:bg-[#0a0a0a] text-slate-900 dark:text-slate-200">
-      {/* Top bar */}
       <header className="border-b border-slate-200 dark:border-white/5 bg-white/90 dark:bg-[#0f0f0f]/90 backdrop-blur-md z-50">
         <div className="flex items-center justify-between px-3 md:px-6 py-2 md:py-3">
           <button onClick={onBack} className="flex items-center gap-1.5 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:text-blue-600 transition-colors shrink-0">
@@ -130,7 +143,6 @@ export const SettingsPage: React.FC<{
             )}
           </div>
         </div>
-        {/* Tab strip — scrollable on mobile */}
         <nav className="flex items-center gap-1 px-3 md:px-6 pb-2 overflow-x-auto">
           {tabs.map((tab) => (
             <button
@@ -148,7 +160,6 @@ export const SettingsPage: React.FC<{
         </nav>
       </header>
 
-      {/* Tab content */}
       <div className="flex-1 overflow-hidden">
         {activeTab === 'models' && (
           <div className="h-full overflow-y-auto p-3 md:p-6">
@@ -158,9 +169,7 @@ export const SettingsPage: React.FC<{
           </div>
         )}
 
-        {activeTab === 'agents' && (
-          <AgentsTab projectRoot={projectRoot} />
-        )}
+        {activeTab === 'agents' && <AgentsTab projectRoot={projectRoot} />}
 
         {activeTab === 'skills' && (
           <div className="h-full overflow-y-auto px-3 md:px-6 py-4 md:py-5">
@@ -172,37 +181,24 @@ export const SettingsPage: React.FC<{
 
         {activeTab === 'tools' && (
           <div className="h-full overflow-y-auto p-3 md:p-6">
-            <div className="max-w-4xl mx-auto">
-              <ToolsTab />
-            </div>
+            <div className="max-w-4xl mx-auto"><ToolsTab /></div>
           </div>
         )}
 
         {activeTab === 'general' && (
           <div className="h-full overflow-y-auto p-3 md:p-6">
-            <div className="max-w-4xl mx-auto">
-              <GeneralTab config={config} onChange={setConfig} />
-            </div>
+            <div className="max-w-4xl mx-auto"><GeneralTab config={config} onChange={setConfig} /></div>
           </div>
         )}
 
         {activeTab === 'mission' && (
-          <MissionPage
-            embedded
-            onBack={onBack}
-            projectRoot={projectRoot}
-            agents={missionAgents ?? []}
-          />
+          <MissionPage embedded onBack={onBack} projectRoot={projectRoot} agents={missionAgents ?? []} />
         )}
 
-        {activeTab === 'storage' && (
-          <StoragePage embedded onBack={onBack} />
-        )}
+        {activeTab === 'storage' && <StoragePage embedded onBack={onBack} />}
 
         {activeTab === 'room' && (
-          <div className="h-full overflow-y-auto p-3 md:p-5">
-            <RoomTab />
-          </div>
+          <div className="h-full overflow-y-auto p-3 md:p-5"><RoomTab /></div>
         )}
       </div>
     </div>
