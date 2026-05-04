@@ -1117,6 +1117,11 @@ async fn auto_recall_memory(
     const FETCH_LIMIT: usize = 8;
     const TOP_K: usize = 3;
     const MIN_PROMPT_CHARS: usize = 8;
+    /// Cosine similarity floor — drop rows below this from the recall
+    /// prefix. Calibrated for MiniLM-L6-v2 outputs where strong matches
+    /// land in `[0.30, 0.45]` and noise sits below `0.25`. Override
+    /// per-process with `LINGGEN_RECALL_MIN_SCORE`.
+    const DEFAULT_MIN_SCORE: f32 = 0.30;
 
     let trimmed = prompt.trim();
     if trimmed.chars().count() < MIN_PROMPT_CHARS {
@@ -1135,10 +1140,16 @@ async fn auto_recall_memory(
         .and_then(|sid| state.manager.global_sessions.get_session_meta(sid).ok().flatten())
         .and_then(|m| m.project_name);
 
+    let min_score: f32 = std::env::var("LINGGEN_RECALL_MIN_SCORE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MIN_SCORE);
+
     let args = serde_json::json!({
         "verb": "search",
         "query": trimmed,
         "limit": FETCH_LIMIT,
+        "min_score": min_score,
     });
 
     let dispatch = crate::engine::capability_tools::dispatch(
