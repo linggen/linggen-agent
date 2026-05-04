@@ -316,12 +316,14 @@ export const ChatInput: React.FC<ChatInputProps> = ({
               <span className="flex-1">{visibleQueued.length} message{visibleQueued.length > 1 ? 's' : ''} queued — agent is busy</span>
               <button
                 onClick={async () => {
-                  // Optimistic local clear so the badge disappears immediately.
-                  useInteractionStore.getState().setQueuedMessages([]);
-                  // Authoritative drop on the server. Without this, queued
+                  // Authoritative drop on the server first. Without this, queued
                   // messages survive the dismiss and fire when the agent frees up.
+                  // Guard before the optimistic clear — if any required id is
+                  // missing we skip both calls instead of clearing the local
+                  // store while leaving the server queue intact.
                   const { selectedProjectRoot, activeSessionId } = useSessionStore.getState();
                   if (!selectedProjectRoot || !activeSessionId || !selectedAgent) return;
+                  useInteractionStore.getState().setQueuedMessages([]);
                   try {
                     await fetch('/api/queue/clear', {
                       method: 'POST',
