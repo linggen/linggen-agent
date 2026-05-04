@@ -96,6 +96,12 @@ pub struct ServerState {
     pub proxy_connections: Arc<rtc::proxy_room::ProxyRoomConnections>,
     /// Persistent token usage for proxy room budget enforcement.
     pub token_usage: Arc<tokio::sync::Mutex<rtc::token_store::TokenUsageStore>>,
+    /// In-flight ChatGPT OAuth login task. A new login attempt aborts the
+    /// prior one — without this, two `browser_login()` flows can run in
+    /// parallel after a failed attempt and the second one's callback hits
+    /// the first one's callback server (or vice versa), producing a
+    /// "State mismatch" error. Logout also aborts.
+    pub codex_login_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1268,6 +1274,7 @@ async fn prepare_server(
         user_bash_cwd: Arc::new(Mutex::new(HashMap::new())),
         proxy_connections: Arc::new(rtc::proxy_room::ProxyRoomConnections::new()),
         token_usage: Arc::new(tokio::sync::Mutex::new(rtc::token_store::TokenUsageStore::load())),
+        codex_login_task: Arc::new(tokio::sync::Mutex::new(None)),
     });
 
     // Flush token usage to disk every 30 seconds.

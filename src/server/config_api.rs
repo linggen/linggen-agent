@@ -170,12 +170,28 @@ pub(crate) async fn get_codex_auth_status() -> impl IntoResponse {
 }
 
 /// Start ChatGPT OAuth browser login flow.
+///
+/// Aborts any prior in-flight login task before spawning a new one. Without
+/// this, two `browser_login()` flows can race after a failed first attempt:
+/// each holds an independent state + callback server, and the browser's
+/// cached redirect from one attempt lands at the other's server, producing
+/// a "State mismatch. Please try again." error. The Sys Doctor settings
+/// page is the typical reproducer (signin → fail → signout → signin).
 pub(crate) async fn start_codex_auth_login(
     State(state): State<std::sync::Arc<crate::server::ServerState>>,
 ) -> impl IntoResponse {
+    // Cancel any prior in-flight flow before starting a new one.
+    {
+        let mut guard = state.codex_login_task.lock().await;
+        if let Some(prior) = guard.take() {
+            prior.abort();
+            tracing::info!("Aborted prior ChatGPT OAuth login task to start a fresh one");
+        }
+    }
+
     let manager = state.manager.clone();
-    // Spawn the browser login in a background task
-    tokio::spawn(async move {
+    let state_for_task = state.clone();
+    let handle = tokio::spawn(async move {
         match codex_auth::browser_login().await {
             Ok(_) => {
                 tracing::info!("ChatGPT OAuth login completed via Web UI");
@@ -188,12 +204,16 @@ pub(crate) async fn start_codex_auth_login(
                 // Clear all session engines so they use the new models
                 manager.session_engines.lock().await.clear();
                 // Restore proxy models that the rebuild above dropped.
-                crate::server::rtc::proxy_room::reapply_proxy_models(&state).await;
+                crate::server::rtc::proxy_room::reapply_proxy_models(&state_for_task).await;
                 tracing::info!("Reloaded models after ChatGPT OAuth login");
             }
             Err(e) => tracing::warn!("ChatGPT OAuth login failed: {}", e),
         }
+        // Self-clear: drop our slot so logout/restart can detect "no flow alive".
+        let mut guard = state_for_task.codex_login_task.lock().await;
+        *guard = None;
     });
+    *state.codex_login_task.lock().await = Some(handle);
 
     Json(serde_json::json!({
         "status": "login_started",
@@ -203,7 +223,20 @@ pub(crate) async fn start_codex_auth_login(
 }
 
 /// Logout from ChatGPT OAuth.
-pub(crate) async fn codex_auth_logout() -> impl IntoResponse {
+///
+/// Also aborts any in-flight login task so a sign-out mid-attempt fully
+/// clears server-side state — the next sign-in starts from a clean slate.
+pub(crate) async fn codex_auth_logout(
+    State(state): State<std::sync::Arc<crate::server::ServerState>>,
+) -> impl IntoResponse {
+    {
+        let mut guard = state.codex_login_task.lock().await;
+        if let Some(prior) = guard.take() {
+            prior.abort();
+            tracing::info!("Aborted in-flight ChatGPT OAuth login task on logout");
+        }
+    }
+
     let manager = codex_auth::CodexAuthManager::new();
     match manager.logout().await {
         Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
