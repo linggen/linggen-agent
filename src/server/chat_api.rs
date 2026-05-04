@@ -554,9 +554,7 @@ async fn run_skill_dispatch(
     engine.observations.clear();
     engine.task = Some(task_for_loop);
 
-    // Add user message to chat history so subsequent turns have conversational context.
-    engine.chat_history.push(crate::ollama::ChatMessage::new("user", ctx.clean_msg.clone()));
-    engine.truncate_chat_history();
+    push_user_turn_with_recall(ctx, engine).await;
 
     let skill_msg = format!("Running skill: {}", cmd);
     persist_and_emit_message(
@@ -750,9 +748,7 @@ async fn run_trigger_dispatch(
     engine.observations.clear();
     engine.task = Some(task_for_loop);
 
-    // Add user message to chat history so subsequent turns have conversational context.
-    engine.chat_history.push(crate::ollama::ChatMessage::new("user", ctx.clean_msg.clone()));
-    engine.truncate_chat_history();
+    push_user_turn_with_recall(ctx, engine).await;
 
     let skill_msg = format!("Running skill via trigger: {}", skill_name);
     persist_and_emit_message(
@@ -833,9 +829,7 @@ async fn run_plan_dispatch(
     if engine.pending_images.is_empty() && !ctx.images.is_empty() {
         engine.pending_images = ctx.images.clone();
     }
-    // Add user message to chat history so subsequent turns have conversational context.
-    engine.chat_history.push(crate::ollama::ChatMessage::new("user", ctx.clean_msg.clone()));
-    engine.truncate_chat_history();
+    push_user_turn_with_recall(ctx, engine).await;
 
     // Wire up the thinking channel.
     let (thinking_tx, mut thinking_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1099,6 +1093,156 @@ async fn persist_and_emit_last_assistant_text(
     }
 }
 
+/// Per-turn semantic recall against the active memory provider.
+///
+/// Called right before the user's message is pushed onto the engine's chat
+/// history. Returns a "From memory: ..." prefix block (or `None`) that
+/// `run_structured_loop` injects as a system message ahead of the user
+/// turn — implementing the "push at turn start" half of memory-spec.md
+/// §"Retrieval doubles as maintenance".
+///
+/// Bails silently on any path that could block the user: short prompts,
+/// no memory provider installed, daemon unreachable within the budget,
+/// dispatch errors, malformed responses. Project-scoped rows from a
+/// different project are filtered out — same recipe as the Claude Code
+/// `UserPromptSubmit` hook (cross-project / no-context / current project
+/// only).
+async fn auto_recall_memory(
+    state: &Arc<ServerState>,
+    prompt: &str,
+    session_id: Option<&str>,
+) -> Option<String> {
+    use std::time::Duration;
+    const RECALL_BUDGET: Duration = Duration::from_secs(3);
+    const FETCH_LIMIT: usize = 8;
+    const TOP_K: usize = 3;
+    const MIN_PROMPT_CHARS: usize = 8;
+
+    let trimmed = prompt.trim();
+    if trimmed.chars().count() < MIN_PROMPT_CHARS {
+        return None;
+    }
+
+    // No memory provider installed → skip silently. (Same shape as the CC
+    // hook's "ling-mem not on PATH" early-out.)
+    if state.skill_manager.active_provider("memory").await.is_none() {
+        return None;
+    }
+
+    // Current project (last segment of git root, or None in home mode).
+    // Used to filter out rows scoped to a *different* project.
+    let project_name: Option<String> = session_id
+        .and_then(|sid| state.manager.global_sessions.get_session_meta(sid).ok().flatten())
+        .and_then(|m| m.project_name);
+
+    let args = serde_json::json!({
+        "verb": "search",
+        "query": trimmed,
+        "limit": FETCH_LIMIT,
+    });
+
+    let dispatch = crate::engine::capability_tools::dispatch(
+        &state.skill_manager,
+        "Memory_query",
+        args,
+    );
+    let result = match tokio::time::timeout(RECALL_BUDGET, dispatch).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            tracing::debug!("auto-recall: dispatch failed: {e}");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!("auto-recall: dispatch exceeded {}s budget", RECALL_BUDGET.as_secs());
+            return None;
+        }
+    };
+
+    let rows = result.as_array()?;
+    if rows.is_empty() {
+        return None;
+    }
+
+    let want_proj_ctx = project_name
+        .as_deref()
+        .map(|p| format!("project/{p}"));
+
+    let mut hits: Vec<String> = Vec::new();
+    for row in rows {
+        if hits.len() >= TOP_K {
+            break;
+        }
+
+        // Drop rows scoped to a different project; rows with no project/*
+        // context (cross-project, no-context, domain-scoped) always pass.
+        let project_scoped: Vec<&str> = row
+            .get("contexts")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|s| s.starts_with("project/"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let project_ok = project_scoped.is_empty()
+            || want_proj_ctx
+                .as_deref()
+                .map(|w| project_scoped.iter().any(|s| *s == w))
+                .unwrap_or(false);
+        if !project_ok {
+            continue;
+        }
+
+        let typ = row.get("type").and_then(|v| v.as_str()).unwrap_or("fact");
+        let date = row
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .map(|s| if s.len() >= 10 { &s[..10] } else { s })
+            .unwrap_or("");
+        let content = row
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if content.is_empty() {
+            continue;
+        }
+        hits.push(format!("From memory ({typ}, {date}): {content}"));
+    }
+
+    if hits.is_empty() {
+        None
+    } else {
+        Some(hits.join("\n"))
+    }
+}
+
+/// Push the user message onto the engine's chat history with auto-recall
+/// applied. Used by every turn-start site (skill dispatch, trigger
+/// dispatch, plan mode, structured loop) so all four entry points get
+/// the same per-turn memory prefix without duplicating the logic.
+async fn push_user_turn_with_recall(
+    ctx: &ChatRunCtx,
+    engine: &mut crate::engine::AgentEngine,
+) {
+    if let Some(prefix) = auto_recall_memory(
+        &ctx.state,
+        &ctx.clean_msg,
+        ctx.session_id.as_deref(),
+    )
+    .await
+    {
+        engine
+            .chat_history
+            .push(crate::ollama::ChatMessage::new("system", prefix));
+    }
+    engine
+        .chat_history
+        .push(crate::ollama::ChatMessage::new("user", ctx.clean_msg.clone()));
+    engine.truncate_chat_history();
+}
+
 /// Dispatch the structured (auto) mode agent loop.
 async fn run_structured_loop(
     ctx: &ChatRunCtx,
@@ -1140,12 +1284,7 @@ async fn run_structured_loop(
     }
     let task_for_loop = ctx.clean_msg.trim().to_string();
     engine.task = Some(task_for_loop);
-    // Add user message to chat history so subsequent turns have conversational context.
-    // Per-turn semantic retrieval against skill memory will hook in here once
-    // a `provides: [memory]` skill is active and `Memory_query({verb: "search"})`
-    // is reachable via the memory dispatch layer (see memory-spec.md).
-    engine.chat_history.push(crate::ollama::ChatMessage::new("user", ctx.clean_msg.clone()));
-    engine.truncate_chat_history();
+    push_user_turn_with_recall(ctx, engine).await;
 
     // Wire up the thinking channel so streaming thinking tokens reach the UI.
     let (thinking_tx, mut thinking_rx) = tokio::sync::mpsc::unbounded_channel();
