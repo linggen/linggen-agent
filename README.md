@@ -6,14 +6,15 @@
 
 <p align="center">
   <strong>A local AI app engine — and your general-purpose personal assistant.</strong><br>
-  Open-source. Any model. WebRTC remote access. Skills you can share.
+  Two faces of one runtime: out of the box, the assistant chats and acts;
+  install skills and the same runtime hosts them as full apps.
 </p>
 
 <p align="center">
   <a href="https://linggen.dev">Website</a> &middot;
-  <a href="https://linggen.dev">Demo Video</a> &middot;
+  <a href="https://linggen.dev/apps/sysdoctor">Apps</a> &middot;
+  <a href="https://linggen.dev/skills">Skills</a> &middot;
   <a href="https://linggen.dev/docs">Docs</a> &middot;
-  <a href="https://linggen.dev/skills">Skills Marketplace</a> &middot;
   <a href="https://discord.gg/linggen">Discord</a>
 </p>
 
@@ -25,106 +26,67 @@
 
 ---
 
+## Install
+
+```bash
+curl -fsSL https://linggen.dev/install.sh | bash
+ling
+```
+
+Opens the web UI at `http://localhost:9898`. macOS and Linux.
+
+---
+
 ## What is Linggen?
 
-Linggen is a local AI app engine. Out of the box, it's a general-purpose personal assistant that chats and acts. Install skills and the same runtime hosts them as full AI apps — coding, system diagnostics, semantic memory, model sharing, anything you want to drop in. Runs on your machine; access it from any device via WebRTC. No cloud hosting, no subscriptions, your models and your data.
+Architecturally, Linggen is **the root system for AI agents**. The core
+runtime manages agent processes, communication, and execution; everything
+else (skills, agents, missions) grows on top as files. An "AI app" in
+Linggen is a skill, an agent, or a mission — markdown + scripts, not code
+plugins. The runtime gives every app a process, syscalls (built-in tools),
+a filesystem (memory), permissions, and a network surface (P2P rooms).
 
-```bash
-curl -fsSL https://linggen.dev/install.sh | bash
-ling
-```
+Apps drop into a folder and run.
 
-That's it. Opens a web UI at `localhost:9898`.
+### OS analogy
 
-## Why Linggen over Claude Code / Cursor / Codex?
+| OS | Linggen |
+|:---|:---|
+| Process | Agentic loop — one running agent |
+| Interrupt | User message queue — checked each iteration |
+| Thread / Fork | Subagent delegation — concurrent child execution |
+| Syscall | Tool call — built-in tools are the kernel API |
+| Dynamic library | Skill — loaded at runtime, no code changes |
+| Cron job | Mission — scheduled agent / app / script |
+| Driver | Model provider — Ollama, Claude, GPT, Gemini, Bedrock |
+| Filesystem | Memory store — core markdown + LanceDB RAG via `ling-mem` |
+| Process privilege | Permission modes (chat / read / edit / admin) + path scoping |
+| Network share | Rooms — share models with peers over P2P WebRTC |
 
-| | Linggen | Claude Code | Cursor | Codex |
-|---|---|---|---|---|
-| **Runs locally** | Yes | Yes | No (cloud) | Cloud-only |
-| **Any model** | Ollama, Claude, GPT, Gemini, DeepSeek, Groq, OpenRouter | Claude only | Multi-model | GPT only |
-| **Remote access** | P2P WebRTC — your machine, any device | Cloud-hosted web app | No | Cloud-only |
-| **Share models with others** | Yes — proxy rooms over P2P | No | No | No |
-| **Open source** | MIT | No | No | CLI only |
-| **Skills/extensions** | Drop-in SKILL.md files ([Agent Skills](https://agentskills.io) standard) | Custom slash commands | Plugins | No |
-| **Web UI** | Full web interface with streaming | Terminal + web app | IDE-embedded | Web (cloud) |
-| **Data stays local** | Always — P2P, no relay | Code sent to cloud for web app | Cloud-processed | Cloud-processed |
-| **Cost** | Free + your model costs | $20/mo or API costs | $20/mo | API costs |
+Full table and design principles in [`doc/product-spec.md`](doc/product-spec.md);
+vision and roadmap in [`doc/insight.md`](doc/insight.md).
 
-## Key Features
+---
 
-### Remote Access via WebRTC
+## Apps built on Linggen
 
-Start a coding task on your desktop, monitor it from your phone. No VPN, no port forwarding — peer-to-peer encrypted connection.
+- **[Sys Doctor](https://linggen.dev/apps/sysdoctor)** — AI health analyst for your Mac. Disk, security, performance, dormant apps, buyer's guide. Bundled `.app` available.
+- **Memory** — `ling-mem` skill. LanceDB semantic store with typed facts, embeddings, first-class forgetting. Same store reachable from Linggen, Claude Code, or any tool that can shell out.
+- **Model Sharing** — Rooms. Open one and let friends use your models over P2P WebRTC. No keys for the consumer, no cloud middleman, owner controls budget and tools.
+- **Architecture Guardian** — Agent + mission. Reviews code and updates dependency graphs on a schedule, flags design violations.
+- **DevOps** — Mission. Monitor CI/CD, auto-fix flaky tests, manage deployments — all defined in markdown.
 
-```bash
-ling login   # link to linggen.dev
-```
+Skills, agents, missions — all files. New apps are a folder away. Browse community skills at [linggen.dev/skills](https://linggen.dev/skills).
 
-Then open `linggen.dev/app` from any browser, anywhere.
+---
 
-### Any Model, Your Choice
+## Add an app
 
-Use local models via Ollama, or cloud APIs — Claude, GPT, Gemini, DeepSeek, Groq, OpenRouter. Switch models mid-conversation. Configure fallback chains so work never stops.
-
-### Proxy Rooms — Share Your Models
-
-Open a private or public room and let friends, teammates, or the community talk to your models — over the same P2P WebRTC link, no cloud middleman. Pick which models are shared, which tools and skills consumers can use, and set daily token budgets per room and per consumer. Disable the room and everyone is kicked instantly.
-
-```bash
-# Owner: enable a room in Settings → Sharing
-# Consumer: open linggen.dev/app and connect to the room name
-```
-
-Room config lives at `~/.linggen/room_config.toml`; persistent token usage at `~/.linggen/token_usage.json` (auto-resets at midnight UTC).
-
-### Semantic Memory
-
-The `ling-mem` skill gives the agent a LanceDB-backed semantic memory: typed facts (preference / decision / learned / fact), 384-dim embeddings, filter-and-search, first-class forgetting. It remembers across sessions, projects, and tools — and works the same from Linggen, Claude Code, or any agent that can shell out.
-
-### Skills, Not Plugins
-
-Drop a `SKILL.md` into your project and the agent gains new capabilities instantly. Skills follow the open [Agent Skills](https://agentskills.io) standard, compatible with Claude Code and Codex.
-
-```
-~/.linggen/skills/my-skill/SKILL.md
-```
-
-Browse and install community skills from the [marketplace](https://linggen.dev/skills).
-
-### Multi-Agent Delegation
-
-Agents delegate tasks to other agents — each with its own context, tools, and model. Like `fork()` for AI.
-
-### Plan Mode
-
-For complex tasks, the agent proposes a plan before acting. Review, edit, or approve — then it executes. Stay in control on high-stakes changes.
-
-### Mission System
-
-Schedule recurring tasks with cron expressions. Three run modes — `agent` (full agent loop), `app` (open a URL), or `script` (run a shell command) — so missions cover everything from code reviews and dependency updates to dashboards and one-shot scripts. Each mission carries its own permission scope, allowed tools, and allowed skills.
-
-## Quick Start
-
-```bash
-# Install
-curl -fsSL https://linggen.dev/install.sh | bash
-
-# First-time setup
-ling init
-
-# Start (opens browser)
-ling
-
-# Optional: enable remote access
-ling login
-```
-
-## Adding Agents
-
-Drop a markdown file in `~/.linggen/agents/` — available immediately, no restart:
+Drop a markdown file in `~/.linggen/` — available immediately, no restart:
 
 ```markdown
 ---
+# ~/.linggen/agents/reviewer.md
 name: reviewer
 description: Code review specialist.
 tools: ["Read", "Glob", "Grep"]
@@ -134,16 +96,44 @@ model: claude-sonnet-4-20250514
 You review code for bugs, style issues, and security vulnerabilities.
 ```
 
+Skills (`~/.linggen/skills/<name>/SKILL.md`) and missions (cron-scheduled
+agent / app / script) follow the same drop-in pattern. Skills use the open
+[Agent Skills](https://agentskills.io) standard and work in Claude Code
+and Codex too.
+
+---
+
+## Where Linggen sits
+
+- **Local-first.** Runtime, data, and inference (when you pick local models) live on your machine. Cloud is opt-in via your own API keys.
+- **Model-agnostic.** Any model — Ollama, Claude, GPT, Gemini, DeepSeek, Groq, OpenRouter. Routing policies (`local-first`, `cloud-first`, custom) decide which model handles each request.
+- **App platform, not a single product.** Coding is one app among many.
+- **P2P, not centralized.** Remote access and model sharing flow over WebRTC data channels. `linggen.dev` acts as a signaling relay; it does not see chat content.
+- **Skills as the contract.** Apps follow the open Agent Skills standard.
+
+---
+
+## Remote access
+
+```bash
+ling login   # link to linggen.dev
+```
+
+Then open `linggen.dev/app` from any browser. P2P-encrypted tunnel back to
+your machine; no VPN, no port forwarding.
+
+---
+
 ## Documentation
 
-- [Design docs](doc/) — architecture, specs, and internals
-- [Full docs](https://linggen.dev/docs) — guides and reference
+- [Design docs](doc/) — architecture, specs, internals
+- [Product spec](doc/product-spec.md) — system definition + design principles
+- [Insight](doc/insight.md) — vision, roadmap, problems Linggen solves
 - [Skill spec](doc/skill-spec.md) — how to write skills
+- [Full docs](https://linggen.dev/docs) — guides and reference
 
-## Contributing
-
-Contributions welcome. See the [design docs](doc/) for architecture context.
+---
 
 ## License
 
-MIT
+MIT — engine and bundled skills. Branded apps shipped from [linggen-releases](https://github.com/linggen/linggen-releases) ship under their own terms.
