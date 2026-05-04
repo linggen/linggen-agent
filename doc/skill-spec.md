@@ -188,6 +188,19 @@ Interactive apps are **session-bound** — every message in the session activate
 
 Every app skill receives a built-in `PageUpdate` data tool — the agent calls it whenever state the user should see changes, and the iframe re-renders. Each app defines its own page layout schema in its SKILL.md.
 
+### App-mode (`?app_mode=1`)
+
+When a skill page is hosted by a Linggen app shell (e.g. SysDoctor.app, LingMem.app), the shell appends `?app_mode=1` to the URL and drives shell-level UI affordances via `window.postMessage`. The skill is otherwise unchanged — the same files run in the public web UI without app_mode and behave identically.
+
+Skills that want to be hostable by an app shell ship a tiny `app-mode.js` that:
+
+1. No-ops if `URLSearchParams(location.search).get("app_mode") !== "1"`.
+2. Listens on `window.message` and handles:
+   - `{ type: "linggen:show-settings" }` → overlay `settings.html` over the page.
+   - `{ type: "linggen:hide-settings" }` → hide the overlay.
+
+The shell never reaches into skill DOM; it only posts these messages. Reference: `sys-doctor/scripts/app-mode.js`.
+
 ## Install
 
 Skills can declare an `install` field pointing to a script that runs once when the skill is installed. Used to seed directories, copy mission files into `~/.linggen/missions/`, fetch binaries via `requires:`, or perform any other one-time setup.

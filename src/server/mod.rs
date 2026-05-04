@@ -30,7 +30,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use agent_api::{
-    cancel_agent_run, cancel_tool_execution,
+    cancel_agent_run, cancel_tool_execution, clear_queued_messages,
     run_agent, set_task,
 };
 use chat_api::{approve_plan_handler, ask_user_response_handler, chat_handler, clear_chat_history_api, compact_chat_api, edit_plan_handler, get_system_prompt_api, pending_ask_user_handler, reject_plan_handler};
@@ -1425,6 +1425,7 @@ async fn prepare_server(
         .route("/api/skill-sessions/state", get(get_skill_session_state))
         .route("/api/task", post(set_task))
         .route("/api/agent-cancel", post(cancel_agent_run))
+        .route("/api/queue/clear", post(clear_queued_messages))
         // Missions
         .route("/api/missions", get(list_missions).post(create_mission))
         .route("/api/missions/sessions/state", get(get_mission_session_state))

@@ -230,3 +230,27 @@ pub(crate) async fn cancel_agent_run(
     }
 }
 
+#[derive(Deserialize)]
+pub(crate) struct ClearQueueRequest {
+    project_root: String,
+    session_id: String,
+    agent_id: String,
+}
+
+/// Drop all messages queued behind a busy agent without cancelling its
+/// in-flight run. Wired to the chat input's "Dismiss queue" button —
+/// previously that only cleared the local UI store, leaving the server
+/// queue intact and causing dismissed messages to fire later.
+pub(crate) async fn clear_queued_messages(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<ClearQueueRequest>,
+) -> impl IntoResponse {
+    let key = queue_key(&req.project_root, &req.session_id, &req.agent_id);
+    {
+        let mut guard = state.queued_chats.lock().await;
+        guard.remove(&key);
+    }
+    emit_queue_updated(&state, &req.project_root, &req.session_id, &req.agent_id).await;
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
