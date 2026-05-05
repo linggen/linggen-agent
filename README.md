@@ -20,7 +20,7 @@
 
 <p align="center">
   <a href="https://github.com/linggen/linggen/releases"><img src="https://img.shields.io/github/v/release/linggen/linggen?style=flat-square" alt="Release" /></a>
-  <a href="https://github.com/linggen/linggen/blob/main/LICENSE"><img src="https://img.shields.io/github/license/linggen/linggen?style=flat-square" alt="MIT License" /></a>
+  <a href="https://github.com/linggen/linggen/blob/main/LICENSE"><img src="https://img.shields.io/github/license/linggen/linggen?style=flat-square" alt="Apache 2.0 License" /></a>
   <a href="https://github.com/linggen/linggen/stargazers"><img src="https://img.shields.io/github/stars/linggen/linggen?style=flat-square" alt="Stars" /></a>
 </p>
 
@@ -136,4 +136,4 @@ your machine; no VPN, no port forwarding.
 
 ## License
 
-MIT — engine and bundled skills. Branded apps shipped from [linggen-releases](https://github.com/linggen/linggen-releases) ship under their own terms.
+Apache 2.0 — engine and bundled skills. Branded apps shipped from [linggen-releases](https://github.com/linggen/linggen-releases) ship under their own terms.
